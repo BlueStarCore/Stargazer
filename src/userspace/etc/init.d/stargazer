@@ -1,0 +1,56 @@
+#!/bin/sh
+# Stargazer NGFW Service
+# Manages module loading and kernel parameters
+
+NAME="stargazer"
+MODULE_DIR="/lib/modules/stargazer"
+MODULES_CONF="/etc/modules-load.d/stargazer.conf"
+SYSCTL_CONF="/etc/sysctl.d/10-stargazer.conf"
+
+log() { echo "[$NAME] $1"; }
+
+load_modules() {
+    [ -f "$MODULES_CONF" ] || return 0
+    while read -r mod || [ -n "$mod" ]; do
+        case "$mod" in \#*|"") continue ;; esac
+        [ -f "$MODULE_DIR/${mod}.ko" ] && {
+            log "Loading: $mod"
+            insmod "$MODULE_DIR/${mod}.ko" 2>/dev/null && log "OK: $mod" || log "FAIL: $mod"
+        }
+    done < "$MODULES_CONF"
+}
+
+unload_modules() {
+    [ -f "$MODULES_CONF" ] || return 0
+    mods=""
+    while read -r mod || [ -n "$mod" ]; do
+        case "$mod" in \#*|"") continue ;; esac
+        mods="$mod $mods"
+    done < "$MODULES_CONF"
+    for mod in $mods; do
+        log "Unloading: $mod"
+        rmmod "$mod" 2>/dev/null
+    done
+}
+
+apply_sysctl() {
+    [ -f "$SYSCTL_CONF" ] || return 0
+    log "Applying sysctl..."
+    while IFS='=' read -r key val || [ -n "$key" ]; do
+        case "$key" in \#*|"") continue ;; esac
+        key=$(echo "$key" | tr -d ' ')
+        val=$(echo "$val" | tr -d ' ')
+        path="/proc/sys/$(echo "$key" | tr '.' '/')"
+        [ -f "$path" ] && echo "$val" > "$path" 2>/dev/null
+    done < "$SYSCTL_CONF"
+}
+
+case "$1" in
+    start)   log "Starting..."; apply_sysctl; load_modules; log "Started" ;;
+    stop)    log "Stopping..."; unload_modules; log "Stopped" ;;
+    restart) $0 stop; sleep 1; $0 start ;;
+    status)  lsmod | grep -q pkt_forward && log "Running" || log "Not running" ;;
+    *)       echo "Usage: $0 {start|stop|restart|status}" ;;
+esac
+
+exit $?

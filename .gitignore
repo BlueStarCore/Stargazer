@@ -1,0 +1,35 @@
+# Build artifacts
+build/
+*.ko
+*.o
+*.mod
+*.mod.c
+*.order
+*.symvers
+.*.cmd
+.tmp_versions/
+.cache.mk
+
+# Kernel source (large external dependency ~500MB)
+/kernel/
+
+# LightGBM (clone externally)
+./stargazer-lightgbm/
+
+# Rootfs (generated)
+./stargazer-rootfs/
+rootfs/
+*.img
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Do not commit copyrighted book PDFs or other proprietary documents
+docs/*.pdf

@@ -1,0 +1,53 @@
+#!/bin/sh
+# Stargazer NGFW - Init (PID 1)
+
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
+# Mount filesystems
+mount -t proc none /proc
+mount -t sysfs none /sys
+mount -t devtmpfs none /dev 2>/dev/null || true
+echo 1 > /proc/sys/kernel/sysrq
+exec 0</dev/console 1>/dev/console 2>&1
+
+# Banner
+clear 2>/dev/null
+cat << 'EOF'
+
+  ╔═══════════════════════════════════════════════════════════╗
+  ║  STARGAZER NGFW v@VERSION@                                ║
+  ╠═══════════════════════════════════════════════════════════╣
+  ║  service stargazer {start|stop|status}                    ║
+  ║  poweroff | reboot                                        ║
+  ╚═══════════════════════════════════════════════════════════╝
+
+EOF
+echo "Kernel: $(uname -r) | Arch: $(uname -m)"
+
+# Start services
+[ -x /etc/init.d/stargazer ] && /etc/init.d/stargazer start
+
+# Create commands
+cat > /sbin/service << 'SVC'
+#!/bin/sh
+[ -x "/etc/init.d/$1" ] && "/etc/init.d/$1" "$2" || echo "Usage: service <name> <action>"
+SVC
+
+cat > /sbin/poweroff << 'PWR'
+#!/bin/sh
+for s in /etc/init.d/*; do [ -x "$s" ] && "$s" stop 2>/dev/null; done
+sync; echo o > /proc/sysrq-trigger
+PWR
+
+cat > /sbin/reboot << 'RBT'
+#!/bin/sh
+for s in /etc/init.d/*; do [ -x "$s" ] && "$s" stop 2>/dev/null; done
+sync; echo b > /proc/sysrq-trigger
+RBT
+
+chmod +x /sbin/service /sbin/poweroff /sbin/reboot
+cp /sbin/poweroff /sbin/halt
+
+# Shell loop
+echo "[INIT] Ready. Type 'exit' to shutdown."
+while true; do /bin/sh; /sbin/poweroff; done
