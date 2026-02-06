@@ -1,0 +1,28 @@
+name: Build Kernel Stargazer
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Stargazer repo
+        uses: actions/checkout@v4
+        with:
+          repository: mobius-infinity/Stargazer
+          ref: develop
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+              git make gcc-aarch64-linux-gnu \
+              bc bison flex libssl-dev libncurses5-dev \
+              qemu-system-arm xorriso wget cpio
+
+      - name: Run make
+        run: make
