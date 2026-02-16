@@ -506,49 +506,38 @@ static const char *policy_reason(int rc)
 	}
 }
 
-/* ── Enforce password change ────────────────────────────────────────────── */
+/* ── Password change core ──────────────────────────────────────────────── */
 
-static int enforce_password_change(const char *username)
+/*
+ * Print password requirements line.
+ * Used by both enforce_password_change and enforce_policy_compliance.
+ */
+static void print_requirements(int eff_min_len, int has_policy,
+			       const struct password_policy *pol)
 {
-	char val[64];
-	char section[MAX_LINE_LEN];
-	snprintf(section, sizeof(section), "system_admin:%s", username);
-
-	if (read_ini_value(SYSTEM_CONF, section,
-			   "enforce-change-password", val, sizeof(val)) != 0)
-		return 0; /* no policy → skip */
-
-	if (strcmp(val, "enable") != 0)
-		return 0;
-
-	/* Read password policy for requirements display */
-	struct password_policy pol;
-	int has_policy = is_password_policy_enforced(username);
-	if (has_policy)
-		read_password_policy(&pol);
-	else
-		memset(&pol, 0, sizeof(pol));
-
-	/* Determine effective min length: policy or fallback */
-	int eff_min_len = (has_policy && pol.min_length > 0)
-		? pol.min_length : MIN_PASS_LEN;
-
-	fprintf(stderr, "\n");
-	fprintf(stderr, " PASSWORD CHANGE REQUIRED\n");
-	fprintf(stderr, " Account '%s' must change password now.\n", username);
 	fprintf(stderr, " Requirements: minimum %d characters", eff_min_len);
 	if (has_policy) {
-		if (pol.min_uppercase > 0)
-			fprintf(stderr, ", %d uppercase", pol.min_uppercase);
-		if (pol.min_lowercase > 0)
-			fprintf(stderr, ", %d lowercase", pol.min_lowercase);
-		if (pol.min_digit > 0)
-			fprintf(stderr, ", %d digit(s)", pol.min_digit);
-		if (pol.min_special > 0)
-			fprintf(stderr, ", %d special", pol.min_special);
+		if (pol->min_uppercase > 0)
+			fprintf(stderr, ", %d uppercase", pol->min_uppercase);
+		if (pol->min_lowercase > 0)
+			fprintf(stderr, ", %d lowercase", pol->min_lowercase);
+		if (pol->min_digit > 0)
+			fprintf(stderr, ", %d digit(s)", pol->min_digit);
+		if (pol->min_special > 0)
+			fprintf(stderr, ", %d special", pol->min_special);
 	}
 	fprintf(stderr, ".\n\n");
+}
 
+/*
+ * Core password change loop — prompts, validates, hashes, updates shadow.
+ * Returns: 0 on success, -1 on error, -2 on Ctrl+C.
+ * Does NOT read or write any config flags — caller handles that.
+ */
+static int force_password_change(const char *username, int eff_min_len,
+				 int has_policy,
+				 const struct password_policy *pol)
+{
 	char pw1[MAX_PASS_LEN], pw2[MAX_PASS_LEN];
 	int rc;
 
@@ -564,7 +553,7 @@ static int enforce_password_change(const char *username)
 		}
 
 		if (has_policy) {
-			int prc = check_password_policy(pw1, username, &pol);
+			int prc = check_password_policy(pw1, username, pol);
 			if (prc != 1) {
 				fprintf(stderr, "  %s\n\n", policy_reason(prc));
 				continue;
@@ -601,17 +590,80 @@ static int enforce_password_change(const char *username)
 		break;
 	}
 
-	/* Clear zero-out password buffers */
 	explicit_bzero(pw1, sizeof(pw1));
 	explicit_bzero(pw2, sizeof(pw2));
 
-	/* Clear enforce flag */
+	fprintf(stderr, "\n  Password set successfully.\n\n");
+	return 0;
+}
+
+/* ── Enforce password change (admin-controlled flag) ───────────────────── */
+
+static int enforce_password_change(const char *username)
+{
+	char val[64];
+	char section[MAX_LINE_LEN];
+	snprintf(section, sizeof(section), "system_admin:%s", username);
+
+	if (read_ini_value(SYSTEM_CONF, section,
+			   "enforce-change-password", val, sizeof(val)) != 0)
+		return 0; /* no key → skip */
+
+	if (strcmp(val, "enable") != 0)
+		return 0;
+
+	/* Read password policy for requirements */
+	struct password_policy pol;
+	int has_policy = is_password_policy_enforced(username);
+	if (has_policy)
+		read_password_policy(&pol);
+	else
+		memset(&pol, 0, sizeof(pol));
+
+	int eff_min_len = (has_policy && pol.min_length > 0)
+		? pol.min_length : MIN_PASS_LEN;
+
+	fprintf(stderr, "\n");
+	fprintf(stderr, " PASSWORD CHANGE REQUIRED\n");
+	fprintf(stderr, " Account '%s' must change password now.\n", username);
+	print_requirements(eff_min_len, has_policy, &pol);
+
+	int rc = force_password_change(username, eff_min_len, has_policy, &pol);
+	if (rc != 0)
+		return rc;
+
+	/* Clear admin-controlled enforce flag */
 	write_ini_value(SYSTEM_CONF, section,
 			"enforce-change-password", "disable");
 
-	audit_log(username, "password_force_change", "source=logind");
+	audit_log(username, "password_force_change", "source=admin-flag");
+	return 0;
+}
 
-	fprintf(stderr, "\n  Password set successfully.\n\n");
+/* ── Enforce policy compliance (triggered by global policy change) ─────── */
+
+static int enforce_policy_compliance(const char *username,
+				     const struct password_policy *pol)
+{
+	fprintf(stderr, "\n");
+	fprintf(stderr, " NOTICE: Password Policy Changed\n");
+	fprintf(stderr, " Your current password does not meet the updated\n");
+	fprintf(stderr, " global password policy. You must set a new password.\n");
+	print_requirements(
+		(pol->min_length > 0) ? pol->min_length : MIN_PASS_LEN,
+		1, pol);
+
+	int rc = force_password_change(username,
+		(pol->min_length > 0) ? pol->min_length : MIN_PASS_LEN,
+		1, pol);
+	if (rc != 0)
+		return rc;
+
+	/* NOTE: enforce-change-password is NOT touched here.
+	 * This is a system-triggered change due to policy update,
+	 * not an admin-controlled flag. */
+
+	audit_log(username, "password_policy_change", "source=policy-mismatch");
 	return 0;
 }
 
@@ -651,17 +703,17 @@ int main(int argc, char *argv[])
 	}
 
 	/*
-	 * Check if current password meets policy — if not, force a change.
-	 * We still have the plaintext password here, so we can validate it.
-	 * This handles the case where global policy changed after last login.
+	 * Check if current password meets policy — store result but don't
+	 * act yet. We need the plaintext password for the check, but the
+	 * admin-controlled enforce-change-password flag takes priority.
 	 */
-	int need_policy_change = 0;
+	struct password_policy login_pol;
+	int policy_mismatch = 0;
 	if (is_password_policy_enforced(username)) {
-		struct password_policy pol;
-		read_password_policy(&pol);
-		int prc = check_password_policy(password, username, &pol);
+		read_password_policy(&login_pol);
+		int prc = check_password_policy(password, username, &login_pol);
 		if (prc != 1) {
-			need_policy_change = 1;
+			policy_mismatch = 1;
 			audit_log(username, "password_policy_mismatch",
 				  policy_reason(prc));
 		}
@@ -669,23 +721,54 @@ int main(int argc, char *argv[])
 
 	explicit_bzero(password, sizeof(password));
 
-	/* Check enforce-change-password policy (explicit flag or policy mismatch) */
-	if (need_policy_change) {
-		/* Set enforce flag so enforce_password_change() triggers */
-		char section[MAX_LINE_LEN];
-		snprintf(section, sizeof(section), "system_admin:%s", username);
-		write_ini_value(SYSTEM_CONF, section,
-				"enforce-change-password", "enable");
+	/*
+	 * Read admin flag BEFORE calling enforce_password_change so we
+	 * know whether it will actually trigger a change or just skip.
+	 */
+	char epc_val[64];
+	char epc_section[MAX_LINE_LEN];
+	int admin_flag_set = 0;
+	snprintf(epc_section, sizeof(epc_section), "system_admin:%s", username);
+	if (read_ini_value(SYSTEM_CONF, epc_section,
+			   "enforce-change-password", epc_val,
+			   sizeof(epc_val)) == 0) {
+		if (strcmp(epc_val, "enable") == 0)
+			admin_flag_set = 1;
 	}
+
+	/*
+	 * Path 1: Admin-controlled enforce-change-password flag.
+	 * If triggered, the new password is validated against policy too,
+	 * so a successful change here satisfies both the admin flag AND
+	 * any policy mismatch — we can skip the policy path entirely.
+	 */
 	int epc_rc = enforce_password_change(username);
 	if (epc_rc == -2) {
-		/* Ctrl+C during password change — return to login prompt */
 		audit_log(username, "login_fail", "reason=password-change-interrupted");
 		return EXIT_SIGINT;
 	}
 	if (epc_rc != 0) {
 		audit_log(username, "login_fail", "reason=enforce-change-failed");
 		return 1;
+	}
+
+	/*
+	 * Path 2: Policy mismatch — system-triggered, does NOT touch
+	 * enforce-change-password config. Only runs if the admin flag
+	 * did NOT trigger (if it did, the new password already meets policy).
+	 */
+	if (policy_mismatch && !admin_flag_set) {
+		int pm_rc = enforce_policy_compliance(username, &login_pol);
+		if (pm_rc == -2) {
+			audit_log(username, "login_fail",
+				  "reason=policy-change-interrupted");
+			return EXIT_SIGINT;
+		}
+		if (pm_rc != 0) {
+			audit_log(username, "login_fail",
+				  "reason=policy-change-failed");
+			return 1;
+		}
 	}
 
 	/* Restore signals */
