@@ -1940,6 +1940,7 @@ _apply_config_direct() {
 			return 0
 			;;
 		system_admin-profile)
+			_prof_name="$_apply_id"
 			_perms=$(grep '^permissions=' "$_apply_file" 2>/dev/null | cut -d= -f2-)
 			_desc=$(grep '^description=' "$_apply_file" 2>/dev/null | cut -d= -f2-)
 			_desc="${_desc:-Custom profile}"
