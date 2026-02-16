@@ -107,6 +107,8 @@ if (!session)
 
 ## Error Handling
 
+```c
+// Guard clauses reject bad input early, keep main logic flat
 if (rating >= MALICIOUS_THRESHOLD)
     return -EPERM;
 

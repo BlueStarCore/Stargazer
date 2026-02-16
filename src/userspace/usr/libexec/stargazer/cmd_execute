@@ -1,0 +1,385 @@
+#!/bin/sh
+# Stargazer NGFW - Execute Command (runtime actions)
+# Includes execute debug subtree.
+
+CMD_DIR="${CMD_DIR:-/usr/libexec/stargazer}"
+. "$CMD_DIR/config_lib.sh"
+
+has_permission() {
+	echo ",$STARGAZER_PERMISSIONS," | grep -q ",$1,"
+}
+
+require_admin() {
+	if ! has_permission "admin"; then
+		echo "  Permission denied: requires 'admin'"
+		return 1
+	fi
+	return 0
+}
+
+bool_norm() {
+	case "$1" in
+		enable|on|1|yes) echo 1 ;;
+		disable|off|0|no) echo 0 ;;
+		*) echo "" ;;
+	esac
+}
+
+print_status() {
+	echo ""
+	echo "  Debug status:"
+	echo "  Global debug:        $( [ "$(debug_get enabled 0)" = "1" ] && echo enable || echo disable )"
+	echo "  Option timestamp:    $( [ "$(debug_get opt_timestamp 1)" = "1" ] && echo enable || echo disable )"
+	echo "  Option actor:        $( [ "$(debug_get opt_actor 1)" = "1" ] && echo enable || echo disable )"
+	echo "  Option function:     $( [ "$(debug_get opt_function 1)" = "1" ] && echo enable || echo disable )"
+	echo "  Option hierarchy:    $( [ "$(debug_get opt_hierarchy 1)" = "1" ] && echo enable || echo disable )"
+	echo "  Flow trace:          $( [ "$(debug_get flow_trace 0)" = "1" ] && echo enable || echo disable )"
+	_fl="$(debug_get flow_limit 0)"
+	if [ "$_fl" = "0" ]; then
+		echo "  Flow limit:          unlimited"
+	else
+		echo "  Flow limit:          $_fl"
+	fi
+	echo "  CLI debug:           $( [ "$(debug_get cli_debug 0)" = "1" ] && echo enable || echo disable )"
+	echo "  mgmtd debug:         $( [ "$(debug_get mgmtd_debug 0)" = "1" ] && echo enable || echo disable )"
+	echo "  Auth admin debug:    $( [ "$(debug_get auth_admin 0)" = "1" ] && echo enable || echo disable )"
+	echo "  Auth user debug:     $( [ "$(debug_get auth_user 0)" = "1" ] && echo enable || echo disable )"
+	echo ""
+}
+
+trace_flow_snapshot() {
+	if ! debug_enabled; then
+		echo "  Debug is disabled. Run: execute debug enable"
+		return 0
+	fi
+	if ! debug_feature_enabled flow_trace; then
+		echo "  Flow trace is disabled. Run: execute debug flow trace enable"
+		return 0
+	fi
+
+	_limit="$(debug_get flow_limit 0)"
+	[ -z "$_limit" ] && _limit=0
+	if [ "$_limit" = "0" ]; then
+		_max_lines=99999
+	else
+		_max_lines="$_limit"
+	fi
+
+	debug_log "flow" "system" "pkt_forward_ingress" "trace start" 0
+	debug_log "flow" "system" "pkt_forward_lookup_session" "session table lookup" 1
+	debug_log "flow" "system" "pkt_forward_route_resolve" "route lookup" 2
+	debug_log "flow" "system" "pkt_forward_nat_apply" "NAT policy evaluation" 2
+	debug_log "flow" "system" "pkt_forward_egress" "enqueue egress packet" 1
+
+	echo ""
+	echo "  Flow trace snapshot:"
+	if command -v dmesg >/dev/null 2>&1; then
+		dmesg 2>/dev/null | grep -i 'pkt_forward\|forward\|drop\|session' | tail -n "$_max_lines" | sed 's/^/    /'
+	fi
+	if [ -r /proc/net/dev ]; then
+		echo "  Interface counters:"
+		tail -n +3 /proc/net/dev | head -n "$_max_lines" | sed 's/^/    /'
+	fi
+	echo ""
+	debug_log "flow" "system" "pkt_forward_trace" "trace end" 0
+}
+
+show_debug_top() {
+	echo ""
+	echo "  Process snapshot:"
+	if command -v top >/dev/null 2>&1; then
+		top -bn1 2>/dev/null | head -n 25 | sed 's/^/  /'
+	elif command -v ps >/dev/null 2>&1; then
+		ps w 2>/dev/null | head -n 25 | sed 's/^/  /'
+	else
+		echo "  top/ps command not available"
+	fi
+	echo ""
+}
+
+show_cpu_resources() {
+	echo ""
+	echo "---CPU resources:"
+	_cores=$(awk '/^cpu[0-9]+ /{n++} END{print n+0}' /proc/stat 2>/dev/null)
+	[ -z "$_cores" ] && _cores=0
+	echo "  CPU cores: $_cores"
+
+	_s1="/tmp/sg_cpu_stat1.$$"
+	_s2="/tmp/sg_cpu_stat2.$$"
+	awk '/^cpu[0-9]* /{idle=$5+$6; total=0; for(i=2;i<=NF;i++) total+=$i; print $1,total,idle}' /proc/stat > "$_s1" 2>/dev/null
+	sleep 1
+	awk '/^cpu[0-9]* /{idle=$5+$6; total=0; for(i=2;i<=NF;i++) total+=$i; print $1,total,idle}' /proc/stat > "$_s2" 2>/dev/null
+	paste "$_s1" "$_s2" | awk '
+		BEGIN {printf "  Utilization (1s window):\n"}
+		{
+			name=$1; t1=$2; i1=$3; t2=$5; i2=$6;
+			dt=t2-t1; di=i2-i1;
+			u=(dt>0)?((dt-di)*100.0/dt):0.0;
+			if (name=="cpu") printf "    total : %.2f%%\n", u;
+			else printf "    %-5s : %.2f%%\n", name, u;
+		}
+	'
+	rm -f "$_s1" "$_s2" 2>/dev/null || true
+
+	# Temperature (often unavailable in VM)
+	_t_sum=0
+	_t_n=0
+	echo "  Temperatures:"
+	for _tf in /sys/class/thermal/thermal_zone*/temp; do
+		[ -r "$_tf" ] || continue
+		_tv=$(cat "$_tf" 2>/dev/null)
+		case "$_tv" in
+			''|*[!0-9]*) continue ;;
+		esac
+		_tn=$((_tv / 1000))
+		echo "    $(basename "$(dirname "$_tf")") : ${_tn}°C"
+		_t_sum=$((_t_sum + _tv))
+		_t_n=$((_t_n + 1))
+	done
+	if [ "$_t_n" -gt 0 ] 2>/dev/null; then
+		_t_avg=$((_t_sum / _t_n))
+		echo "    average sensor temp: $((_t_avg / 1000))°C"
+	else
+		echo "    N/A (VM or sensor not exposed)"
+	fi
+	echo ""
+}
+
+show_ram_resources() {
+	echo ""
+	echo "---RAM resources:"
+	_mt=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null)
+	_ma=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)
+	if [ -z "$_mt" ] || [ -z "$_ma" ]; then
+		echo "  N/A"
+		echo ""
+		return
+	fi
+	_mu=$((_mt - _ma))
+	awk -v t="$_mt" -v u="$_mu" -v a="$_ma" 'BEGIN {
+		p=(t>0)?(u*100.0/t):0;
+		printf "  Used: %.2f%% (%d MiB / %d MiB), Available: %d MiB\n", p, int(u/1024), int(t/1024), int(a/1024);
+	}'
+	echo ""
+}
+
+show_disk_resources() {
+	echo ""
+	echo "---Disk resources:"
+	if command -v df >/dev/null 2>&1; then
+		df -P -h / 2>/dev/null | awk 'NR==1{print "  "$0} NR==2{print "  "$0}'
+	else
+		echo "  N/A"
+	fi
+	echo ""
+}
+
+show_interface_resources() {
+	echo ""
+	echo "---Interface resources:"
+	_i1="/tmp/sg_if_stat1.$$"
+	_i2="/tmp/sg_if_stat2.$$"
+	awk -F'[: ]+' '/:/{if($1!~"lo"){print $1,$3,$11}}' /proc/net/dev > "$_i1" 2>/dev/null
+	sleep 1
+	awk -F'[: ]+' '/:/{if($1!~"lo"){print $1,$3,$11}}' /proc/net/dev > "$_i2" 2>/dev/null
+	paste "$_i1" "$_i2" | awk '
+		BEGIN {printf "  Throughput (1s window):\n"}
+		{
+			iface=$1; rx1=$2; tx1=$3; rx2=$5; tx2=$6;
+			drx=rx2-rx1; dtx=tx2-tx1;
+			if (drx<0) drx=0; if (dtx<0) dtx=0;
+			printf "    %-10s rx=%8.2f KB/s  tx=%8.2f KB/s\n", iface, drx/1024.0, dtx/1024.0;
+		}
+	'
+	rm -f "$_i1" "$_i2" 2>/dev/null || true
+
+	echo "  Link speed (best effort):"
+	for _ifd in /sys/class/net/*; do
+		_if=$(basename "$_ifd")
+		[ "$_if" = "lo" ] && continue
+		_speed="unknown"
+		[ -r "$_ifd/speed" ] && _speed=$(cat "$_ifd/speed" 2>/dev/null)
+		echo "    $_if: speed=${_speed}Mbps"
+	done
+	echo ""
+}
+
+show_resources() {
+	_res="${1:-all}"
+	case "$_res" in
+		cpu) show_cpu_resources ;;
+		ram) show_ram_resources ;;
+		disk) show_disk_resources ;;
+		interface) show_interface_resources ;;
+		all)
+			show_cpu_resources
+			show_ram_resources
+			show_disk_resources
+			show_interface_resources
+			;;
+		*)
+			echo "  Usage: execute debug resources [cpu|ram|disk|interface|all]"
+			return 1
+			;;
+	esac
+}
+
+cmd="$1"
+shift 2>/dev/null
+
+case "$cmd" in
+	debug)
+		require_admin || exit 1
+		sub="$1"
+		shift 2>/dev/null
+		case "$sub" in
+			enable|disable)
+				_bv=$(bool_norm "$sub")
+				debug_set enabled "$_bv" || {
+					echo "  Failed to update debug state"
+					exit 1
+				}
+				echo "  Debug ${sub}d."
+				if [ "$_bv" = "1" ]; then
+					debug_log "debug" "user" "execute_debug" "global debug enabled" 0 >/dev/null
+				fi
+				;;
+			reset)
+				debug_reset
+				echo "  Debug state reset. All debug features disabled and options restored."
+				;;
+			status|"")
+				print_status
+				;;
+			option)
+				_opt="$1"
+				_act="$2"
+				case "$_opt" in
+					timestamp) _k="opt_timestamp" ;;
+					actor) _k="opt_actor" ;;
+					function) _k="opt_function" ;;
+					hierarchy) _k="opt_hierarchy" ;;
+					*)
+						echo "  Usage: execute debug option <timestamp|actor|function|hierarchy> <enable|disable>"
+						exit 1
+						;;
+				esac
+				_bv=$(bool_norm "$_act")
+				if [ -z "$_bv" ]; then
+					echo "  Usage: execute debug option <timestamp|actor|function|hierarchy> <enable|disable>"
+					exit 1
+				fi
+				debug_set "$_k" "$_bv"
+				echo "  Debug option $_opt ${_act}d."
+				;;
+			cli)
+				_act="${1:-enable}"
+				_bv=$(bool_norm "$_act")
+				if [ -z "$_bv" ]; then
+					echo "  Usage: execute debug cli [enable|disable]"
+					exit 1
+				fi
+				debug_set cli_debug "$_bv"
+				echo "  Debug CLI ${_act}d."
+				;;
+			mgmtd)
+				_act="${1:-enable}"
+				_bv=$(bool_norm "$_act")
+				if [ -z "$_bv" ]; then
+					echo "  Usage: execute debug mgmtd [enable|disable]"
+					exit 1
+				fi
+				debug_set mgmtd_debug "$_bv"
+				echo "  Debug mgmtd ${_act}d."
+				;;
+			auth)
+				_role="$1"
+				_act="${2:-enable}"
+				case "$_role" in
+					admin) _k="auth_admin" ;;
+					user)  _k="auth_user" ;;
+					*)
+						echo "  Usage: execute debug auth <admin|user> [enable|disable]"
+						exit 1
+						;;
+				esac
+				_bv=$(bool_norm "$_act")
+				if [ -z "$_bv" ]; then
+					echo "  Usage: execute debug auth <admin|user> [enable|disable]"
+					exit 1
+				fi
+				debug_set "$_k" "$_bv"
+				echo "  Debug auth $_role ${_act}d."
+				;;
+			flow)
+				lvl1="$1"
+				lvl2="$2"
+				if [ "$lvl1" != "trace" ]; then
+					echo "  Usage: execute debug flow trace [enable|disable] [limit <n>|unlimited]"
+					exit 1
+				fi
+				shift 2>/dev/null
+				_act="enable"
+				if [ -n "$1" ]; then
+					case "$1" in
+						enable|disable)
+							_act="$1"
+							shift
+							;;
+					esac
+				fi
+				_bv=$(bool_norm "$_act")
+				if [ -z "$_bv" ]; then
+					echo "  Usage: execute debug flow trace [enable|disable] [limit <n>|unlimited]"
+					exit 1
+				fi
+				debug_set flow_trace "$_bv"
+
+				if [ -n "$1" ]; then
+					if [ "$1" = "limit" ]; then
+						if [ "$2" = "unlimited" ]; then
+							debug_set flow_limit 0
+						elif echo "$2" | grep -Eq '^[0-9]+$'; then
+							debug_set flow_limit "$2"
+						else
+							echo "  Invalid limit value: $2"
+							exit 1
+						fi
+					elif [ "$1" = "unlimited" ]; then
+						debug_set flow_limit 0
+					else
+						echo "  Usage: execute debug flow trace [enable|disable] [limit <n>|unlimited]"
+						exit 1
+					fi
+				fi
+
+				echo "  Debug flow trace ${_act}d."
+				trace_flow_snapshot
+				;;
+			top)
+				show_debug_top
+				;;
+			resources)
+				show_resources "$1" || exit 1
+				;;
+			*)
+				echo "  Usage: execute debug <enable|disable|reset|status|option|flow|cli|mgmtd|auth|top|resources>"
+				echo "  Examples:"
+				echo "    execute debug enable"
+				echo "    execute debug option timestamp enable"
+				echo "    execute debug flow trace enable limit 100"
+				echo "    execute debug cli enable"
+				echo "    execute debug mgmtd enable"
+				echo "    execute debug auth admin enable"
+				echo "    execute debug top"
+				echo "    execute debug resources all"
+				echo "    execute debug reset"
+				exit 1
+				;;
+		esac
+		;;
+	*)
+		echo "  Usage: execute debug ..."
+		exit 1
+		;;
+esac

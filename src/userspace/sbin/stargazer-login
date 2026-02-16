@@ -1,0 +1,447 @@
+#!/bin/sh
+# Stargazer NGFW - Login Handler
+# First-boot setup (hardware detection + default config generation) + stargazer-logind handoff
+
+CMD_DIR="/usr/libexec/stargazer"
+. "$CMD_DIR/config_lib.sh"
+
+# ----------------------------------------------------------------------------
+# First-boot: generate default config files + instance-id
+# Triggered when system.conf does not exist (first boot or tmpfs wipe)
+# ----------------------------------------------------------------------------
+generate_first_boot() {
+	mkdir -p "$STARGAZER_CONF_DIR"
+	chmod 755 "$STARGAZER_CONF_DIR" 2>/dev/null
+
+	# ── Instance ID (unique per install) ──────────────────────────────────
+	if [ ! -f "$STARGAZER_CONF_DIR/.instance-id" ]; then
+		cat /proc/sys/kernel/random/uuid \
+			> "$STARGAZER_CONF_DIR/.instance-id" 2>/dev/null \
+			|| echo "no-uuid" > "$STARGAZER_CONF_DIR/.instance-id"
+	fi
+
+	# ── system.conf ──────────────────────────────────────────────────────
+	cat > "$STARGAZER_CONF_DIR/system.conf" << 'EOF'
+[system_settings]
+hostname=stargazer
+ip-forward=enable
+
+[system_admin-profile:read-write]
+permissions=monitor,configure,admin
+description=Full administrative access
+builtin=yes
+
+[system_admin-profile:read-only]
+permissions=monitor
+description=Read-only monitoring access
+builtin=yes
+
+[system_password-policy]
+min-length=8
+min-uppercase=1
+min-lowercase=1
+min-digit=1
+min-special=0
+
+[system_admin:admin]
+profile=read-write
+enforce-change-password=enable
+enforce-password-policy=enable
+builtin=yes
+
+EOF
+	chmod 640 "$STARGAZER_CONF_DIR/system.conf" 2>/dev/null
+	chgrp stargazer "$STARGAZER_CONF_DIR/system.conf" 2>/dev/null
+
+	# ── network.conf (auto-detect hardware interfaces) ────────────────────
+	_nf="$STARGAZER_CONF_DIR/network.conf"
+	> "$_nf"
+	for _iface_path in /sys/class/net/*; do
+		_iface="${_iface_path##*/}"
+		# Skip loopback
+		[ "$_iface" = "lo" ] && continue
+		# Skip virtual/docker bridges (optional, keep real hardware)
+		printf '[system_interface:%s]\nstatus=up\n\n' "$_iface" >> "$_nf"
+	done
+	chmod 640 "$_nf" 2>/dev/null
+	chgrp stargazer "$_nf" 2>/dev/null
+
+	# ── firewall.conf (deny-all default policy) ──────────────────────────
+	cat > "$STARGAZER_CONF_DIR/firewall.conf" << 'EOF'
+[firewall_policy:1]
+name=default-deny
+srcintf=any
+dstintf=any
+srcaddr=all
+dstaddr=all
+action=deny
+status=enable
+comment=Default deny all traffic
+
+EOF
+	chmod 640 "$STARGAZER_CONF_DIR/firewall.conf" 2>/dev/null
+	chgrp stargazer "$STARGAZER_CONF_DIR/firewall.conf" 2>/dev/null
+
+	# Set directory group ownership
+	chgrp stargazer "$STARGAZER_CONF_DIR" 2>/dev/null
+	chmod 750 "$STARGAZER_CONF_DIR" 2>/dev/null
+
+	echo "[FIRST-BOOT] Default configuration generated."
+}
+
+# ----------------------------------------------------------------------------
+# Ensure built-in admin account exists in Linux user database
+# Reads admin data from system.conf — does NOT use profiles.conf/admins.conf
+# ----------------------------------------------------------------------------
+ensure_admin_account() {
+	chmod 755 "$STARGAZER_CONF_DIR" 2>/dev/null
+
+	# Find next available UID >= 1000 for admin (same as normal admins)
+	_ea_next_uid=1000
+	if [ -f /etc/passwd ]; then
+		while grep -q "^[^:]*:[^:]*:${_ea_next_uid}:" /etc/passwd 2>/dev/null; do
+			_ea_next_uid=$((_ea_next_uid + 1))
+		done
+	fi
+
+	if grep -q '^admin:' /etc/passwd 2>/dev/null; then
+		# Admin exists — ensure shell is correct, but preserve existing UID
+		_ea_cur_uid=$(grep '^admin:' /etc/passwd | head -1 | cut -d: -f3)
+		if [ "$_ea_cur_uid" = "0" ]; then
+			# Migrate UID 0 admin to unprivileged UID (VULN-06)
+			_ea_tmp=$(mktemp /etc/passwd.XXXXXX 2>/dev/null) || _ea_tmp="/etc/passwd.tmp.$$"
+			sed "s|^admin:[^:]*:[0-9]*:[0-9]*:[^:]*:[^:]*:.*|admin:x:${_ea_next_uid}:${_ea_next_uid}:Stargazer Admin:/home/admin:/sbin/stargazer-cli|" /etc/passwd > "$_ea_tmp" && mv "$_ea_tmp" /etc/passwd
+			# Ensure group entry exists
+			if ! grep -q "^admin:" /etc/group 2>/dev/null; then
+				echo "admin:x:${_ea_next_uid}:" >> /etc/group
+			fi
+			mkdir -p /home/admin 2>/dev/null
+			chown "${_ea_next_uid}:${_ea_next_uid}" /home/admin 2>/dev/null
+		else
+			# Non-root UID — just fix shell
+			_ea_tmp=$(mktemp /etc/passwd.XXXXXX 2>/dev/null) || _ea_tmp="/etc/passwd.tmp.$$"
+			sed "s|^admin:\([^:]*\):\([0-9]*\):\([0-9]*\):[^:]*:[^:]*:.*|admin:\1:\2:\3:Stargazer Admin:/home/admin:/sbin/stargazer-cli|" /etc/passwd > "$_ea_tmp" && mv "$_ea_tmp" /etc/passwd
+		fi
+	else
+		echo "admin:x:${_ea_next_uid}:${_ea_next_uid}:Stargazer Admin:/home/admin:/sbin/stargazer-cli" >> /etc/passwd
+		# Ensure group entry exists
+		if ! grep -q "^admin:" /etc/group 2>/dev/null; then
+			echo "admin:x:${_ea_next_uid}:" >> /etc/group
+		fi
+		mkdir -p /home/admin 2>/dev/null
+		chown "${_ea_next_uid}:${_ea_next_uid}" /home/admin 2>/dev/null
+	fi
+
+	# Only create shadow entry if missing — never reset existing password
+	if ! grep -q '^admin:' /etc/shadow 2>/dev/null; then
+		echo 'admin::19700:0:99999:7:::' >> /etc/shadow
+	fi
+
+	# Ensure built-in profiles exist in system.conf
+	_sysconf="$STARGAZER_CONF_DIR/system.conf"
+	if ! cfg_get "$_sysconf" "system_admin-profile:read-write" >/dev/null 2>&1; then
+		_tmp="/tmp/login_prof_rw.$$"
+		printf 'permissions=monitor,configure,admin\ndescription=Full administrative access\nbuiltin=yes\n' > "$_tmp"
+		cfg_set "$_sysconf" "system_admin-profile:read-write" "$_tmp"
+		rm -f "$_tmp"
+	fi
+	if ! cfg_get "$_sysconf" "system_admin-profile:read-only" >/dev/null 2>&1; then
+		_tmp="/tmp/login_prof_ro.$$"
+		printf 'permissions=monitor\ndescription=Read-only monitoring access\nbuiltin=yes\n' > "$_tmp"
+		cfg_set "$_sysconf" "system_admin-profile:read-only" "$_tmp"
+		rm -f "$_tmp"
+	fi
+
+	# Ensure admin account section exists in system.conf
+	if ! cfg_get "$_sysconf" "system_admin:admin" >/dev/null 2>&1; then
+		_tmp="/tmp/login_admin.$$"
+		printf 'profile=read-write\nenforce-change-password=enable\nbuiltin=yes\n' > "$_tmp"
+		cfg_set "$_sysconf" "system_admin:admin" "$_tmp"
+		rm -f "$_tmp"
+	else
+		_admin_data=$(cfg_get "$_sysconf" "system_admin:admin" 2>/dev/null)
+		if ! echo "$_admin_data" | grep -q '^enforce-change-password='; then
+			_tmp="/tmp/login_admin.$$"
+			echo "$_admin_data" | sed '/^enforce-change-password=/d' > "$_tmp"
+			echo 'enforce-change-password=disable' >> "$_tmp"
+			cfg_set "$_sysconf" "system_admin:admin" "$_tmp"
+			rm -f "$_tmp"
+		fi
+	fi
+
+	# Add admin to stargazer group (for socket + config access)
+	if grep -q '^stargazer:' /etc/group 2>/dev/null; then
+		if ! grep '^stargazer:' /etc/group | grep -q '\badmin\b' 2>/dev/null; then
+			_ea_grp_line=$(grep '^stargazer:' /etc/group)
+			_ea_members="${_ea_grp_line##*:}"
+			if [ -n "$_ea_members" ]; then
+				_ea_new="${_ea_grp_line},admin"
+			else
+				_ea_new="${_ea_grp_line}admin"
+			fi
+			_ea_tmp=$(mktemp /etc/group.XXXXXX 2>/dev/null) || _ea_tmp="/etc/group.tmp.$$"
+			sed "s|^stargazer:.*|${_ea_new}|" /etc/group > "$_ea_tmp" && mv "$_ea_tmp" /etc/group
+		fi
+	fi
+
+	# Set config files: root:stargazer 0640 (readable by admin group members)
+	_sg_grp="stargazer"
+	chmod 640 "$STARGAZER_CONF_DIR/system.conf" 2>/dev/null
+	chgrp "$_sg_grp" "$STARGAZER_CONF_DIR/system.conf" 2>/dev/null
+	[ -f "$STARGAZER_CONF_DIR/network.conf" ] && chmod 640 "$STARGAZER_CONF_DIR/network.conf" 2>/dev/null && chgrp "$_sg_grp" "$STARGAZER_CONF_DIR/network.conf" 2>/dev/null
+	[ -f "$STARGAZER_CONF_DIR/firewall.conf" ] && chmod 640 "$STARGAZER_CONF_DIR/firewall.conf" 2>/dev/null && chgrp "$_sg_grp" "$STARGAZER_CONF_DIR/firewall.conf" 2>/dev/null
+	# Config directory itself needs group access
+	chgrp "$_sg_grp" "$STARGAZER_CONF_DIR" 2>/dev/null
+	chmod 750 "$STARGAZER_CONF_DIR" 2>/dev/null
+}
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+
+# First boot: generate all default config files
+if [ ! -f "$STARGAZER_CONF_DIR/system.conf" ]; then
+	generate_first_boot
+fi
+
+# Every boot: ensure admin account is consistent
+ensure_admin_account
+
+# Replay saved configuration (must run AFTER config files exist)
+# init.d/stargazer loads modules + sysctl, but config replay belongs here
+# because config files are generated by this script on first boot.
+# Atomic guard: mkdir is race-free (succeeds for exactly one caller)
+_replay_guard="/tmp/.stargazer_replayed.lock"
+if mkdir "$_replay_guard" 2>/dev/null; then
+	echo "[LOGIN] Replaying saved configuration..."
+	cfg_replay "$STARGAZER_CONF_DIR/system.conf" 2>/dev/null
+	cfg_replay "$STARGAZER_CONF_DIR/network.conf" 2>/dev/null
+	cfg_replay "$STARGAZER_CONF_DIR/firewall.conf" 2>/dev/null
+	echo "[LOGIN] Configuration replay complete."
+fi
+
+_db_guard="/tmp/.stargazer_db_migrated.lock"
+if mkdir "$_db_guard" 2>/dev/null; then
+	if [ -f "$CMD_DIR/db_migrate.sh" ]; then
+		sh "$CMD_DIR/db_migrate.sh" >/dev/null 2>&1
+	fi
+fi
+
+# ----------------------------------------------------------------------------
+# Phase B auth hardening: username pre-check + lockout/backoff + audit
+# ----------------------------------------------------------------------------
+
+AUTH_STATE_FILE="/tmp/stargazer-auth.state"
+AUTH_MAX_FAILS=5
+AUTH_LOCK_BASE=120
+AUTH_LOCK_MAX=3600
+
+auth_get_state() {
+	_ag_user="$1"
+	_ag_count=0
+	_ag_until=0
+	if _db_ready; then
+		_ag_uq=$(_db_escape "$_ag_user")
+		_ag_row=$(sqlite3 "$STARGAZER_DB_PATH" "SELECT fail_count, locked_until FROM auth_lockouts WHERE username='${_ag_uq}' LIMIT 1;" 2>/dev/null)
+		if [ -n "$_ag_row" ]; then
+			_ag_count="${_ag_row%%|*}"
+			_ag_until="${_ag_row#*|}"
+		fi
+		echo "${_ag_count:-0}:${_ag_until:-0}"
+		return
+	fi
+	[ -f "$AUTH_STATE_FILE" ] || {
+		echo "$_ag_count:$_ag_until"
+		return
+	}
+	while IFS=: read -r _u _c _t || [ -n "$_u" ]; do
+		[ "$_u" = "$_ag_user" ] || continue
+		_ag_count="${_c:-0}"
+		_ag_until="${_t:-0}"
+		break
+	done < "$AUTH_STATE_FILE"
+	echo "$_ag_count:$_ag_until"
+}
+
+auth_set_state() {
+	_as_user="$1"
+	_as_count="$2"
+	_as_until="$3"
+	if _db_ready; then
+		_as_uq=$(_db_escape "$_as_user")
+		sqlite3 "$STARGAZER_DB_PATH" "INSERT INTO auth_lockouts(username, fail_count, locked_until, updated_at)
+		VALUES('${_as_uq}', ${_as_count}, ${_as_until}, datetime('now'))
+		ON CONFLICT(username) DO UPDATE SET
+		fail_count=excluded.fail_count,
+		locked_until=excluded.locked_until,
+		updated_at=datetime('now');" >/dev/null 2>&1 || true
+		return
+	fi
+	_as_tmp="${AUTH_STATE_FILE}.tmp.$$"
+	> "$_as_tmp"
+	if [ -f "$AUTH_STATE_FILE" ]; then
+		while IFS=: read -r _u _c _t || [ -n "$_u" ]; do
+			[ -z "$_u" ] && continue
+			[ "$_u" = "$_as_user" ] && continue
+			echo "${_u}:${_c}:${_t}" >> "$_as_tmp"
+		done < "$AUTH_STATE_FILE"
+	fi
+	echo "${_as_user}:${_as_count}:${_as_until}" >> "$_as_tmp"
+	mv "$_as_tmp" "$AUTH_STATE_FILE"
+}
+
+auth_clear_state() {
+	_ac_user="$1"
+	if _db_ready; then
+		_ac_uq=$(_db_escape "$_ac_user")
+		sqlite3 "$STARGAZER_DB_PATH" "DELETE FROM auth_lockouts WHERE username='${_ac_uq}';" >/dev/null 2>&1 || true
+		return 0
+	fi
+	_ac_tmp="${AUTH_STATE_FILE}.tmp.$$"
+	[ -f "$AUTH_STATE_FILE" ] || return 0
+	> "$_ac_tmp"
+	while IFS=: read -r _u _c _t || [ -n "$_u" ]; do
+		[ -z "$_u" ] && continue
+		[ "$_u" = "$_ac_user" ] && continue
+		echo "${_u}:${_c}:${_t}" >> "$_ac_tmp"
+	done < "$AUTH_STATE_FILE"
+	mv "$_ac_tmp" "$AUTH_STATE_FILE"
+}
+
+auth_note_fail() {
+	_af_user="$1"
+	_af_now=$(date +%s 2>/dev/null || echo 0)
+	_af_state=$(auth_get_state "$_af_user")
+	_af_count=${_af_state%%:*}
+	_af_until=${_af_state#*:}
+	[ "$_af_now" -ge "${_af_until:-0}" ] && _af_count=0
+	_af_count=$((_af_count + 1))
+	if [ "$_af_count" -ge "$AUTH_MAX_FAILS" ]; then
+		# Escalating lockout: 2min → 4min → 8min ... max 1hr (BUG-AUTH-07)
+		_af_rounds=$(( (_af_count - AUTH_MAX_FAILS) / AUTH_MAX_FAILS ))
+		_af_duration=$AUTH_LOCK_BASE
+		_af_i=0
+		while [ "$_af_i" -lt "$_af_rounds" ] && [ "$_af_duration" -lt "$AUTH_LOCK_MAX" ]; do
+			_af_duration=$((_af_duration * 2))
+			_af_i=$((_af_i + 1))
+		done
+		[ "$_af_duration" -gt "$AUTH_LOCK_MAX" ] && _af_duration=$AUTH_LOCK_MAX
+		_af_until=$((_af_now + _af_duration))
+	else
+		_af_until=0
+	fi
+	auth_set_state "$_af_user" "$_af_count" "$_af_until"
+}
+
+auth_is_locked() {
+	_al_user="$1"
+	_al_now=$(date +%s 2>/dev/null || echo 0)
+	_al_state=$(auth_get_state "$_al_user")
+	_al_until=${_al_state#*:}
+	[ "$_al_now" -lt "${_al_until:-0}" ]
+}
+
+admin_exists_in_config() {
+	_ae_user="$1"
+	if _db_ready; then
+		_ae_uq=$(_db_escape "$_ae_user")
+		_ae_exists=$(sqlite3 "$STARGAZER_DB_PATH" "SELECT 1 FROM users WHERE username='${_ae_uq}' LIMIT 1;" 2>/dev/null)
+		[ "$_ae_exists" = "1" ] && return 0
+	fi
+	cfg_get "$STARGAZER_CONF_DIR/system.conf" "system_admin:${_ae_user}" >/dev/null 2>&1
+}
+
+# ── Ctrl+C resets to fresh login prompt (no process restart) ──
+_login_interrupted=0
+trap '_login_interrupted=1' INT
+
+while true; do
+	# ── Clean ALL login context at start of each iteration ──
+	_login_interrupted=0
+	unset STARGAZER_LOGIN_USER
+	unset STARGAZER_USER
+	unset LOGIN
+	unset RESOLVED_LOGIN_SOURCE
+	_login_user=""
+
+	printf "login: "
+	read -r _login_user
+	_read_rc=$?
+
+	# ── Handle Ctrl+C: reset to fresh login prompt ──
+	if [ "$_login_interrupted" -eq 1 ]; then
+		echo ""
+		continue
+	fi
+
+	# ── Handle EOF (Ctrl+D) or read failure: restart prompt ──
+	if [ "$_read_rc" -ne 0 ]; then
+		echo ""
+		continue
+	fi
+
+	# ── Normalize username to lowercase (BUG-AUTH-04: prevent lockout bypass) ──
+	_login_user=$(printf '%s' "$_login_user" | tr 'A-Z' 'a-z')
+
+	# ── Set login context for this attempt only ──
+	export STARGAZER_USER="$_login_user"
+	export STARGAZER_LOGIN_USER="$_login_user"
+	export LOGIN="$_login_user"
+	auth_debug "login_attempt attempt_user=${_login_user} env_STARGAZER_LOGIN_USER=${STARGAZER_LOGIN_USER} env_LOGIN=${LOGIN}"
+
+	# ── Check lockout BEFORE authentication (BUG-AUTH-08) ──
+	if _is_safe_id "$_login_user" \
+		&& admin_exists_in_config "$_login_user" \
+		&& grep -q "^${_login_user}:" /etc/passwd 2>/dev/null; then
+		if auth_is_locked "$_login_user"; then
+			audit_log "login_reject" "user=${_login_user} reason=locked"
+			echo "Account temporarily locked. Try again later."
+			sleep 1
+			# ── Ctrl+C during lockout wait → reset ──
+			if [ "$_login_interrupted" -eq 1 ]; then echo ""; continue; fi
+			# Cleanup context
+			unset STARGAZER_LOGIN_USER
+			unset STARGAZER_USER
+			unset LOGIN
+			continue
+		fi
+	fi
+
+	/sbin/stargazer-logind "$_login_user"
+	_logind_rc=$?
+
+	# ── Ctrl+C during password/change-password → reset to login prompt ──
+	if [ "$_logind_rc" -eq 130 ] || [ "$_login_interrupted" -eq 1 ]; then
+		echo ""
+		unset STARGAZER_LOGIN_USER STARGAZER_USER LOGIN
+		continue
+	fi
+
+	if [ "$_logind_rc" -eq 0 ]; then
+		auth_clear_state "$_login_user"
+		audit_log "login_success" "user=${_login_user}"
+		# Cleanup before exit
+		unset STARGAZER_LOGIN_USER
+		unset STARGAZER_USER
+		unset LOGIN
+		exit 0
+	fi
+
+	# ── Cleanup ALL login context after failed attempt ──
+	unset STARGAZER_LOGIN_USER
+	unset STARGAZER_USER
+	unset LOGIN
+
+	# Apply lockout accounting only for syntactically-safe existing users
+	if _is_safe_id "$_login_user" \
+		&& admin_exists_in_config "$_login_user" \
+		&& grep -q "^${_login_user}:" /etc/passwd 2>/dev/null; then
+		auth_note_fail "$_login_user"
+		audit_log "login_reject" "user=${_login_user} reason=bad-password"
+	else
+		audit_log "login_reject" "user=${_login_user} reason=invalid-credential"
+	fi
+	sleep 1
+	# ── Ctrl+C during failure delay → reset ──
+	if [ "$_login_interrupted" -eq 1 ]; then echo ""; continue; fi
+done

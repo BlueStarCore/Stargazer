@@ -1,0 +1,661 @@
+#!/bin/sh
+# Stargazer NGFW - FortiGate-style Configure Command
+# Usage: cmd_configure <category> <subcategory> [object]
+# Enters interactive context with edit/set/show/end commands.
+# Sources cli_input.sh for Tab/? completion inside contexts.
+
+CMD_DIR="${CMD_DIR:-/usr/libexec/stargazer}"
+. "$CMD_DIR/cli_input.sh"
+. "$CMD_DIR/config_lib.sh"
+
+has_permission() {
+	echo ",${STARGAZER_PERMISSIONS}," | grep -q ",$1,"
+}
+
+require_config_permission() {
+	if has_permission "configure" || has_permission "admin"; then
+		return 0
+	fi
+	echo "  Permission denied: requires 'configure' or 'admin'"
+	return 1
+}
+
+can_apply_runtime() {
+	has_permission "configure" || has_permission "admin"
+}
+
+is_valid_key_for_type() {
+	cfg_is_valid_key "$1" "$2"
+}
+
+# Replace key=value in file safely using awk (BUG-CFG-03: avoids sed delimiter injection)
+_kv_replace() {
+	_kvr_file="$1"
+	_kvr_key="$2"
+	_kvr_val="$3"
+	_kvr_tmp="${_kvr_file}.kv.$$"
+	awk -v k="$_kvr_key" -v v="$_kvr_val" -F= \
+		'{if($1==k){print k"="v}else{print}}' \
+		"$_kvr_file" > "$_kvr_tmp" && cat "$_kvr_tmp" > "$_kvr_file" && rm -f "$_kvr_tmp"
+}
+
+value_rule_for_type_key() {
+	cfg_value_rule "$1" "$2"
+}
+
+validate_value_for_type_key() {
+	cfg_validate_value "$1" "$2" "$3"
+}
+
+# ── config_key: join args with underscore ────────────────────────────────────
+config_key() { echo "$*" | tr ' ' '_'; }
+
+_register_set_cmds_for_type() {
+	_rst_type="$1"
+	_rst_keys=$(_get_valid_keys "$_rst_type")
+	for _rst_k in $_rst_keys; do
+		_rst_hint=$(_get_value_hint "$_rst_type" "$_rst_k")
+		if [ -n "$_rst_hint" ]; then
+			cli_register "set $_rst_k" "Set $_rst_k ($_rst_hint)"
+		else
+			cli_register "set $_rst_k" "Set $_rst_k value"
+		fi
+		_rst_vals=$(_get_value_suggestions "$_rst_type" "$_rst_k")
+		for _rst_v in $_rst_vals; do
+			cli_register "set $_rst_k $_rst_v" "Example value for $_rst_k"
+		done
+	done
+	[ -z "$_rst_keys" ] && cli_register "set" "Set a parameter (set <key> <value>)"
+}
+
+# ── Register sub-commands for entry context ─────────────────────────────────
+
+_register_entry_cmds() {
+	_re_name="$1"
+	cli_register "show" "Show all parameters for this entry"
+	cli_register "next" "Save entry and return to table"
+	cli_register "end" "Save entry and exit context"
+	cli_register "abort" "Discard changes and exit"
+	cli_register "unset" "Remove a parameter"
+	cli_register "get" "Show a specific parameter"
+	_register_set_cmds_for_type "$_re_name"
+}
+
+# ── Register sub-commands for table context ─────────────────────────────────
+
+_register_table_cmds() {
+	_rt_type="$1"
+	_rt_rule="$(cfg_entry_id_rule "$_rt_type")"
+	cli_register "show" "Show all entries"
+	cli_register "edit <id>" "Allow: $_rt_rule"
+	cli_register "delete <id>" "Allow: $_rt_rule"
+	cli_register "end" "Exit this context"
+}
+
+# ── Register sub-commands for single context ────────────────────────────────
+
+_register_single_cmds() {
+	_rs_name="$1"
+	cli_register "show" "Show all parameters"
+	cli_register "end" "Save and exit"
+	cli_register "abort" "Discard changes and exit"
+	cli_register "unset" "Remove a parameter"
+	cli_register "get" "Show a specific parameter"
+	_register_set_cmds_for_type "$_rs_name"
+}
+
+# ── Table config type (edit/next/end) ───────────────────────────────────────
+
+context_table() {
+	_ctx_name="$1"
+	_ctx_label="$2"
+	_ctx_file=$(cfg_domain_for "$_ctx_name")
+
+	require_config_permission || return 1
+
+	cli_push
+	_register_table_cmds "$_ctx_name"
+
+	while true; do
+		cli_readline "($_ctx_label) # "
+		_line="$REPLY"
+		while [ "${_line#[ ]}" != "$_line" ]; do _line="${_line# }"; done
+		while [ "${_line%[ ]}" != "$_line" ]; do _line="${_line% }"; done
+		[ -z "$_line" ] && continue
+
+		_cmd="${_line%% *}"
+		_arg="${_line#* }"
+		[ "$_cmd" = "$_line" ] && _arg=""
+
+		case "$_cmd" in
+			show)
+				case "$_ctx_name" in
+					system_admin-profile)
+						echo "  === Admin Profiles ==="
+						printf "  %-20s %-30s %s\n" "NAME" "PERMISSIONS" "DESCRIPTION"
+						printf "  %-20s %-30s %s\n" "----" "-----------" "-----------"
+						for _pid in $(cfg_list "$_ctx_file" "$_ctx_name"); do
+							_perms=""
+							_desc=""
+							_bi=""
+							_tmp_data=$(cfg_get "$_ctx_file" "${_ctx_name}:${_pid}")
+							_perms=$(echo "$_tmp_data" | grep '^permissions=' | cut -d= -f2-)
+							_desc=$(echo "$_tmp_data" | grep '^description=' | cut -d= -f2-)
+							_bi=$(echo "$_tmp_data" | grep '^builtin=' | cut -d= -f2-)
+							[ "$_bi" = "yes" ] && _desc="$_desc [built-in]"
+							printf "  %-20s %-30s %s\n" "$_pid" "$_perms" "$_desc"
+						done
+						;;
+					system_admin)
+						echo "  === Admin Accounts ==="
+						printf "  %-20s %s\n" "USERNAME" "PROFILE"
+						printf "  %-20s %s\n" "--------" "-------"
+						for _aid in $(cfg_list "$_ctx_file" "$_ctx_name"); do
+							_prof=$(cfg_get "$_ctx_file" "${_ctx_name}:${_aid}" | grep '^profile=' | cut -d= -f2-)
+							printf "  %-20s %s\n" "$_aid" "$_prof"
+						done
+						;;
+					*)
+						_ids=$(cfg_list "$_ctx_file" "$_ctx_name")
+						if [ -z "$_ids" ]; then
+							echo "  No entries configured."
+						else
+							for _eid in $_ids; do
+								echo "  == Entry $_eid =="
+								cfg_get "$_ctx_file" "${_ctx_name}:${_eid}" | sed 's/^/    /'
+								echo ""
+							done
+						fi
+						;;
+				esac
+				;;
+			edit)
+				if [ -z "$_arg" ]; then
+					echo "  Usage: edit <id>  (expected: $(cfg_entry_id_rule "$_ctx_name"))"
+					continue
+				fi
+				if ! cfg_validate_entry_id "$_ctx_name" "$_arg"; then
+					echo "  Error: invalid ID '$_arg' for $_ctx_name"
+					echo "  Expected: $(cfg_entry_id_rule "$_ctx_name")"
+					audit_log "config_edit_reject" "type=${_ctx_name} id=${_arg} reason=invalid-id"
+					continue
+				fi
+				context_entry "$_ctx_name" "$_ctx_label" "$_arg"
+				;;
+			delete)
+				if [ -z "$_arg" ]; then
+					echo "  Usage: delete <id>  (expected: $(cfg_entry_id_rule "$_ctx_name"))"
+					continue
+				fi
+				if ! cfg_validate_entry_id "$_ctx_name" "$_arg"; then
+					echo "  Error: invalid ID '$_arg' for $_ctx_name"
+					echo "  Expected: $(cfg_entry_id_rule "$_ctx_name")"
+					audit_log "config_delete_reject" "type=${_ctx_name} id=${_arg} reason=invalid-id"
+					continue
+				fi
+				case "$_ctx_name" in
+					system_admin-profile)
+						_bi=$(cfg_get "$_ctx_file" "${_ctx_name}:${_arg}" 2>/dev/null \
+							| grep '^builtin=' | cut -d= -f2-)
+						if [ "$_bi" = "yes" ]; then
+							echo "  Error: cannot delete built-in profile '$_arg'"
+							audit_log "admin_profile_delete_reject" "name=${_arg} reason=builtin"
+							continue
+						fi
+						# Check if in use by any admin
+						_in_use=""
+						for _au in $(cfg_list "$_ctx_file" "system_admin"); do
+							_ap=$(cfg_get "$_ctx_file" "system_admin:${_au}" | grep '^profile=' | cut -d= -f2-)
+							if [ "$_ap" = "$_arg" ]; then
+								_in_use="$_au"
+								break
+							fi
+						done
+						if [ -n "$_in_use" ]; then
+							echo "  Error: profile '$_arg' is assigned to '$_in_use', reassign first"
+							audit_log "admin_profile_delete_reject" "name=${_arg} reason=in-use by=${_in_use}"
+							continue
+						fi
+						cfg_del "$_ctx_file" "${_ctx_name}:${_arg}"
+						audit_log "admin_profile_delete" "name=${_arg}"
+						session_profile_rev_bump "$_arg" >/dev/null 2>&1 || true
+						echo "  Profile '$_arg' deleted."
+						;;
+					system_admin)
+						if _ipc_available; then
+							# Use ADMIN_DELETE which handles builtin check + config + Linux user
+							ipc_send 301 "$_arg"
+							if [ "$IPC_RC" -eq 0 ]; then
+								audit_log "admin_delete" "name=${_arg}"
+								session_user_rev_bump "$_arg" >/dev/null 2>&1 || true
+								echo "  Admin '$_arg' deleted."
+							else
+								ipc_print_error
+							fi
+						else
+							_bi=$(cfg_get "$_ctx_file" "${_ctx_name}:${_arg}" 2>/dev/null \
+								| grep '^builtin=' | cut -d= -f2-)
+							if [ "$_bi" = "yes" ]; then
+								echo "  Error: cannot delete built-in 'admin' account"
+								audit_log "admin_delete_reject" "name=${_arg} reason=builtin"
+								continue
+							fi
+							cfg_del "$_ctx_file" "${_ctx_name}:${_arg}"
+							_delete_system_user "$_arg"
+							audit_log "admin_delete" "name=${_arg}"
+							session_user_rev_bump "$_arg" >/dev/null 2>&1 || true
+							echo "  Admin '$_arg' deleted."
+						fi
+						;;
+					*)
+						if cfg_get "$_ctx_file" "${_ctx_name}:${_arg}" >/dev/null 2>&1; then
+							cfg_del "$_ctx_file" "${_ctx_name}:${_arg}"
+							echo "  Entry $_arg deleted."
+						else
+							echo "  Entry $_arg not found."
+						fi
+						;;
+				esac
+				;;
+			end|abort)
+				break
+				;;
+			*)
+				echo "  Unknown command: $_cmd (try '?')"
+				;;
+		esac
+	done
+
+	cli_pop
+}
+
+# ── Entry context (set/unset/show/next/end) ─────────────────────────────────
+
+context_entry() {
+	_ent_name="$1"
+	_ent_label="$2"
+	_ent_id="$3"
+	_ent_section="${_ent_name}:${_ent_id}"
+	_ent_domain=$(cfg_domain_for "$_ent_name")
+	_ent_tmp=$(mktemp /tmp/cfg_entry.XXXXXX 2>/dev/null || echo "/tmp/cfg_entry_$$.tmp")
+	_ent_modified=0
+	_umask_old=$(umask)
+	umask 077
+	trap 'rm -f "$_ent_tmp"; umask "$_umask_old"' INT TERM EXIT
+
+	# Load existing data or start empty
+	if cfg_get "$_ent_domain" "$_ent_section" > "$_ent_tmp" 2>/dev/null; then
+		echo "  Editing entry $_ent_id."
+	else
+		> "$_ent_tmp"
+		echo "  Creating new entry $_ent_id."
+	fi
+
+	cli_push
+	_register_entry_cmds "$_ent_name"
+
+	while true; do
+		cli_readline "($_ent_label-$_ent_id) # "
+		_line="$REPLY"
+		while [ "${_line#[ ]}" != "$_line" ]; do _line="${_line# }"; done
+		while [ "${_line%[ ]}" != "$_line" ]; do _line="${_line% }"; done
+		[ -z "$_line" ] && continue
+
+		_cmd="${_line%% *}"
+		_rest="${_line#* }"
+		[ "$_cmd" = "$_line" ] && _rest=""
+		_key="${_rest%% *}"
+		_val="${_rest#* }"
+		[ "$_key" = "$_rest" ] && _val=""
+
+		case "$_cmd" in
+			set)
+				if [ -z "$_key" ]; then
+					echo "  Usage: set <key> <value>"
+					continue
+				fi
+				if ! is_valid_key_for_type "$_ent_name" "$_key"; then
+					echo "  Error: invalid key '$_key' for $_ent_name"
+					_show_valid_keys "$_ent_name"
+					continue
+				fi
+				# Special: interactive password prompt for admin accounts
+				if [ "$_ent_name" = "system_admin" ] && [ "$_key" = "password" ]; then
+					stty "$_cli_saved_tty" 2>/dev/null
+					printf "  New password: "
+					stty -echo 2>/dev/null
+					read -r _pw1
+					stty echo 2>/dev/null
+					echo ""
+					# Read enforce-password-policy from temp file (may not be saved yet)
+					_pw_enf=$(grep '^enforce-password-policy=' "$_ent_tmp" 2>/dev/null | cut -d= -f2-)
+					# Validate against password policy (pass override for unsaved context)
+					check_password_policy "$_pw1" "$_ent_id" "$_pw_enf"
+					_pw_prc=$?
+					if [ "$_pw_prc" -ge 2 ]; then
+						echo "  Error: $(password_policy_reason "$_pw_prc")"
+						continue
+					fi
+					printf "  Retype password: "
+					stty -echo 2>/dev/null
+					read -r _pw2
+					stty echo 2>/dev/null
+					echo ""
+					if [ "$_pw1" != "$_pw2" ]; then
+						echo "  Passwords don't match."
+						continue
+					fi
+					if grep -q "^password=" "$_ent_tmp" 2>/dev/null; then
+						_kv_replace "$_ent_tmp" "password" "$_pw1"
+					else
+						echo "password=${_pw1}" >> "$_ent_tmp"
+					fi
+					echo "  Password will be set on save."
+					_ent_modified=1
+					continue
+				fi
+				if [ -z "$_val" ]; then
+					_dyn_vals=$(_get_value_suggestions "$_ent_name" "$_key")
+					if [ -n "$_dyn_vals" ]; then
+						echo "  Suggested values for '$_key':"
+						for _dv in $_dyn_vals; do
+							echo "    $_dv"
+						done
+					fi
+					echo "  Usage: set $_key <value>"
+					continue
+				fi
+				if ! validate_value_for_type_key "$_ent_name" "$_key" "$_val"; then
+					echo "  Error: invalid value for '$_key': '$_val'"
+					echo "  Expected: $(value_rule_for_type_key "$_ent_name" "$_key")"
+					continue
+				fi
+				if grep -q "^${_key}=" "$_ent_tmp" 2>/dev/null; then
+					_kv_replace "$_ent_tmp" "$_key" "$_val"
+				else
+					echo "${_key}=${_val}" >> "$_ent_tmp"
+				fi
+				_ent_modified=1
+				;;
+			unset)
+				if [ -z "$_key" ]; then
+					echo "  Usage: unset <key>"
+					continue
+				fi
+				if ! is_valid_key_for_type "$_ent_name" "$_key"; then
+					echo "  Error: invalid key '$_key' for $_ent_name"
+					_show_valid_keys "$_ent_name"
+					continue
+				fi
+				_cf_sed="${_ent_tmp}.kv.$$"
+				awk -v k="$_key" -F= '$1!=k{print}' "$_ent_tmp" > "$_cf_sed" && cat "$_cf_sed" > "$_ent_tmp" && rm -f "$_cf_sed" >/dev/null 2>&1 || true
+				_ent_modified=1
+				;;
+			get)
+				if [ -z "$_key" ]; then
+					echo "  Usage: get <key>"
+					continue
+				fi
+				if ! is_valid_key_for_type "$_ent_name" "$_key"; then
+					echo "  Error: invalid key '$_key' for $_ent_name"
+					_show_valid_keys "$_ent_name"
+					continue
+				fi
+				_v=$(grep "^${_key}=" "$_ent_tmp" 2>/dev/null | cut -d= -f2-)
+				if [ -n "$_v" ]; then
+					if [ "$_ent_name" = "system_admin" ] && [ "$_key" = "password" ]; then
+						echo "  $_key = ********"
+					else
+						echo "  $_key = $_v"
+					fi
+				else
+					echo "  $_key: (not set)"
+				fi
+				;;
+			show)
+				if [ -s "$_ent_tmp" ]; then
+					echo "  == Entry $_ent_id =="
+					if [ "$_ent_name" = "system_admin" ]; then
+						sed '/^password=/s/=.*/=********/; s/^/    /' "$_ent_tmp"
+					else
+						sed 's/^/    /' "$_ent_tmp"
+					fi
+				else
+					echo "  (empty — use 'set <key> <value>')"
+				fi
+				;;
+			next|end)
+				if [ "$_ent_modified" -eq 1 ]; then
+					# Apply to running system only when privileged
+					if can_apply_runtime; then
+						if ! _apply_config "$_ent_name" "$_ent_id" "$_ent_tmp"; then
+							echo "  Apply failed. Changes not saved."
+							continue
+						fi
+					else
+						echo "  Saved (runtime apply deferred: requires 'configure' or 'admin')."
+					fi
+					# Strip plaintext password before persisting
+					_cf_sed="${_ent_tmp}.sed.$$"
+					sed '/^password=/d' "$_ent_tmp" > "$_cf_sed" && cat "$_cf_sed" > "$_ent_tmp" && rm -f "$_cf_sed" >/dev/null 2>&1 || true
+					# Persist to domain file
+					cfg_set "$_ent_domain" "$_ent_section" "$_ent_tmp"
+				fi
+				rm -f "$_ent_tmp"
+				umask "$_umask_old"
+				trap - INT TERM EXIT
+				break
+				;;
+			abort)
+				echo "  Changes discarded."
+				rm -f "$_ent_tmp"
+				umask "$_umask_old"
+				trap - INT TERM EXIT
+				break
+				;;
+			*)
+				echo "  Unknown command: $_cmd (try '?')"
+				;;
+		esac
+	done
+
+	cli_pop
+}
+
+# ── Single config type (set/show/end, no edit) ──────────────────────────────
+
+context_single() {
+	_sng_name="$1"
+	_sng_label="$2"
+	_sng_section="$_sng_name"
+	_sng_domain=$(cfg_domain_for "$_sng_name")
+	_sng_tmp=$(mktemp /tmp/cfg_single.XXXXXX 2>/dev/null || echo "/tmp/cfg_single_$$.tmp")
+	_sng_modified=0
+	_umask_old=$(umask)
+	umask 077
+	trap 'rm -f "$_sng_tmp"; umask "$_umask_old"' INT TERM EXIT
+
+	require_config_permission || return 1
+
+	# Load existing data or start empty
+	if ! cfg_get "$_sng_domain" "$_sng_section" > "$_sng_tmp" 2>/dev/null; then
+		> "$_sng_tmp"
+	fi
+
+	cli_push
+	_register_single_cmds "$_sng_name"
+
+	while true; do
+		cli_readline "($_sng_label) # "
+		_line="$REPLY"
+		while [ "${_line#[ ]}" != "$_line" ]; do _line="${_line# }"; done
+		while [ "${_line%[ ]}" != "$_line" ]; do _line="${_line% }"; done
+		[ -z "$_line" ] && continue
+
+		_cmd="${_line%% *}"
+		_rest="${_line#* }"
+		[ "$_cmd" = "$_line" ] && _rest=""
+		_key="${_rest%% *}"
+		_val="${_rest#* }"
+		[ "$_key" = "$_rest" ] && _val=""
+
+		case "$_cmd" in
+			set)
+				if [ -z "$_key" ] || [ -z "$_val" ]; then
+					if [ -n "$_key" ]; then
+						_dyn_vals=$(_get_value_suggestions "$_sng_name" "$_key")
+						if [ -n "$_dyn_vals" ]; then
+							echo "  Suggested values for '$_key':"
+							for _dv in $_dyn_vals; do
+								echo "    $_dv"
+							done
+						fi
+					fi
+					echo "  Usage: set <key> <value>"
+					continue
+				fi
+				if ! is_valid_key_for_type "$_sng_name" "$_key"; then
+					echo "  Error: invalid key '$_key' for $_sng_name"
+					_show_valid_keys "$_sng_name"
+					continue
+				fi
+				if ! validate_value_for_type_key "$_sng_name" "$_key" "$_val"; then
+					echo "  Error: invalid value for '$_key': '$_val'"
+					echo "  Expected: $(value_rule_for_type_key "$_sng_name" "$_key")"
+					continue
+				fi
+				if grep -q "^${_key}=" "$_sng_tmp" 2>/dev/null; then
+					_kv_replace "$_sng_tmp" "$_key" "$_val"
+				else
+					echo "${_key}=${_val}" >> "$_sng_tmp"
+				fi
+				_sng_modified=1
+				;;
+			unset)
+				if [ -z "$_key" ]; then
+					echo "  Usage: unset <key>"
+					continue
+				fi
+				if ! is_valid_key_for_type "$_sng_name" "$_key"; then
+					echo "  Error: invalid key '$_key' for $_sng_name"
+					_show_valid_keys "$_sng_name"
+					continue
+				fi
+				_cf_sed="${_sng_tmp}.kv.$$"
+				awk -v k="$_key" -F= '$1!=k{print}' "$_sng_tmp" > "$_cf_sed" && cat "$_cf_sed" > "$_sng_tmp" && rm -f "$_cf_sed" >/dev/null 2>&1 || true
+				_sng_modified=1
+				;;
+			get)
+				if [ -z "$_key" ]; then
+					echo "  Usage: get <key>"
+					continue
+				fi
+				if ! is_valid_key_for_type "$_sng_name" "$_key"; then
+					echo "  Error: invalid key '$_key' for $_sng_name"
+					_show_valid_keys "$_sng_name"
+					continue
+				fi
+				_v=$(grep "^${_key}=" "$_sng_tmp" 2>/dev/null | cut -d= -f2-)
+				[ -n "$_v" ] && echo "  $_key = $_v" || echo "  $_key: (not set)"
+				;;
+			show)
+				if [ -s "$_sng_tmp" ]; then
+					echo "  == $_sng_label =="
+					sed 's/^/    /' "$_sng_tmp"
+				else
+					echo "  (empty — use 'set <key> <value>')"
+				fi
+				;;
+			end)
+				if [ "$_sng_modified" -eq 1 ]; then
+					if can_apply_runtime; then
+						if ! _apply_config "$_sng_name" "0" "$_sng_tmp"; then
+							echo "  Apply failed. Changes not saved."
+							continue
+						fi
+					else
+						echo "  Saved (runtime apply deferred: requires 'configure' or 'admin')."
+					fi
+					cfg_set "$_sng_domain" "$_sng_section" "$_sng_tmp"
+				fi
+				rm -f "$_sng_tmp"
+				umask "$_umask_old"
+				trap - INT TERM EXIT
+				break
+				;;
+			abort)
+				echo "  Changes discarded."
+				rm -f "$_sng_tmp"
+				umask "$_umask_old"
+				trap - INT TERM EXIT
+				break
+				;;
+			*)
+				echo "  Unknown: $_cmd (try '?')"
+				;;
+		esac
+	done
+
+	cli_pop
+}
+
+# ── Main dispatch ───────────────────────────────────────────────────────────
+
+if [ $# -eq 0 ]; then
+	echo "  Usage: configure <category> <subcategory> [object]"
+	echo "  Examples:"
+	echo "    configure network route static"
+	echo "    configure network nat"
+	echo "    configure system settings"
+	echo "    configure system interface"
+	echo "    configure firewall policy"
+	echo "  Type 'configure ?' in CLI for all options."
+	exit 0
+fi
+
+case "$1" in
+	commit)
+		shift
+		_msg="${*:-manual commit}"
+		_rev=$(cfg_record_revision "$_msg")
+		if [ -n "$_rev" ]; then
+			echo "  Commit complete. Revision: $_rev"
+		else
+			echo "  Commit failed (DB unavailable?)"
+			exit 1
+		fi
+		exit 0
+		;;
+	revisions)
+		cfg_list_revisions
+		exit $?
+		;;
+	rollback)
+		shift
+		cfg_rollback_revision "$1"
+		exit $?
+		;;
+esac
+
+_key="$(config_key "$@")"
+_label="$(_key_to_label "$_key")"
+
+_type=$(cfg_type_mode "$_key")
+
+if [ -z "$_type" ]; then
+	echo "  Unknown config path: $*"
+	echo "  Run 'configure ?' to see available options."
+	exit 1
+fi
+
+case "$_type" in
+	table)
+		context_table "$_key" "$_label"
+		;;
+	single)
+		context_single "$_key" "$_label"
+		;;
+	*)
+		echo "  Config type not implemented: $_type"
+		;;
+esac

@@ -7,8 +7,15 @@ export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 mount -t proc none /proc
 mount -t sysfs none /sys
 mount -t devtmpfs none /dev 2>/dev/null || true
+mount -t tmpfs none /tmp 2>/dev/null || true
+mkdir -p /run 2>/dev/null
+# Ensure /dev/tty is accessible by non-root users (for readline terminal I/O)
+[ -c /dev/tty ] && chmod 0666 /dev/tty 2>/dev/null
 echo 1 > /proc/sys/kernel/sysrq
 exec 0</dev/console 1>/dev/console 2>&1
+
+# Suppress kernel console messages (prevents raw terminal corruption)
+echo 1 > /proc/sys/kernel/printk
 
 # Banner
 clear 2>/dev/null
@@ -16,18 +23,45 @@ cat << 'EOF'
 
   ╔═══════════════════════════════════════════════════════════╗
   ║  STARGAZER NGFW v@VERSION@                                ║
-  ╠═══════════════════════════════════════════════════════════╣
-  ║  service stargazer {start|stop|status}                    ║
-  ║  poweroff | reboot                                        ║
+  ║  Multi-User Authenticated System                          ║
   ╚═══════════════════════════════════════════════════════════╝
 
 EOF
 echo "Kernel: $(uname -r) | Arch: $(uname -m)"
 
+# Ensure stargazer system group exists (used for socket + config file ACL)
+if ! grep -q '^stargazer:' /etc/group 2>/dev/null; then
+	# Find a free GID in system range
+	_sg_gid=900
+	while grep -q "^[^:]*:[^:]*:${_sg_gid}:" /etc/group 2>/dev/null; do
+		_sg_gid=$((_sg_gid + 1))
+	done
+	echo "stargazer:x:${_sg_gid}:" >> /etc/group
+fi
+
 # Start services
 [ -x /etc/init.d/stargazer ] && /etc/init.d/stargazer start
 
-# Create commands
+# Start management daemon (privilege separation)
+if [ -x /sbin/stargazer-mgmtd ]; then
+	echo "[INIT] Starting management daemon..."
+	/sbin/stargazer-mgmtd &
+	# Wait briefly for socket to be ready
+	_mgmt_wait=0
+	while [ ! -S /run/stargazer-mgmtd.sock ] && [ "$_mgmt_wait" -lt 20 ]; do
+		usleep 50000 2>/dev/null || sleep 1
+		_mgmt_wait=$((_mgmt_wait + 1))
+	done
+	if [ -S /run/stargazer-mgmtd.sock ]; then
+		echo "[INIT] Management daemon ready."
+	else
+		echo "[INIT] WARNING: Management daemon socket not found."
+	fi
+fi
+
+# Create commands (remove busybox symlinks first to avoid "Text file busy")
+rm -f /sbin/service /sbin/poweroff /sbin/reboot /sbin/halt /sbin/shutdown
+
 cat > /sbin/service << 'SVC'
 #!/bin/sh
 [ -x "/etc/init.d/$1" ] && "/etc/init.d/$1" "$2" || echo "Usage: service <name> <action>"
@@ -47,7 +81,36 @@ RBT
 
 chmod +x /sbin/service /sbin/poweroff /sbin/reboot
 cp /sbin/poweroff /sbin/halt
+cp /sbin/poweroff /sbin/shutdown
 
-# Shell loop
-echo "[INIT] Ready. Type 'exit' to shutdown."
-while true; do /bin/sh; /sbin/poweroff; done
+# Check for test mode (boot parameter: test_mode=1)
+_cmdline=$(cat /proc/cmdline 2>/dev/null)
+echo "[INIT] cmdline: ${_cmdline}"
+if echo "${_cmdline}" | grep -q "test_mode=1" || [ -f /.test_mode ]; then
+	echo "[INIT] TEST MODE ENABLED"
+	if [ -f /usr/libexec/stargazer/test_suite.sh ]; then
+		echo "[INIT] Running test suite..."
+		# Run test suite and capture output
+		sh /usr/libexec/stargazer/test_suite.sh 2>&1 | tee /tmp/test_output.log
+		echo "[INIT] Test suite completed."
+		if [ -f /tmp/stargazer_bugs.json ]; then
+			cp /tmp/stargazer_bugs.json /tmp/TEST_RESULTS.json
+			echo "[INIT] Bug report saved to /tmp/TEST_RESULTS.json"
+		fi
+		# Flush output and sync filesystem
+		sleep 2
+		sync
+	else
+		echo "[INIT] ERROR: Test suite not found at /usr/libexec/stargazer/test_suite.sh"
+	fi
+	# After tests, loop forever to keep init alive
+	echo "[INIT] Tests completed. System stable. Ready for external poweroff."
+	while true; do sleep 3600; done
+else
+	# Login loop (normal mode)
+	# -c: set stdin as controlling terminal so Ctrl+C generates SIGINT
+	echo "[INIT] Ready."
+	while true; do
+		setsid -c /sbin/stargazer-login </dev/console >/dev/console 2>&1 || sleep 2
+	done
+fi

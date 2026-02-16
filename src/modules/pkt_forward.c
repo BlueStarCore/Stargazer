@@ -87,7 +87,7 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 	return NF_ACCEPT;
 }
 
-static struct nf_hook_ops nf_forward_ops = {
+static const struct nf_hook_ops nf_forward_ops = {
 	.hook     = forward_hook,
 	.pf       = NFPROTO_IPV4,
 	.hooknum  = NF_INET_FORWARD,

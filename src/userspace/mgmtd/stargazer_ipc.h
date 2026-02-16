@@ -1,0 +1,165 @@
+/* SPDX-License-Identifier: MIT */
+/*
+ * stargazer_ipc.h — Shared IPC protocol for Stargazer NGFW
+ *
+ * Defines the wire protocol between CLI (unprivileged) and mgmtd (root).
+ * Used by: stargazer-mgmtd, stargazer-ipc-cli, stargazer-logind
+ *
+ * Architecture:
+ *   CLI (user-level)  ──Unix Domain Socket──►  mgmtd (root daemon)
+ *   CLI only parses text and displays results.
+ *   mgmtd performs all privileged operations (file I/O, shadow, iptables).
+ */
+
+#ifndef STARGAZER_IPC_H
+#define STARGAZER_IPC_H
+
+#include <stdint.h>
+
+/* ── Socket path ────────────────────────────────────────────────────────── */
+#define SG_MGMTD_SOCK   "/run/stargazer-mgmtd.sock"
+
+/* ── Status codes ───────────────────────────────────────────────────────── */
+typedef enum {
+	SG_OK                = 0,
+
+	/* Client/validation errors (100-199) */
+	SG_ERR_INVALID_CMD   = 100,
+	SG_ERR_INVALID_ARG   = 101,
+	SG_ERR_INVALID_VAL   = 102,
+	SG_ERR_MISSING_ARG   = 103,
+
+	/* Permission/auth errors (200-299) */
+	SG_ERR_PERM_DENIED   = 200,
+	SG_ERR_AUTH_FAIL     = 201,
+	SG_ERR_LOCKED        = 202,
+	SG_ERR_PROFILE_DENY  = 203,
+
+	/* Not found errors (300-399) */
+	SG_ERR_NOT_FOUND     = 300,
+	SG_ERR_USER_NOT_FOUND = 301,
+	SG_ERR_PROFILE_NOT_FOUND = 302,
+	SG_ERR_ENTRY_NOT_FOUND = 303,
+
+	/* Conflict errors (400-499) */
+	SG_ERR_ALREADY_EXISTS = 400,
+	SG_ERR_IN_USE        = 401,
+	SG_ERR_BUILTIN       = 402,
+
+	/* System errors (500-599) */
+	SG_ERR_SYSTEM_FAIL   = 500,
+	SG_ERR_IO_FAIL       = 501,
+	SG_ERR_DISK_FULL     = 502,
+	SG_ERR_INTERNAL      = 503,
+} sg_status_t;
+
+/* ── Command IDs ────────────────────────────────────────────────────────── */
+typedef enum {
+	/* Config read operations (1xx) */
+	SG_CMD_CFG_GET       = 100,   /* Get section data               */
+	SG_CMD_CFG_LIST      = 101,   /* List entries of a type          */
+	SG_CMD_CFG_LIST_TYPES = 102,  /* List all types in a domain      */
+
+	/* Config write operations (2xx) */
+	SG_CMD_CFG_SET       = 200,   /* Set/update section data         */
+	SG_CMD_CFG_DEL       = 201,   /* Delete a section                */
+	SG_CMD_CFG_APPLY     = 202,   /* Apply config to running system  */
+
+	/* Admin management (3xx) */
+	SG_CMD_ADMIN_CREATE  = 300,   /* Create admin user               */
+	SG_CMD_ADMIN_DELETE  = 301,   /* Delete admin user               */
+	SG_CMD_ADMIN_SET_PW  = 302,   /* Set admin password              */
+	SG_CMD_ADMIN_SET_ENF = 303,   /* Set enforce-change-password     */
+
+	/* Session/auth (4xx) */
+	SG_CMD_SESSION_REV   = 400,   /* Get session revision for user   */
+	SG_CMD_SESSION_BUMP  = 401,   /* Bump session revision           */
+
+	/* Config revision management (5xx) */
+	SG_CMD_COMMIT        = 500,   /* Record config revision          */
+	SG_CMD_REVISIONS     = 501,   /* List revisions                  */
+	SG_CMD_ROLLBACK      = 502,   /* Rollback to revision            */
+
+	/* System operations (6xx) */
+	SG_CMD_SYS_POWEROFF  = 600,
+	SG_CMD_SYS_REBOOT    = 601,
+	SG_CMD_SHOW_STATUS   = 610,
+	SG_CMD_SHOW_IFACES   = 611,
+	SG_CMD_SHOW_ROUTES   = 612,
+	SG_CMD_SHOW_CONFIG   = 613,
+	SG_CMD_WHOAMI        = 620,   /* Get caller's profile+permissions */
+
+	/* Keepalive / ping (9xx) */
+	SG_CMD_PING          = 900,
+} sg_cmd_t;
+
+/* ── Message header ─────────────────────────────────────────────────────── */
+
+#define SG_MSG_MAGIC     0x5347    /* "SG" */
+#define SG_MSG_VERSION   1
+#define SG_PAYLOAD_MAX   4096
+#define SG_USERNAME_MAX  64
+#define SG_EXTRA_MAX     256
+
+/*
+ * Request: CLI → mgmtd
+ *
+ * Wire format (fixed header + variable payload):
+ *   [ magic:2 | version:1 | _pad:1 | cmd:4 | user[64] | payload_len:4 | payload[...] ]
+ */
+typedef struct {
+	uint16_t  magic;                     /* SG_MSG_MAGIC               */
+	uint8_t   version;                   /* SG_MSG_VERSION             */
+	uint8_t   _pad;
+	uint32_t  cmd;                       /* sg_cmd_t                   */
+	char      username[SG_USERNAME_MAX]; /* authenticated user         */
+	uint32_t  payload_len;               /* length of payload data     */
+	/* followed by payload_len bytes of payload (key=value lines, etc) */
+} __attribute__((packed)) sg_request_hdr_t;
+
+/*
+ * Response: mgmtd → CLI
+ *
+ * Wire format (fixed header + variable payload):
+ *   [ magic:2 | version:1 | _pad:1 | status:4 | extra[256] | payload_len:4 | payload[...] ]
+ */
+typedef struct {
+	uint16_t   magic;                    /* SG_MSG_MAGIC               */
+	uint8_t    version;                  /* SG_MSG_VERSION             */
+	uint8_t    _pad;
+	uint32_t   status;                   /* sg_status_t                */
+	char       extra[SG_EXTRA_MAX];      /* human hint (for CLI)       */
+	uint32_t   payload_len;              /* length of response payload */
+	/* followed by payload_len bytes of payload data                   */
+} __attribute__((packed)) sg_response_hdr_t;
+
+/* ── Error message lookup ───────────────────────────────────────────────── */
+
+static inline const char *sg_status_str(sg_status_t s)
+{
+	switch (s) {
+	case SG_OK:                    return "Success";
+	case SG_ERR_INVALID_CMD:       return "Invalid command";
+	case SG_ERR_INVALID_ARG:       return "Invalid argument";
+	case SG_ERR_INVALID_VAL:       return "Invalid value";
+	case SG_ERR_MISSING_ARG:       return "Missing required argument";
+	case SG_ERR_PERM_DENIED:       return "Permission denied";
+	case SG_ERR_AUTH_FAIL:         return "Authentication failed";
+	case SG_ERR_LOCKED:            return "Account is locked";
+	case SG_ERR_PROFILE_DENY:      return "Profile does not allow this operation";
+	case SG_ERR_NOT_FOUND:         return "Not found";
+	case SG_ERR_USER_NOT_FOUND:    return "User not found";
+	case SG_ERR_PROFILE_NOT_FOUND: return "Profile not found";
+	case SG_ERR_ENTRY_NOT_FOUND:   return "Entry not found";
+	case SG_ERR_ALREADY_EXISTS:    return "Already exists";
+	case SG_ERR_IN_USE:            return "Resource is in use";
+	case SG_ERR_BUILTIN:           return "Cannot modify built-in object";
+	case SG_ERR_SYSTEM_FAIL:       return "System error";
+	case SG_ERR_IO_FAIL:           return "I/O error";
+	case SG_ERR_DISK_FULL:         return "Disk full";
+	case SG_ERR_INTERNAL:          return "Internal error";
+	default:                       return "Unknown error";
+	}
+}
+
+#endif /* STARGAZER_IPC_H */

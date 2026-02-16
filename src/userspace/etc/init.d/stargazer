@@ -1,6 +1,10 @@
 #!/bin/sh
 # Stargazer NGFW Service
 # Manages module loading and kernel parameters
+#
+# NOTE: Config replay is handled by stargazer-login (runs after config
+# files are generated on first boot). This script only handles modules
+# and sysctl which don't depend on config files.
 
 NAME="stargazer"
 MODULE_DIR="/lib/modules/stargazer"

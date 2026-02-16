@@ -1,0 +1,200 @@
+#!/bin/sh
+# Stargazer NGFW - Admin Command
+# Requires: admin permission (enforced by profile, not UID)
+# All privileged ops routed through mgmtd via IPC.
+
+CMD_DIR="${CMD_DIR:-/usr/libexec/stargazer}"
+. "$CMD_DIR/config_lib.sh"
+
+VALID_PERMS="monitor,configure,admin"
+_sysconf="$STARGAZER_CONF_DIR/system.conf"
+
+subcmd="$1"
+shift 2>/dev/null
+
+# ----------------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------------
+
+validate_permissions() {
+	perms="$1"
+	for p in $(echo "$perms" | tr ',' ' '); do
+		if ! echo ",$VALID_PERMS," | grep -q ",$p,"; then
+			echo "  Invalid permission: $p"
+			echo "  Valid permissions: $VALID_PERMS"
+			return 1
+		fi
+	done
+	return 0
+}
+
+# Check if a profile name is in use by any admin
+profile_in_use() {
+	_piu_prof="$1"
+	for _piu_u in $(cfg_list "$_sysconf" "system_admin"); do
+		_piu_p=$(cfg_get "$_sysconf" "system_admin:${_piu_u}" | grep '^profile=' | cut -d= -f2-)
+		if [ "$_piu_p" = "$_piu_prof" ]; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+# ----------------------------------------------------------------------------
+# Subcommands
+# ----------------------------------------------------------------------------
+
+case "$subcmd" in
+	user-add)
+		username="$1"
+		profile="$2"
+		if [ -z "$username" ] || [ -z "$profile" ]; then
+			echo "  Usage: admin user-add <username> <profile>"
+			exit 1
+		fi
+		# Create admin user via IPC (mgmtd handles profile check, Linux user, config)
+		if _ipc_available; then
+			ipc_send 300 "$(printf '%s\n%s' "$username" "$profile")"
+			if [ "$IPC_RC" -eq 0 ]; then
+				echo "  User '$username' created with profile '$profile'"
+				echo "  (password is empty - user should change it)"
+			else
+				ipc_print_error
+				exit 1
+			fi
+		else
+			# Direct fallback (root context)
+			if ! cfg_get "$_sysconf" "system_admin-profile:${profile}" >/dev/null 2>&1; then
+				echo "  Error: profile '$profile' does not exist"
+				exit 1
+			fi
+			if cfg_get "$_sysconf" "system_admin:${username}" >/dev/null 2>&1; then
+				echo "  Error: user '$username' already exists"
+				exit 1
+			fi
+			_create_system_user "$username" /sbin/stargazer-cli
+			_tmp="/tmp/cmd_admin_ua.$$"
+			printf 'profile=%s\n' "$profile" > "$_tmp"
+			cfg_set "$_sysconf" "system_admin:${username}" "$_tmp"
+			rm -f "$_tmp"
+			echo "  User '$username' created with profile '$profile'"
+			echo "  (password is empty - user should change it)"
+		fi
+		;;
+
+	user-del)
+		username="$1"
+		if [ -z "$username" ]; then
+			echo "  Usage: admin user-del <username>"
+			exit 1
+		fi
+		# Delete admin user via IPC (mgmtd handles builtin check, Linux user, config)
+		if _ipc_available; then
+			ipc_send 301 "$username"
+			if [ "$IPC_RC" -eq 0 ]; then
+				echo "  User '$username' deleted"
+			else
+				ipc_print_error
+				exit 1
+			fi
+		else
+			# Direct fallback (root context)
+			_bi=$(cfg_get "$_sysconf" "system_admin:${username}" 2>/dev/null \
+				| grep '^builtin=' | cut -d= -f2-)
+			if [ "$_bi" = "yes" ]; then
+				echo "  Error: cannot delete built-in '$username' account"
+				exit 1
+			fi
+			if ! cfg_get "$_sysconf" "system_admin:${username}" >/dev/null 2>&1; then
+				echo "  Error: user '$username' not found"
+				exit 1
+			fi
+			cfg_del "$_sysconf" "system_admin:${username}"
+			_delete_system_user "$username"
+			echo "  User '$username' deleted"
+		fi
+		;;
+
+	user-list)
+		echo "  === Stargazer Users ==="
+		printf "  %-20s %s\n" "USERNAME" "PROFILE"
+		printf "  %-20s %s\n" "--------" "-------"
+		for _ul_u in $(cfg_list "$_sysconf" "system_admin"); do
+			_ul_p=$(cfg_get "$_sysconf" "system_admin:${_ul_u}" | grep '^profile=' | cut -d= -f2-)
+			printf "  %-20s %s\n" "$_ul_u" "$_ul_p"
+		done
+		;;
+
+	profile-create)
+		name="$1"
+		perms="$2"
+		desc="$3"
+		if [ -z "$name" ] || [ -z "$perms" ]; then
+			echo "  Usage: admin profile-create <name> <perms> [description]"
+			echo "  Example: admin profile-create ops monitor,configure \"Ops team\""
+			exit 1
+		fi
+		# Check if already exists
+		if cfg_get "$_sysconf" "system_admin-profile:${name}" >/dev/null 2>&1; then
+			echo "  Error: profile '$name' already exists"
+			exit 1
+		fi
+		if ! validate_permissions "$perms"; then
+			exit 1
+		fi
+		desc="${desc:-Custom profile}"
+		_tmp="/tmp/cmd_admin_pc.$$"
+		printf 'permissions=%s\ndescription=%s\n' "$perms" "$desc" > "$_tmp"
+		cfg_set "$_sysconf" "system_admin-profile:${name}" "$_tmp"
+		rm -f "$_tmp"
+		echo "  Profile '$name' created (perms: $perms)"
+		;;
+
+	profile-delete)
+		name="$1"
+		if [ -z "$name" ]; then
+			echo "  Usage: admin profile-delete <name>"
+			exit 1
+		fi
+		_bi=$(cfg_get "$_sysconf" "system_admin-profile:${name}" 2>/dev/null \
+			| grep '^builtin=' | cut -d= -f2-)
+		if [ "$_bi" = "yes" ]; then
+			echo "  Error: cannot delete built-in profile '$name'"
+			exit 1
+		fi
+		if ! cfg_get "$_sysconf" "system_admin-profile:${name}" >/dev/null 2>&1; then
+			echo "  Error: profile '$name' not found"
+			exit 1
+		fi
+		if profile_in_use "$name"; then
+			echo "  Error: profile '$name' is assigned to users, reassign them first"
+			exit 1
+		fi
+		cfg_del "$_sysconf" "system_admin-profile:${name}"
+		echo "  Profile '$name' deleted"
+		;;
+
+	profile-list)
+		echo "  === Stargazer Profiles ==="
+		printf "  %-20s %-30s %s\n" "NAME" "PERMISSIONS" "DESCRIPTION"
+		printf "  %-20s %-30s %s\n" "----" "-----------" "-----------"
+		for _pl_n in $(cfg_list "$_sysconf" "system_admin-profile"); do
+			_pl_data=$(cfg_get "$_sysconf" "system_admin-profile:${_pl_n}")
+			_pl_p=$(echo "$_pl_data" | grep '^permissions=' | cut -d= -f2-)
+			_pl_d=$(echo "$_pl_data" | grep '^description=' | cut -d= -f2-)
+			_pl_bi=$(echo "$_pl_data" | grep '^builtin=' | cut -d= -f2-)
+			[ "$_pl_bi" = "yes" ] && _pl_d="$_pl_d [built-in]"
+			printf "  %-20s %-30s %s\n" "$_pl_n" "$_pl_p" "$_pl_d"
+		done
+		;;
+
+	"")
+		echo "  Usage: admin <subcommand>"
+		echo "  Subcommands: user-add, user-del, user-list, profile-create, profile-delete, profile-list"
+		;;
+
+	*)
+		echo "  Unknown subcommand: $subcmd"
+		echo "  Subcommands: user-add, user-del, user-list, profile-create, profile-delete, profile-list"
+		;;
+esac
