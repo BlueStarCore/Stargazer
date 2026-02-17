@@ -28,6 +28,7 @@ typedef enum {
 	SG_ERR_INVALID_ARG   = 101,
 	SG_ERR_INVALID_VAL   = 102,
 	SG_ERR_MISSING_ARG   = 103,
+	SG_ERR_POLICY_FAIL   = 104,
 
 	/* Permission/auth errors (200-299) */
 	SG_ERR_PERM_DENIED   = 200,
@@ -70,6 +71,7 @@ typedef enum {
 	SG_CMD_ADMIN_DELETE  = 301,   /* Delete admin user               */
 	SG_CMD_ADMIN_SET_PW  = 302,   /* Set admin password              */
 	SG_CMD_ADMIN_SET_ENF = 303,   /* Set enforce-change-password     */
+	SG_CMD_ADMIN_CHECK_PW = 304,  /* Validate password against policy */
 
 	/* Session/auth (4xx) */
 	SG_CMD_SESSION_REV   = 400,   /* Get session revision for user   */
@@ -143,6 +145,7 @@ static inline const char *sg_status_str(sg_status_t s)
 	case SG_ERR_INVALID_ARG:       return "Invalid argument";
 	case SG_ERR_INVALID_VAL:       return "Invalid value";
 	case SG_ERR_MISSING_ARG:       return "Missing required argument";
+	case SG_ERR_POLICY_FAIL:       return "Password policy violation";
 	case SG_ERR_PERM_DENIED:       return "Permission denied";
 	case SG_ERR_AUTH_FAIL:         return "Authentication failed";
 	case SG_ERR_LOCKED:            return "Account is locked";

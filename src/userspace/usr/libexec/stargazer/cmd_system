@@ -67,6 +67,7 @@ case "$subcmd" in
 			echo "  configure system admin-profile   Manage admin profiles"
 			echo "  configure system admin profile   (alias)"
 			echo "  configure system admin           Manage admin accounts"
+			echo "  configure system password-policy  Manage password policy"
 			echo "  execute debug enable|disable     Toggle debug output"
 			echo "  execute debug flow trace ...     Packet flow trace"
 			echo "  execute debug cli ...            CLI input/action trace"

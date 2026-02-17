@@ -40,6 +40,7 @@
 #include <sys/wait.h>
 
 #include "stargazer_ipc.h"
+#include "password_policy.h"
 
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
@@ -652,6 +653,32 @@ static int set_password(const char *username, const char *password)
 	return 0;
 }
 
+/*
+ * Check whether a user has a valid password hash in /etc/shadow.
+ * Returns 1 if user has a usable password, 0 if locked/empty/missing.
+ */
+static int user_has_password(const char *username)
+{
+	FILE *fp = fopen("/etc/shadow", "r");
+	if (!fp) return 0;
+
+	char line[MAX_LINE];
+	size_t ulen = strlen(username);
+
+	while (fgets(line, sizeof(line), fp)) {
+		if (strncmp(line, username, ulen) == 0 && line[ulen] == ':') {
+			fclose(fp);
+			char c = line[ulen + 1];
+			/* Locked (!), disabled (*), or empty field = no password */
+			if (c == '!' || c == '*' || c == ':' || c == '\n' || c == '\0')
+				return 0;
+			return 1;
+		}
+	}
+	fclose(fp);
+	return 0; /* user not found in shadow */
+}
+
 /* ── User management ────────────────────────────────────────────────────── */
 
 /*
@@ -950,6 +977,92 @@ static void extract_val(const char *data, const char *key,
 	}
 }
 
+/* ── Password policy helpers ─────────────────────────────────────────────── */
+
+/*
+ * Read global password policy from system.conf [system_password-policy].
+ * Uses cfg_get_section + extract_val (mgmtd-specific).
+ */
+static void mgmtd_read_password_policy(struct password_policy *pol)
+{
+	pol->min_length = 0;
+	pol->min_uppercase = 0;
+	pol->min_lowercase = 0;
+	pol->min_digit = 0;
+	pol->min_special = 0;
+
+	char *data = cfg_get_section(SYSTEM_CONF, "system_password-policy");
+	if (!data) return;
+
+	char val[VALBUFSZ];
+	extract_val(data, "min-length", val, sizeof(val));
+	if (val[0]) { int v = atoi(val); pol->min_length = (v > 0) ? v : 0; }
+	extract_val(data, "min-uppercase", val, sizeof(val));
+	if (val[0]) { int v = atoi(val); pol->min_uppercase = (v > 0) ? v : 0; }
+	extract_val(data, "min-lowercase", val, sizeof(val));
+	if (val[0]) { int v = atoi(val); pol->min_lowercase = (v > 0) ? v : 0; }
+	extract_val(data, "min-digit", val, sizeof(val));
+	if (val[0]) { int v = atoi(val); pol->min_digit = (v > 0) ? v : 0; }
+	extract_val(data, "min-special", val, sizeof(val));
+	if (val[0]) { int v = atoi(val); pol->min_special = (v > 0) ? v : 0; }
+
+	free(data);
+}
+
+/*
+ * Check if user has enforce-password-policy=enable in their admin config.
+ * Returns 1 if enforced, 0 if not.
+ */
+static int mgmtd_is_policy_enforced(const char *username)
+{
+	char section[256];
+	snprintf(section, sizeof(section), "system_admin:%s", username);
+
+	char *data = cfg_get_section(SYSTEM_CONF, section);
+	if (!data) return 0;
+
+	char val[VALBUFSZ];
+	extract_val(data, "enforce-password-policy", val, sizeof(val));
+	free(data);
+
+	return (strcmp(val, "enable") == 0) ? 1 : 0;
+}
+
+/*
+ * Validate password against policy.
+ * Returns 0 if ok (policy not enforced or satisfied), >0 on violation.
+ * Sets *reason to human-readable string on failure.
+ *
+ * enforce_override: if non-empty, overrides the per-user enforce flag
+ *   (used by CFG_APPLY where the value may not be saved yet).
+ */
+static int mgmtd_validate_password(const char *username, const char *password,
+				    const char *enforce_override,
+				    const char **reason)
+{
+	int enforced;
+
+	if (enforce_override && enforce_override[0])
+		enforced = (strcmp(enforce_override, "enable") == 0);
+	else
+		enforced = mgmtd_is_policy_enforced(username);
+
+	if (!enforced) return 0;
+
+	struct password_policy pol;
+	mgmtd_read_password_policy(&pol);
+
+	/* Apply MIN_PASS_LEN floor (same as logind) */
+	if (pol.min_length <= 0) pol.min_length = PW_MIN_PASS_LEN;
+
+	int rc = pw_check_policy(password, username, &pol);
+	if (rc == 1) return 0; /* satisfied */
+	if (reason) *reason = pw_policy_reason(rc);
+	return rc;
+}
+
+/* ── Apply config to running system ─────────────────────────────────────── */
+
 static sg_status_t apply_config(const char *type, const char *id,
 				const char *data, char *result, size_t rsize)
 {
@@ -1162,9 +1275,12 @@ static sg_status_t apply_config(const char *type, const char *id,
 
 	if (strcmp(type, "system_admin") == 0) {
 		char profile[VALBUFSZ], password[VALBUFSZ], enforce[VALBUFSZ];
+		char enforce_policy[VALBUFSZ];
 		extract_val(data, "profile", profile, sizeof(profile));
 		extract_val(data, "password", password, sizeof(password));
 		extract_val(data, "enforce-change-password", enforce, sizeof(enforce));
+		extract_val(data, "enforce-password-policy", enforce_policy,
+			    sizeof(enforce_policy));
 
 		if (profile[0] == '\0') {
 			snprintf(result, rsize, "'profile' not set.");
@@ -1194,11 +1310,31 @@ static sg_status_t apply_config(const char *type, const char *id,
 
 		/* Handle password */
 		if (password[0]) {
+			/* Validate against password policy */
+			const char *pw_reason = NULL;
+			int pw_rc = mgmtd_validate_password(id, password,
+							    enforce_policy,
+							    &pw_reason);
+			if (pw_rc > 0) {
+				explicit_bzero(password, sizeof(password));
+				snprintf(result, rsize, "Password policy: %s",
+					 pw_reason ? pw_reason : "violation");
+				return SG_ERR_POLICY_FAIL;
+			}
 			if (set_password(id, password) != 0) {
+				explicit_bzero(password, sizeof(password));
 				snprintf(result, rsize, "Failed to set password for '%s'.", id);
 				return SG_ERR_SYSTEM_FAIL;
 			}
+			explicit_bzero(password, sizeof(password));
 			audit_log(id, "admin_password_set", "source=mgmtd");
+		}
+
+		/* Ensure admin has a usable password (new or existing) */
+		if (!user_has_password(id)) {
+			snprintf(result, rsize,
+				 "Admin '%s' has no password. Use 'set password'.", id);
+			return SG_ERR_MISSING_ARG;
 		}
 
 		/* Handle enforce-change-password default for new users */
@@ -1663,6 +1799,16 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 			return;
 		}
 
+		/* Validate against password policy */
+		const char *pw_reason = NULL;
+		int pw_rc = mgmtd_validate_password(target, pw, NULL, &pw_reason);
+		if (pw_rc > 0) {
+			explicit_bzero(pw, sizeof(pw));
+			send_error(client_fd, SG_ERR_POLICY_FAIL,
+				   pw_reason ? pw_reason : "Policy violation");
+			return;
+		}
+
 		if (set_password(target, pw) != 0) {
 			explicit_bzero(pw, sizeof(pw));
 			mgmt_log("ERROR", "set_password failed for %s: %s",
@@ -1732,6 +1878,59 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		free(newdata);
 		audit_log(user, "admin_set_enforce", target);
 		send_ok(client_fd, "Enforce policy updated", NULL);
+		return;
+	}
+
+	case SG_CMD_ADMIN_CHECK_PW: {
+		/* Validate password against policy without setting it.
+		 * Payload: "username\npassword[\nenforce_override]" */
+		if (!payload) {
+			send_error(client_fd, SG_ERR_MISSING_ARG,
+				   "Missing username+password");
+			return;
+		}
+		char chk_user[128] = {0}, chk_pw[256] = {0};
+		char chk_enforce[32] = {0};
+		const char *nl1 = strchr(payload, '\n');
+		if (!nl1) {
+			send_error(client_fd, SG_ERR_INVALID_ARG, "Bad format");
+			return;
+		}
+		size_t ulen = (size_t)(nl1 - payload);
+		if (ulen >= sizeof(chk_user)) ulen = sizeof(chk_user) - 1;
+		memcpy(chk_user, payload, ulen);
+
+		const char *p2 = nl1 + 1;
+		const char *nl2 = strchr(p2, '\n');
+		if (nl2) {
+			size_t plen2 = (size_t)(nl2 - p2);
+			if (plen2 >= sizeof(chk_pw)) plen2 = sizeof(chk_pw) - 1;
+			memcpy(chk_pw, p2, plen2);
+			/* Third line: enforce override */
+			const char *p3 = nl2 + 1;
+			size_t elen = strlen(p3);
+			if (elen > 0 && p3[elen-1] == '\n') elen--;
+			if (elen >= sizeof(chk_enforce)) elen = sizeof(chk_enforce) - 1;
+			memcpy(chk_enforce, p3, elen);
+		} else {
+			size_t plen2 = strlen(p2);
+			if (plen2 > 0 && p2[plen2-1] == '\n') plen2--;
+			if (plen2 >= sizeof(chk_pw)) plen2 = sizeof(chk_pw) - 1;
+			memcpy(chk_pw, p2, plen2);
+		}
+
+		const char *reason = NULL;
+		int rc = mgmtd_validate_password(chk_user, chk_pw,
+						  chk_enforce[0] ? chk_enforce : NULL,
+						  &reason);
+		explicit_bzero(chk_pw, sizeof(chk_pw));
+
+		if (rc > 0) {
+			send_error(client_fd, SG_ERR_POLICY_FAIL,
+				   reason ? reason : "Policy violation");
+		} else {
+			send_ok(client_fd, "Password meets policy", NULL);
+		}
 		return;
 	}
 

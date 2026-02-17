@@ -20,8 +20,46 @@ generate_first_boot() {
 			|| echo "no-uuid" > "$STARGAZER_CONF_DIR/.instance-id"
 	fi
 
-	# ── system.conf ──────────────────────────────────────────────────────
-	cat > "$STARGAZER_CONF_DIR/system.conf" << 'EOF'
+	_default_conf="$STARGAZER_CONF_DIR/default.conf"
+	_sg_grp="stargazer"
+
+	if [ -f "$_default_conf" ]; then
+		# ── Template-based first boot ─────────────────────────────────────
+		_cur_domain=""
+		_sys_f="$STARGAZER_CONF_DIR/system.conf"
+		_net_f="$STARGAZER_CONF_DIR/network.conf"
+		_fw_f="$STARGAZER_CONF_DIR/firewall.conf"
+		> "$_sys_f"
+		> "$_net_f"
+		> "$_fw_f"
+
+		while IFS= read -r _line || [ -n "$_line" ]; do
+			case "$_line" in
+				"### DOMAIN:system ###")   _cur_domain="system";   continue ;;
+				"### DOMAIN:network ###")  _cur_domain="network";  continue ;;
+				"### DOMAIN:firewall ###") _cur_domain="firewall"; continue ;;
+			esac
+			case "$_cur_domain" in
+				system)   echo "$_line" >> "$_sys_f" ;;
+				network)  echo "$_line" >> "$_net_f" ;;
+				firewall) echo "$_line" >> "$_fw_f" ;;
+				*)        echo "$_line" >> "$_sys_f" ;;
+			esac
+		done < "$_default_conf"
+
+		# Auto-detect hardware interfaces → append to network.conf if not in template
+		for _iface_path in /sys/class/net/*; do
+			_iface="${_iface_path##*/}"
+			[ "$_iface" = "lo" ] && continue
+			if ! grep -q "^\[system_interface:${_iface}\]" "$_net_f" 2>/dev/null; then
+				printf '[system_interface:%s]\nstatus=up\n\n' "$_iface" >> "$_net_f"
+			fi
+		done
+
+		rm -f "$_default_conf"
+	else
+		# ── Legacy hardcoded fallback ─────────────────────────────────────
+		cat > "$STARGAZER_CONF_DIR/system.conf" << 'SYSEOF'
 [system_settings]
 hostname=stargazer
 ip-forward=enable
@@ -49,25 +87,17 @@ enforce-change-password=enable
 enforce-password-policy=enable
 builtin=yes
 
-EOF
-	chmod 640 "$STARGAZER_CONF_DIR/system.conf" 2>/dev/null
-	chgrp stargazer "$STARGAZER_CONF_DIR/system.conf" 2>/dev/null
+SYSEOF
 
-	# ── network.conf (auto-detect hardware interfaces) ────────────────────
-	_nf="$STARGAZER_CONF_DIR/network.conf"
-	> "$_nf"
-	for _iface_path in /sys/class/net/*; do
-		_iface="${_iface_path##*/}"
-		# Skip loopback
-		[ "$_iface" = "lo" ] && continue
-		# Skip virtual/docker bridges (optional, keep real hardware)
-		printf '[system_interface:%s]\nstatus=up\n\n' "$_iface" >> "$_nf"
-	done
-	chmod 640 "$_nf" 2>/dev/null
-	chgrp stargazer "$_nf" 2>/dev/null
+		_net_f="$STARGAZER_CONF_DIR/network.conf"
+		> "$_net_f"
+		for _iface_path in /sys/class/net/*; do
+			_iface="${_iface_path##*/}"
+			[ "$_iface" = "lo" ] && continue
+			printf '[system_interface:%s]\nstatus=up\n\n' "$_iface" >> "$_net_f"
+		done
 
-	# ── firewall.conf (deny-all default policy) ──────────────────────────
-	cat > "$STARGAZER_CONF_DIR/firewall.conf" << 'EOF'
+		cat > "$STARGAZER_CONF_DIR/firewall.conf" << 'FWEOF'
 [firewall_policy:1]
 name=default-deny
 srcintf=any
@@ -78,12 +108,17 @@ action=deny
 status=enable
 comment=Default deny all traffic
 
-EOF
-	chmod 640 "$STARGAZER_CONF_DIR/firewall.conf" 2>/dev/null
-	chgrp stargazer "$STARGAZER_CONF_DIR/firewall.conf" 2>/dev/null
+FWEOF
+	fi
 
-	# Set directory group ownership
-	chgrp stargazer "$STARGAZER_CONF_DIR" 2>/dev/null
+	# Set permissions on all config files: 0640, group stargazer
+	for _cf in system.conf network.conf firewall.conf; do
+		[ -f "$STARGAZER_CONF_DIR/$_cf" ] || continue
+		chmod 640 "$STARGAZER_CONF_DIR/$_cf" 2>/dev/null
+		chgrp "$_sg_grp" "$STARGAZER_CONF_DIR/$_cf" 2>/dev/null
+	done
+
+	chgrp "$_sg_grp" "$STARGAZER_CONF_DIR" 2>/dev/null
 	chmod 750 "$STARGAZER_CONF_DIR" 2>/dev/null
 
 	echo "[FIRST-BOOT] Default configuration generated."

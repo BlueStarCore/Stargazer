@@ -32,11 +32,12 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#include "password_policy.h"
+
 #define SYSTEM_CONF       "/etc/stargazer/system.conf"
 #define AUDIT_LOG         "/var/log/stargazer-audit.log"
 #define AUDIT_LOG_FALLBACK "/tmp/stargazer-audit.log"
 #define MAX_PASS_LEN      256
-#define MIN_PASS_LEN      8
 #define MAX_LINE_LEN      1024
 #define MAX_SALT_LEN      32
 #define EXIT_SIGINT       130  /* Convention: 128 + SIGINT(2) */
@@ -403,14 +404,6 @@ static int generate_salt(char *salt, size_t saltlen)
 
 /* ── Password policy ────────────────────────────────────────────────────── */
 
-struct password_policy {
-	int min_length;
-	int min_uppercase;
-	int min_lowercase;
-	int min_digit;
-	int min_special;
-};
-
 /*
  * Read global password policy from system.conf [system_password-policy].
  * Missing keys default to 0 (no requirement).
@@ -454,56 +447,6 @@ static int is_password_policy_enforced(const char *username)
 		return 0; /* key missing → not enforced */
 
 	return (strcmp(val, "enable") == 0) ? 1 : 0;
-}
-
-/*
- * Check password against policy.
- * Returns: 0=no policy, 1=satisfied, 2=special, 3=uppercase,
- *          4=lowercase, 5=digit, 6=length, 7=contains-username
- */
-static int check_password_policy(const char *password, const char *username,
-				 const struct password_policy *pol)
-{
-	int cnt_upper = 0, cnt_lower = 0, cnt_digit = 0, cnt_special = 0;
-	int len = 0;
-
-	for (const char *p = password; *p; p++) {
-		len++;
-		if (*p >= 'A' && *p <= 'Z')      cnt_upper++;
-		else if (*p >= 'a' && *p <= 'z')  cnt_lower++;
-		else if (*p >= '0' && *p <= '9')  cnt_digit++;
-		else                              cnt_special++;
-	}
-
-	if (pol->min_length > 0 && len < pol->min_length)
-		return 6;
-	if (pol->min_uppercase > 0 && cnt_upper < pol->min_uppercase)
-		return 3;
-	if (pol->min_lowercase > 0 && cnt_lower < pol->min_lowercase)
-		return 4;
-	if (pol->min_digit > 0 && cnt_digit < pol->min_digit)
-		return 5;
-	if (pol->min_special > 0 && cnt_special < pol->min_special)
-		return 2;
-
-	/* Reject password containing username */
-	if (username && username[0] && strstr(password, username))
-		return 7;
-
-	return 1; /* satisfied */
-}
-
-static const char *policy_reason(int rc)
-{
-	switch (rc) {
-	case 2: return "not enough special characters";
-	case 3: return "not enough uppercase characters";
-	case 4: return "not enough lowercase characters";
-	case 5: return "not enough digits";
-	case 6: return "password too short";
-	case 7: return "password must not contain your username";
-	default: return "password does not meet policy";
-	}
 }
 
 /* ── Password change core ──────────────────────────────────────────────── */
@@ -553,9 +496,9 @@ static int force_password_change(const char *username, int eff_min_len,
 		}
 
 		if (has_policy) {
-			int prc = check_password_policy(pw1, username, pol);
+			int prc = pw_check_policy(pw1, username, pol);
 			if (prc != 1) {
-				fprintf(stderr, "  %s\n\n", policy_reason(prc));
+				fprintf(stderr, "  %s\n\n", pw_policy_reason(prc));
 				continue;
 			}
 		}
@@ -620,8 +563,9 @@ static int enforce_password_change(const char *username)
 	else
 		memset(&pol, 0, sizeof(pol));
 
-	int eff_min_len = (has_policy && pol.min_length > 0)
-		? pol.min_length : MIN_PASS_LEN;
+	int eff_min_len = has_policy
+		? ((pol.min_length > 0) ? pol.min_length : PW_MIN_PASS_LEN)
+		: PW_MIN_PASS_LEN_ABS;
 
 	fprintf(stderr, "\n");
 	fprintf(stderr, " PASSWORD CHANGE REQUIRED\n");
@@ -650,11 +594,11 @@ static int enforce_policy_compliance(const char *username,
 	fprintf(stderr, " Your current password does not meet the updated\n");
 	fprintf(stderr, " global password policy. You must set a new password.\n");
 	print_requirements(
-		(pol->min_length > 0) ? pol->min_length : MIN_PASS_LEN,
+		(pol->min_length > 0) ? pol->min_length : PW_MIN_PASS_LEN,
 		1, pol);
 
 	int rc = force_password_change(username,
-		(pol->min_length > 0) ? pol->min_length : MIN_PASS_LEN,
+		(pol->min_length > 0) ? pol->min_length : PW_MIN_PASS_LEN,
 		1, pol);
 	if (rc != 0)
 		return rc;
@@ -711,11 +655,11 @@ int main(int argc, char *argv[])
 	int policy_mismatch = 0;
 	if (is_password_policy_enforced(username)) {
 		read_password_policy(&login_pol);
-		int prc = check_password_policy(password, username, &login_pol);
+		int prc = pw_check_policy(password, username, &login_pol);
 		if (prc != 1) {
 			policy_mismatch = 1;
 			audit_log(username, "password_policy_mismatch",
-				  policy_reason(prc));
+				  pw_policy_reason(prc));
 		}
 	}
 

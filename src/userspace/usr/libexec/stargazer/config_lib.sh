@@ -1000,45 +1000,56 @@ cfg_replay() {
 }
 
 # ── Password policy ──────────────────────────────────────────────────────────
-# check_password_policy(password, username)
-# Returns: 0=no policy enforced, 1=satisfied, 2=special, 3=uppercase,
-#          4=lowercase, 5=digit, 6=length, 7=contains-username
+# check_password_policy(password, username, [enforce_override])
+# Returns: 0=no policy enforced, 1=satisfied, 2=policy violation (reason in IPC_EXTRA)
+#          Direct fallback: 2=special, 3=uppercase, 4=lowercase, 5=digit, 6=length, 7=username
+#
+# When mgmtd is available, delegates to opcode 304 (single source of truth in C).
+# Falls back to local shell validation when mgmtd is not running (init/replay).
 
 check_password_policy() {
 	_cpp_pass="$1"
 	_cpp_user="$2"
-	_cpp_enforce_override="$3"  # optional: "enable"/"disable" override
+	_cpp_enforce_override="$3"
 
-	# Use override if provided (for unsaved config contexts like new admin creation)
+	if _ipc_available; then
+		_cpp_payload=$(printf '%s\n%s' "$_cpp_user" "$_cpp_pass")
+		[ -n "$_cpp_enforce_override" ] && \
+			_cpp_payload=$(printf '%s\n%s\n%s' "$_cpp_user" "$_cpp_pass" "$_cpp_enforce_override")
+		ipc_send 304 "$_cpp_payload"
+		if [ "$IPC_RC" -eq 0 ]; then
+			return 1  # satisfied (or not enforced)
+		else
+			# IPC_EXTRA contains the reason string from mgmtd
+			return 2  # generic policy failure
+		fi
+	fi
+
+	# Direct fallback (root/init context — mgmtd not running)
+	_check_password_policy_direct "$_cpp_pass" "$_cpp_user" "$_cpp_enforce_override"
+}
+
+# _check_password_policy_direct — local shell validation (init/replay fallback)
+# Same return codes as original: 0=no policy, 1=satisfied, 2-7=violation
+_check_password_policy_direct() {
+	_cpp_pass="$1"
+	_cpp_user="$2"
+	_cpp_enforce_override="$3"
+
 	_cpp_enforce="$_cpp_enforce_override"
 
-	# Otherwise read user's enforce-password-policy flag from saved config
 	if [ -z "$_cpp_enforce" ]; then
 		_cpp_conf="$STARGAZER_CONF_DIR/system.conf"
-		if _ipc_available; then
-			_cpp_data=$(cfg_get "$_cpp_conf" "system_admin:${_cpp_user}" 2>/dev/null)
-			_cpp_enforce=$(echo "$_cpp_data" | grep '^enforce-password-policy=' | cut -d= -f2-)
-		else
-			_cpp_enforce=$(_cfg_get_direct "$_cpp_conf" "system_admin:${_cpp_user}" 2>/dev/null \
-				| grep '^enforce-password-policy=' | cut -d= -f2-)
-		fi
+		_cpp_enforce=$(_cfg_get_direct "$_cpp_conf" "system_admin:${_cpp_user}" 2>/dev/null \
+			| grep '^enforce-password-policy=' | cut -d= -f2-)
 	fi
 
 	if [ "$_cpp_enforce" != "enable" ]; then
-		if debug_enabled && debug_feature_enabled auth_debug; then
-			debug_log "password-policy" "system" "check_password_policy" \
-				"user=${_cpp_user} enforce=disabled" 0 >/dev/null
-		fi
 		return 0  # no policy enforced
 	fi
 
-	# Read global password policy
-	_cpp_policy=""
-	if _ipc_available; then
-		_cpp_policy=$(cfg_get "$_cpp_conf" "system_password-policy" 2>/dev/null)
-	else
-		_cpp_policy=$(_cfg_get_direct "$_cpp_conf" "system_password-policy" 2>/dev/null)
-	fi
+	_cpp_conf="$STARGAZER_CONF_DIR/system.conf"
+	_cpp_policy=$(_cfg_get_direct "$_cpp_conf" "system_password-policy" 2>/dev/null)
 
 	_cpp_min_len=$(echo "$_cpp_policy" | grep '^min-length=' | cut -d= -f2-)
 	_cpp_min_upper=$(echo "$_cpp_policy" | grep '^min-uppercase=' | cut -d= -f2-)
@@ -1046,16 +1057,15 @@ check_password_policy() {
 	_cpp_min_digit=$(echo "$_cpp_policy" | grep '^min-digit=' | cut -d= -f2-)
 	_cpp_min_special=$(echo "$_cpp_policy" | grep '^min-special=' | cut -d= -f2-)
 
-	# Default to 0 if not set
 	: "${_cpp_min_len:=0}"
 	: "${_cpp_min_upper:=0}"
 	: "${_cpp_min_lower:=0}"
 	: "${_cpp_min_digit:=0}"
 	: "${_cpp_min_special:=0}"
 
-	if debug_enabled && debug_feature_enabled auth_debug; then
-		debug_log "password-policy" "system" "check_password_policy" \
-			"user=${_cpp_user} min_len=${_cpp_min_len} min_upper=${_cpp_min_upper} min_lower=${_cpp_min_lower} min_digit=${_cpp_min_digit} min_special=${_cpp_min_special}" 1 >/dev/null
+	# Apply MIN_PASS_LEN=8 floor (match C behavior)
+	if [ "$_cpp_min_len" -le 0 ]; then
+		_cpp_min_len=8
 	fi
 
 	# Check length
@@ -1064,7 +1074,7 @@ check_password_policy() {
 		return 6
 	fi
 
-	# Count character classes using awk
+	# Count character classes using awk (byte comparison, ASCII)
 	_cpp_counts=$(printf '%s' "$_cpp_pass" | awk '{
 		u=0; l=0; d=0; s=0
 		for (i=1; i<=length($0); i++) {
@@ -1081,22 +1091,15 @@ check_password_policy() {
 	_cpp_cnt_digit=$(echo "$_cpp_counts" | awk '{print $3}')
 	_cpp_cnt_special=$(echo "$_cpp_counts" | awk '{print $4}')
 
-	# Check uppercase
 	if [ "$_cpp_min_upper" -gt 0 ] && [ "$_cpp_cnt_upper" -lt "$_cpp_min_upper" ]; then
 		return 3
 	fi
-
-	# Check lowercase
 	if [ "$_cpp_min_lower" -gt 0 ] && [ "$_cpp_cnt_lower" -lt "$_cpp_min_lower" ]; then
 		return 4
 	fi
-
-	# Check digit
 	if [ "$_cpp_min_digit" -gt 0 ] && [ "$_cpp_cnt_digit" -lt "$_cpp_min_digit" ]; then
 		return 5
 	fi
-
-	# Check special
 	if [ "$_cpp_min_special" -gt 0 ] && [ "$_cpp_cnt_special" -lt "$_cpp_min_special" ]; then
 		return 2
 	fi
@@ -1111,7 +1114,14 @@ check_password_policy() {
 
 # password_policy_reason(rc) — returns human-readable reason for check_password_policy return code
 password_policy_reason() {
-	case "$1" in
+	_ppr_rc="$1"
+	# When IPC was used, reason came from IPC_EXTRA
+	if [ -n "$IPC_EXTRA" ] && [ "$_ppr_rc" = "2" ]; then
+		echo "$IPC_EXTRA"
+		return
+	fi
+	# Fallback: local reason strings (for direct mode)
+	case "$_ppr_rc" in
 		0) echo "no policy enforced" ;;
 		1) echo "password meets policy" ;;
 		2) echo "not enough special characters" ;;
@@ -1124,15 +1134,29 @@ password_policy_reason() {
 	esac
 }
 
-# register_password(username, password)
+# register_password(username, password, [enforce_override])
 # Validates password against policy, then hashes and sets it.
+# When mgmtd is available, opcode 302 validates + sets server-side.
 # Returns 0 on success, 1 on failure.
 register_password() {
 	_rp_user="$1"
 	_rp_pass="$2"
-	_rp_enforce_override="$3"  # optional: "enable"/"disable" for unsaved contexts
+	_rp_enforce_override="$3"
 
-	# Check if user exists (skip for new admin creation where user was just created)
+	if _ipc_available; then
+		# mgmtd 302 now validates policy server-side before setting
+		_set_password "$_rp_user" "$_rp_pass"
+		_rp_rc=$?
+		if [ "$_rp_rc" -ne 0 ]; then
+			# IPC_EXTRA has the error reason from mgmtd
+			[ -n "$IPC_EXTRA" ] && echo "  Error: $IPC_EXTRA"
+			return 1
+		fi
+		return 0
+	fi
+
+	# Direct fallback (root/init)
+	# Check if user exists (skip for new admin creation)
 	if [ -z "$_rp_enforce_override" ]; then
 		if ! grep -q "^${_rp_user}:" /etc/passwd 2>/dev/null; then
 			if ! admin_exists_in_config "$_rp_user"; then
@@ -1142,29 +1166,17 @@ register_password() {
 		fi
 	fi
 
-	check_password_policy "$_rp_pass" "$_rp_user" "$_rp_enforce_override"
+	_check_password_policy_direct "$_rp_pass" "$_rp_user" "$_rp_enforce_override"
 	_rp_rc=$?
 
-	if debug_enabled && debug_feature_enabled auth_debug; then
-		debug_log "password-policy" "user" "register_password" \
-			"user=${_rp_user} policy_rc=${_rp_rc}" 1 >/dev/null
-	fi
-
 	case "$_rp_rc" in
-		0|1)
-			# No policy or satisfied — proceed to set password
-			;;
+		0|1) ;;  # ok
 		*)
 			echo "  Error: $(password_policy_reason "$_rp_rc")"
-			return 1
-			;;
+			return 1 ;;
 	esac
 
-	if ! _set_password "$_rp_user" "$_rp_pass"; then
-		echo "  Error: failed to set password for '$_rp_user'."
-		return 1
-	fi
-	return 0
+	_set_password_direct "$_rp_user" "$_rp_pass"
 }
 
 # ── _set_password(user, pass) ────────────────────────────────────────────────
@@ -1334,6 +1346,71 @@ _get_valid_keys() {
 		system_admin-profile) echo "permissions description" ;;
 		system_admin)         echo "profile password enforce-change-password enforce-password-policy" ;;
 		*)                    echo "" ;;
+	esac
+}
+
+# ── cfg_required_keys(config_type) ───────────────────────────────────────────
+# Returns space-separated mandatory keys for a config type.
+
+cfg_required_keys() {
+	case "$1" in
+		network_route_static) echo "dst" ;;
+		firewall_policy)      echo "name srcintf dstintf srcaddr dstaddr action status" ;;
+		firewall_address)     echo "name subnet type" ;;
+		firewall_service)     echo "name protocol port-range" ;;
+		system_admin)         echo "profile" ;;
+		system_admin-profile) echo "permissions" ;;
+		*)                    echo "" ;;
+	esac
+}
+
+# ── cfg_validate_required(config_type, tmpfile) ──────────────────────────────
+# Returns 0 if all required keys present, 1 + prints missing keys to stdout.
+
+cfg_validate_required() {
+	_vr_type="$1"
+	_vr_file="$2"
+	_vr_keys=$(cfg_required_keys "$_vr_type")
+	[ -z "$_vr_keys" ] && return 0
+	_vr_missing=""
+	for _vr_k in $_vr_keys; do
+		if ! grep -q "^${_vr_k}=" "$_vr_file" 2>/dev/null; then
+			_vr_missing="$_vr_missing $_vr_k"
+		fi
+	done
+	if [ -n "$_vr_missing" ]; then
+		echo "$_vr_missing"
+		return 1
+	fi
+	return 0
+}
+
+# ── cfg_default_values(config_type) ──────────────────────────────────────────
+# Outputs key=value lines for sensible defaults when creating new entries.
+
+cfg_default_values() {
+	case "$1" in
+		firewall_policy)
+			printf '%s\n' "status=enable" "action=deny" "srcintf=any" "dstintf=any" "srcaddr=all" "dstaddr=all"
+			;;
+		system_admin)
+			printf '%s\n' "enforce-change-password=enable" "enforce-password-policy=enable"
+			;;
+		system_interface)
+			printf '%s\n' "status=up" "mtu=1500"
+			;;
+		network_route_static)
+			printf '%s\n' "status=enable" "distance=10"
+			;;
+		firewall_address)
+			printf '%s\n' "type=ipmask"
+			;;
+		firewall_service)
+			printf '%s\n' "protocol=tcp"
+			;;
+		system_password-policy)
+			printf '%s\n' "min-length=8" "min-uppercase=0" "min-lowercase=0" "min-digit=0" "min-special=0"
+			;;
 	esac
 }
 

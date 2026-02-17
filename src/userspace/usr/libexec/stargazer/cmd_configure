@@ -283,12 +283,19 @@ context_entry() {
 	umask 077
 	trap 'rm -f "$_ent_tmp"; umask "$_umask_old"' INT TERM EXIT
 
-	# Load existing data or start empty
+	# Load existing data or start empty (with defaults for new entries)
+	_ent_is_new=0
 	if cfg_get "$_ent_domain" "$_ent_section" > "$_ent_tmp" 2>/dev/null; then
 		echo "  Editing entry $_ent_id."
 	else
-		> "$_ent_tmp"
-		echo "  Creating new entry $_ent_id."
+		_ent_is_new=1
+		cfg_default_values "$_ent_name" > "$_ent_tmp"
+		if [ -s "$_ent_tmp" ]; then
+			_ent_modified=1
+			echo "  Creating new entry $_ent_id (defaults applied)."
+		else
+			echo "  Creating new entry $_ent_id."
+		fi
 	fi
 
 	cli_push
@@ -425,7 +432,27 @@ context_entry() {
 				fi
 				;;
 			next|end)
+				# Warn if entry is completely empty (no config set at all)
+				if [ "$_ent_modified" -eq 0 ] && [ ! -s "$_ent_tmp" ]; then
+					echo "  Entry has no configuration. Use 'set' or 'abort'."
+					continue
+				fi
 				if [ "$_ent_modified" -eq 1 ]; then
+					# Validate required fields before saving
+					_ent_missing=$(cfg_validate_required "$_ent_name" "$_ent_tmp")
+					if [ $? -ne 0 ] && [ -n "$_ent_missing" ]; then
+						echo "  Error: missing required field(s):${_ent_missing}"
+						echo "  Use 'set <key> <value>' to fill them, or 'abort' to discard."
+						continue
+					fi
+					# New admin entries must have a password set
+					if [ "$_ent_is_new" -eq 1 ] && [ "$_ent_name" = "system_admin" ]; then
+						if ! grep -q '^password=' "$_ent_tmp" 2>/dev/null; then
+							echo "  Error: new admin requires a password."
+							echo "  Use 'set password' to set one, or 'abort' to discard."
+							continue
+						fi
+					fi
 					# Apply to running system only when privileged
 					if can_apply_runtime; then
 						if ! _apply_config "$_ent_name" "$_ent_id" "$_ent_tmp"; then
@@ -477,9 +504,12 @@ context_single() {
 
 	require_config_permission || return 1
 
-	# Load existing data or start empty
+	# Load existing data or start empty (with defaults for new entries)
 	if ! cfg_get "$_sng_domain" "$_sng_section" > "$_sng_tmp" 2>/dev/null; then
-		> "$_sng_tmp"
+		cfg_default_values "$_sng_name" > "$_sng_tmp"
+		if [ -s "$_sng_tmp" ]; then
+			_sng_modified=1
+		fi
 	fi
 
 	cli_push
@@ -568,6 +598,13 @@ context_single() {
 				;;
 			end)
 				if [ "$_sng_modified" -eq 1 ]; then
+					# Validate required fields before saving
+					_sng_missing=$(cfg_validate_required "$_sng_name" "$_sng_tmp")
+					if [ $? -ne 0 ] && [ -n "$_sng_missing" ]; then
+						echo "  Error: missing required field(s):${_sng_missing}"
+						echo "  Use 'set <key> <value>' to fill them, or 'abort' to discard."
+						continue
+					fi
 					if can_apply_runtime; then
 						if ! _apply_config "$_sng_name" "0" "$_sng_tmp"; then
 							echo "  Apply failed. Changes not saved."
