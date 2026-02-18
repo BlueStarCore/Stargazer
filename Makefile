@@ -61,6 +61,9 @@ LOGIND_DIR     := $(PROJECT_ROOT)/src/userspace/logind
 # mgmtd (management daemon + IPC client)
 MGMTD_DIR      := $(PROJECT_ROOT)/src/userspace/mgmtd
 
+# CLI (C binary replacing shell stargazer-cli for interactive mode)
+CLI_DIR        := $(PROJECT_ROOT)/src/userspace/cli
+
 # Musl cross toolchain (for clean static linking — no glibc NSS issues)
 # Auto-downloaded from musl.cc on first build
 MUSL_CROSS_URL := https://musl.cc/aarch64-linux-musl-cross.tgz
@@ -72,7 +75,7 @@ MUSL_CROSS     := $(MUSL_CROSS_DIR)/bin/aarch64-linux-musl-
 # Main targets
 # =============================================================================
 
-.PHONY: all kernel modules busybox musl-toolchain dash logind mgmtd rootfs iso test clean help
+.PHONY: all kernel modules busybox musl-toolchain dash logind mgmtd cli rootfs iso test clean help
 
 all: iso
 	@echo ""
@@ -239,12 +242,27 @@ $(BUILD_DIR)/mgmtd/stargazer-mgmtd $(BUILD_DIR)/mgmtd/stargazer-ipc-cli: $(MUSL_
 	@echo "[3e/5] mgmtd + IPC client ready."
 
 # =============================================================================
+# 3f. CLI — C binary (cross-compile with musl)
+# =============================================================================
+
+cli: $(BUILD_DIR)/cli/stargazer-cli
+
+$(BUILD_DIR)/cli/stargazer-cli: $(MUSL_CC)
+	@echo "[3f/5] Building C CLI binary (musl static)..."
+	@mkdir -p $(BUILD_DIR)/cli
+	$(MAKE) -C $(CLI_DIR) \
+		CROSS_COMPILE=$(MUSL_CROSS) \
+		BUILD_DIR=$(BUILD_DIR)/cli \
+		VERSION=$(VERSION)
+	@echo "[3f/5] CLI binary ready."
+
+# =============================================================================
 # 4. Rootfs (userspace)
 # =============================================================================
 
 rootfs: $(ROOTFS_DIR)/.stamp
 
-$(ROOTFS_DIR)/.stamp: modules busybox dash logind mgmtd
+$(ROOTFS_DIR)/.stamp: modules busybox dash logind mgmtd cli
 	@echo "[4/5] Creating rootfs..."
 	@rm -rf $(ROOTFS_DIR)
 	@mkdir -p $(ROOTFS_DIR)
@@ -282,6 +300,10 @@ $(ROOTFS_DIR)/.stamp: modules busybox dash logind mgmtd
 	cp $(BUILD_DIR)/mgmtd/stargazer-ipc-cli $(ROOTFS_DIR)/sbin/
 	@chmod +x $(ROOTFS_DIR)/sbin/stargazer-mgmtd $(ROOTFS_DIR)/sbin/stargazer-ipc-cli
 
+	# Install C CLI binary as primary CLI
+	cp $(BUILD_DIR)/cli/stargazer-cli $(ROOTFS_DIR)/sbin/stargazer-cli
+	@chmod +x $(ROOTFS_DIR)/sbin/stargazer-cli
+
 	# Create minimal /etc files (no Alpine branding)
 	@echo 'root:x:0:0:root:/root:/bin/sh' > $(ROOTFS_DIR)/etc/passwd
 	@echo 'nobody:x:65534:65534:nobody:/:/bin/false' >> $(ROOTFS_DIR)/etc/passwd
@@ -313,12 +335,9 @@ $(ROOTFS_DIR)/.stamp: modules busybox dash logind mgmtd
 	@mv $(ROOTFS_DIR)/init.tmp $(ROOTFS_DIR)/init
 	@chmod +x $(ROOTFS_DIR)/init
 
-	# Copy login and CLI scripts
+	# Copy login script
 	@cp $(USERSPACE_DIR)/sbin/stargazer-login $(ROOTFS_DIR)/sbin/
-	@cp $(USERSPACE_DIR)/sbin/stargazer-cli $(ROOTFS_DIR)/sbin/stargazer-cli.tmp
-	@sed -i 's/@VERSION@/$(VERSION)/g' $(ROOTFS_DIR)/sbin/stargazer-cli.tmp
-	@mv $(ROOTFS_DIR)/sbin/stargazer-cli.tmp $(ROOTFS_DIR)/sbin/stargazer-cli
-	@chmod +x $(ROOTFS_DIR)/sbin/stargazer-login $(ROOTFS_DIR)/sbin/stargazer-cli
+	@chmod +x $(ROOTFS_DIR)/sbin/stargazer-login
 
 	# Copy CLI command scripts
 	@mkdir -p $(ROOTFS_DIR)/usr/libexec/stargazer
@@ -376,6 +395,7 @@ $(ISO_FILE): $(ROOTFS_DIR)/.stamp
 	@echo " Dash:     $(DASH_BIN)"
 	@echo " Logind:   $(BUILD_DIR)/logind/"
 	@echo " mgmtd:    $(BUILD_DIR)/mgmtd/"
+	@echo " CLI:      $(BUILD_DIR)/cli/"
 	@echo " Rootfs:   $(ROOTFS_DIR)"
 	@echo " Image:    $(ISO_FILE)"
 	@echo ""
@@ -387,7 +407,7 @@ $(ISO_FILE): $(ROOTFS_DIR)/.stamp
 # Test in QEMU
 # =============================================================================
 
-test: modules busybox dash logind mgmtd
+test: modules busybox dash logind mgmtd cli
 	@echo "Starting QEMU test..."
 	@mkdir -p $(BUILD_DIR)/test
 
@@ -429,6 +449,10 @@ test: modules busybox dash logind mgmtd
 	cp $(BUILD_DIR)/mgmtd/stargazer-ipc-cli $(BUILD_DIR)/test/initramfs/sbin/
 	@chmod +x $(BUILD_DIR)/test/initramfs/sbin/stargazer-mgmtd $(BUILD_DIR)/test/initramfs/sbin/stargazer-ipc-cli
 
+	# Install C CLI binary as primary CLI
+	cp $(BUILD_DIR)/cli/stargazer-cli $(BUILD_DIR)/test/initramfs/sbin/stargazer-cli
+	@chmod +x $(BUILD_DIR)/test/initramfs/sbin/stargazer-cli
+
 	# Create minimal /etc files
 	@echo 'root:x:0:0:root:/root:/bin/sh' > $(BUILD_DIR)/test/initramfs/etc/passwd
 	@echo 'nobody:x:65534:65534:nobody:/:/bin/false' >> $(BUILD_DIR)/test/initramfs/etc/passwd
@@ -460,12 +484,9 @@ test: modules busybox dash logind mgmtd
 	@cp $(USERSPACE_DIR)/etc/modules-load.d/*.conf $(BUILD_DIR)/test/initramfs/etc/modules-load.d/
 	@cp $(USERSPACE_DIR)/etc/sysctl.d/*.conf $(BUILD_DIR)/test/initramfs/etc/sysctl.d/
 
-	# Copy login and CLI scripts
+	# Copy login script
 	@cp $(USERSPACE_DIR)/sbin/stargazer-login $(BUILD_DIR)/test/initramfs/sbin/
-	@cp $(USERSPACE_DIR)/sbin/stargazer-cli $(BUILD_DIR)/test/initramfs/sbin/stargazer-cli.tmp
-	@sed -i 's/@VERSION@/$(VERSION)/g' $(BUILD_DIR)/test/initramfs/sbin/stargazer-cli.tmp
-	@mv $(BUILD_DIR)/test/initramfs/sbin/stargazer-cli.tmp $(BUILD_DIR)/test/initramfs/sbin/stargazer-cli
-	@chmod +x $(BUILD_DIR)/test/initramfs/sbin/stargazer-login $(BUILD_DIR)/test/initramfs/sbin/stargazer-cli
+	@chmod +x $(BUILD_DIR)/test/initramfs/sbin/stargazer-login
 
 	# Copy CLI command scripts
 	@mkdir -p $(BUILD_DIR)/test/initramfs/usr/libexec/stargazer
@@ -497,6 +518,7 @@ clean:
 	$(MAKE) -C $(MODULE_DIR) clean 2>/dev/null || true
 	$(MAKE) -C $(LOGIND_DIR) clean BUILD_DIR=$(BUILD_DIR)/logind 2>/dev/null || true
 	$(MAKE) -C $(MGMTD_DIR) clean BUILD_DIR=$(BUILD_DIR)/mgmtd 2>/dev/null || true
+	$(MAKE) -C $(CLI_DIR) clean BUILD_DIR=$(BUILD_DIR)/cli 2>/dev/null || true
 	rm -rf $(BUILD_DIR)
 	@echo "Clean complete (source caches preserved in .cache/)"
 
@@ -513,6 +535,7 @@ help:
 	@echo "  make dash     - Cross-compile dash (POSIX shell, replaces ash)"
 	@echo "  make logind   - Cross-compile logind + C helpers"
 	@echo "  make mgmtd    - Cross-compile mgmtd daemon + IPC client"
+	@echo "  make cli      - Cross-compile C CLI binary"
 	@echo "  make rootfs   - Create userspace rootfs"
 	@echo "  make iso      - Create bootable ISO"
 	@echo "  make test     - Test in QEMU"

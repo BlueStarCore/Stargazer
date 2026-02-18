@@ -53,46 +53,45 @@ _dump_single() {
 	echo ""
 }
 
-# Show all configuration from all domain files in FortiGate style
+# Show all configuration from SQLite (normalized config table) in FortiGate style
 _show_all_config_db() {
 	_db_ready || return 1
-	_rows=$(sqlite3 -separator '|' "$STARGAZER_DB_PATH" "SELECT type, object_id, data FROM config_objects ORDER BY type, object_id;" 2>/dev/null)
-	[ -z "$_rows" ] && return 1
-	_cur_type=""
-	_cur_mode=""
-	echo "$_rows" | while IFS='|' read -r _t _id _blob; do
-		[ -z "$_t" ] && continue
-		if [ "$_cur_type" != "$_t" ]; then
-			[ -n "$_cur_type" ] && echo "end" && echo ""
-			_cur_type="$_t"
-			_cur_mode=$(cfg_type_mode "$_t")
-			echo "config $(_key_to_label "$_t")"
-		fi
-		_dec=$(printf '%s' "$_blob" | sed 's/\\n/\
-/g')
-		case "$_cur_mode" in
-			table)
+	# Query distinct type+id pairs, then keys for each
+	_types=$(sqlite3 "$STARGAZER_DB_PATH" \
+		"SELECT DISTINCT type FROM config ORDER BY type;" 2>/dev/null)
+	[ -z "$_types" ] && return 1
+	for _t in $_types; do
+		_mode=$(cfg_type_mode "$_t")
+		echo "config $(_key_to_label "$_t")"
+		if [ "$_mode" = "table" ]; then
+			_ids=$(sqlite3 "$STARGAZER_DB_PATH" \
+				"SELECT DISTINCT id FROM config WHERE type='$_t' ORDER BY id;" 2>/dev/null)
+			for _id in $_ids; do
 				echo "  edit $_id"
-				echo "$_dec" | while IFS='=' read -r _k _v; do
+				sqlite3 -separator '=' "$STARGAZER_DB_PATH" \
+					"SELECT key, value FROM config WHERE type='$_t' AND id='$_id' ORDER BY rowid;" 2>/dev/null \
+				| while IFS='=' read -r _k _v; do
 					[ -z "$_k" ] && continue
 					case "$_k" in
-						password) _v="********" ;;
 						builtin) continue ;;
+						password) _v="********" ;;
 					esac
 					echo "    set $_k $_v"
 				done
 				echo "  next"
-				;;
-			single)
-				echo "$_dec" | while IFS='=' read -r _k _v; do
-					[ -z "$_k" ] && continue
-					case "$_k" in builtin) continue ;; esac
-					echo "  set $_k $_v"
-				done
-				;;
-		esac
+			done
+		else
+			sqlite3 -separator '=' "$STARGAZER_DB_PATH" \
+				"SELECT key, value FROM config WHERE type='$_t' AND id='0' ORDER BY rowid;" 2>/dev/null \
+			| while IFS='=' read -r _k _v; do
+				[ -z "$_k" ] && continue
+				case "$_k" in builtin) continue ;; esac
+				echo "  set $_k $_v"
+			done
+		fi
+		echo "end"
+		echo ""
 	done
-	[ -n "$_cur_type" ] && echo "end" && echo ""
 	return 0
 }
 

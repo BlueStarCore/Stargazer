@@ -1,6 +1,6 @@
 #!/bin/sh
 # Stargazer NGFW - Configuration Library
-# Sourced by cmd_configure, cmd_show, cmd_admin, stargazer-cli, stargazer-login,
+# Sourced by cmd_show, cmd_execute, stargazer-login,
 # and the init service script. Do not execute directly.
 #
 # Provides:
@@ -1709,7 +1709,7 @@ cfg_validate_value() {
 			esac
 			;;
 		password-interactive)
-			# handled by interactive branch in cmd_configure
+			# handled by interactive prompt in CLI
 			return 0
 			;;
 		*)
