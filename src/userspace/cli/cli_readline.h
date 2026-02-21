@@ -1,0 +1,52 @@
+/* SPDX-License-Identifier: MIT */
+/*
+ * cli_readline.h — Embedded readline engine for Stargazer CLI
+ *
+ * Provides interactive line editing with Tab completion, ? help, history,
+ * arrow keys, and UTF-8 support. Zero forks per keystroke.
+ *
+ * Completion registry supports push/pop for nested CLI contexts.
+ */
+
+#ifndef CLI_READLINE_H
+#define CLI_READLINE_H
+
+#define CLI_MAX_LINE   4096
+#define CLI_MAX_COMPS  1024
+#define CLI_MAX_HIST   100
+#define CLI_MAX_DESC   256
+#define CLI_MAX_STACK  8
+
+/* Initialize terminal I/O (opens /dev/tty). Returns 0 on success. */
+int cli_term_init(void);
+
+/* Restore terminal and close fds. */
+void cli_term_cleanup(void);
+
+/* Register a completion entry for the current context. */
+void cli_register(const char *path, const char *desc);
+
+/* Save current completion set and start fresh (for sub-contexts). */
+void cli_push(void);
+
+/* Restore previous completion set. */
+void cli_pop(void);
+
+/* Clear all completions in the current context. */
+void cli_clear(void);
+
+/* Print all registered commands and descriptions. */
+void cli_print_help(void);
+
+/*
+ * Read one line interactively with prompt, Tab completion, ? help.
+ * Returns pointer to internal buffer (valid until next call), or NULL on EOF.
+ * Buffer is null-terminated, no trailing newline.
+ */
+const char *cli_readline(const char *prompt);
+
+/* History management. */
+void cli_hist_load(const char *file);
+void cli_hist_save(const char *file);
+
+#endif /* CLI_READLINE_H */

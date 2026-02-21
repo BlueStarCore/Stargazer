@@ -1,0 +1,1111 @@
+/* SPDX-License-Identifier: MIT */
+/*
+ * cli_diagnose_config.c — Configuration validation diagnostics for Stargazer CLI
+ *
+ * Implements "execute diagnose test-configure [full]":
+ *   - Basic: exercises all sg_validate validators and registry lookups
+ *   - Full:  round-trip IPC tests (create/validate/delete config entries)
+ *
+ * Uses the same PASS/FAIL pattern as cli_diagnose.c (test-permissions).
+ */
+
+#define _POSIX_C_SOURCE 200809L
+
+#include "cli_diagnose.h"
+#include "cli_ipc.h"
+#include "sg_validate.h"
+
+#include <stdio.h>
+#include <string.h>
+
+/* ── Test counters ────────────────────────────────────────────────────── */
+
+static int tc_pass;
+static int tc_fail;
+static int tc_total;
+
+/* ── ANSI colors ──────────────────────────────────────────────────────── */
+
+#define C_GREEN  "\033[0;32m"
+#define C_RED    "\033[0;31m"
+#define C_CYAN   "\033[0;36m"
+#define C_YELLOW "\033[0;33m"
+#define C_NC     "\033[0m"
+
+/* ── Generic assertion helper ─────────────────────────────────────────── */
+
+static void tc_check(const char *section, const char *desc,
+		     int result, int expected)
+{
+	tc_total++;
+	if (result == expected) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC " [%s] %s\n", section, desc);
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC " [%s] %s (got %d, expected %d)\n",
+		       section, desc, result, expected);
+	}
+}
+
+/* ── Section 1: sg_is_safe_id ─────────────────────────────────────────── */
+
+static void test_safe_id(void)
+{
+	printf(C_CYAN "\n  --- safe-id validator ---" C_NC "\n");
+
+	/* Accept */
+	tc_check("safe-id", "accept: alphanumeric 'hello123'",
+		 sg_is_safe_id("hello123"), 1);
+	tc_check("safe-id", "accept: with dash 'my-rule'",
+		 sg_is_safe_id("my-rule"), 1);
+	tc_check("safe-id", "accept: with underscore 'my_rule'",
+		 sg_is_safe_id("my_rule"), 1);
+	tc_check("safe-id", "accept: with dot 'v2.1'",
+		 sg_is_safe_id("v2.1"), 1);
+	tc_check("safe-id", "accept: single char 'a'",
+		 sg_is_safe_id("a"), 1);
+	tc_check("safe-id", "accept: digits only '999'",
+		 sg_is_safe_id("999"), 1);
+
+	/* Reject */
+	tc_check("safe-id", "reject: NULL",
+		 sg_is_safe_id(NULL), 0);
+	tc_check("safe-id", "reject: empty ''",
+		 sg_is_safe_id(""), 0);
+	tc_check("safe-id", "reject: space 'my rule'",
+		 sg_is_safe_id("my rule"), 0);
+	tc_check("safe-id", "reject: colon 'a:b'",
+		 sg_is_safe_id("a:b"), 0);
+	tc_check("safe-id", "reject: slash '../etc'",
+		 sg_is_safe_id("../etc"), 0);
+	tc_check("safe-id", "reject: semicolon 'a;b'",
+		 sg_is_safe_id("a;b"), 0);
+	tc_check("safe-id", "reject: dollar 'a$b'",
+		 sg_is_safe_id("a$b"), 0);
+	tc_check("safe-id", "reject: backtick 'a`b'",
+		 sg_is_safe_id("a`b"), 0);
+	tc_check("safe-id", "reject: newline 'a\\nb'",
+		 sg_is_safe_id("a\nb"), 0);
+	tc_check("safe-id", "reject: at-sign 'user@host'",
+		 sg_is_safe_id("user@host"), 0);
+	tc_check("safe-id", "reject: single-quote \"it's\"",
+		 sg_is_safe_id("it's"), 0);
+	tc_check("safe-id", "reject: equals 'a=b'",
+		 sg_is_safe_id("a=b"), 0);
+	tc_check("safe-id", "reject: pipe 'a|b'",
+		 sg_is_safe_id("a|b"), 0);
+}
+
+/* ── Section 2: sg_is_ipv4 ────────────────────────────────────────────── */
+
+static void test_ipv4(void)
+{
+	printf(C_CYAN "\n  --- IPv4 validator ---" C_NC "\n");
+
+	/* Accept */
+	tc_check("ipv4", "accept: 10.0.0.1",
+		 sg_is_ipv4("10.0.0.1"), 1);
+	tc_check("ipv4", "accept: 0.0.0.0",
+		 sg_is_ipv4("0.0.0.0"), 1);
+	tc_check("ipv4", "accept: 255.255.255.255",
+		 sg_is_ipv4("255.255.255.255"), 1);
+	tc_check("ipv4", "accept: 192.168.1.100",
+		 sg_is_ipv4("192.168.1.100"), 1);
+	tc_check("ipv4", "accept: 1.2.3.4",
+		 sg_is_ipv4("1.2.3.4"), 1);
+
+	/* Reject */
+	tc_check("ipv4", "reject: NULL",
+		 sg_is_ipv4(NULL), 0);
+	tc_check("ipv4", "reject: empty",
+		 sg_is_ipv4(""), 0);
+	tc_check("ipv4", "reject: 256.1.1.1 (octet > 255)",
+		 sg_is_ipv4("256.1.1.1"), 0);
+	tc_check("ipv4", "reject: 10.0.0 (3 octets)",
+		 sg_is_ipv4("10.0.0"), 0);
+	tc_check("ipv4", "reject: 10.0.0.0.1 (5 octets)",
+		 sg_is_ipv4("10.0.0.0.1"), 0);
+	tc_check("ipv4", "reject: abc.def.ghi.jkl (alpha)",
+		 sg_is_ipv4("abc.def.ghi.jkl"), 0);
+	tc_check("ipv4", "reject: 10.0.0.1/24 (has CIDR suffix)",
+		 sg_is_ipv4("10.0.0.1/24"), 0);
+	tc_check("ipv4", "reject: 1000.1.1.1 (4-digit octet)",
+		 sg_is_ipv4("1000.1.1.1"), 0);
+	tc_check("ipv4", "reject: .1.2.3 (leading dot)",
+		 sg_is_ipv4(".1.2.3"), 0);
+	tc_check("ipv4", "reject: 1.2.3. (trailing dot)",
+		 sg_is_ipv4("1.2.3."), 0);
+	tc_check("ipv4", "reject: just dots '...'",
+		 sg_is_ipv4("..."), 0);
+	tc_check("ipv4", "reject: 10.0.0.-1 (negative octet)",
+		 sg_is_ipv4("10.0.0.-1"), 0);
+}
+
+/* ── Section 3: sg_is_cidr ────────────────────────────────────────────── */
+
+static void test_cidr(void)
+{
+	printf(C_CYAN "\n  --- CIDR validator ---" C_NC "\n");
+
+	/* Accept */
+	tc_check("cidr", "accept: 192.168.1.0/24",
+		 sg_is_cidr("192.168.1.0/24"), 1);
+	tc_check("cidr", "accept: 10.0.0.0/8",
+		 sg_is_cidr("10.0.0.0/8"), 1);
+	tc_check("cidr", "accept: 172.16.0.1/32",
+		 sg_is_cidr("172.16.0.1/32"), 1);
+	tc_check("cidr", "accept: 0.0.0.0/0",
+		 sg_is_cidr("0.0.0.0/0"), 1);
+
+	/* Reject */
+	tc_check("cidr", "reject: NULL",
+		 sg_is_cidr(NULL), 0);
+	tc_check("cidr", "reject: empty",
+		 sg_is_cidr(""), 0);
+	tc_check("cidr", "reject: 192.168.1.0/33 (prefix > 32)",
+		 sg_is_cidr("192.168.1.0/33"), 0);
+	tc_check("cidr", "reject: 192.168.1.0 (no prefix)",
+		 sg_is_cidr("192.168.1.0"), 0);
+	tc_check("cidr", "reject: 192.168.1.0/abc (non-numeric prefix)",
+		 sg_is_cidr("192.168.1.0/abc"), 0);
+	tc_check("cidr", "reject: 999.168.1.0/24 (bad IP)",
+		 sg_is_cidr("999.168.1.0/24"), 0);
+	tc_check("cidr", "reject: /24 (no IP address)",
+		 sg_is_cidr("/24"), 0);
+	tc_check("cidr", "reject: 10.0.0.1/ (empty prefix)",
+		 sg_is_cidr("10.0.0.1/"), 0);
+	tc_check("cidr", "reject: 10.0.0.1/-1 (negative prefix)",
+		 sg_is_cidr("10.0.0.1/-1"), 0);
+}
+
+/* ── Section 4: sg_is_iface_name ──────────────────────────────────────── */
+
+static void test_iface(void)
+{
+	printf(C_CYAN "\n  --- iface-name validator ---" C_NC "\n");
+
+	/* Accept */
+	tc_check("iface", "accept: eth0",
+		 sg_is_iface_name("eth0"), 1);
+	tc_check("iface", "accept: wan.1",
+		 sg_is_iface_name("wan.1"), 1);
+	tc_check("iface", "accept: br-lan",
+		 sg_is_iface_name("br-lan"), 1);
+	tc_check("iface", "accept: eth0:1 (alias)",
+		 sg_is_iface_name("eth0:1"), 1);
+	tc_check("iface", "accept: wlan_ap0",
+		 sg_is_iface_name("wlan_ap0"), 1);
+
+	/* Reject */
+	tc_check("iface", "reject: NULL",
+		 sg_is_iface_name(NULL), 0);
+	tc_check("iface", "reject: empty",
+		 sg_is_iface_name(""), 0);
+	tc_check("iface", "reject: space 'eth 0'",
+		 sg_is_iface_name("eth 0"), 0);
+	tc_check("iface", "reject: semicolon 'eth;0'",
+		 sg_is_iface_name("eth;0"), 0);
+	tc_check("iface", "reject: dollar 'eth$0'",
+		 sg_is_iface_name("eth$0"), 0);
+	tc_check("iface", "reject: slash 'eth/0'",
+		 sg_is_iface_name("eth/0"), 0);
+	tc_check("iface", "reject: backtick 'eth`0`'",
+		 sg_is_iface_name("eth`0`"), 0);
+}
+
+/* ── Section 5: sg_is_uint_range ──────────────────────────────────────── */
+
+static void test_uint_range(void)
+{
+	printf(C_CYAN "\n  --- uint-range validator ---" C_NC "\n");
+
+	/* Range 1-255 */
+	tc_check("uint", "accept: 1 in [1,255]",
+		 sg_is_uint_range("1", 1, 255), 1);
+	tc_check("uint", "accept: 255 in [1,255]",
+		 sg_is_uint_range("255", 1, 255), 1);
+	tc_check("uint", "accept: 128 in [1,255]",
+		 sg_is_uint_range("128", 1, 255), 1);
+	tc_check("uint", "reject: 0 in [1,255] (below min)",
+		 sg_is_uint_range("0", 1, 255), 0);
+	tc_check("uint", "reject: 256 in [1,255] (above max)",
+		 sg_is_uint_range("256", 1, 255), 0);
+
+	/* Range 576-9200 (MTU) */
+	tc_check("uint", "accept: 576 in [576,9200]",
+		 sg_is_uint_range("576", 576, 9200), 1);
+	tc_check("uint", "accept: 9200 in [576,9200]",
+		 sg_is_uint_range("9200", 576, 9200), 1);
+	tc_check("uint", "accept: 1500 in [576,9200]",
+		 sg_is_uint_range("1500", 576, 9200), 1);
+	tc_check("uint", "reject: 575 in [576,9200]",
+		 sg_is_uint_range("575", 576, 9200), 0);
+	tc_check("uint", "reject: 9201 in [576,9200]",
+		 sg_is_uint_range("9201", 576, 9200), 0);
+
+	/* Range 0-128 (password policy) */
+	tc_check("uint", "accept: 0 in [0,128]",
+		 sg_is_uint_range("0", 0, 128), 1);
+	tc_check("uint", "accept: 128 in [0,128]",
+		 sg_is_uint_range("128", 0, 128), 1);
+	tc_check("uint", "reject: 129 in [0,128]",
+		 sg_is_uint_range("129", 0, 128), 0);
+
+	/* Invalid input */
+	tc_check("uint", "reject: NULL",
+		 sg_is_uint_range(NULL, 0, 100), 0);
+	tc_check("uint", "reject: empty",
+		 sg_is_uint_range("", 0, 100), 0);
+	tc_check("uint", "reject: negative '-1'",
+		 sg_is_uint_range("-1", 0, 100), 0);
+	tc_check("uint", "reject: alpha 'abc'",
+		 sg_is_uint_range("abc", 0, 100), 0);
+	tc_check("uint", "reject: mixed '10abc'",
+		 sg_is_uint_range("10abc", 0, 100), 0);
+	tc_check("uint", "reject: float '1.5'",
+		 sg_is_uint_range("1.5", 0, 100), 0);
+	tc_check("uint", "reject: hex '0x10'",
+		 sg_is_uint_range("0x10", 0, 100), 0);
+}
+
+/* ── Section 6: sg_is_tz_token ────────────────────────────────────────── */
+
+static void test_tz_token(void)
+{
+	printf(C_CYAN "\n  --- tz-token validator ---" C_NC "\n");
+
+	/* Accept */
+	tc_check("tz", "accept: UTC",
+		 sg_is_tz_token("UTC"), 1);
+	tc_check("tz", "accept: Asia/Ho_Chi_Minh",
+		 sg_is_tz_token("Asia/Ho_Chi_Minh"), 1);
+	tc_check("tz", "accept: US/Eastern",
+		 sg_is_tz_token("US/Eastern"), 1);
+	tc_check("tz", "accept: Etc/GMT+5",
+		 sg_is_tz_token("Etc/GMT+5"), 1);
+	tc_check("tz", "accept: Etc/GMT-12",
+		 sg_is_tz_token("Etc/GMT-12"), 1);
+
+	/* Reject */
+	tc_check("tz", "reject: NULL",
+		 sg_is_tz_token(NULL), 0);
+	tc_check("tz", "reject: empty",
+		 sg_is_tz_token(""), 0);
+	tc_check("tz", "reject: space 'US Eastern'",
+		 sg_is_tz_token("US Eastern"), 0);
+	tc_check("tz", "reject: semicolon 'UTC;date'",
+		 sg_is_tz_token("UTC;date"), 0);
+	tc_check("tz", "reject: shell injection '$(date)'",
+		 sg_is_tz_token("$(date)"), 0);
+}
+
+/* ── Section 7: sg_is_permissions_csv ─────────────────────────────────── */
+
+static void test_permissions_csv(void)
+{
+	printf(C_CYAN "\n  --- permissions-csv validator ---" C_NC "\n");
+
+	/* Accept */
+	tc_check("perms", "accept: 'monitor'",
+		 sg_is_permissions_csv("monitor"), 1);
+	tc_check("perms", "accept: 'configure'",
+		 sg_is_permissions_csv("configure"), 1);
+	tc_check("perms", "accept: 'admin'",
+		 sg_is_permissions_csv("admin"), 1);
+	tc_check("perms", "accept: 'monitor,configure'",
+		 sg_is_permissions_csv("monitor,configure"), 1);
+	tc_check("perms", "accept: 'monitor,configure,admin'",
+		 sg_is_permissions_csv("monitor,configure,admin"), 1);
+
+	/* Reject */
+	tc_check("perms", "reject: NULL",
+		 sg_is_permissions_csv(NULL), 0);
+	tc_check("perms", "reject: empty",
+		 sg_is_permissions_csv(""), 0);
+	tc_check("perms", "reject: 'root' (unknown permission)",
+		 sg_is_permissions_csv("root"), 0);
+	tc_check("perms", "reject: 'monitor,root'",
+		 sg_is_permissions_csv("monitor,root"), 0);
+	tc_check("perms", "reject: 'superadmin'",
+		 sg_is_permissions_csv("superadmin"), 0);
+	tc_check("perms", "reject: 'Monitor' (case sensitive)",
+		 sg_is_permissions_csv("Monitor"), 0);
+	tc_check("perms", "reject: 'monitor,' (trailing comma)",
+		 sg_is_permissions_csv("monitor,"), 0);
+	tc_check("perms", "reject: ',monitor' (leading comma)",
+		 sg_is_permissions_csv(",monitor"), 0);
+}
+
+/* ── Section 8: sg_is_port_or_range ───────────────────────────────────── */
+
+static void test_port_or_range(void)
+{
+	printf(C_CYAN "\n  --- port-or-range validator ---" C_NC "\n");
+
+	/* Accept */
+	tc_check("port", "accept: 80",
+		 sg_is_port_or_range("80"), 1);
+	tc_check("port", "accept: 1",
+		 sg_is_port_or_range("1"), 1);
+	tc_check("port", "accept: 65535",
+		 sg_is_port_or_range("65535"), 1);
+	tc_check("port", "accept: 443",
+		 sg_is_port_or_range("443"), 1);
+	tc_check("port", "accept: 1024-65535 (range)",
+		 sg_is_port_or_range("1024-65535"), 1);
+	tc_check("port", "accept: 80-80 (single port range)",
+		 sg_is_port_or_range("80-80"), 1);
+	tc_check("port", "accept: 8080-8090",
+		 sg_is_port_or_range("8080-8090"), 1);
+
+	/* Reject */
+	tc_check("port", "reject: 0 (below min)",
+		 sg_is_port_or_range("0"), 0);
+	tc_check("port", "reject: 65536 (above max)",
+		 sg_is_port_or_range("65536"), 0);
+	tc_check("port", "reject: 80-22 (start > end)",
+		 sg_is_port_or_range("80-22"), 0);
+	tc_check("port", "reject: abc (non-numeric)",
+		 sg_is_port_or_range("abc"), 0);
+	tc_check("port", "reject: 80- (incomplete range)",
+		 sg_is_port_or_range("80-"), 0);
+	tc_check("port", "reject: -80 (no start)",
+		 sg_is_port_or_range("-80"), 0);
+	tc_check("port", "reject: 80-90-100 (double dash)",
+		 sg_is_port_or_range("80-90-100"), 0);
+	tc_check("port", "reject: NULL",
+		 sg_is_port_or_range(NULL), 0);
+	tc_check("port", "reject: empty",
+		 sg_is_port_or_range(""), 0);
+}
+
+/* ── Section 9: sg_match_csv_option ───────────────────────────────────── */
+
+static void test_csv_option(void)
+{
+	printf(C_CYAN "\n  --- csv-option matcher ---" C_NC "\n");
+
+	tc_check("csv", "accept: 'enable' in 'enable,disable'",
+		 sg_match_csv_option("enable,disable", "enable"), 1);
+	tc_check("csv", "accept: 'disable' in 'enable,disable'",
+		 sg_match_csv_option("enable,disable", "disable"), 1);
+	tc_check("csv", "accept: 'accept' in 'accept,deny,drop'",
+		 sg_match_csv_option("accept,deny,drop", "accept"), 1);
+	tc_check("csv", "accept: 'drop' in 'accept,deny,drop'",
+		 sg_match_csv_option("accept,deny,drop", "drop"), 1);
+	tc_check("csv", "accept: 'all' in 'all,any'",
+		 sg_match_csv_option("all,any", "all"), 1);
+
+	tc_check("csv", "reject: 'maybe' in 'enable,disable'",
+		 sg_match_csv_option("enable,disable", "maybe"), 0);
+	tc_check("csv", "reject: 'en' in 'enable,disable' (prefix match)",
+		 sg_match_csv_option("enable,disable", "en"), 0);
+	tc_check("csv", "reject: 'enabled' in 'enable,disable' (suffix)",
+		 sg_match_csv_option("enable,disable", "enabled"), 0);
+	tc_check("csv", "reject: NULL value",
+		 sg_match_csv_option("enable,disable", NULL), 0);
+	tc_check("csv", "reject: NULL opts",
+		 sg_match_csv_option(NULL, "enable"), 0);
+}
+
+/* ── Section 10: entry ID validation ──────────────────────────────────── */
+
+static void test_entry_id(void)
+{
+	printf(C_CYAN "\n  --- entry-id validation ---" C_NC "\n");
+
+	/* firewall_policy: uint IDs */
+	tc_check("entry-id", "firewall_policy: accept '1'",
+		 sg_reg_validate_entry_id("firewall_policy", "1"), 1);
+	tc_check("entry-id", "firewall_policy: accept '100'",
+		 sg_reg_validate_entry_id("firewall_policy", "100"), 1);
+	tc_check("entry-id", "firewall_policy: accept '99999'",
+		 sg_reg_validate_entry_id("firewall_policy", "99999"), 1);
+	tc_check("entry-id", "firewall_policy: reject 'abc'",
+		 sg_reg_validate_entry_id("firewall_policy", "abc"), 0);
+	tc_check("entry-id", "firewall_policy: reject '1.5'",
+		 sg_reg_validate_entry_id("firewall_policy", "1.5"), 0);
+	tc_check("entry-id", "firewall_policy: reject '-1'",
+		 sg_reg_validate_entry_id("firewall_policy", "-1"), 0);
+	tc_check("entry-id", "firewall_policy: reject '0x10'",
+		 sg_reg_validate_entry_id("firewall_policy", "0x10"), 0);
+	tc_check("entry-id", "firewall_policy: reject empty",
+		 sg_reg_validate_entry_id("firewall_policy", ""), 0);
+
+	/* firewall_address: safe-id IDs */
+	tc_check("entry-id", "firewall_address: accept 'my-addr'",
+		 sg_reg_validate_entry_id("firewall_address", "my-addr"), 1);
+	tc_check("entry-id", "firewall_address: accept 'addr_1'",
+		 sg_reg_validate_entry_id("firewall_address", "addr_1"), 1);
+	tc_check("entry-id", "firewall_address: accept 'v2.0'",
+		 sg_reg_validate_entry_id("firewall_address", "v2.0"), 1);
+	tc_check("entry-id", "firewall_address: reject 'my addr' (space)",
+		 sg_reg_validate_entry_id("firewall_address", "my addr"), 0);
+	tc_check("entry-id", "firewall_address: reject 'a:b' (colon)",
+		 sg_reg_validate_entry_id("firewall_address", "a:b"), 0);
+	tc_check("entry-id", "firewall_address: reject '../etc'",
+		 sg_reg_validate_entry_id("firewall_address", "../etc"), 0);
+	tc_check("entry-id", "firewall_address: reject '$var'",
+		 sg_reg_validate_entry_id("firewall_address", "$var"), 0);
+	tc_check("entry-id", "firewall_address: reject empty",
+		 sg_reg_validate_entry_id("firewall_address", ""), 0);
+}
+
+/* ── Section 11: registry lookups ─────────────────────────────────────── */
+
+static void test_registry(void)
+{
+	printf(C_CYAN "\n  --- registry lookups ---" C_NC "\n");
+
+	/* Type mode */
+	tc_check("registry", "firewall_policy is TABLE",
+		 sg_reg_type_mode("firewall_policy"), CFG_TABLE);
+	tc_check("registry", "system_settings is SINGLE",
+		 sg_reg_type_mode("system_settings"), CFG_SINGLE);
+	tc_check("registry", "network_nat is TABLE",
+		 sg_reg_type_mode("network_nat"), CFG_TABLE);
+	tc_check("registry", "system_password-policy is SINGLE",
+		 sg_reg_type_mode("system_password-policy"), CFG_SINGLE);
+	tc_check("registry", "unknown type returns -1",
+		 sg_reg_type_mode("nonexistent_type"), -1);
+	tc_check("registry", "NULL type returns -1",
+		 sg_reg_type_mode(NULL), -1);
+
+	/* Valid keys */
+	tc_check("registry", "'name' valid for firewall_policy",
+		 sg_reg_is_valid_key("firewall_policy", "name"), 1);
+	tc_check("registry", "'action' valid for firewall_policy",
+		 sg_reg_is_valid_key("firewall_policy", "action"), 1);
+	tc_check("registry", "'mtu' valid for system_interface",
+		 sg_reg_is_valid_key("system_interface", "mtu"), 1);
+	tc_check("registry", "'foobar' invalid for firewall_policy",
+		 sg_reg_is_valid_key("firewall_policy", "foobar"), 0);
+	tc_check("registry", "'password' valid for system_admin",
+		 sg_reg_is_valid_key("system_admin", "password"), 1);
+	tc_check("registry", "'builtin' NOT a valid key for system_admin",
+		 sg_reg_is_valid_key("system_admin", "builtin"), 0);
+	tc_check("registry", "key valid for unknown type returns 0",
+		 sg_reg_is_valid_key("nonexistent", "name"), 0);
+
+	/* Entry ID kind */
+	tc_check("registry", "firewall_policy ID kind is 'uint'",
+		 strcmp(sg_reg_entry_id_kind("firewall_policy"), "uint") == 0, 1);
+	tc_check("registry", "firewall_address ID kind is 'safe-id'",
+		 strcmp(sg_reg_entry_id_kind("firewall_address"), "safe-id") == 0, 1);
+	tc_check("registry", "system_admin ID kind is 'safe-id'",
+		 strcmp(sg_reg_entry_id_kind("system_admin"), "safe-id") == 0, 1);
+}
+
+/* ── Section 12: value validation via registry ────────────────────────── */
+
+static void test_value_validation(void)
+{
+	printf(C_CYAN "\n  --- value validation (via registry) ---" C_NC "\n");
+
+	/* enum values */
+	tc_check("val", "firewall_policy.action = 'accept'",
+		 sg_reg_validate_value("firewall_policy", "action", "accept"), 1);
+	tc_check("val", "firewall_policy.action = 'deny'",
+		 sg_reg_validate_value("firewall_policy", "action", "deny"), 1);
+	tc_check("val", "firewall_policy.action = 'drop'",
+		 sg_reg_validate_value("firewall_policy", "action", "drop"), 1);
+	tc_check("val", "firewall_policy.action = 'ACCEPT' (case)",
+		 sg_reg_validate_value("firewall_policy", "action", "ACCEPT"), 0);
+	tc_check("val", "firewall_policy.action = 'maybe' (invalid)",
+		 sg_reg_validate_value("firewall_policy", "action", "maybe"), 0);
+	tc_check("val", "firewall_policy.action = 'accept,deny' (multi)",
+		 sg_reg_validate_value("firewall_policy", "action", "accept,deny"), 0);
+	tc_check("val", "firewall_policy.action = 'enabled' (close)",
+		 sg_reg_validate_value("firewall_policy", "status", "enabled"), 0);
+
+	tc_check("val", "system_interface.status = 'up'",
+		 sg_reg_validate_value("system_interface", "status", "up"), 1);
+	tc_check("val", "system_interface.status = 'down'",
+		 sg_reg_validate_value("system_interface", "status", "down"), 1);
+	tc_check("val", "system_interface.status = 'enable' (wrong enum)",
+		 sg_reg_validate_value("system_interface", "status", "enable"), 0);
+
+	tc_check("val", "firewall_address.type = 'ipmask'",
+		 sg_reg_validate_value("firewall_address", "type", "ipmask"), 1);
+	tc_check("val", "firewall_address.type = 'iprange'",
+		 sg_reg_validate_value("firewall_address", "type", "iprange"), 1);
+	tc_check("val", "firewall_address.type = 'fqdn'",
+		 sg_reg_validate_value("firewall_address", "type", "fqdn"), 1);
+	tc_check("val", "firewall_address.type = 'wildcard' (invalid)",
+		 sg_reg_validate_value("firewall_address", "type", "wildcard"), 0);
+
+	tc_check("val", "network_nat.type = 'snat'",
+		 sg_reg_validate_value("network_nat", "type", "snat"), 1);
+	tc_check("val", "network_nat.type = 'dnat'",
+		 sg_reg_validate_value("network_nat", "type", "dnat"), 1);
+	tc_check("val", "network_nat.type = 'masquerade' (invalid)",
+		 sg_reg_validate_value("network_nat", "type", "masquerade"), 0);
+
+	tc_check("val", "firewall_service.protocol = 'tcp'",
+		 sg_reg_validate_value("firewall_service", "protocol", "tcp"), 1);
+	tc_check("val", "firewall_service.protocol = 'udp'",
+		 sg_reg_validate_value("firewall_service", "protocol", "udp"), 1);
+	tc_check("val", "firewall_service.protocol = 'icmp'",
+		 sg_reg_validate_value("firewall_service", "protocol", "icmp"), 1);
+	tc_check("val", "firewall_service.protocol = 'gre' (invalid)",
+		 sg_reg_validate_value("firewall_service", "protocol", "gre"), 0);
+
+	/* CIDR values */
+	tc_check("val", "network_route_static.dst = '10.0.0.0/8'",
+		 sg_reg_validate_value("network_route_static", "dst", "10.0.0.0/8"), 1);
+	tc_check("val", "network_route_static.dst = '10.0.0.0' (no prefix)",
+		 sg_reg_validate_value("network_route_static", "dst", "10.0.0.0"), 0);
+	tc_check("val", "firewall_address.subnet = '192.168.1.0/24'",
+		 sg_reg_validate_value("firewall_address", "subnet", "192.168.1.0/24"), 1);
+	tc_check("val", "system_interface.ip = '172.16.0.1/32'",
+		 sg_reg_validate_value("system_interface", "ip", "172.16.0.1/32"), 1);
+
+	/* IPv4 values */
+	tc_check("val", "network_route_static.gateway = '10.0.0.1'",
+		 sg_reg_validate_value("network_route_static", "gateway", "10.0.0.1"), 1);
+	tc_check("val", "network_route_static.gateway = '999.0.0.1' (bad)",
+		 sg_reg_validate_value("network_route_static", "gateway", "999.0.0.1"), 0);
+	tc_check("val", "network_dns.primary = '8.8.8.8'",
+		 sg_reg_validate_value("network_dns", "primary", "8.8.8.8"), 1);
+	tc_check("val", "network_nat.mapped-ip = '192.168.1.100'",
+		 sg_reg_validate_value("network_nat", "mapped-ip", "192.168.1.100"), 1);
+
+	/* uint values */
+	tc_check("val", "network_route_static.distance = '10'",
+		 sg_reg_validate_value("network_route_static", "distance", "10"), 1);
+	tc_check("val", "network_route_static.distance = '0' (below min)",
+		 sg_reg_validate_value("network_route_static", "distance", "0"), 0);
+	tc_check("val", "network_route_static.distance = '256' (above max)",
+		 sg_reg_validate_value("network_route_static", "distance", "256"), 0);
+	tc_check("val", "system_interface.mtu = '1500'",
+		 sg_reg_validate_value("system_interface", "mtu", "1500"), 1);
+	tc_check("val", "system_interface.mtu = '100' (below 576)",
+		 sg_reg_validate_value("system_interface", "mtu", "100"), 0);
+	tc_check("val", "system_password-policy.min-length = '0'",
+		 sg_reg_validate_value("system_password-policy", "min-length", "0"), 1);
+	tc_check("val", "system_password-policy.min-length = '128'",
+		 sg_reg_validate_value("system_password-policy", "min-length", "128"), 1);
+	tc_check("val", "system_password-policy.min-length = '999' (over 128)",
+		 sg_reg_validate_value("system_password-policy", "min-length", "999"), 0);
+	tc_check("val", "system_password-policy.min-length = 'abc'",
+		 sg_reg_validate_value("system_password-policy", "min-length", "abc"), 0);
+	tc_check("val", "system_password-policy.min-length = '-1'",
+		 sg_reg_validate_value("system_password-policy", "min-length", "-1"), 0);
+
+	/* NAT port values */
+	tc_check("val", "network_nat.dstport = '80'",
+		 sg_reg_validate_value("network_nat", "dstport", "80"), 1);
+	tc_check("val", "network_nat.dstport = '0' (below min)",
+		 sg_reg_validate_value("network_nat", "dstport", "0"), 0);
+	tc_check("val", "network_nat.dstport = '65536' (above max)",
+		 sg_reg_validate_value("network_nat", "dstport", "65536"), 0);
+
+	/* iface values */
+	tc_check("val", "firewall_policy.srcintf = 'eth0'",
+		 sg_reg_validate_value("firewall_policy", "srcintf", "eth0"), 1);
+	tc_check("val", "firewall_policy.srcintf = 'eth;0' (semicolon)",
+		 sg_reg_validate_value("firewall_policy", "srcintf", "eth;0"), 0);
+
+	/* safe-id values */
+	tc_check("val", "firewall_policy.name = 'my-policy'",
+		 sg_reg_validate_value("firewall_policy", "name", "my-policy"), 1);
+	tc_check("val", "firewall_policy.name = 'a:b' (colon)",
+		 sg_reg_validate_value("firewall_policy", "name", "a:b"), 0);
+
+	/* tz-token */
+	tc_check("val", "system_settings.timezone = 'Asia/Ho_Chi_Minh'",
+		 sg_reg_validate_value("system_settings", "timezone", "Asia/Ho_Chi_Minh"), 1);
+	tc_check("val", "system_settings.timezone = 'US Eastern' (space)",
+		 sg_reg_validate_value("system_settings", "timezone", "US Eastern"), 0);
+	tc_check("val", "system_settings.timezone = '$(date)' (inject)",
+		 sg_reg_validate_value("system_settings", "timezone", "$(date)"), 0);
+
+	/* permissions-csv */
+	tc_check("val", "system_admin-profile.permissions = 'monitor,admin'",
+		 sg_reg_validate_value("system_admin-profile", "permissions", "monitor,admin"), 1);
+	tc_check("val", "system_admin-profile.permissions = 'root' (invalid)",
+		 sg_reg_validate_value("system_admin-profile", "permissions", "root"), 0);
+
+	/* port-or-range */
+	tc_check("val", "firewall_service.port-range = '80'",
+		 sg_reg_validate_value("firewall_service", "port-range", "80"), 1);
+	tc_check("val", "firewall_service.port-range = '1024-65535'",
+		 sg_reg_validate_value("firewall_service", "port-range", "1024-65535"), 1);
+	tc_check("val", "firewall_service.port-range = '80-22' (start>end)",
+		 sg_reg_validate_value("firewall_service", "port-range", "80-22"), 0);
+
+	/* cidr-or */
+	tc_check("val", "network_nat.srcaddr = 'any' (keyword)",
+		 sg_reg_validate_value("network_nat", "srcaddr", "any"), 1);
+	tc_check("val", "network_nat.srcaddr = 'all' (keyword)",
+		 sg_reg_validate_value("network_nat", "srcaddr", "all"), 1);
+	tc_check("val", "network_nat.srcaddr = '10.0.0.0/8' (cidr)",
+		 sg_reg_validate_value("network_nat", "srcaddr", "10.0.0.0/8"), 1);
+	tc_check("val", "network_nat.srcaddr = '10.0.0.0' (plain ipv4 fail)",
+		 sg_reg_validate_value("network_nat", "srcaddr", "10.0.0.0"), 0);
+	tc_check("val", "network_nat.srcaddr = 'none' (invalid keyword)",
+		 sg_reg_validate_value("network_nat", "srcaddr", "none"), 0);
+
+	/* ref-or */
+	tc_check("val", "firewall_policy.srcaddr = 'all'",
+		 sg_reg_validate_value("firewall_policy", "srcaddr", "all"), 1);
+	tc_check("val", "firewall_policy.srcaddr = 'any'",
+		 sg_reg_validate_value("firewall_policy", "srcaddr", "any"), 1);
+	tc_check("val", "firewall_policy.srcaddr = 'my-addr' (safe-id ref)",
+		 sg_reg_validate_value("firewall_policy", "srcaddr", "my-addr"), 1);
+	tc_check("val", "firewall_policy.srcaddr = 'a:b' (invalid ref id)",
+		 sg_reg_validate_value("firewall_policy", "srcaddr", "a:b"), 0);
+
+	/* safe-id-or */
+	tc_check("val", "firewall_policy.schedule = 'all'",
+		 sg_reg_validate_value("firewall_policy", "schedule", "all"), 1);
+	tc_check("val", "firewall_policy.schedule = 'any'",
+		 sg_reg_validate_value("firewall_policy", "schedule", "any"), 1);
+	tc_check("val", "firewall_policy.schedule = 'weekdays' (safe-id)",
+		 sg_reg_validate_value("firewall_policy", "schedule", "weekdays"), 1);
+	tc_check("val", "firewall_policy.schedule = 'a;b' (invalid)",
+		 sg_reg_validate_value("firewall_policy", "schedule", "a;b"), 0);
+
+	/* ref */
+	tc_check("val", "system_admin.profile = 'read-write' (safe-id ref)",
+		 sg_reg_validate_value("system_admin", "profile", "read-write"), 1);
+	tc_check("val", "system_admin.profile = 'a:b' (invalid)",
+		 sg_reg_validate_value("system_admin", "profile", "a:b"), 0);
+
+	/* string kind (comment fields — any non-empty) */
+	tc_check("val", "firewall_policy.comment = 'hello world'",
+		 sg_reg_validate_value("firewall_policy", "comment", "hello world"), 1);
+	tc_check("val", "firewall_policy.comment = '$(whoami)' (accepted, string kind)",
+		 sg_reg_validate_value("firewall_policy", "comment", "$(whoami)"), 1);
+}
+
+/* ── Section 13: IPC validation (full mode) ───────────────────────────── */
+
+/*
+ * ipc_check — send IPC request and check status matches expected.
+ */
+static void ipc_check(const char *desc, uint32_t opcode,
+		      const char *payload, uint32_t expect_status)
+{
+	struct ipc_response resp;
+	int conn;
+
+	tc_total++;
+	conn = ipc_send_str(opcode, payload, &resp);
+
+	if (conn < 0) {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC " [IPC/%u] %s (connection failed)\n",
+		       opcode, desc);
+		return;
+	}
+
+	if (resp.status == expect_status) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC " [IPC/%u] %s (status=%u)\n",
+		       opcode, desc, resp.status);
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC " [IPC/%u] %s (got %u, expected %u",
+		       opcode, desc, resp.status, expect_status);
+		if (resp.extra[0])
+			printf(": %s", resp.extra);
+		printf(")\n");
+	}
+
+	ipc_resp_free(&resp);
+}
+
+static void test_ipc_cfg_reject(void)
+{
+	printf(C_CYAN "\n  --- IPC: config commands reject invalid input ---"
+	       C_NC "\n");
+
+	/* CFG_SET with unknown type */
+	ipc_check("CFG_SET unknown type 'bogus_type'",
+		  SG_CMD_CFG_SET,
+		  "bogus_type:test\nkey=val\n",
+		  SG_ERR_INVALID_ARG);
+
+	/* CFG_SET with injection in type */
+	ipc_check("CFG_SET type with colon 'a:b:c'",
+		  SG_CMD_CFG_SET,
+		  "a:b:c\nkey=val\n",
+		  SG_ERR_INVALID_ARG);
+
+	/* CFG_SET with injection chars in ID */
+	ipc_check("CFG_SET ID with semicolon '../etc'",
+		  SG_CMD_CFG_SET,
+		  "firewall_address:../etc\nname=test\n",
+		  SG_ERR_INVALID_ARG);
+
+	/* CFG_DEL with unknown type */
+	ipc_check("CFG_DEL unknown type 'bogus_type:test'",
+		  SG_CMD_CFG_DEL,
+		  "bogus_type:test",
+		  SG_ERR_INVALID_ARG);
+
+	/* CFG_GET with invalid type ID */
+	ipc_check("CFG_GET invalid section 'a;b'",
+		  SG_CMD_CFG_GET,
+		  "a;b",
+		  SG_ERR_INVALID_ARG);
+
+	/* CFG_LIST with invalid prefix */
+	ipc_check("CFG_LIST invalid prefix 'a;drop'",
+		  SG_CMD_CFG_LIST,
+		  "a;drop",
+		  SG_ERR_INVALID_ARG);
+}
+
+static void test_ipc_admin_reject(void)
+{
+	printf(C_CYAN "\n  --- IPC: admin commands reject invalid input ---"
+	       C_NC "\n");
+
+	/* ADMIN_SET_ENF with bad username */
+	ipc_check("ADMIN_SET_ENF username with colon 'a:b'",
+		  SG_CMD_ADMIN_SET_ENF,
+		  "a:b\nenable\n",
+		  SG_ERR_INVALID_ARG);
+
+	/* ADMIN_SET_ENF with bad value (not enable/disable) */
+	ipc_check("ADMIN_SET_ENF value 'maybe' (not enable/disable)",
+		  SG_CMD_ADMIN_SET_ENF,
+		  "admin\nmaybe\n",
+		  SG_ERR_INVALID_VAL);
+
+	/* ADMIN_CHECK_PW with bad username */
+	ipc_check("ADMIN_CHECK_PW username '../etc'",
+		  SG_CMD_ADMIN_CHECK_PW,
+		  "../etc\npassword\n",
+		  SG_ERR_INVALID_ARG);
+
+	/* ADMIN_LOCK_PW with bad username */
+	ipc_check("ADMIN_LOCK_PW username 'a;b'",
+		  SG_CMD_ADMIN_LOCK_PW,
+		  "a;b",
+		  SG_ERR_INVALID_ARG);
+
+	/* SESSION_REV with bad username */
+	ipc_check("SESSION_REV username '$var'",
+		  SG_CMD_SESSION_REV,
+		  "$var",
+		  SG_ERR_INVALID_ARG);
+
+	/* SESSION_BUMP with bad username */
+	ipc_check("SESSION_BUMP username '`id`'",
+		  SG_CMD_SESSION_BUMP,
+		  "`id`",
+		  SG_ERR_INVALID_ARG);
+
+	/* ADMIN_CREATE with bad username (no validation, but verify it
+	 * does not crash — this tests existing behavior) */
+	ipc_check("ADMIN_CREATE username 'a:b' (should reject)",
+		  SG_CMD_ADMIN_CREATE,
+		  "a:b\nread-write\n",
+		  SG_ERR_INVALID_ARG);
+}
+
+static void test_ipc_builtin_protect(void)
+{
+	printf(C_CYAN "\n  --- IPC: builtin objects protected ---" C_NC "\n");
+
+	/* Cannot delete builtin admin */
+	ipc_check("ADMIN_DELETE builtin 'admin'",
+		  SG_CMD_ADMIN_DELETE,
+		  "admin",
+		  SG_ERR_BUILTIN);
+
+	/* Cannot delete builtin profile via CFG_DEL */
+	ipc_check("CFG_DEL builtin profile 'read-write'",
+		  SG_CMD_CFG_DEL,
+		  "system_admin-profile:read-write",
+		  SG_ERR_BUILTIN);
+
+	ipc_check("CFG_DEL builtin profile 'read-only'",
+		  SG_CMD_CFG_DEL,
+		  "system_admin-profile:read-only",
+		  SG_ERR_BUILTIN);
+}
+
+/* ── Section 14: IPC round-trip (full mode) ───────────────────────────── */
+
+static void test_ipc_roundtrip(void)
+{
+	struct ipc_response resp;
+	int conn;
+	const char *test_section = "firewall_address:__diag_cfgtest";
+
+	printf(C_CYAN "\n  --- IPC: config create/read/delete round-trip ---"
+	       C_NC "\n");
+
+	/* 1. Create entry via CFG_SET */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_SET,
+			    "firewall_address:__diag_cfgtest\n"
+			    "name=__diag_cfgtest\n"
+			    "subnet=10.99.99.0/24\n"
+			    "type=ipmask\n",
+			    &resp);
+	if (conn == 0 && resp.status == SG_OK) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [IPC/200] create firewall_address __diag_cfgtest\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [IPC/200] create __diag_cfgtest (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+		ipc_resp_free(&resp);
+		return;
+	}
+	ipc_resp_free(&resp);
+
+	/* 2. Read back via CFG_GET */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_GET, test_section, &resp);
+	if (conn == 0 && resp.status == SG_OK && resp.payload &&
+	    strstr(resp.payload, "name=__diag_cfgtest") &&
+	    strstr(resp.payload, "subnet=10.99.99.0/24") &&
+	    strstr(resp.payload, "type=ipmask")) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [IPC/100] read back __diag_cfgtest (data matches)\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [IPC/100] read back __diag_cfgtest"
+		       " (status=%u, payload=%s)\n",
+		       conn < 0 ? 999 : resp.status,
+		       resp.payload ? resp.payload : "(null)");
+	}
+	ipc_resp_free(&resp);
+
+	/* 3. Verify it appears in CFG_LIST */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_LIST, "firewall_address", &resp);
+	if (conn == 0 && resp.status == SG_OK && resp.payload &&
+	    strstr(resp.payload, "__diag_cfgtest")) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [IPC/101] __diag_cfgtest in CFG_LIST\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [IPC/101] __diag_cfgtest not in CFG_LIST"
+		       " (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+	}
+	ipc_resp_free(&resp);
+
+	/* 4. Update via CFG_SET (overwrite with changed data) */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_SET,
+			    "firewall_address:__diag_cfgtest\n"
+			    "name=__diag_cfgtest\n"
+			    "subnet=172.16.0.0/12\n"
+			    "type=ipmask\n"
+			    "comment=roundtrip-test\n",
+			    &resp);
+	if (conn == 0 && resp.status == SG_OK) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [IPC/200] update __diag_cfgtest\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [IPC/200] update __diag_cfgtest (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+	}
+	ipc_resp_free(&resp);
+
+	/* 5. Verify update via CFG_GET */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_GET, test_section, &resp);
+	if (conn == 0 && resp.status == SG_OK && resp.payload &&
+	    strstr(resp.payload, "subnet=172.16.0.0/12") &&
+	    strstr(resp.payload, "comment=roundtrip-test")) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [IPC/100] updated data verified\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [IPC/100] updated data mismatch (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+	}
+	ipc_resp_free(&resp);
+
+	/* 6. Delete via CFG_DEL */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_DEL, test_section, &resp);
+	if (conn == 0 && resp.status == SG_OK) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [IPC/201] delete __diag_cfgtest\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [IPC/201] delete __diag_cfgtest (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+	}
+	ipc_resp_free(&resp);
+
+	/* 7. Verify deletion — CFG_GET should return NOT_FOUND */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_GET, test_section, &resp);
+	if (conn == 0 && resp.status != SG_OK) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [IPC/100] __diag_cfgtest gone after delete"
+		       " (status=%u)\n", resp.status);
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [IPC/100] __diag_cfgtest still exists after"
+		       " delete\n");
+	}
+	ipc_resp_free(&resp);
+}
+
+/* ── Section 15: IPC static route round-trip with apply ───────────────── */
+
+static void test_ipc_apply(void)
+{
+	struct ipc_response resp;
+	int conn;
+
+	printf(C_CYAN "\n  --- IPC: config apply (runtime handler) ---"
+	       C_NC "\n");
+
+	/* Apply a system_settings config — tests the hostname handler */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_APPLY,
+			    "system_settings\n0\n"
+			    "hostname=stargazer\n"
+			    "ip-forward=enable\n",
+			    &resp);
+	if (conn == 0 && resp.status == SG_OK) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [IPC/202] CFG_APPLY system_settings accepted\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [IPC/202] CFG_APPLY system_settings (status=%u",
+		       conn < 0 ? 999 : resp.status);
+		if (resp.extra[0])
+			printf(": %s", resp.extra);
+		printf(")\n");
+	}
+	ipc_resp_free(&resp);
+
+	/* Apply with known type but unknown apply handler (should still OK) */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_APPLY,
+			    "network_dns\n0\n"
+			    "primary=8.8.8.8\n",
+			    &resp);
+	if (conn == 0 && resp.status == SG_OK) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [IPC/202] CFG_APPLY network_dns (no handler OK)\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [IPC/202] CFG_APPLY network_dns (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+	}
+	ipc_resp_free(&resp);
+}
+
+/* ── Section 16: Nonexistent entry operations ─────────────────────────── */
+
+static void test_ipc_not_found(void)
+{
+	printf(C_CYAN "\n  --- IPC: not-found behavior ---" C_NC "\n");
+
+	/* CFG_GET for nonexistent entry */
+	ipc_check("CFG_GET nonexistent firewall_address:__noexist",
+		  SG_CMD_CFG_GET,
+		  "firewall_address:__noexist",
+		  SG_ERR_ENTRY_NOT_FOUND);
+
+	/* ADMIN_DELETE nonexistent user */
+	ipc_check("ADMIN_DELETE nonexistent '__diag_nobody'",
+		  SG_CMD_ADMIN_DELETE,
+		  "__diag_nobody",
+		  SG_ERR_USER_NOT_FOUND);
+}
+
+/* ── Cleanup helper ───────────────────────────────────────────────────── */
+
+static void cleanup_test_entries(void)
+{
+	struct ipc_response resp;
+
+	/* Best-effort cleanup of test entries */
+	if (ipc_send_str(SG_CMD_CFG_DEL,
+			 "firewall_address:__diag_cfgtest", &resp) == 0 &&
+	    resp.status == SG_OK)
+		printf("  cleanup: deleted __diag_cfgtest\n");
+	ipc_resp_free(&resp);
+}
+
+/* ── Public entry point ───────────────────────────────────────────────── */
+
+int cli_diagnose_test_configure(int mode)
+{
+	tc_pass  = 0;
+	tc_fail  = 0;
+	tc_total = 0;
+
+	printf("\n  Stargazer Configuration Validation Diagnostics\n");
+	printf("  ===============================================\n");
+
+	/* Basic tests: validator unit tests (no IPC needed) */
+	test_safe_id();
+	test_ipv4();
+	test_cidr();
+	test_iface();
+	test_uint_range();
+	test_tz_token();
+	test_permissions_csv();
+	test_port_or_range();
+	test_csv_option();
+	test_entry_id();
+	test_registry();
+	test_value_validation();
+
+	if (mode == 1) {
+		/* Full mode: IPC round-trip tests */
+		if (!ipc_available()) {
+			printf(C_RED "\n  ERROR" C_NC
+			       ": mgmtd socket not found (%s)\n",
+			       SG_MGMTD_SOCK);
+			printf("  IPC tests skipped."
+			       " Start stargazer-mgmtd for full tests.\n");
+		} else {
+			cleanup_test_entries();
+			test_ipc_cfg_reject();
+			test_ipc_admin_reject();
+			test_ipc_builtin_protect();
+			test_ipc_roundtrip();
+			test_ipc_apply();
+			test_ipc_not_found();
+			cleanup_test_entries();
+		}
+	}
+
+	/* Summary */
+	printf("\n  Results: %d/%d passed", tc_pass, tc_total);
+	if (tc_fail > 0)
+		printf(C_RED ", %d FAILED" C_NC, tc_fail);
+	else
+		printf(C_GREEN " (all passed)" C_NC);
+	printf("\n\n");
+
+	return tc_fail > 0 ? 1 : 0;
+}

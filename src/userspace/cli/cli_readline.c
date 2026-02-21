@@ -1,26 +1,26 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * stargazer-readline — C readline helper for Stargazer CLI
+ * cli_readline.c — Embedded readline engine for Stargazer CLI
  *
- * Usage: stargazer-readline <prompt> [completions_file] [history_file]
- *        stargazer-readline <prompt> --stdin-comps [history_file]
- * Output: single line of user input to stdout
+ * Refactored from stargazer-readline.c into a library form.
+ * No main(), no stdout capture — returns buffer directly.
  *
  * Features:
  *   - Raw terminal mode (termios)
  *   - Character-by-character read (no dd fork per char)
  *   - Backspace, Ctrl-C, Ctrl-D, Ctrl-U, Ctrl-W
- *   - Arrow keys (up/down for history from stdin pipe or file)
- *   - Tab completion: reads candidates from completions_file
- *   - ? help: reads and displays matching entries from completions_file
+ *   - Arrow keys (up/down for history, left/right cursor movement)
+ *   - Tab completion: cycle through registered candidates
+ *   - ? help: display matching entries
+ *   - Home/End keys
  *   - UTF-8 aware (multi-byte passthrough)
- *
- * Completions file format (one entry per line):
- *   path|description
- * Example:
- *   show|Display current settings
- *   configure system|Enter system configuration
+ *   - Completion push/pop stack for nested CLI contexts
+ *   - In-process history with on-demand file I/O
  */
+
+#define _POSIX_C_SOURCE 200809L
+
+#include "cli_readline.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -31,30 +31,39 @@
 #include <termios.h>
 #include <unistd.h>
 
-#define MAX_LINE    4096
-#define MAX_COMPS   1024
-#define MAX_HIST    100
-#define MAX_DESC    256
+/* Terminal writes: non-actionable on failure, suppress warn_unused_result */
+static inline void tty_write(int fd, const void *buf, size_t len)
+{
+	if (write(fd, buf, len) < 0) { /* terminal I/O, ignore */ }
+}
 
-struct completion {
-	char path[MAX_LINE];
-	char desc[MAX_DESC];
+/* ── Data structures ──────────────────────────────────────────────────── */
+
+struct cli_completion {
+	char path[CLI_MAX_LINE];
+	char desc[CLI_MAX_DESC];
 };
 
-static struct completion comps[MAX_COMPS];
-static int ncomps;
+struct cli_comp_set {
+	struct cli_completion entries[CLI_MAX_COMPS];
+	int count;
+};
 
-static char hist[MAX_HIST][MAX_LINE];
-static int nhist;
+static struct cli_comp_set comp_stack[CLI_MAX_STACK];
+static int stack_depth = 0;
+static struct cli_comp_set current_comps;	/* active completion set */
 
-static char history_path[MAX_LINE];
+static char hist[CLI_MAX_HIST][CLI_MAX_LINE];
+static int nhist = 0;
 
 static struct termios orig_termios;
-static int raw_mode;
-static int tty_fd = -1;   /* fd for terminal I/O (keystrokes + display) */
-static int out_fd = -1;   /* saved original stdout for result output    */
+static int raw_mode = 0;
+static int tty_fd = -1;
 
-/* ── Terminal ──────────────────────────────────────────────────────────── */
+/* Internal static buffer returned by cli_readline() */
+static char line_buf[CLI_MAX_LINE];
+
+/* ── Terminal ─────────────────────────────────────────────────────────── */
 
 /*
  * Open a terminal device for interactive I/O.
@@ -86,6 +95,8 @@ static void disable_raw(void)
 
 static int enable_raw(void)
 {
+	struct termios t;
+
 	if (tty_fd < 0)
 		return -1;
 	if (!isatty(tty_fd))
@@ -93,11 +104,11 @@ static int enable_raw(void)
 	if (tcgetattr(tty_fd, &orig_termios) != 0)
 		return -1;
 
-	struct termios t = orig_termios;
-	t.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
-	t.c_oflag &= ~(OPOST);
+	t = orig_termios;
+	t.c_iflag &= ~(unsigned)(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+	t.c_oflag &= ~(unsigned)(OPOST);
 	t.c_cflag |= CS8;
-	t.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
+	t.c_lflag &= ~(unsigned)(ECHO | ICANON | IEXTEN | ISIG);
 	t.c_cc[VMIN] = 1;
 	t.c_cc[VTIME] = 0;
 
@@ -108,65 +119,114 @@ static int enable_raw(void)
 	return 0;
 }
 
-/* ── Completion loading ───────────────────────────────────────────────── */
+/* ── Public terminal API ──────────────────────────────────────────────── */
 
-static void load_completions_fp(FILE *fp)
+int cli_term_init(void)
 {
-	char line[MAX_LINE + MAX_DESC + 2];
+	if (tty_fd >= 0)
+		return 0;	/* already initialized */
 
-	while (fgets(line, sizeof(line), fp) && ncomps < MAX_COMPS) {
-		size_t len = strlen(line);
-		if (len > 0 && line[len - 1] == '\n')
-			line[len - 1] = '\0';
-		if (line[0] == '\0')
-			continue;
-
-		char *sep = strchr(line, '|');
-		if (sep) {
-			*sep = '\0';
-			strncpy(comps[ncomps].path, line, MAX_LINE - 1);
-			comps[ncomps].path[MAX_LINE - 1] = '\0';
-			strncpy(comps[ncomps].desc, sep + 1, MAX_DESC - 1);
-			comps[ncomps].desc[MAX_DESC - 1] = '\0';
-		} else {
-			strncpy(comps[ncomps].path, line, MAX_LINE - 1);
-			comps[ncomps].path[MAX_LINE - 1] = '\0';
-			comps[ncomps].desc[0] = '\0';
-		}
-		ncomps++;
+	tty_fd = open_terminal();
+	if (tty_fd < 0) {
+		/* Last resort: stdin might be the terminal */
+		if (isatty(STDIN_FILENO))
+			tty_fd = dup(STDIN_FILENO);
 	}
+	if (tty_fd < 0)
+		return -1;
+
+	current_comps.count = 0;
+	stack_depth = 0;
+	return 0;
 }
 
-static void load_completions(const char *file)
+void cli_term_cleanup(void)
 {
-	FILE *fp;
+	disable_raw();
+	if (tty_fd >= 0) {
+		close(tty_fd);
+		tty_fd = -1;
+	}
+	raw_mode = 0;
+}
 
-	ncomps = 0;
-	if (!file)
+/* ── Completion registry ──────────────────────────────────────────────── */
+
+void cli_register(const char *path, const char *desc)
+{
+	if (current_comps.count >= CLI_MAX_COMPS)
 		return;
 
-	fp = fopen(file, "r");
-	if (!fp)
+	struct cli_completion *e = &current_comps.entries[current_comps.count];
+	strncpy(e->path, path ? path : "", CLI_MAX_LINE - 1);
+	e->path[CLI_MAX_LINE - 1] = '\0';
+	strncpy(e->desc, desc ? desc : "", CLI_MAX_DESC - 1);
+	e->desc[CLI_MAX_DESC - 1] = '\0';
+	current_comps.count++;
+}
+
+void cli_push(void)
+{
+	if (stack_depth >= CLI_MAX_STACK)
 		return;
 
-	load_completions_fp(fp);
-	fclose(fp);
+	memcpy(&comp_stack[stack_depth], &current_comps,
+	       sizeof(struct cli_comp_set));
+	stack_depth++;
+	current_comps.count = 0;
+}
+
+void cli_pop(void)
+{
+	if (stack_depth <= 0)
+		return;
+
+	stack_depth--;
+	memcpy(&current_comps, &comp_stack[stack_depth],
+	       sizeof(struct cli_comp_set));
+}
+
+void cli_clear(void)
+{
+	current_comps.count = 0;
+}
+
+void cli_print_help(void)
+{
+	/* Find longest command path for alignment */
+	int max_len = 0;
+	for (int i = 0; i < current_comps.count; i++) {
+		int len = (int)strlen(current_comps.entries[i].path);
+		if (len > max_len)
+			max_len = len;
+	}
+	if (max_len > 40)
+		max_len = 40;
+
+	printf("\n  === Stargazer NGFW — Command Reference ===\n\n");
+	for (int i = 0; i < current_comps.count; i++) {
+		printf("  %-*s  %s\n", max_len,
+		       current_comps.entries[i].path,
+		       current_comps.entries[i].desc);
+	}
+	printf("\n  Press Tab for completion, ? for context help.\n\n");
 }
 
 /* ── Redraw ───────────────────────────────────────────────────────────── */
 
 static void redraw_at(const char *prompt, const char *buf, int cursor)
 {
-	/* Move to start, clear line, write prompt + buffer */
-	write(tty_fd, "\r\033[K", 4);
-	write(tty_fd, prompt, strlen(prompt));
 	int len = (int)strlen(buf);
-	write(tty_fd, buf, (size_t)len);
+
+	/* Move to start, clear line, write prompt + buffer */
+	tty_write(tty_fd, "\r\033[K", 4);
+	tty_write(tty_fd, prompt, strlen(prompt));
+	tty_write(tty_fd, buf, (size_t)len);
 	/* Move cursor back if not at end */
 	if (cursor < len) {
 		char esc[16];
 		int n = snprintf(esc, sizeof(esc), "\033[%dD", len - cursor);
-		write(tty_fd, esc, (size_t)n);
+		tty_write(tty_fd, esc, (size_t)n);
 	}
 }
 
@@ -181,6 +241,7 @@ static int word_count(const char *s)
 {
 	int n = 0;
 	int in_word = 0;
+
 	for (; *s; s++) {
 		if (*s == ' ') {
 			in_word = 0;
@@ -221,7 +282,8 @@ static const char *nth_word(const char *s, int n, int *wlen)
 
 /* ── Tab completion ───────────────────────────────────────────────────── */
 
-static int tab_find_matches(const char *buf, char matches[][MAX_LINE], int max_matches)
+static int tab_find_matches(const char *buf,
+			    char matches[][CLI_MAX_LINE], int max_matches)
 {
 	int count = 0;
 	int trailing_space = (buf[0] != '\0' && buf[strlen(buf) - 1] == ' ');
@@ -231,18 +293,20 @@ static int tab_find_matches(const char *buf, char matches[][MAX_LINE], int max_m
 		int depth = word_count(buf);
 		int target = depth + 1;
 
-		for (int i = 0; i < ncomps && count < max_matches; i++) {
-			if (strncmp(comps[i].path, buf, strlen(buf)) != 0)
+		for (int i = 0; i < current_comps.count && count < max_matches; i++) {
+			if (strncmp(current_comps.entries[i].path, buf,
+				    strlen(buf)) != 0)
 				continue;
 			int wl;
-			const char *w = nth_word(comps[i].path, target, &wl);
+			const char *w = nth_word(current_comps.entries[i].path,
+						 target, &wl);
 			if (!w || wl == 0)
 				continue;
 
 			/* Build candidate: buf + word */
-			char cand[MAX_LINE];
+			char cand[CLI_MAX_LINE];
 			snprintf(cand, sizeof(cand), "%.*s%.*s",
-				(int)strlen(buf), buf, wl, w);
+				 (int)strlen(buf), buf, wl, w);
 
 			/* Deduplicate */
 			int dup = 0;
@@ -253,22 +317,24 @@ static int tab_find_matches(const char *buf, char matches[][MAX_LINE], int max_m
 				}
 			}
 			if (!dup)
-				snprintf(matches[count++], MAX_LINE, "%s", cand);
+				snprintf(matches[count++], CLI_MAX_LINE,
+					 "%s", cand);
 		}
 	} else {
 		/* Complete partial word */
 		int nw = word_count(buf);
 		if (nw <= 1) {
 			/* Single partial word */
-			for (int i = 0; i < ncomps && count < max_matches; i++) {
+			for (int i = 0; i < current_comps.count && count < max_matches; i++) {
 				int wl;
-				const char *first = nth_word(comps[i].path, 1, &wl);
+				const char *first = nth_word(
+					current_comps.entries[i].path, 1, &wl);
 				if (!first)
 					continue;
 				if (strncmp(first, buf, strlen(buf)) != 0)
 					continue;
 
-				char cand[MAX_LINE];
+				char cand[CLI_MAX_LINE];
 				snprintf(cand, sizeof(cand), "%.*s", wl, first);
 
 				int dup = 0;
@@ -279,7 +345,8 @@ static int tab_find_matches(const char *buf, char matches[][MAX_LINE], int max_m
 					}
 				}
 				if (!dup)
-					snprintf(matches[count++], MAX_LINE, "%s", cand);
+					snprintf(matches[count++], CLI_MAX_LINE,
+						 "%s", cand);
 			}
 		} else {
 			/* Multi-word: find prefix and partial */
@@ -290,22 +357,25 @@ static int tab_find_matches(const char *buf, char matches[][MAX_LINE], int max_m
 			const char *partial = last_space + 1;
 			size_t plen = strlen(partial);
 
-			for (int i = 0; i < ncomps && count < max_matches; i++) {
-				if (strncmp(comps[i].path, buf, prefix_len) != 0)
+			for (int i = 0; i < current_comps.count && count < max_matches; i++) {
+				if (strncmp(current_comps.entries[i].path, buf,
+					    (size_t)prefix_len) != 0)
 					continue;
 				/* Check the next word starts with partial */
-				const char *rest = comps[i].path + prefix_len;
+				const char *rest =
+					current_comps.entries[i].path + prefix_len;
 				if (strncmp(rest, partial, plen) != 0)
 					continue;
 
 				int wl;
-				const char *w = nth_word(comps[i].path, nw, &wl);
+				const char *w = nth_word(
+					current_comps.entries[i].path, nw, &wl);
 				if (!w)
 					continue;
 
-				char cand[MAX_LINE];
+				char cand[CLI_MAX_LINE];
 				snprintf(cand, sizeof(cand), "%.*s%.*s",
-					prefix_len, buf, wl, w);
+					 prefix_len, buf, wl, w);
 
 				int dup = 0;
 				for (int j = 0; j < count; j++) {
@@ -315,7 +385,8 @@ static int tab_find_matches(const char *buf, char matches[][MAX_LINE], int max_m
 					}
 				}
 				if (!dup)
-					snprintf(matches[count++], MAX_LINE, "%s", cand);
+					snprintf(matches[count++], CLI_MAX_LINE,
+						 "%s", cand);
 			}
 		}
 	}
@@ -331,9 +402,10 @@ static void show_help(const char *buf)
 	int depth;
 	const char *pattern;
 	int target;
-	char exact_cmd[MAX_LINE];
+	char exact_cmd[CLI_MAX_LINE];
+	char exact_desc[CLI_MAX_DESC];
+
 	exact_cmd[0] = '\0';
-	char exact_desc[MAX_DESC];
 	exact_desc[0] = '\0';
 
 	if (buf[0] == '\0') {
@@ -350,7 +422,7 @@ static void show_help(const char *buf)
 		target = depth;
 		const char *last_space = strrchr(buf, ' ');
 		if (last_space)
-			pattern = buf; /* full match prefix */
+			pattern = buf;	/* full match prefix */
 		else
 			pattern = "";
 	}
@@ -363,38 +435,44 @@ static void show_help(const char *buf)
 	}
 
 	if (exact_cmd[0] != '\0') {
-		for (int i = 0; i < ncomps; i++) {
-			if (strcmp(comps[i].path, exact_cmd) == 0) {
-				snprintf(exact_desc, sizeof(exact_desc), "%s", comps[i].desc);
+		for (int i = 0; i < current_comps.count; i++) {
+			if (strcmp(current_comps.entries[i].path,
+				   exact_cmd) == 0) {
+				snprintf(exact_desc, sizeof(exact_desc), "%s",
+					 current_comps.entries[i].desc);
 				break;
 			}
 		}
 	}
 
 	if (exact_cmd[0] != '\0' && exact_desc[0] != '\0') {
-		char enter_line[MAX_LINE];
-		snprintf(enter_line, sizeof(enter_line), "  %-24s %s\r\n", "<Enter>", exact_desc);
-		write(tty_fd, enter_line, strlen(enter_line));
+		char enter_line[CLI_MAX_LINE];
+		snprintf(enter_line, sizeof(enter_line),
+			 "  %-24s %s\r\n", "<Enter>", exact_desc);
+		tty_write(tty_fd, enter_line, strlen(enter_line));
 	}
 
-	char seen[MAX_COMPS][64];
+	char seen[CLI_MAX_COMPS][64];
 	int nseen = 0;
 
-	for (int i = 0; i < ncomps; i++) {
+	for (int i = 0; i < current_comps.count; i++) {
 		/* Check if path matches pattern prefix */
 		if (pattern[0] != '\0') {
 			if (trailing_space || buf[0] == '\0') {
-				if (strncmp(comps[i].path, pattern, strlen(pattern)) != 0)
+				if (strncmp(current_comps.entries[i].path,
+					    pattern, strlen(pattern)) != 0)
 					continue;
 			} else {
 				/* Partial match: check the full buf as prefix */
 				size_t blen = strlen(buf);
-				if (strncmp(comps[i].path, buf, blen) != 0) {
+				if (strncmp(current_comps.entries[i].path,
+					    buf, blen) != 0) {
 					/* Also try matching up to last space */
 					const char *ls = strrchr(buf, ' ');
 					if (ls) {
-						size_t plen = (size_t)(ls - buf + 1);
-						if (strncmp(comps[i].path, buf, plen) != 0)
+						size_t pl = (size_t)(ls - buf + 1);
+						if (strncmp(current_comps.entries[i].path,
+							    buf, pl) != 0)
 							continue;
 					} else {
 						continue;
@@ -404,7 +482,8 @@ static void show_help(const char *buf)
 		}
 
 		int wl;
-		const char *w = nth_word(comps[i].path, target, &wl);
+		const char *w = nth_word(current_comps.entries[i].path,
+					 target, &wl);
 		if (!w || wl == 0)
 			continue;
 
@@ -423,22 +502,23 @@ static void show_help(const char *buf)
 		}
 		if (dup)
 			continue;
-		if (nseen < MAX_COMPS)
+		if (nseen < CLI_MAX_COMPS)
 			snprintf(seen[nseen++], 64, "%s", word);
 
 		/* Print with padding */
-		char line[MAX_LINE];
-		snprintf(line, sizeof(line), "  %-24s %s\r\n", word, comps[i].desc);
-		write(tty_fd, line, strlen(line));
+		char line[CLI_MAX_LINE];
+		snprintf(line, sizeof(line), "  %-24s %s\r\n", word,
+			 current_comps.entries[i].desc);
+		tty_write(tty_fd, line, strlen(line));
 	}
 
 	if (nseen == 0) {
 		if (buf[0] != '\0' && exact_desc[0] == '\0') {
 			const char *msg = "  Not a command.\r\n";
-			write(tty_fd, msg, strlen(msg));
+			tty_write(tty_fd, msg, strlen(msg));
 		} else if (buf[0] == '\0') {
 			const char *msg = "  <cr>  Execute command\r\n";
-			write(tty_fd, msg, strlen(msg));
+			tty_write(tty_fd, msg, strlen(msg));
 		}
 	}
 }
@@ -452,31 +532,20 @@ static void hist_add(const char *line)
 	/* Don't duplicate last entry */
 	if (nhist > 0 && strcmp(hist[nhist - 1], line) == 0)
 		return;
-	if (nhist < MAX_HIST) {
-		snprintf(hist[nhist++], MAX_LINE, "%s", line);
+	if (nhist < CLI_MAX_HIST) {
+		snprintf(hist[nhist++], CLI_MAX_LINE, "%s", line);
 	} else {
 		/* Shift up */
-		memmove(hist[0], hist[1], (size_t)(MAX_HIST - 1) * MAX_LINE);
-		snprintf(hist[MAX_HIST - 1], MAX_LINE, "%s", line);
+		memmove(hist[0], hist[1],
+			(size_t)(CLI_MAX_HIST - 1) * CLI_MAX_LINE);
+		snprintf(hist[CLI_MAX_HIST - 1], CLI_MAX_LINE, "%s", line);
 	}
 }
 
-static void default_history_path(char *out, size_t outlen)
-{
-	const char *env = getenv("STARGAZER_HISTORY_FILE");
-
-	if (env && env[0]) {
-		snprintf(out, outlen, "%s", env);
-		return;
-	}
-
-	snprintf(out, outlen, "/tmp/stargazer_cli_history_%ld", (long)getuid());
-}
-
-static void load_history(const char *file)
+void cli_hist_load(const char *file)
 {
 	FILE *fp;
-	char line[MAX_LINE];
+	char line[CLI_MAX_LINE];
 
 	if (!file || !file[0])
 		return;
@@ -487,7 +556,8 @@ static void load_history(const char *file)
 
 	while (fgets(line, sizeof(line), fp)) {
 		size_t len = strlen(line);
-		while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+		while (len > 0 &&
+		       (line[len - 1] == '\n' || line[len - 1] == '\r')) {
 			line[len - 1] = '\0';
 			len--;
 		}
@@ -497,15 +567,16 @@ static void load_history(const char *file)
 	fclose(fp);
 }
 
-static void save_history(const char *file)
+void cli_hist_save(const char *file)
 {
-	char tmppath[MAX_LINE + 32];
+	char tmppath[CLI_MAX_LINE + 32];
 	FILE *fp;
 
 	if (!file || !file[0])
 		return;
 
-	snprintf(tmppath, sizeof(tmppath), "%s.tmp.%d", file, (int)getpid());
+	snprintf(tmppath, sizeof(tmppath), "%s.tmp.%d",
+		 file, (int)getpid());
 	fp = fopen(tmppath, "w");
 	if (!fp)
 		return;
@@ -521,72 +592,46 @@ static void save_history(const char *file)
 
 /* ── Main readline loop ──────────────────────────────────────────────── */
 
-int main(int argc, char *argv[])
+const char *cli_readline(const char *prompt)
 {
-	if (argc < 2) {
-		fprintf(stderr, "Usage: stargazer-readline <prompt> [completions_file] [history_file]\n");
-		fprintf(stderr, "       stargazer-readline <prompt> --stdin-comps [history_file]\n");
-		return 1;
-	}
+	char buf[CLI_MAX_LINE];
+	int pos = 0;		/* buffer length */
+	int cursor = 0;		/* cursor position within buffer */
 
-	const char *prompt = argv[1];
-	const char *comp_file = NULL;
-	const char *hist_file = NULL;
-	int stdin_comps = 0;
-	int i;
+	/* Tab state */
+	char tab_matches[64][CLI_MAX_LINE];
+	int tab_count = 0;
+	int tab_idx = 0;
+	int tab_active = 0;
+	char tab_base[CLI_MAX_LINE];
 
-	/* Parse arguments: detect --stdin-comps flag, collect positional args */
-	for (i = 2; i < argc; i++) {
-		if (strcmp(argv[i], "--stdin-comps") == 0) {
-			stdin_comps = 1;
-		} else if (!comp_file && !stdin_comps) {
-			comp_file = argv[i];
-		} else {
-			hist_file = argv[i];
-		}
-	}
+	int hist_idx = nhist;
+	char hist_saved[CLI_MAX_LINE];
 
-	if (hist_file && hist_file[0])
-		snprintf(history_path, sizeof(history_path), "%s", hist_file);
-	else
-		default_history_path(history_path, sizeof(history_path));
+	buf[0] = '\0';
+	tab_base[0] = '\0';
+	hist_saved[0] = '\0';
 
-	/*
-	 * Load completions from stdin or file.
-	 * When --stdin-comps is used, stdin carries the completion data
-	 * (piped from the shell). We must read it all BEFORE opening
-	 * /dev/tty for interactive I/O.
-	 */
-	ncomps = 0;
-	if (stdin_comps) {
-		load_completions_fp(stdin);
-	} else {
-		load_completions(comp_file);
-	}
-	load_history(history_path);
-
-	/*
-	 * Open a terminal device for interactive I/O.
-	 * This makes us independent of shell-level /dev/tty redirections.
-	 * stdout (fd 1) is kept untouched for $(…) capture by the caller.
-	 */
-	out_fd = dup(STDOUT_FILENO);
-	tty_fd = open_terminal();
-	if (tty_fd < 0) {
-		/* Last resort: stdin might be the terminal (direct invocation) */
-		if (isatty(STDIN_FILENO))
-			tty_fd = dup(STDIN_FILENO);
-	}
+	if (tty_fd < 0)
+		return NULL;
 
 	if (enable_raw() != 0) {
-		/* Fallback: just read a line in cooked mode */
-		int rfd = (tty_fd >= 0) ? tty_fd : STDIN_FILENO;
-		int wfd = (tty_fd >= 0) ? tty_fd : STDERR_FILENO;
-		write(wfd, prompt, strlen(prompt));
-		char buf[MAX_LINE];
-		int bpos = 0;
+		/* Fallback: just read a line in cooked mode.
+		 * Arrow keys and history will NOT work. */
+		static int warned;
+		if (!warned) {
+			const char *msg =
+				"\r\n  [warn] raw mode unavailable — "
+				"arrow keys/history disabled\r\n";
+			tty_write(tty_fd, msg, strlen(msg));
+			warned = 1;
+		}
+		int rfd = tty_fd;
 		char ch;
-		while (bpos < MAX_LINE - 1) {
+		int bpos = 0;
+
+		tty_write(tty_fd, prompt, strlen(prompt));
+		while (bpos < CLI_MAX_LINE - 1) {
 			if (read(rfd, &ch, 1) <= 0)
 				break;
 			if (ch == '\n' || ch == '\r')
@@ -594,62 +639,43 @@ int main(int argc, char *argv[])
 			buf[bpos++] = ch;
 		}
 		buf[bpos] = '\0';
-		dprintf(out_fd, "%s\n", buf);
-		if (tty_fd >= 0) close(tty_fd);
-		if (out_fd >= 0) close(out_fd);
-		return 0;
+		snprintf(line_buf, sizeof(line_buf), "%s", buf);
+		return line_buf;
 	}
 
-	/* Cleanup on exit */
-	atexit(disable_raw);
-
-	char buf[MAX_LINE];
-	int pos = 0;    /* buffer length */
-	int cursor = 0; /* cursor position within buffer */
-	buf[0] = '\0';
-
-	/* Tab state */
-	char tab_matches[64][MAX_LINE];
-	int tab_count = 0;
-	int tab_idx = 0;
-	int tab_active = 0;
-	char tab_base[MAX_LINE];
-	tab_base[0] = '\0';
-
-	int hist_idx = nhist;
-	char hist_saved[MAX_LINE];
-	hist_saved[0] = '\0';
-
-	write(tty_fd, prompt, strlen(prompt));
+	tty_write(tty_fd, prompt, strlen(prompt));
 
 	while (1) {
 		char c;
 		ssize_t n = read(tty_fd, &c, 1);
-		if (n <= 0)
-			break;
+		if (n <= 0) {
+			disable_raw();
+			return NULL;	/* EOF */
+		}
 
 		switch (c) {
 		case '\r':
 		case '\n':
-			write(tty_fd, "\r\n", 2);
+			tty_write(tty_fd, "\r\n", 2);
 			hist_add(buf);
-			save_history(history_path);
-			goto done;
+			disable_raw();
+			snprintf(line_buf, sizeof(line_buf), "%s", buf);
+			return line_buf;
 
 		case 3: /* Ctrl-C */
 			buf[0] = '\0';
 			pos = 0;
 			cursor = 0;
-			write(tty_fd, "\r\n", 2);
-			goto done;
+			tty_write(tty_fd, "\r\n", 2);
+			disable_raw();
+			line_buf[0] = '\0';
+			return line_buf;
 
 		case 4: /* Ctrl-D */
 			if (pos == 0) {
-				snprintf(buf, sizeof(buf), "exit");
-				pos = 4;
-				cursor = 4;
-				write(tty_fd, "\r\n", 2);
-				goto done;
+				tty_write(tty_fd, "\r\n", 2);
+				disable_raw();
+				return NULL;	/* EOF on empty line */
 			}
 			break;
 
@@ -684,14 +710,23 @@ int main(int argc, char *argv[])
 				break;
 			if (read(tty_fd, &seq[1], 1) <= 0)
 				break;
-			/* Handle CSI (\033[) and SS3 (\033O) prefixes */
+			/*
+			 * Handle both CSI (\033[) and SS3 (\033O)
+			 * prefixes. Some terminals (VT100 application
+			 * mode, QEMU console) send \033O for arrow
+			 * keys instead of \033[.
+			 */
 			if (seq[0] == '[' || seq[0] == 'O') {
 				if (seq[1] == 'A') { /* Up */
 					if (hist_idx == nhist)
-						snprintf(hist_saved, sizeof(hist_saved), "%s", buf);
+						snprintf(hist_saved,
+							 sizeof(hist_saved),
+							 "%s", buf);
 					if (hist_idx > 0) {
 						hist_idx--;
-						snprintf(buf, sizeof(buf), "%s", hist[hist_idx]);
+						snprintf(buf, sizeof(buf),
+							 "%s",
+							 hist[hist_idx]);
 						pos = (int)strlen(buf);
 						cursor = pos;
 						redraw(prompt, buf);
@@ -702,10 +737,16 @@ int main(int argc, char *argv[])
 					if (hist_idx < nhist) {
 						hist_idx++;
 						if (hist_idx == nhist) {
-							snprintf(buf, sizeof(buf), "%s", hist_saved);
+							snprintf(buf,
+								 sizeof(buf),
+								 "%s",
+								 hist_saved);
 							pos = (int)strlen(buf);
 						} else {
-							snprintf(buf, sizeof(buf), "%s", hist[hist_idx]);
+							snprintf(buf,
+								 sizeof(buf),
+								 "%s",
+								 hist[hist_idx]);
 							pos = (int)strlen(buf);
 						}
 						cursor = pos;
@@ -761,7 +802,7 @@ int main(int argc, char *argv[])
 		case 127:
 		case 8: /* Backspace */
 			if (cursor > 0) {
-				/* Handle UTF-8: find start of previous character */
+				/* Handle UTF-8: find start of previous char */
 				int prev = cursor - 1;
 				while (prev > 0 && (buf[prev] & 0xC0) == 0x80)
 					prev--;
@@ -778,8 +819,10 @@ int main(int argc, char *argv[])
 
 		case '\t': { /* Tab completion */
 			if (!tab_active) {
-				snprintf(tab_base, sizeof(tab_base), "%s", buf);
-				tab_count = tab_find_matches(tab_base, tab_matches, 64);
+				snprintf(tab_base, sizeof(tab_base),
+					 "%s", buf);
+				tab_count = tab_find_matches(tab_base,
+							     tab_matches, 64);
 				tab_idx = 0;
 				tab_active = 1;
 			} else {
@@ -789,7 +832,8 @@ int main(int argc, char *argv[])
 			if (tab_count > 0) {
 				if (tab_idx >= tab_count)
 					tab_idx = 0;
-				snprintf(buf, sizeof(buf), "%s", tab_matches[tab_idx]);
+				snprintf(buf, sizeof(buf), "%s",
+					 tab_matches[tab_idx]);
 				pos = (int)strlen(buf);
 				cursor = pos;
 				redraw(prompt, buf);
@@ -798,7 +842,7 @@ int main(int argc, char *argv[])
 		}
 
 		case '?': /* Help */
-			write(tty_fd, "\r\n", 2);
+			tty_write(tty_fd, "\r\n", 2);
 			show_help(buf);
 			redraw(prompt, buf);
 			tab_count = 0;
@@ -808,17 +852,23 @@ int main(int argc, char *argv[])
 		default:
 			/* Printable or UTF-8 */
 			if ((unsigned char)c >= 32) {
-				if (pos < MAX_LINE - 1) {
+				if (pos < CLI_MAX_LINE - 1) {
 					/* Check for UTF-8 multi-byte */
 					int bytes = 1;
-					if ((c & 0xE0) == 0xC0) bytes = 2;
-					else if ((c & 0xF0) == 0xE0) bytes = 3;
-					else if ((c & 0xF8) == 0xF0) bytes = 4;
+					if ((c & 0xE0) == 0xC0)
+						bytes = 2;
+					else if ((c & 0xF0) == 0xE0)
+						bytes = 3;
+					else if ((c & 0xF8) == 0xF0)
+						bytes = 4;
 
 					char ins[4];
 					ins[0] = c;
 					int got = 1;
-					for (int b = 1; b < bytes && pos + got < MAX_LINE - 1; b++) {
+					for (int b = 1;
+					     b < bytes &&
+					     pos + got < CLI_MAX_LINE - 1;
+					     b++) {
 						char cb;
 						if (read(tty_fd, &cb, 1) <= 0)
 							break;
@@ -826,11 +876,12 @@ int main(int argc, char *argv[])
 					}
 
 					/* Insert at cursor position */
-					if (pos + got < MAX_LINE) {
+					if (pos + got < CLI_MAX_LINE) {
 						memmove(buf + cursor + got,
 							buf + cursor,
 							(size_t)(pos - cursor + 1));
-						memcpy(buf + cursor, ins, (size_t)got);
+						memcpy(buf + cursor, ins,
+						       (size_t)got);
 						pos += got;
 						cursor += got;
 						redraw_at(prompt, buf, cursor);
@@ -842,13 +893,4 @@ int main(int argc, char *argv[])
 			break;
 		}
 	}
-
-done:
-	disable_raw();
-	dprintf(out_fd, "%s\n", buf);
-	if (tty_fd >= 0)
-		close(tty_fd);
-	if (out_fd >= 0)
-		close(out_fd);
-	return 0;
 }

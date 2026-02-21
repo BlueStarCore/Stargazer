@@ -7,7 +7,7 @@
  *   1. Receive username as argv[1]
  *   2. Prompt for password (stty -echo equivalent via termios)
  *   3. Authenticate via shadow + crypt(3)
- *   4. Check enforce-change-password policy from system.conf
+ *   4. Check enforce-change-password policy from SQLite database
  *   5. If enforced: prompt new password, update shadow, clear flag
  *   6. Audit log all events
  *   7. Drop privileges (setgid/setuid)
@@ -28,13 +28,14 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
 #include "password_policy.h"
+#include "sg_db.h"
 
-#define SYSTEM_CONF       "/etc/stargazer/system.conf"
 #define AUDIT_LOG         "/var/log/stargazer-audit.log"
 #define AUDIT_LOG_FALLBACK "/tmp/stargazer-audit.log"
 #define MAX_PASS_LEN      256
@@ -180,151 +181,33 @@ static int authenticate(const char *username, const char *password)
 	return strcmp(result, sp->sp_pwdp) == 0 ? 0 : -1;
 }
 
-/* ── Minimal INI parser for system.conf ─────────────────────────────────── */
-
-static int read_ini_value(const char *file, const char *section,
-			  const char *key, char *out, size_t outlen)
-{
-	FILE *fp = fopen(file, "r");
-	if (!fp)
-		return -1;
-
-	char line[MAX_LINE_LEN];
-	char sec_header[MAX_LINE_LEN + 3]; /* room for '[', ']', '\0' */
-	int in_section = 0;
-
-	snprintf(sec_header, sizeof(sec_header), "[%s]", section);
-
-	while (fgets(line, sizeof(line), fp)) {
-		/* Strip newline */
-		size_t len = strlen(line);
-		if (len > 0 && line[len - 1] == '\n')
-			line[len - 1] = '\0';
-
-		if (strcmp(line, sec_header) == 0) {
-			in_section = 1;
-			continue;
-		}
-		if (line[0] == '[') {
-			if (in_section)
-				break;
-			continue;
-		}
-		if (!in_section)
-			continue;
-		if (line[0] == '#' || line[0] == '\0')
-			continue;
-
-		/* Check for key= match */
-		size_t klen = strlen(key);
-		if (strncmp(line, key, klen) == 0 && line[klen] == '=') {
-			const char *val = line + klen + 1;
-			size_t vlen = strlen(val);
-			if (vlen >= outlen)
-				vlen = outlen - 1;
-			memcpy(out, val, vlen);
-			out[vlen] = '\0';
-			fclose(fp);
-			return 0;
-		}
-	}
-
-	fclose(fp);
-	return -1;
-}
-
-static int write_ini_value(const char *file, const char *section,
-			   const char *key, const char *value)
-{
-	FILE *fp = fopen(file, "r");
-	if (!fp)
-		return -1;
-
-	char tmppath[MAX_LINE_LEN];
-	snprintf(tmppath, sizeof(tmppath), "%s.XXXXXX", file);
-	int tfd = mkstemp(tmppath);
-	if (tfd < 0) {
-		fclose(fp);
-		return -1;
-	}
-	fchmod(tfd, 0640);
-	FILE *out = fdopen(tfd, "w");
-	if (!out) {
-		close(tfd);
-		unlink(tmppath);
-		fclose(fp);
-		return -1;
-	}
-
-	char line[MAX_LINE_LEN];
-	char sec_header[MAX_LINE_LEN + 3]; /* room for '[', ']', '\0' */
-	int in_section = 0;
-	int key_written = 0;
-
-	snprintf(sec_header, sizeof(sec_header), "[%s]", section);
-
-	while (fgets(line, sizeof(line), fp)) {
-		size_t len = strlen(line);
-		/* Make a copy without newline for comparison */
-		char trimmed[MAX_LINE_LEN];
-		snprintf(trimmed, sizeof(trimmed), "%s", line);
-		if (len > 0 && trimmed[len - 1] == '\n')
-			trimmed[len - 1] = '\0';
-
-		if (strcmp(trimmed, sec_header) == 0) {
-			in_section = 1;
-			fputs(line, out);
-			continue;
-		}
-		if (trimmed[0] == '[') {
-			/* Leaving section — write key if not yet written */
-			if (in_section && !key_written) {
-				fprintf(out, "%s=%s\n", key, value);
-				key_written = 1;
-			}
-			in_section = 0;
-			fputs(line, out);
-			continue;
-		}
-		if (in_section) {
-			size_t klen = strlen(key);
-			if (strncmp(trimmed, key, klen) == 0 && trimmed[klen] == '=') {
-				fprintf(out, "%s=%s\n", key, value);
-				key_written = 1;
-				continue; /* skip old line */
-			}
-		}
-		fputs(line, out);
-	}
-
-	/* If section was the last one and key wasn't written */
-	if (in_section && !key_written)
-		fprintf(out, "%s=%s\n", key, value);
-
-	fclose(fp);
-	fclose(out);
-
-	if (rename(tmppath, file) != 0) {
-		unlink(tmppath);
-		return -1;
-	}
-	chmod(file, 0640);
-	return 0;
-}
-
 /* ── Shadow update (atomic tmpfile + rename) ────────────────────────────── */
 
 static int update_shadow(const char *username, const char *hash)
 {
-	FILE *fp = fopen("/etc/shadow", "r");
-	if (!fp)
+	/* Acquire advisory lock for shadow file manipulation */
+	int lockfd = open("/etc/shadow.lock", O_CREAT | O_RDWR, 0600);
+	if (lockfd < 0)
 		return -1;
+	if (flock(lockfd, LOCK_EX) != 0) {
+		close(lockfd);
+		return -1;
+	}
+
+	FILE *fp = fopen("/etc/shadow", "r");
+	if (!fp) {
+		flock(lockfd, LOCK_UN);
+		close(lockfd);
+		return -1;
+	}
 
 	char tmppath[64];
 	snprintf(tmppath, sizeof(tmppath), "/etc/shadow.XXXXXX");
 	int tfd = mkstemp(tmppath);
 	if (tfd < 0) {
 		fclose(fp);
+		flock(lockfd, LOCK_UN);
+		close(lockfd);
 		return -1;
 	}
 	fchmod(tfd, 0640);
@@ -333,6 +216,8 @@ static int update_shadow(const char *username, const char *hash)
 		close(tfd);
 		unlink(tmppath);
 		fclose(fp);
+		flock(lockfd, LOCK_UN);
+		close(lockfd);
 		return -1;
 	}
 
@@ -359,13 +244,19 @@ static int update_shadow(const char *username, const char *hash)
 
 	if (!found) {
 		unlink(tmppath);
+		flock(lockfd, LOCK_UN);
+		close(lockfd);
 		return -1;
 	}
 
 	if (rename(tmppath, "/etc/shadow") != 0) {
 		unlink(tmppath);
+		flock(lockfd, LOCK_UN);
+		close(lockfd);
 		return -1;
 	}
+	flock(lockfd, LOCK_UN);
+	close(lockfd);
 	return 0;
 }
 
@@ -405,13 +296,12 @@ static int generate_salt(char *salt, size_t saltlen)
 /* ── Password policy ────────────────────────────────────────────────────── */
 
 /*
- * Read global password policy from system.conf [system_password-policy].
+ * Read global password policy from SQLite (system_password-policy).
  * Missing keys default to 0 (no requirement).
  */
 static void read_password_policy(struct password_policy *pol)
 {
-	char val[64];
-	const char *section = "system_password-policy";
+	char *v;
 
 	pol->min_length = 0;
 	pol->min_uppercase = 0;
@@ -419,17 +309,16 @@ static void read_password_policy(struct password_policy *pol)
 	pol->min_digit = 0;
 	pol->min_special = 0;
 
-	int v;
-	if (read_ini_value(SYSTEM_CONF, section, "min-length", val, sizeof(val)) == 0)
-		{ v = atoi(val); pol->min_length = (v > 0) ? v : 0; }
-	if (read_ini_value(SYSTEM_CONF, section, "min-uppercase", val, sizeof(val)) == 0)
-		{ v = atoi(val); pol->min_uppercase = (v > 0) ? v : 0; }
-	if (read_ini_value(SYSTEM_CONF, section, "min-lowercase", val, sizeof(val)) == 0)
-		{ v = atoi(val); pol->min_lowercase = (v > 0) ? v : 0; }
-	if (read_ini_value(SYSTEM_CONF, section, "min-digit", val, sizeof(val)) == 0)
-		{ v = atoi(val); pol->min_digit = (v > 0) ? v : 0; }
-	if (read_ini_value(SYSTEM_CONF, section, "min-special", val, sizeof(val)) == 0)
-		{ v = atoi(val); pol->min_special = (v > 0) ? v : 0; }
+	v = sg_db_get_val("system_password-policy", "0", "min-length");
+	if (v) { int n = atoi(v); pol->min_length = (n > 0) ? n : 0; free(v); }
+	v = sg_db_get_val("system_password-policy", "0", "min-uppercase");
+	if (v) { int n = atoi(v); pol->min_uppercase = (n > 0) ? n : 0; free(v); }
+	v = sg_db_get_val("system_password-policy", "0", "min-lowercase");
+	if (v) { int n = atoi(v); pol->min_lowercase = (n > 0) ? n : 0; free(v); }
+	v = sg_db_get_val("system_password-policy", "0", "min-digit");
+	if (v) { int n = atoi(v); pol->min_digit = (n > 0) ? n : 0; free(v); }
+	v = sg_db_get_val("system_password-policy", "0", "min-special");
+	if (v) { int n = atoi(v); pol->min_special = (n > 0) ? n : 0; free(v); }
 }
 
 /*
@@ -438,15 +327,14 @@ static void read_password_policy(struct password_policy *pol)
  */
 static int is_password_policy_enforced(const char *username)
 {
-	char section[MAX_LINE_LEN];
-	char val[64];
-
-	snprintf(section, sizeof(section), "system_admin:%s", username);
-	if (read_ini_value(SYSTEM_CONF, section, "enforce-password-policy",
-			   val, sizeof(val)) != 0)
+	char *val = sg_db_get_val("system_admin", username,
+				  "enforce-password-policy");
+	if (!val)
 		return 0; /* key missing → not enforced */
 
-	return (strcmp(val, "enable") == 0) ? 1 : 0;
+	int enforced = (strcmp(val, "enable") == 0) ? 1 : 0;
+	free(val);
+	return enforced;
 }
 
 /* ── Password change core ──────────────────────────────────────────────── */
@@ -544,15 +432,14 @@ static int force_password_change(const char *username, int eff_min_len,
 
 static int enforce_password_change(const char *username)
 {
-	char val[64];
-	char section[MAX_LINE_LEN];
-	snprintf(section, sizeof(section), "system_admin:%s", username);
-
-	if (read_ini_value(SYSTEM_CONF, section,
-			   "enforce-change-password", val, sizeof(val)) != 0)
+	char *val = sg_db_get_val("system_admin", username,
+				  "enforce-change-password");
+	if (!val)
 		return 0; /* no key → skip */
 
-	if (strcmp(val, "enable") != 0)
+	int need_change = (strcmp(val, "enable") == 0);
+	free(val);
+	if (!need_change)
 		return 0;
 
 	/* Read password policy for requirements */
@@ -577,8 +464,8 @@ static int enforce_password_change(const char *username)
 		return rc;
 
 	/* Clear admin-controlled enforce flag */
-	write_ini_value(SYSTEM_CONF, section,
-			"enforce-change-password", "disable");
+	sg_db_set_val("system_admin", username,
+		      "enforce-change-password", "disable");
 
 	audit_log(username, "password_force_change", "source=admin-flag");
 	return 0;
@@ -626,6 +513,12 @@ int main(int argc, char *argv[])
 	install_sigint_handler();
 	signal(SIGQUIT, SIG_IGN);
 
+	/* Open config database (read password policy, enforce flags) */
+	if (sg_db_open(SG_DB_PATH) != 0) {
+		fprintf(stderr, "stargazer-logind: failed to open config database\n");
+		return 1;
+	}
+
 	/* Authenticate */
 	char password[MAX_PASS_LEN];
 	int pw_rc = read_password("Password: ", password, sizeof(password));
@@ -669,15 +562,15 @@ int main(int argc, char *argv[])
 	 * Read admin flag BEFORE calling enforce_password_change so we
 	 * know whether it will actually trigger a change or just skip.
 	 */
-	char epc_val[64];
-	char epc_section[MAX_LINE_LEN];
 	int admin_flag_set = 0;
-	snprintf(epc_section, sizeof(epc_section), "system_admin:%s", username);
-	if (read_ini_value(SYSTEM_CONF, epc_section,
-			   "enforce-change-password", epc_val,
-			   sizeof(epc_val)) == 0) {
-		if (strcmp(epc_val, "enable") == 0)
-			admin_flag_set = 1;
+	{
+		char *epc_val = sg_db_get_val("system_admin", username,
+					      "enforce-change-password");
+		if (epc_val) {
+			if (strcmp(epc_val, "enable") == 0)
+				admin_flag_set = 1;
+			free(epc_val);
+		}
 	}
 
 	/*
@@ -714,6 +607,9 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 	}
+
+	/* Close config database before dropping privileges */
+	sg_db_close();
 
 	/* Restore signals */
 	signal(SIGINT, SIG_DFL);

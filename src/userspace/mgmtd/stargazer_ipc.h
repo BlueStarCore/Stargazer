@@ -17,7 +17,9 @@
 #include <stdint.h>
 
 /* ── Socket path ────────────────────────────────────────────────────────── */
+#ifndef SG_MGMTD_SOCK
 #define SG_MGMTD_SOCK   "/run/stargazer-mgmtd.sock"
+#endif
 
 /* ── Status codes ───────────────────────────────────────────────────────── */
 typedef enum {
@@ -72,6 +74,7 @@ typedef enum {
 	SG_CMD_ADMIN_SET_PW  = 302,   /* Set admin password              */
 	SG_CMD_ADMIN_SET_ENF = 303,   /* Set enforce-change-password     */
 	SG_CMD_ADMIN_CHECK_PW = 304,  /* Validate password against policy */
+	SG_CMD_ADMIN_LOCK_PW  = 305,  /* Lock (invalidate) admin password */
 
 	/* Session/auth (4xx) */
 	SG_CMD_SESSION_REV   = 400,   /* Get session revision for user   */
@@ -89,6 +92,7 @@ typedef enum {
 	SG_CMD_SHOW_IFACES   = 611,
 	SG_CMD_SHOW_ROUTES   = 612,
 	SG_CMD_SHOW_CONFIG   = 613,
+	SG_CMD_SHOW_STATS    = 614,
 	SG_CMD_WHOAMI        = 620,   /* Get caller's profile+permissions */
 
 	/* Keepalive / ping (9xx) */
