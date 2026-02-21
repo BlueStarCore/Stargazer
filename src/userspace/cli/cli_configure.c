@@ -2,7 +2,7 @@
 /*
  * cli_configure.c — Interactive configure mode for Stargazer CLI
  *
- * C translation of cmd_configure (698 lines shell).
+ * C translation of cmd_configure.
  * Three context types: table (show/edit/delete/end),
  * entry (set/unset/show/get/next/end/abort),
  * single (set/unset/show/get/end/abort).
@@ -662,7 +662,12 @@ static int context_entry(const char *type_name, const char *label,
 		char *trimmed = trim(linebuf);
 		if (!*trimmed) continue;
 
-		parse_line(trimmed, cmd, sizeof(cmd),
+		char resolved[CLI_MAX_LINE];
+		if (cli_resolve_cmd(trimmed, resolved,
+				    sizeof(resolved)) != 0)
+			continue;
+
+		parse_line(resolved, cmd, sizeof(cmd),
 			   key, sizeof(key), val, sizeof(val));
 
 		if (strcmp(cmd, "set") == 0) {
@@ -904,7 +909,12 @@ static int context_table(const char *type_name, const char *label)
 		char *trimmed = trim(linebuf);
 		if (!*trimmed) continue;
 
-		parse_line(trimmed, cmd, sizeof(cmd),
+		char resolved[CLI_MAX_LINE];
+		if (cli_resolve_cmd(trimmed, resolved,
+				    sizeof(resolved)) != 0)
+			continue;
+
+		parse_line(resolved, cmd, sizeof(cmd),
 			   arg, sizeof(arg), dummy, sizeof(dummy));
 
 		if (strcmp(cmd, "show") == 0) {
@@ -1125,7 +1135,12 @@ static int context_single(const char *type_name, const char *label)
 		char *trimmed = trim(linebuf);
 		if (!*trimmed) continue;
 
-		parse_line(trimmed, cmd, sizeof(cmd),
+		char resolved[CLI_MAX_LINE];
+		if (cli_resolve_cmd(trimmed, resolved,
+				    sizeof(resolved)) != 0)
+			continue;
+
+		parse_line(resolved, cmd, sizeof(cmd),
 			   key, sizeof(key), val, sizeof(val));
 
 		if (strcmp(cmd, "set") == 0) {

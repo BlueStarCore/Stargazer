@@ -1755,6 +1755,13 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		}
 		free(existing);
 
+		/* Block self-deletion */
+		if (strcmp(target, user) == 0) {
+			send_error(client_fd, SG_ERR_IN_USE,
+				   "Cannot delete your own account");
+			return;
+		}
+
 		sg_db_del("system_admin", target);
 		delete_system_user(target);
 		session_rev_bump(target);

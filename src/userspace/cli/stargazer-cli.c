@@ -1,11 +1,8 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * stargazer-cli.c — Main entry point for Stargazer NGFW CLI
- *
- * Replaces the shell-based stargazer-cli with a C binary.
  * Zero forks in the interactive loop (readline + dispatch are in-process).
- * Non-interactive command handlers (show, execute, system) are still
- * shell scripts called via fork+exec.
+ * Only low-level system queries (ip, dmesg, etc.) fork external binaries.
  *
  * Build: aarch64-linux-musl-gcc -static -DVERSION=\"x.y.z\" ...
  */
@@ -129,8 +126,6 @@ int main(void)
 	/* 7. Session tracking */
 	int session_rev_start = get_session_rev(user);
 	int session_rev_cached = session_rev_start;
-	int cmd_count = 0;
-	int force_session_check = 0;
 
 	/* 8. Main loop */
 	const char *line;
@@ -153,43 +148,45 @@ int main(void)
 		if (len == 0)
 			continue;
 
-		/* Session check (every command) */
-		cmd_count++;
-		if (cmd_count >= 1 || force_session_check) {
-			cmd_count = 0;
-			force_session_check = 0;
-			session_rev_cached = get_session_rev(user);
-			if (session_rev_cached != session_rev_start) {
-				printf("  Session expired due to account/profile change.\n");
-				printf("  Please login again.\n");
-				break;
-			}
+		/* Resolve abbreviated commands */
+		char resolved[CLI_MAX_LINE];
+		if (cli_resolve_cmd(trimmed, resolved,
+				    sizeof(resolved)) != 0)
+			continue;
+
+		/* Session check — detect external account/profile changes */
+		session_rev_cached = get_session_rev(user);
+		if (session_rev_cached != session_rev_start) {
+			printf("  Session expired due to account/profile change.\n");
+			printf("  Please login again.\n");
+			break;
 		}
 
 		/* Extract command and args (zero forks) */
 		char cmd[CLI_MAX_LINE];
 		const char *args = "";
-		const char *sp = strchr(trimmed, ' ');
+		const char *sp = strchr(resolved, ' ');
 		if (sp) {
-			size_t clen = (size_t)(sp - trimmed);
+			size_t clen = (size_t)(sp - resolved);
 			if (clen >= sizeof(cmd))
 				clen = sizeof(cmd) - 1;
-			memcpy(cmd, trimmed, clen);
+			memcpy(cmd, resolved, clen);
 			cmd[clen] = '\0';
 			args = sp + 1;
 			while (*args == ' ')
 				args++;
 		} else {
-			snprintf(cmd, sizeof(cmd), "%s", trimmed);
+			snprintf(cmd, sizeof(cmd), "%s", resolved);
 		}
 
 		/* Dispatch */
 		int rc = dispatch_command(cmd, args, permissions);
 
-		/* Force session recheck after configure or execute */
+		/* Refresh session baseline after commands that modify config */
 		if (strcmp(cmd, "configure") == 0 ||
-		    strcmp(cmd, "execute") == 0)
-			force_session_check = 1;
+		    strcmp(cmd, "execute") == 0) {
+			session_rev_start = get_session_rev(user);
+		}
 
 		if (rc != 0)
 			break;

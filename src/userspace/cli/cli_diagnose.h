@@ -6,6 +6,13 @@
 #ifndef CLI_DIAGNOSE_H
 #define CLI_DIAGNOSE_H
 
+/* ── ANSI colors (shared by cli_diagnose.c and cli_diagnose_config.c) ── */
+
+#define C_GREEN  "\033[0;32m"
+#define C_RED    "\033[0;31m"
+#define C_CYAN   "\033[0;36m"
+#define C_NC     "\033[0m"
+
 /*
  * Run IPC permission model diagnostics.
  *   mode=0: self-test (verify current user's access matches permissions)

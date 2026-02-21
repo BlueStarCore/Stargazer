@@ -25,13 +25,6 @@ static int diag_pass;
 static int diag_fail;
 static int diag_total;
 
-/* ── ANSI colors ───────────────────────────────────────────────────────── */
-
-#define C_GREEN  "\033[0;32m"
-#define C_RED    "\033[0;31m"
-#define C_CYAN   "\033[0;36m"
-#define C_NC     "\033[0m"
-
 /* ── Test helpers ──────────────────────────────────────────────────────── */
 
 /*
@@ -563,9 +556,9 @@ static void diag_security_tests(void)
 			 SG_OK);
 
 	/* Admin self-delete blocked */
-	diag_test_status("Admin self-delete blocked",
-			 SG_CMD_ADMIN_DELETE, diag_username(),
-			 SG_ERR_BUILTIN);
+	diag_test_status2("Admin self-delete blocked",
+			  SG_CMD_ADMIN_DELETE, diag_username(),
+			  SG_ERR_BUILTIN, SG_ERR_IN_USE);
 
 	/* Session bump for self */
 	diag_test_status("Session bump for self",
@@ -994,6 +987,8 @@ int cli_diagnose_test_permissions(int mode, const char *permissions)
 	printf("\n  Results: %d/%d passed", diag_pass, diag_total);
 	if (diag_fail > 0)
 		printf(C_RED ", %d FAILED" C_NC, diag_fail);
+	else
+		printf(C_GREEN " (all passed)" C_NC);
 	printf("\n\n");
 
 	return diag_fail > 0 ? 1 : 0;

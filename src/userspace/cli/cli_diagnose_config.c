@@ -12,6 +12,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "cli_diagnose.h"
+#include "cli_readline.h"
 #include "cli_ipc.h"
 #include "sg_validate.h"
 
@@ -23,14 +24,6 @@
 static int tc_pass;
 static int tc_fail;
 static int tc_total;
-
-/* ── ANSI colors ──────────────────────────────────────────────────────── */
-
-#define C_GREEN  "\033[0;32m"
-#define C_RED    "\033[0;31m"
-#define C_CYAN   "\033[0;36m"
-#define C_YELLOW "\033[0;33m"
-#define C_NC     "\033[0m"
 
 /* ── Generic assertion helper ─────────────────────────────────────────── */
 
@@ -680,7 +673,224 @@ static void test_value_validation(void)
 		 sg_reg_validate_value("firewall_policy", "comment", "$(whoami)"), 1);
 }
 
-/* ── Section 13: IPC validation (full mode) ───────────────────────────── */
+/* ── Section 13: command abbreviation resolution ──────────────────────── */
+
+static void tc_resolve(const char *desc, const char *input,
+		       int expect_rc, const char *expect_out)
+{
+	char output[CLI_MAX_LINE];
+
+	output[0] = '\0';
+	tc_total++;
+
+	int rc = cli_resolve_cmd(input, output, sizeof(output));
+
+	if (rc != expect_rc) {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC " [cmd-abbr] %s"
+		       " (rc=%d, expected %d)\n",
+		       desc, rc, expect_rc);
+		return;
+	}
+
+	if (expect_rc == 0 && strcmp(output, expect_out) != 0) {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC " [cmd-abbr] %s"
+		       " (got '%s', expected '%s')\n",
+		       desc, output, expect_out);
+		return;
+	}
+
+	tc_pass++;
+	printf(C_GREEN "  PASS" C_NC " [cmd-abbr] %s\n", desc);
+}
+
+static void test_cmd_resolve(void)
+{
+	printf(C_CYAN "\n  --- command abbreviation resolution ---"
+	       C_NC "\n");
+
+	/* Save current completions, start fresh for test */
+	cli_push();
+
+	/* Register a typical top-level command set */
+	cli_register("execute system shutdown",
+		     "Shutdown the system");
+	cli_register("execute system reboot",
+		     "Reboot the system");
+	cli_register("exit", "Exit CLI");
+	cli_register("show status", "Show system status");
+	cli_register("show config", "Show running config");
+	cli_register("show configure",
+		     "Show config mode options");
+	cli_register("configure system admin",
+		     "Admin user config");
+	cli_register("configure system admin-profile",
+		     "Admin profile config");
+	cli_register("configure system settings",
+		     "System settings");
+	cli_register("configure firewall policy",
+		     "Firewall policy");
+	cli_register("help", "Show help");
+	cli_register("set hostname", "Set device hostname");
+
+	/* ── Basic expansion ──────────────────────────────── */
+
+	tc_resolve("expand 'exe sys shut'",
+		   "exe sys shut", 0,
+		   "execute system shutdown");
+	tc_resolve("expand 'exe sys re'",
+		   "exe sys re", 0,
+		   "execute system reboot");
+	tc_resolve("expand 'h' -> help",
+		   "h", 0, "help");
+	tc_resolve("expand 'exi' -> exit",
+		   "exi", 0, "exit");
+	tc_resolve("expand 'sh sta' -> show status",
+		   "sh sta", 0, "show status");
+	tc_resolve("expand 'con fi po'",
+		   "con fi po", 0,
+		   "configure firewall policy");
+	tc_resolve("expand 'con sys se'",
+		   "con sys se", 0,
+		   "configure system settings");
+
+	/* ── Exact match priority ─────────────────────────── */
+
+	tc_resolve("exact 'admin' beats 'admin-profile'",
+		   "con sys admin", 0,
+		   "configure system admin");
+	tc_resolve("full command unchanged",
+		   "execute system shutdown", 0,
+		   "execute system shutdown");
+	tc_resolve("exact single word 'help'",
+		   "help", 0, "help");
+	tc_resolve("exact single word 'exit'",
+		   "exit", 0, "exit");
+
+	/* ── Ambiguity detection ──────────────────────────── */
+
+	tc_resolve("ambiguous 'ex' -> execute/exit",
+		   "ex", -1, NULL);
+	tc_resolve("ambiguous 'con sys adm'",
+		   "con sys adm", -1, NULL);
+	tc_resolve("ambiguous 'sh conf'",
+		   "sh conf", -1, NULL);
+
+	/* ── Hyphenated prefix ────────────────────────────── */
+
+	tc_resolve("prefix 'admin-' -> admin-profile",
+		   "con sys admin-", 0,
+		   "configure system admin-profile");
+	tc_resolve("prefix 'admin-p' -> admin-profile",
+		   "con sys admin-p", 0,
+		   "configure system admin-profile");
+
+	/* ── Longer prefix resolves ambiguity ─────────────── */
+
+	tc_resolve("'sh configu' -> show configure",
+		   "sh configu", 0, "show configure");
+	tc_resolve("'exe' unique (not exit)",
+		   "exe", 0, "execute");
+
+	/* ── Value passthrough ────────────────────────────── */
+
+	tc_resolve("value passthrough 'se hos stargazer'",
+		   "se hos stargazer", 0,
+		   "set hostname stargazer");
+	tc_resolve("dotted value 'se hos fw.example.com'",
+		   "se hos fw.example.com", 0,
+		   "set hostname fw.example.com");
+	tc_resolve("multi value passthrough",
+		   "se hos first second third", 0,
+		   "set hostname first second third");
+
+	/* ── Edge cases ───────────────────────────────────── */
+
+	tc_resolve("empty input",
+		   "", 0, "");
+	tc_resolve("unregistered word passes through",
+		   "nonexistent", 0, "nonexistent");
+	tc_resolve("unregistered + trailing pass through",
+		   "nonexistent foo bar", 0,
+		   "nonexistent foo bar");
+
+	/* ── Push/pop: configure entry context ────────────── */
+
+	printf(C_CYAN "\n  --- cmd-abbr: configure entry context ---"
+	       C_NC "\n");
+
+	cli_push();
+	cli_register("set hostname", "Set hostname");
+	cli_register("set status", "Set status");
+	cli_register("show", "Show parameters");
+	cli_register("get hostname", "Get hostname");
+	cli_register("get status", "Get status");
+	cli_register("unset hostname", "Unset hostname");
+	cli_register("unset status", "Unset status");
+	cli_register("end", "Save and exit");
+	cli_register("abort", "Discard and exit");
+	cli_register("next", "Save and continue");
+
+	tc_resolve("ctx: 'se hos myhost'",
+		   "se hos myhost", 0,
+		   "set hostname myhost");
+	tc_resolve("ctx: 'sh' -> show",
+		   "sh", 0, "show");
+	tc_resolve("ctx: 'g hos' -> get hostname",
+		   "g hos", 0, "get hostname");
+	tc_resolve("ctx: 'un hos' -> unset hostname",
+		   "un hos", 0, "unset hostname");
+	tc_resolve("ctx: 'en' -> end",
+		   "en", 0, "end");
+	tc_resolve("ctx: 'ab' -> abort",
+		   "ab", 0, "abort");
+	tc_resolve("ctx: 'ne' -> next",
+		   "ne", 0, "next");
+	tc_resolve("ctx: ambiguous 's' -> set/show",
+		   "s", -1, NULL);
+	tc_resolve("ctx: 'se sta enable' passthrough",
+		   "se sta enable", 0,
+		   "set status enable");
+
+	cli_pop();
+
+	/* ── Push/pop: configure table context ────────────── */
+
+	printf(C_CYAN "\n  --- cmd-abbr: configure table context ---"
+	       C_NC "\n");
+
+	cli_push();
+	cli_register("show", "Show entries");
+	cli_register("edit <id>", "Edit entry");
+	cli_register("delete <id>", "Delete entry");
+	cli_register("end", "Exit context");
+
+	tc_resolve("table: 'sh' -> show",
+		   "sh", 0, "show");
+	tc_resolve("table: 'ed myid' passthrough",
+		   "ed myid", 0, "edit myid");
+	tc_resolve("table: 'de myid' passthrough",
+		   "de myid", 0, "delete myid");
+	tc_resolve("table: 'en' -> end",
+		   "en", 0, "end");
+	tc_resolve("table: ambiguous 'e' -> edit/end",
+		   "e", -1, NULL);
+
+	cli_pop();
+
+	/* Verify top-level context was restored */
+	tc_resolve("post-pop: 'h' -> help restored",
+		   "h", 0, "help");
+	tc_resolve("post-pop: 'exe sys shut' still works",
+		   "exe sys shut", 0,
+		   "execute system shutdown");
+
+	/* Restore original CLI completions */
+	cli_pop();
+}
+
+/* ── Section 14: IPC validation (full mode) ───────────────────────────── */
 
 /*
  * ipc_check — send IPC request and check status matches expected.
@@ -830,7 +1040,7 @@ static void test_ipc_builtin_protect(void)
 		  SG_ERR_BUILTIN);
 }
 
-/* ── Section 14: IPC round-trip (full mode) ───────────────────────────── */
+/* ── Section 15: IPC round-trip (full mode) ───────────────────────────── */
 
 static void test_ipc_roundtrip(void)
 {
@@ -970,7 +1180,7 @@ static void test_ipc_roundtrip(void)
 	ipc_resp_free(&resp);
 }
 
-/* ── Section 15: IPC static route round-trip with apply ───────────────── */
+/* ── Section 16: IPC static route round-trip with apply ───────────────── */
 
 static void test_ipc_apply(void)
 {
@@ -1021,7 +1231,7 @@ static void test_ipc_apply(void)
 	ipc_resp_free(&resp);
 }
 
-/* ── Section 16: Nonexistent entry operations ─────────────────────────── */
+/* ── Section 17: Nonexistent entry operations ─────────────────────────── */
 
 static void test_ipc_not_found(void)
 {
@@ -1078,6 +1288,7 @@ int cli_diagnose_test_configure(int mode)
 	test_entry_id();
 	test_registry();
 	test_value_validation();
+	test_cmd_resolve();
 
 	if (mode == 1) {
 		/* Full mode: IPC round-trip tests */

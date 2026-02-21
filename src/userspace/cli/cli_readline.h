@@ -11,6 +11,8 @@
 #ifndef CLI_READLINE_H
 #define CLI_READLINE_H
 
+#include <stddef.h>
+
 #define CLI_MAX_LINE   4096
 #define CLI_MAX_COMPS  1024
 #define CLI_MAX_HIST   100
@@ -44,6 +46,12 @@ void cli_print_help(void);
  * Buffer is null-terminated, no trailing newline.
  */
 const char *cli_readline(const char *prompt);
+
+/*
+ * Resolve abbreviated commands against the completion registry.
+ * Returns 0 on success (output filled), -1 on ambiguity (error printed).
+ */
+int cli_resolve_cmd(const char *input, char *output, size_t out_sz);
 
 /* History management. */
 void cli_hist_load(const char *file);

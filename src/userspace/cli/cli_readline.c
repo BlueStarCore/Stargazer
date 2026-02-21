@@ -590,6 +590,146 @@ void cli_hist_save(const char *file)
 		unlink(tmppath);
 }
 
+/* ── Abbreviation resolution ──────────────────────────────────────────── */
+
+int cli_resolve_cmd(const char *input, char *output, size_t out_sz)
+{
+	int nwords = word_count(input);
+
+	if (nwords == 0) {
+		if (out_sz > 0)
+			output[0] = '\0';
+		return 0;
+	}
+
+	char resolved[CLI_MAX_LINE];
+	size_t rpos = 0;
+
+	resolved[0] = '\0';
+
+	for (int depth = 1; depth <= nwords; depth++) {
+		int iwlen;
+		const char *iw = nth_word(input, depth, &iwlen);
+
+		if (!iw || iwlen == 0)
+			break;
+
+		/* Collect unique candidate words at this depth */
+		char cands[64][64];
+		int ncands = 0;
+		int exact = 0;
+		char exact_word[64];
+
+		for (int i = 0; i < current_comps.count; i++) {
+			/* Words 1..depth-1 must match resolved prefix */
+			int prefix_ok = 1;
+
+			for (int d = 1; d < depth; d++) {
+				int rwlen, ewlen;
+				const char *rw = nth_word(resolved,
+							  d, &rwlen);
+				const char *ew = nth_word(
+					current_comps.entries[i].path,
+					d, &ewlen);
+
+				if (!rw || !ew || rwlen != ewlen ||
+				    strncmp(rw, ew,
+					    (size_t)rwlen) != 0) {
+					prefix_ok = 0;
+					break;
+				}
+			}
+			if (!prefix_ok)
+				continue;
+
+			int ewlen;
+			const char *ew = nth_word(
+				current_comps.entries[i].path,
+				depth, &ewlen);
+
+			if (!ew || ewlen == 0)
+				continue;
+
+			/* Exact match takes priority */
+			if (ewlen == iwlen &&
+			    strncmp(ew, iw, (size_t)iwlen) == 0) {
+				exact = 1;
+				int cl = ewlen < 63 ? ewlen : 63;
+				memcpy(exact_word, ew, (size_t)cl);
+				exact_word[cl] = '\0';
+				break;
+			}
+
+			/* Prefix match */
+			if (ewlen > iwlen &&
+			    strncmp(ew, iw, (size_t)iwlen) == 0) {
+				char cand[64];
+				int cl = ewlen < 63 ? ewlen : 63;
+				memcpy(cand, ew, (size_t)cl);
+				cand[cl] = '\0';
+
+				int dup = 0;
+				for (int j = 0; j < ncands; j++) {
+					if (strcmp(cands[j], cand) == 0) {
+						dup = 1;
+						break;
+					}
+				}
+				if (!dup && ncands < 64)
+					snprintf(cands[ncands++], 64,
+						 "%s", cand);
+			}
+		}
+
+		if (exact) {
+			if (rpos > 0)
+				resolved[rpos++] = ' ';
+			size_t wl = strlen(exact_word);
+			if (rpos + wl < sizeof(resolved)) {
+				memcpy(resolved + rpos, exact_word, wl);
+				rpos += wl;
+			}
+			resolved[rpos] = '\0';
+		} else if (ncands == 1) {
+			if (rpos > 0)
+				resolved[rpos++] = ' ';
+			size_t wl = strlen(cands[0]);
+			if (rpos + wl < sizeof(resolved)) {
+				memcpy(resolved + rpos, cands[0], wl);
+				rpos += wl;
+			}
+			resolved[rpos] = '\0';
+		} else if (ncands > 1) {
+			printf("  Ambiguous command: '%.*s',"
+			       " could be:", iwlen, iw);
+			for (int j = 0; j < ncands; j++)
+				printf(" %s", cands[j]);
+			printf("\n");
+			return -1;
+		} else {
+			/* No match — pass through remaining words */
+			for (int d = depth; d <= nwords; d++) {
+				int wl;
+				const char *w = nth_word(input, d, &wl);
+				if (!w)
+					break;
+				if (rpos > 0)
+					resolved[rpos++] = ' ';
+				if (rpos + (size_t)wl < sizeof(resolved)) {
+					memcpy(resolved + rpos,
+					       w, (size_t)wl);
+					rpos += (size_t)wl;
+				}
+				resolved[rpos] = '\0';
+			}
+			break;
+		}
+	}
+
+	snprintf(output, out_sz, "%s", resolved);
+	return 0;
+}
+
 /* ── Main readline loop ──────────────────────────────────────────────── */
 
 const char *cli_readline(const char *prompt)
