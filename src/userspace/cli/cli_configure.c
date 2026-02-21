@@ -11,12 +11,12 @@
  * In-memory key=value buffer replaces temp files.
  */
 
-#define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE
 
 #include "cli_configure.h"
 #include "cli_readline.h"
 #include "cli_ipc.h"
-#include "cli_registry.h"
+#include "sg_validate.h"
 
 #include <fcntl.h>
 #include <stdio.h>
@@ -57,13 +57,13 @@ static const char *kv_get(const struct kv_buf *b, const char *key)
 	return NULL;
 }
 
-static void kv_set(struct kv_buf *b, const char *key, const char *val)
+static int kv_set(struct kv_buf *b, const char *key, const char *val)
 {
 	for (int i = 0; i < b->count; i++) {
 		if (strcmp(b->entries[i].key, key) == 0) {
 			snprintf(b->entries[i].val, KV_MAX_VAL, "%s", val);
 			b->modified = 1;
-			return;
+			return 0;
 		}
 	}
 	if (b->count < KV_MAX_ENTRIES) {
@@ -71,7 +71,9 @@ static void kv_set(struct kv_buf *b, const char *key, const char *val)
 		snprintf(b->entries[b->count].val, KV_MAX_VAL, "%s", val);
 		b->count++;
 		b->modified = 1;
+		return 0;
 	}
+	return -1;
 }
 
 static void kv_unset(struct kv_buf *b, const char *key)
@@ -229,7 +231,7 @@ static const char *validate_required(const char *type_name,
 	static char missing[512];
 	missing[0] = '\0';
 
-	const char *req = reg_required_keys(type_name);
+	const char *req = sg_reg_required_keys(type_name);
 	if (!req || !*req)
 		return NULL;
 
@@ -421,7 +423,7 @@ static void register_value_completions(const char *key, const char *kind)
 /* Register set commands for a config type */
 static void register_set_cmds(const char *type_name)
 {
-	const char *keys = reg_valid_keys(type_name);
+	const char *keys = sg_reg_valid_keys(type_name);
 	if (!keys || !*keys) {
 		cli_register("set", "Set a parameter (set <key> <value>)");
 		return;
@@ -441,13 +443,13 @@ static void register_set_cmds(const char *type_name)
 		*end = '\0';
 
 		char regpath[CLI_MAX_LINE], regdesc[CLI_MAX_LINE];
-		const char *rule = reg_value_rule(type_name, tok);
+		const char *rule = sg_reg_value_rule(type_name, tok);
 		snprintf(regpath, sizeof(regpath), "set %s", tok);
 		snprintf(regdesc, sizeof(regdesc), "Set %s (%s)", tok, rule);
 		cli_register(regpath, regdesc);
 
 		/* Register value-level completions based on kind */
-		const char *kind = reg_value_kind(type_name, tok);
+		const char *kind = sg_reg_value_kind(type_name, tok);
 		if (kind)
 			register_value_completions(tok, kind);
 
@@ -459,7 +461,7 @@ static void register_set_cmds(const char *type_name)
 /* Register unset/get completions for each valid key */
 static void register_unset_get_cmds(const char *type_name)
 {
-	const char *keys = reg_valid_keys(type_name);
+	const char *keys = sg_reg_valid_keys(type_name);
 	if (!keys || !*keys)
 		return;
 
@@ -504,7 +506,7 @@ static void register_entry_cmds(const char *type_name)
 /* Register table context sub-commands */
 static void register_table_cmds(const char *type_name)
 {
-	const char *id_kind = reg_entry_id_kind(type_name);
+	const char *id_kind = sg_reg_entry_id_kind(type_name);
 	char edit_desc[64], del_desc[64];
 	snprintf(edit_desc, sizeof(edit_desc), "Allow: %s", id_kind);
 	snprintf(del_desc, sizeof(del_desc), "Allow: %s", id_kind);
@@ -571,7 +573,7 @@ static int handle_password(const char *entry_id, struct kv_buf *b)
 	/* Check password policy via IPC.
 	 * mgmtd ADMIN_CHECK_PW payload: "username\npassword[\nenforce_override]" */
 	const char *enf = kv_get(b, "enforce-password-policy");
-	char policy_payload[512];
+	char policy_payload[1024];
 	snprintf(policy_payload, sizeof(policy_payload), "%s\n%s\n%s",
 		 entry_id, pw1, enf ? enf : "");
 
@@ -592,15 +594,23 @@ static int handle_password(const char *entry_id, struct kv_buf *b)
 
 	if (strcmp(pw1, pw2) != 0) {
 		printf("  Passwords don't match.\n");
+		explicit_bzero(pw1, sizeof(pw1));
+		explicit_bzero(pw2, sizeof(pw2));
 		return -1;
 	}
 
-	kv_set(b, "password", pw1);
+	if (kv_set(b, "password", pw1) != 0) {
+		printf("  Error: too many configuration entries (max %d).\n",
+		       KV_MAX_ENTRIES);
+		explicit_bzero(pw1, sizeof(pw1));
+		explicit_bzero(pw2, sizeof(pw2));
+		return -1;
+	}
 	printf("  Password will be set on save.\n");
 
 	/* Clear from stack */
-	memset(pw1, 0, sizeof(pw1));
-	memset(pw2, 0, sizeof(pw2));
+	explicit_bzero(pw1, sizeof(pw1));
+	explicit_bzero(pw2, sizeof(pw2));
 	return 0;
 }
 
@@ -626,7 +636,7 @@ static int context_entry(const char *type_name, const char *label,
 	} else {
 		is_new = 1;
 		/* Apply defaults */
-		const char *defs = reg_default_values(type_name);
+		const char *defs = sg_reg_default_values(type_name);
 		if (defs && *defs) {
 			kv_parse(&data, defs);
 			data.modified = 1;
@@ -641,7 +651,7 @@ static int context_entry(const char *type_name, const char *label,
 	cli_push();
 	register_entry_cmds(type_name);
 
-	char prompt[128];
+	char prompt[384];
 	snprintf(prompt, sizeof(prompt), "(%s-%s) # ", label, entry_id);
 
 	const char *line;
@@ -660,11 +670,11 @@ static int context_entry(const char *type_name, const char *label,
 				printf("  Usage: set <key> <value>\n");
 				continue;
 			}
-			if (!reg_is_valid_key(type_name, key)) {
+			if (!sg_reg_is_valid_key(type_name, key)) {
 				printf("  Error: invalid key '%s' for %s\n",
 				       key, type_name);
 				printf("  Valid: %s\n",
-				       reg_valid_keys(type_name));
+				       sg_reg_valid_keys(type_name));
 				continue;
 			}
 			/* Password: interactive prompt */
@@ -677,23 +687,27 @@ static int context_entry(const char *type_name, const char *label,
 			if (!val[0]) {
 				printf("  Usage: set %s <value>\n", key);
 				printf("  Expected: %s\n",
-				       reg_value_rule(type_name, key));
+				       sg_reg_value_rule(type_name, key));
 				continue;
 			}
-			if (!reg_validate_value(type_name, key, val)) {
+			if (!sg_reg_validate_value(type_name, key, val)) {
 				printf("  Error: invalid value for '%s': '%s'\n",
 				       key, val);
 				printf("  Expected: %s\n",
-				       reg_value_rule(type_name, key));
+				       sg_reg_value_rule(type_name, key));
 				continue;
 			}
-			kv_set(&data, key, val);
+			if (kv_set(&data, key, val) != 0) {
+				printf("  Error: too many configuration entries (max %d).\n",
+				       KV_MAX_ENTRIES);
+				continue;
+			}
 		} else if (strcmp(cmd, "unset") == 0) {
 			if (!key[0]) {
 				printf("  Usage: unset <key>\n");
 				continue;
 			}
-			if (!reg_is_valid_key(type_name, key)) {
+			if (!sg_reg_is_valid_key(type_name, key)) {
 				printf("  Error: invalid key '%s' for %s\n",
 				       key, type_name);
 				continue;
@@ -709,7 +723,7 @@ static int context_entry(const char *type_name, const char *label,
 				printf("  Usage: get <key>\n");
 				continue;
 			}
-			if (!reg_is_valid_key(type_name, key)) {
+			if (!sg_reg_is_valid_key(type_name, key)) {
 				printf("  Error: invalid key '%s' for %s\n",
 				       key, type_name);
 				continue;
@@ -778,7 +792,7 @@ static int context_entry(const char *type_name, const char *label,
 					   "system_admin") == 0) {
 					const char *enf = kv_get(&data,
 						"enforce-password-policy");
-					char pp[512];
+					char pp[768];
 					snprintf(pp, sizeof(pp),
 						 "%s\n\n%s",
 						 entry_id,
@@ -959,14 +973,14 @@ static int context_table(const char *type_name, const char *label)
 		} else if (strcmp(cmd, "edit") == 0) {
 			if (!arg[0]) {
 				printf("  Usage: edit <id>  (expected: %s)\n",
-				       reg_entry_id_kind(type_name));
+				       sg_reg_entry_id_kind(type_name));
 				continue;
 			}
-			if (!reg_validate_entry_id(type_name, arg)) {
+			if (!sg_reg_validate_entry_id(type_name, arg)) {
 				printf("  Error: invalid ID '%s' for %s\n",
 				       arg, type_name);
 				printf("  Expected: %s\n",
-				       reg_entry_id_kind(type_name));
+				       sg_reg_entry_id_kind(type_name));
 				continue;
 			}
 			int exit_all = 0;
@@ -976,10 +990,10 @@ static int context_table(const char *type_name, const char *label)
 		} else if (strcmp(cmd, "delete") == 0) {
 			if (!arg[0]) {
 				printf("  Usage: delete <id>  (expected: %s)\n",
-				       reg_entry_id_kind(type_name));
+				       sg_reg_entry_id_kind(type_name));
 				continue;
 			}
-			if (!reg_validate_entry_id(type_name, arg)) {
+			if (!sg_reg_validate_entry_id(type_name, arg)) {
 				printf("  Error: invalid ID '%s' for %s\n",
 				       arg, type_name);
 				continue;
@@ -1089,7 +1103,7 @@ static int context_single(const char *type_name, const char *label)
 		kv_parse(&data, resp.payload);
 	} else {
 		/* Apply defaults */
-		const char *defs = reg_default_values(type_name);
+		const char *defs = sg_reg_default_values(type_name);
 		if (defs && *defs) {
 			kv_parse(&data, defs);
 			data.modified = 1;
@@ -1118,33 +1132,37 @@ static int context_single(const char *type_name, const char *label)
 			if (!key[0] || !val[0]) {
 				if (key[0]) {
 					printf("  Expected: %s\n",
-					       reg_value_rule(type_name,
+					       sg_reg_value_rule(type_name,
 							      key));
 				}
 				printf("  Usage: set <key> <value>\n");
 				continue;
 			}
-			if (!reg_is_valid_key(type_name, key)) {
+			if (!sg_reg_is_valid_key(type_name, key)) {
 				printf("  Error: invalid key '%s'"
 				       " for %s\n", key, type_name);
 				printf("  Valid: %s\n",
-				       reg_valid_keys(type_name));
+				       sg_reg_valid_keys(type_name));
 				continue;
 			}
-			if (!reg_validate_value(type_name, key, val)) {
+			if (!sg_reg_validate_value(type_name, key, val)) {
 				printf("  Error: invalid value for '%s':"
 				       " '%s'\n", key, val);
 				printf("  Expected: %s\n",
-				       reg_value_rule(type_name, key));
+				       sg_reg_value_rule(type_name, key));
 				continue;
 			}
-			kv_set(&data, key, val);
+			if (kv_set(&data, key, val) != 0) {
+				printf("  Error: too many configuration entries (max %d).\n",
+				       KV_MAX_ENTRIES);
+				continue;
+			}
 		} else if (strcmp(cmd, "unset") == 0) {
 			if (!key[0]) {
 				printf("  Usage: unset <key>\n");
 				continue;
 			}
-			if (!reg_is_valid_key(type_name, key)) {
+			if (!sg_reg_is_valid_key(type_name, key)) {
 				printf("  Error: invalid key '%s'"
 				       " for %s\n", key, type_name);
 				continue;
@@ -1155,7 +1173,7 @@ static int context_single(const char *type_name, const char *label)
 				printf("  Usage: get <key>\n");
 				continue;
 			}
-			if (!reg_is_valid_key(type_name, key)) {
+			if (!sg_reg_is_valid_key(type_name, key)) {
 				printf("  Error: invalid key '%s'"
 				       " for %s\n", key, type_name);
 				continue;
@@ -1333,7 +1351,7 @@ int cli_configure(int argc, const char **argv)
 	}
 
 	/* Look up type mode */
-	int mode = reg_type_mode(type_key);
+	int mode = sg_reg_type_mode(type_key);
 	if (mode < 0) {
 		printf("  Unknown config path:");
 		for (int i = 0; i < argc; i++)
@@ -1342,7 +1360,7 @@ int cli_configure(int argc, const char **argv)
 		return 0;
 	}
 
-	const char *label = reg_type_label(type_key);
+	const char *label = sg_reg_type_label(type_key);
 
 	if (mode == CFG_TABLE)
 		context_table(type_key, label);

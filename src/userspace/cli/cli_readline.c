@@ -616,7 +616,16 @@ const char *cli_readline(const char *prompt)
 		return NULL;
 
 	if (enable_raw() != 0) {
-		/* Fallback: just read a line in cooked mode */
+		/* Fallback: just read a line in cooked mode.
+		 * Arrow keys and history will NOT work. */
+		static int warned;
+		if (!warned) {
+			const char *msg =
+				"\r\n  [warn] raw mode unavailable — "
+				"arrow keys/history disabled\r\n";
+			tty_write(tty_fd, msg, strlen(msg));
+			warned = 1;
+		}
 		int rfd = tty_fd;
 		char ch;
 		int bpos = 0;
@@ -701,7 +710,13 @@ const char *cli_readline(const char *prompt)
 				break;
 			if (read(tty_fd, &seq[1], 1) <= 0)
 				break;
-			if (seq[0] == '[') {
+			/*
+			 * Handle both CSI (\033[) and SS3 (\033O)
+			 * prefixes. Some terminals (VT100 application
+			 * mode, QEMU console) send \033O for arrow
+			 * keys instead of \033[.
+			 */
+			if (seq[0] == '[' || seq[0] == 'O') {
 				if (seq[1] == 'A') { /* Up */
 					if (hist_idx == nhist)
 						snprintf(hist_saved,
@@ -762,6 +777,23 @@ const char *cli_readline(const char *prompt)
 				} else if (seq[1] == 'F') { /* End */
 					cursor = pos;
 					redraw_at(prompt, buf, cursor);
+				} else if (seq[0] == '[' &&
+					   seq[1] == '3') {
+					/* Delete key: \033[3~ */
+					char tilde;
+					if (read(tty_fd, &tilde, 1) > 0 &&
+					    tilde == '~' && cursor < pos) {
+						int next = cursor + 1;
+						while (next < pos &&
+						       (buf[next] & 0xC0) == 0x80)
+							next++;
+						memmove(buf + cursor,
+							buf + next,
+							(size_t)(pos - next + 1));
+						pos -= (next - cursor);
+						redraw_at(prompt, buf,
+							  cursor);
+					}
 				}
 			}
 			break;

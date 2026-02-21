@@ -3,7 +3,8 @@
  * cli_dispatch.c — Command registration and dispatch for Stargazer CLI
  *
  * Registers readline completions based on permissions, then dispatches
- * parsed commands to C handlers (configure) or shell scripts (show, etc.).
+ * parsed commands to C handlers.  All commands are now pure C — no
+ * shell script forks.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -12,15 +13,13 @@
 #include "cli_readline.h"
 #include "cli_configure.h"
 #include "cli_diagnose.h"
+#include "cli_show.h"
+#include "cli_execute.h"
 #include "cli_ipc.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
-#define CMD_DIR "/usr/libexec/stargazer"
 
 /* ── Permission check (zero-fork) ──────────────────────────────────────── */
 
@@ -48,37 +47,6 @@ int has_permission(const char *permissions, const char *perm)
 			p++;
 	}
 	return 0;
-}
-
-/* ── Execute a shell script (fork + exec + wait) ──────────────────────── */
-
-static void exec_shell(const char *script, const char *args)
-{
-	pid_t pid = fork();
-	if (pid < 0) {
-		perror("  fork");
-		return;
-	}
-	if (pid == 0) {
-		/*
-		 * Use "sh -c" so the shell word-splits args into $1, $2, etc.
-		 * execl(sh, script, args) would pass args as a single $1,
-		 * breaking scripts that expect multiple positional parameters.
-		 */
-		if (args && args[0]) {
-			char cmdline[CLI_MAX_LINE + 256];
-			snprintf(cmdline, sizeof(cmdline),
-				 ". '%s' %s", script, args);
-			execl("/bin/sh", "sh", "-c", cmdline,
-			      (char *)NULL);
-		} else {
-			execl("/bin/sh", "sh", script, (char *)NULL);
-		}
-		_exit(127);
-	}
-	/* Parent: wait for child */
-	int status;
-	waitpid(pid, &status, 0);
 }
 
 /* ── Command registration ──────────────────────────────────────────────── */
@@ -121,6 +89,8 @@ void register_commands(const char *permissions)
 		cli_register("execute diagnose",                       "Run diagnostic tools");
 		cli_register("execute diagnose test-permissions",      "Test IPC permission model");
 		cli_register("execute diagnose test-permissions full", "Full test with temp accounts");
+		cli_register("execute diagnose test-configure",       "Test config validation");
+		cli_register("execute diagnose test-configure full",  "Full test with IPC round-trip");
 	}
 
 	if (has_permission(permissions, "monitor")) {
@@ -181,13 +151,7 @@ int dispatch_command(const char *cmd, const char *args,
 			printf("  Permission denied: requires 'monitor'\n");
 			return 0;
 		}
-		if (!args || !args[0]) {
-			printf("  Usage: show <subcommand>\n");
-			printf("  Subcommands: status sessions stats"
-			       " interfaces routes configure config\n");
-			return 0;
-		}
-		exec_shell(CMD_DIR "/cmd_show", args);
+		cli_show(args);
 		return 0;
 	}
 
@@ -251,7 +215,7 @@ int dispatch_command(const char *cmd, const char *args,
 			}
 			return 0;
 		}
-		/* Handle "execute diagnose ..." in C (no shell fork) */
+		/* Handle "execute diagnose ..." in C */
 		if (args && strncmp(args, "diagnose", 8) == 0 &&
 		    (args[8] == ' ' || args[8] == '\0')) {
 			const char *dsub = args + 8;
@@ -276,18 +240,39 @@ int dispatch_command(const char *cmd, const char *args,
 				}
 				cli_diagnose_test_permissions(mode,
 							     permissions);
+			} else if (strncmp(dsub, "test-configure", 14) == 0 &&
+				   (dsub[14] == ' ' || dsub[14] == '\0')) {
+				int mode = 0;
+				const char *rest = dsub + 14;
+				while (*rest == ' ')
+					rest++;
+				if (*rest == '\0') {
+					mode = 0;
+				} else if (strcmp(rest, "full") == 0) {
+					mode = 1;
+				} else {
+					printf("  Unknown argument: %s\n",
+					       rest);
+					printf("  Usage: execute diagnose"
+					       " test-configure [full]\n");
+					return 0;
+				}
+				cli_diagnose_test_configure(mode);
 			} else if (*dsub == '\0') {
 				printf("  Usage: execute diagnose"
-				       " test-permissions [full]\n");
+				       " test-permissions|test-configure"
+				       " [full]\n");
 			} else {
 				printf("  Unknown diagnose command: %s\n",
 				       dsub);
 				printf("  Usage: execute diagnose"
-				       " test-permissions [full]\n");
+				       " test-permissions|test-configure"
+				       " [full]\n");
 			}
 			return 0;
 		}
-		exec_shell(CMD_DIR "/cmd_execute", args);
+		/* All other execute subcommands (debug, etc.) */
+		cli_execute(args, permissions);
 		return 0;
 	}
 

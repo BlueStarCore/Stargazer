@@ -15,7 +15,9 @@
 
 #include <stddef.h>
 
+#ifndef SG_DB_PATH
 #define SG_DB_PATH "/etc/stargazer/stargazer.db"
+#endif
 
 /*
  * Open (or create) the database at 'path'.

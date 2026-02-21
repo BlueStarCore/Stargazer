@@ -63,7 +63,7 @@ ensure_admin_account() {
 
 	# Add admin to stargazer group (for socket + config access)
 	if grep -q '^stargazer:' /etc/group 2>/dev/null; then
-		if ! grep '^stargazer:' /etc/group | grep -q '\badmin\b' 2>/dev/null; then
+		if ! grep '^stargazer:' /etc/group | grep -q -E '(:|,)admin(,|$)' 2>/dev/null; then
 			_ea_grp_line=$(grep '^stargazer:' /etc/group)
 			_ea_members="${_ea_grp_line##*:}"
 			if [ -n "$_ea_members" ]; then
@@ -203,20 +203,6 @@ auth_is_locked() {
 	_al_state=$(auth_get_state "$_al_user")
 	_al_until=${_al_state#*:}
 	[ "$_al_now" -lt "${_al_until:-0}" ]
-}
-
-admin_exists_in_config() {
-	_ae_user="$1"
-	# Check the normalized config table (mgmtd's SQLite DB)
-	if _db_ready; then
-		_ae_uq=$(_db_escape "$_ae_user")
-		_ae_exists=$(sqlite3 "$STARGAZER_DB_PATH" \
-			"SELECT 1 FROM config WHERE type='system_admin' AND id='${_ae_uq}' LIMIT 1;" 2>/dev/null)
-		[ "$_ae_exists" = "1" ] && return 0
-		return 1
-	fi
-	# Fallback: check if user exists in passwd with stargazer-cli shell
-	grep "^${_ae_user}:" /etc/passwd 2>/dev/null | grep -q '/sbin/stargazer-cli'
 }
 
 # ── Ctrl+C resets to fresh login prompt (no process restart) ──

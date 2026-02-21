@@ -449,8 +449,9 @@ admin_exists_in_config() {
 	_ae_user="$1"
 	if _db_ready; then
 		_ae_uq=$(_db_escape "$_ae_user")
-		_ae_exists=$(sqlite3 "$STARGAZER_DB_PATH" "SELECT 1 FROM users WHERE username='${_ae_uq}' LIMIT 1;" 2>/dev/null)
+		_ae_exists=$(sqlite3 "$STARGAZER_DB_PATH" "SELECT 1 FROM config WHERE type='system_admin' AND id='${_ae_uq}' LIMIT 1;" 2>/dev/null)
 		[ "$_ae_exists" = "1" ] && return 0
+		return 1
 	fi
 	cfg_get "$STARGAZER_CONF_DIR/system.conf" "system_admin:${_ae_user}" >/dev/null 2>&1
 }
@@ -523,7 +524,7 @@ session_profile_rev_bump() {
 	[ -z "$_sp_profile" ] && return 0
 	if _db_ready; then
 		_sp_q=$(_db_escape "$_sp_profile")
-		sqlite3 "$STARGAZER_DB_PATH" "SELECT username FROM users WHERE profile='${_sp_q}';" 2>/dev/null \
+		sqlite3 "$STARGAZER_DB_PATH" "SELECT DISTINCT id FROM config WHERE type='system_admin' AND key='profile' AND value='${_sp_q}';" 2>/dev/null \
 		| while IFS= read -r _u; do
 			[ -n "$_u" ] && session_user_rev_bump "$_u"
 		done
@@ -560,9 +561,11 @@ admin_get_enforce_policy() {
 	esac
 	if _db_ready; then
 		_ag_q=$(_db_escape "$_ag_user")
-		_ag_db=$(sqlite3 "$STARGAZER_DB_PATH" "SELECT enforce_change_password FROM users WHERE username='${_ag_q}' LIMIT 1;" 2>/dev/null)
-		[ "$_ag_db" = "1" ] && echo "enable" && return 0
-		[ "$_ag_db" = "0" ] && echo "disable" && return 0
+		_ag_db=$(sqlite3 "$STARGAZER_DB_PATH" "SELECT value FROM config WHERE type='system_admin' AND id='${_ag_q}' AND key='enforce-change-password' LIMIT 1;" 2>/dev/null)
+		case "$_ag_db" in
+			enable)  echo "enable";  return 0 ;;
+			disable) echo "disable"; return 0 ;;
+		esac
 	fi
 	echo "disable"
 }

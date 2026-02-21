@@ -1,14 +1,15 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * cli_registry.c — Config type/key registry for Stargazer CLI
+ * sg_validate.c — Shared config registry and input validators for Stargazer
  *
  * Static tables of config types, valid keys, default values, required
- * fields, and validation rules.  Translated from config_lib.sh.
+ * fields, and validation rules.  Shared by CLI and mgmtd.
+ * Extracted from cli_registry.c.
  */
 
 #define _POSIX_C_SOURCE 200809L
 
-#include "cli_registry.h"
+#include "sg_validate.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -202,7 +203,7 @@ static const struct kind_entry kind_table[] = {
 /* ── Pure validation helpers ─────────────────────────────────────────────── */
 
 int
-is_safe_id(const char *s)
+sg_is_safe_id(const char *s)
 {
 	if (!s || !*s)
 		return 0;
@@ -217,7 +218,7 @@ is_safe_id(const char *s)
 }
 
 int
-is_ipv4(const char *s)
+sg_is_ipv4(const char *s)
 {
 	if (!s || !*s)
 		return 0;
@@ -253,7 +254,7 @@ is_ipv4(const char *s)
 }
 
 int
-is_cidr(const char *s)
+sg_is_cidr(const char *s)
 {
 	if (!s || !*s)
 		return 0;
@@ -272,15 +273,15 @@ is_cidr(const char *s)
 	memcpy(ip_buf, s, ip_len);
 	ip_buf[ip_len] = '\0';
 
-	if (!is_ipv4(ip_buf))
+	if (!sg_is_ipv4(ip_buf))
 		return 0;
 
 	/* Validate mask */
-	return is_uint_range(slash + 1, 0, 32);
+	return sg_is_uint_range(slash + 1, 0, 32);
 }
 
 int
-is_iface_name(const char *s)
+sg_is_iface_name(const char *s)
 {
 	if (!s || !*s)
 		return 0;
@@ -295,7 +296,7 @@ is_iface_name(const char *s)
 }
 
 int
-is_uint_range(const char *s, int min, int max)
+sg_is_uint_range(const char *s, int min, int max)
 {
 	if (!s || !*s)
 		return 0;
@@ -310,63 +311,8 @@ is_uint_range(const char *s, int min, int max)
 	return val >= min && val <= max;
 }
 
-/* ── Internal helpers ────────────────────────────────────────────────────── */
-
-/*
- * Check if val matches one of the comma-separated options in opts.
- * Returns 1 if found, 0 if not.
- */
-static int
-match_csv_option(const char *opts, const char *val)
-{
-	if (!opts || !val)
-		return 0;
-
-	size_t val_len = strlen(val);
-	const char *p = opts;
-
-	while (*p) {
-		const char *comma = strchr(p, ',');
-		size_t span = comma ? (size_t)(comma - p) : strlen(p);
-
-		if (span == val_len && strncmp(p, val, span) == 0)
-			return 1;
-
-		if (!comma)
-			break;
-		p = comma + 1;
-	}
-	return 0;
-}
-
-/*
- * Parse "uint:min:max" kind string into min/max values.
- * Returns 1 on success, 0 on parse error.
- */
-static int
-parse_uint_kind(const char *kind, int *out_min, int *out_max)
-{
-	/* kind = "uint:MIN:MAX" */
-	const char *p = kind + 5;  /* skip "uint:" */
-	char *end;
-
-	long mn = strtol(p, &end, 10);
-	if (*end != ':')
-		return 0;
-	long mx = strtol(end + 1, &end, 10);
-	if (*end != '\0')
-		return 0;
-
-	*out_min = (int)mn;
-	*out_max = (int)mx;
-	return 1;
-}
-
-/*
- * Validate a tz-token string: [A-Za-z0-9_./+-]
- */
-static int
-is_tz_token(const char *s)
+int
+sg_is_tz_token(const char *s)
 {
 	if (!s || !*s)
 		return 0;
@@ -380,21 +326,22 @@ is_tz_token(const char *s)
 	return 1;
 }
 
-/*
- * Validate a permissions-csv string: comma-separated, each token must
- * be "monitor", "configure", or "admin".
- */
-static int
-is_permissions_csv(const char *s)
+int
+sg_is_permissions_csv(const char *s)
 {
 	if (!s || !*s)
 		return 0;
 
-	/* Work on a mutable copy */
+	/* Reject leading/trailing commas and empty tokens */
 	size_t len = strlen(s);
 	if (len > 256)
 		return 0;
+	if (s[0] == ',' || s[len - 1] == ',')
+		return 0;
+	if (strstr(s, ",,"))
+		return 0;
 
+	/* Work on a mutable copy */
 	char buf[257];
 	memcpy(buf, s, len + 1);
 
@@ -413,11 +360,8 @@ is_permissions_csv(const char *s)
 	return 1;
 }
 
-/*
- * Validate a port or port range: "80" or "1024-65535".
- */
-static int
-is_port_or_range(const char *s)
+int
+sg_is_port_or_range(const char *s)
 {
 	if (!s || !*s)
 		return 0;
@@ -443,9 +387,9 @@ is_port_or_range(const char *s)
 
 		const char *b_str = dash + 1;
 
-		if (!is_uint_range(a_buf, 1, 65535))
+		if (!sg_is_uint_range(a_buf, 1, 65535))
 			return 0;
-		if (!is_uint_range(b_str, 1, 65535))
+		if (!sg_is_uint_range(b_str, 1, 65535))
 			return 0;
 
 		long a_val = strtol(a_buf, NULL, 10);
@@ -453,13 +397,61 @@ is_port_or_range(const char *s)
 		return a_val <= b_val;
 	}
 
-	return is_uint_range(s, 1, 65535);
+	return sg_is_uint_range(s, 1, 65535);
+}
+
+int
+sg_match_csv_option(const char *opts, const char *val)
+{
+	if (!opts || !val)
+		return 0;
+
+	size_t val_len = strlen(val);
+	const char *p = opts;
+
+	while (*p) {
+		const char *comma = strchr(p, ',');
+		size_t span = comma ? (size_t)(comma - p) : strlen(p);
+
+		if (span == val_len && strncmp(p, val, span) == 0)
+			return 1;
+
+		if (!comma)
+			break;
+		p = comma + 1;
+	}
+	return 0;
+}
+
+/* ── Internal helpers ────────────────────────────────────────────────────── */
+
+/*
+ * Parse "uint:min:max" kind string into min/max values.
+ * Returns 1 on success, 0 on parse error.
+ */
+static int
+parse_uint_kind(const char *kind, int *out_min, int *out_max)
+{
+	/* kind = "uint:MIN:MAX" */
+	const char *p = kind + 5;  /* skip "uint:" */
+	char *end;
+
+	long mn = strtol(p, &end, 10);
+	if (*end != ':')
+		return 0;
+	long mx = strtol(end + 1, &end, 10);
+	if (*end != '\0')
+		return 0;
+
+	*out_min = (int)mn;
+	*out_max = (int)mx;
+	return 1;
 }
 
 /* ── Public API ──────────────────────────────────────────────────────────── */
 
 int
-reg_type_mode(const char *type_name)
+sg_reg_type_mode(const char *type_name)
 {
 	if (!type_name)
 		return -1;
@@ -475,7 +467,7 @@ reg_type_mode(const char *type_name)
  * Returns pointer to static buffer (not thread-safe, fine for CLI).
  */
 const char *
-reg_type_label(const char *type_name)
+sg_reg_type_label(const char *type_name)
 {
 	static char buf[128];
 
@@ -498,7 +490,7 @@ reg_type_label(const char *type_name)
 }
 
 const char *
-reg_valid_keys(const char *type_name)
+sg_reg_valid_keys(const char *type_name)
 {
 	if (!type_name)
 		return "";
@@ -510,12 +502,12 @@ reg_valid_keys(const char *type_name)
 }
 
 int
-reg_is_valid_key(const char *type_name, const char *key)
+sg_reg_is_valid_key(const char *type_name, const char *key)
 {
 	if (!type_name || !key)
 		return 0;
 
-	const char *keys = reg_valid_keys(type_name);
+	const char *keys = sg_reg_valid_keys(type_name);
 	if (!*keys)
 		return 0;
 
@@ -541,7 +533,7 @@ reg_is_valid_key(const char *type_name, const char *key)
 }
 
 const char *
-reg_required_keys(const char *type_name)
+sg_reg_required_keys(const char *type_name)
 {
 	if (!type_name)
 		return "";
@@ -553,7 +545,7 @@ reg_required_keys(const char *type_name)
 }
 
 const char *
-reg_default_values(const char *type_name)
+sg_reg_default_values(const char *type_name)
 {
 	if (!type_name)
 		return "";
@@ -565,7 +557,7 @@ reg_default_values(const char *type_name)
 }
 
 const char *
-reg_value_kind(const char *type_name, const char *key)
+sg_reg_value_kind(const char *type_name, const char *key)
 {
 	if (!type_name || !key)
 		return "string";
@@ -578,11 +570,11 @@ reg_value_kind(const char *type_name, const char *key)
 }
 
 const char *
-reg_value_rule(const char *type_name, const char *key)
+sg_reg_value_rule(const char *type_name, const char *key)
 {
 	static char buf[256];
 
-	const char *kind = reg_value_kind(type_name, key);
+	const char *kind = sg_reg_value_kind(type_name, key);
 
 	if (strcmp(kind, "cidr") == 0)
 		return "CIDR (A.B.C.D/len)";
@@ -703,7 +695,7 @@ reg_value_rule(const char *type_name, const char *key)
 }
 
 const char *
-reg_entry_id_kind(const char *type_name)
+sg_reg_entry_id_kind(const char *type_name)
 {
 	if (type_name && strcmp(type_name, "firewall_policy") == 0)
 		return "uint";
@@ -711,7 +703,7 @@ reg_entry_id_kind(const char *type_name)
 }
 
 const char *
-reg_domain_for(const char *type_name)
+sg_reg_domain_for(const char *type_name)
 {
 	if (!type_name)
 		return "/etc/stargazer/system.conf";
@@ -733,60 +725,60 @@ reg_domain_for(const char *type_name)
 }
 
 int
-reg_validate_value(const char *type_name, const char *key, const char *val)
+sg_reg_validate_value(const char *type_name, const char *key, const char *val)
 {
 	if (!type_name || !key || !val)
 		return 0;
 
-	const char *kind = reg_value_kind(type_name, key);
+	const char *kind = sg_reg_value_kind(type_name, key);
 
 	/* cidr */
 	if (strcmp(kind, "cidr") == 0)
-		return is_cidr(val);
+		return sg_is_cidr(val);
 
 	/* ipv4 */
 	if (strcmp(kind, "ipv4") == 0)
-		return is_ipv4(val);
+		return sg_is_ipv4(val);
 
 	/* iface */
 	if (strcmp(kind, "iface") == 0)
-		return is_iface_name(val);
+		return sg_is_iface_name(val);
 
 	/* uint:min:max */
 	if (strncmp(kind, "uint:", 5) == 0) {
 		int mn, mx;
 		if (!parse_uint_kind(kind, &mn, &mx))
 			return 0;
-		return is_uint_range(val, mn, mx);
+		return sg_is_uint_range(val, mn, mx);
 	}
 
 	/* enum:a,b,c */
 	if (strncmp(kind, "enum:", 5) == 0)
-		return match_csv_option(kind + 5, val);
+		return sg_match_csv_option(kind + 5, val);
 
 	/* cidr-or:a,b */
 	if (strncmp(kind, "cidr-or:", 8) == 0)
-		return match_csv_option(kind + 8, val) || is_cidr(val);
+		return sg_match_csv_option(kind + 8, val) || sg_is_cidr(val);
 
 	/* safe-id */
 	if (strcmp(kind, "safe-id") == 0)
-		return is_safe_id(val);
+		return sg_is_safe_id(val);
 
 	/* safe-id-or:a,b */
 	if (strncmp(kind, "safe-id-or:", 11) == 0)
-		return match_csv_option(kind + 11, val) || is_safe_id(val);
+		return sg_match_csv_option(kind + 11, val) || sg_is_safe_id(val);
 
 	/* tz-token */
 	if (strcmp(kind, "tz-token") == 0)
-		return is_tz_token(val);
+		return sg_is_tz_token(val);
 
 	/* permissions-csv */
 	if (strcmp(kind, "permissions-csv") == 0)
-		return is_permissions_csv(val);
+		return sg_is_permissions_csv(val);
 
 	/* port-or-range */
 	if (strcmp(kind, "port-or-range") == 0)
-		return is_port_or_range(val);
+		return sg_is_port_or_range(val);
 
 	/* password-interactive — always valid (handled by interactive branch) */
 	if (strcmp(kind, "password-interactive") == 0)
@@ -794,17 +786,17 @@ reg_validate_value(const char *type_name, const char *key, const char *val)
 
 	/* ref:X — validate as safe-id (existence check requires IPC, skip) */
 	if (strncmp(kind, "ref:", 4) == 0)
-		return is_safe_id(val);
+		return sg_is_safe_id(val);
 
 	/* ref-or:TYPE:a,b — check against options OR validate as safe-id */
 	if (strncmp(kind, "ref-or:", 7) == 0) {
 		const char *rest = kind + 7;
 		const char *colon = strchr(rest, ':');
 		if (colon) {
-			if (match_csv_option(colon + 1, val))
+			if (sg_match_csv_option(colon + 1, val))
 				return 1;
 		}
-		return is_safe_id(val);
+		return sg_is_safe_id(val);
 	}
 
 	/* string — non-empty */
@@ -812,12 +804,12 @@ reg_validate_value(const char *type_name, const char *key, const char *val)
 }
 
 int
-reg_validate_entry_id(const char *type_name, const char *id)
+sg_reg_validate_entry_id(const char *type_name, const char *id)
 {
 	if (!type_name || !id || !*id)
 		return 0;
 
-	const char *kind = reg_entry_id_kind(type_name);
+	const char *kind = sg_reg_entry_id_kind(type_name);
 	if (strcmp(kind, "uint") == 0) {
 		/* Digits only, positive */
 		for (const char *p = id; *p; p++) {
@@ -827,5 +819,5 @@ reg_validate_entry_id(const char *type_name, const char *id)
 		return 1;
 	}
 	/* safe-id */
-	return is_safe_id(id);
+	return sg_is_safe_id(id);
 }

@@ -24,10 +24,11 @@ $(BUILD_DIR)/sqlite3.o: sqlite3.c sqlite3.h
 
 $(BUILD_DIR)/stargazer-mgmtd: stargazer-mgmtd.c stargazer_ipc.h sg_db.c sg_db.h \
                                $(COMMON_DIR)/password_policy.c $(COMMON_DIR)/password_policy.h \
+                               $(COMMON_DIR)/sg_validate.c $(COMMON_DIR)/sg_validate.h \
                                $(BUILD_DIR)/sqlite3.o
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(CFLAGS) -o $@ stargazer-mgmtd.c sg_db.c $(COMMON_DIR)/password_policy.c \
-		$(BUILD_DIR)/sqlite3.o $(LDFLAGS) -lcrypt
+		$(COMMON_DIR)/sg_validate.c $(BUILD_DIR)/sqlite3.o $(LDFLAGS) -lcrypt
 
 $(BUILD_DIR)/stargazer-ipc-cli: stargazer-ipc-cli.c stargazer_ipc.h
 	@mkdir -p $(BUILD_DIR)

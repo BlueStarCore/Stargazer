@@ -28,6 +28,7 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -184,15 +185,29 @@ static int authenticate(const char *username, const char *password)
 
 static int update_shadow(const char *username, const char *hash)
 {
-	FILE *fp = fopen("/etc/shadow", "r");
-	if (!fp)
+	/* Acquire advisory lock for shadow file manipulation */
+	int lockfd = open("/etc/shadow.lock", O_CREAT | O_RDWR, 0600);
+	if (lockfd < 0)
 		return -1;
+	if (flock(lockfd, LOCK_EX) != 0) {
+		close(lockfd);
+		return -1;
+	}
+
+	FILE *fp = fopen("/etc/shadow", "r");
+	if (!fp) {
+		flock(lockfd, LOCK_UN);
+		close(lockfd);
+		return -1;
+	}
 
 	char tmppath[64];
 	snprintf(tmppath, sizeof(tmppath), "/etc/shadow.XXXXXX");
 	int tfd = mkstemp(tmppath);
 	if (tfd < 0) {
 		fclose(fp);
+		flock(lockfd, LOCK_UN);
+		close(lockfd);
 		return -1;
 	}
 	fchmod(tfd, 0640);
@@ -201,6 +216,8 @@ static int update_shadow(const char *username, const char *hash)
 		close(tfd);
 		unlink(tmppath);
 		fclose(fp);
+		flock(lockfd, LOCK_UN);
+		close(lockfd);
 		return -1;
 	}
 
@@ -227,13 +244,19 @@ static int update_shadow(const char *username, const char *hash)
 
 	if (!found) {
 		unlink(tmppath);
+		flock(lockfd, LOCK_UN);
+		close(lockfd);
 		return -1;
 	}
 
 	if (rename(tmppath, "/etc/shadow") != 0) {
 		unlink(tmppath);
+		flock(lockfd, LOCK_UN);
+		close(lockfd);
 		return -1;
 	}
+	flock(lockfd, LOCK_UN);
+	close(lockfd);
 	return 0;
 }
 

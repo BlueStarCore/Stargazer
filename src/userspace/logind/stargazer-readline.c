@@ -684,7 +684,8 @@ int main(int argc, char *argv[])
 				break;
 			if (read(tty_fd, &seq[1], 1) <= 0)
 				break;
-			if (seq[0] == '[') {
+			/* Handle CSI (\033[) and SS3 (\033O) prefixes */
+			if (seq[0] == '[' || seq[0] == 'O') {
 				if (seq[1] == 'A') { /* Up */
 					if (hist_idx == nhist)
 						snprintf(hist_saved, sizeof(hist_saved), "%s", buf);
@@ -735,6 +736,23 @@ int main(int argc, char *argv[])
 				} else if (seq[1] == 'F') { /* End */
 					cursor = pos;
 					redraw_at(prompt, buf, cursor);
+				} else if (seq[0] == '[' &&
+					   seq[1] == '3') {
+					/* Delete key: \033[3~ */
+					char tilde;
+					if (read(tty_fd, &tilde, 1) > 0 &&
+					    tilde == '~' && cursor < pos) {
+						int next = cursor + 1;
+						while (next < pos &&
+						       (buf[next] & 0xC0) == 0x80)
+							next++;
+						memmove(buf + cursor,
+							buf + next,
+							(size_t)(pos - next + 1));
+						pos -= (next - cursor);
+						redraw_at(prompt, buf,
+							  cursor);
+					}
 				}
 			}
 			break;

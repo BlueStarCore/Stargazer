@@ -2,7 +2,8 @@
 # Cross-compile for ARM64 with musl static linking
 
 CC           := $(CROSS_COMPILE)gcc
-CFLAGS       := -Wall -Wextra -Werror -Os -static -I. -I../mgmtd
+COMMON_DIR   := ../common
+CFLAGS       := -Wall -Wextra -Werror -Os -static -I. -I../mgmtd -I$(COMMON_DIR)
 LDFLAGS      := -static
 BUILD_DIR    ?= ../../../build/cli
 VERSION      ?= dev
@@ -11,12 +12,17 @@ SRCS := stargazer-cli.c \
         cli_readline.c \
         cli_ipc.c \
         cli_configure.c \
-        cli_registry.c \
         cli_dispatch.c \
-        cli_diagnose.c
+        cli_diagnose.c \
+        cli_diagnose_config.c \
+        cli_show.c \
+        cli_execute.c \
+        cli_debug.c \
+        $(COMMON_DIR)/sg_validate.c
 
-HEADERS := cli_readline.h cli_ipc.h cli_configure.h cli_registry.h cli_dispatch.h \
-           cli_diagnose.h ../mgmtd/stargazer_ipc.h
+HEADERS := cli_readline.h cli_ipc.h cli_configure.h cli_dispatch.h \
+           cli_diagnose.h cli_show.h cli_execute.h cli_debug.h \
+           $(COMMON_DIR)/sg_validate.h ../mgmtd/stargazer_ipc.h
 
 TARGET := $(BUILD_DIR)/stargazer-cli
 

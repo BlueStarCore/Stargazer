@@ -17,7 +17,9 @@
 #include <stdint.h>
 
 /* ── Socket path ────────────────────────────────────────────────────────── */
+#ifndef SG_MGMTD_SOCK
 #define SG_MGMTD_SOCK   "/run/stargazer-mgmtd.sock"
+#endif
 
 /* ── Status codes ───────────────────────────────────────────────────────── */
 typedef enum {
@@ -90,6 +92,7 @@ typedef enum {
 	SG_CMD_SHOW_IFACES   = 611,
 	SG_CMD_SHOW_ROUTES   = 612,
 	SG_CMD_SHOW_CONFIG   = 613,
+	SG_CMD_SHOW_STATS    = 614,
 	SG_CMD_WHOAMI        = 620,   /* Get caller's profile+permissions */
 
 	/* Keepalive / ping (9xx) */
