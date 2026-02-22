@@ -25,6 +25,7 @@ static const sg_type_info_t type_table[] = {
 	{ "network_bgp",            CFG_SINGLE, "configure", "Configure BGP dynamic routing"       },
 	{ "network_nat",            CFG_TABLE,  "configure", "Configure NAT rules (SNAT/DNAT)"     },
 	{ "network_dns",            CFG_SINGLE, "configure", "Configure DNS settings"              },
+	{ "network_dhcp-server",    CFG_TABLE,  "configure", "Configure DHCP server pools"         },
 	{ "system_settings",        CFG_SINGLE, "configure", "System general settings"              },
 	{ "system_interface",       CFG_TABLE,  "configure", "Configure network interfaces"        },
 	{ "system_ntp",             CFG_SINGLE, "configure", "Configure NTP time sync"             },
@@ -80,8 +81,23 @@ static const struct field_entry field_table[] = {
 	{ "system_settings", "timezone",   "tz-token",            0, "UTC",       "System timezone"      },
 
 	/* network_dns */
-	{ "network_dns", "primary",   "ipv4", 0, NULL, "Primary DNS server"   },
-	{ "network_dns", "secondary", "ipv4", 0, NULL, "Secondary DNS server" },
+	{ "network_dns", "primary",    "ipv4",                0, NULL,     "Primary DNS server"       },
+	{ "network_dns", "secondary",  "ipv4",                0, NULL,     "Secondary DNS server"     },
+	{ "network_dns", "listen-on",  "ipv4",                1, NULL,     "Listen address for DNS"   },
+	{ "network_dns", "port",       "uint:1:65535",        1, "53",     "DNS listening port"       },
+	{ "network_dns", "cache-size", "uint:0:100000",       1, "10000",  "DNS cache size (entries)" },
+	{ "network_dns", "status",     "enum:enable,disable", 0, "enable", "Enable or disable DNS"    },
+
+	/* network_dhcp-server */
+	{ "network_dhcp-server", "interface",   "iface",               0, NULL,     "Interface to serve DHCP"      },
+	{ "network_dhcp-server", "start-ip",    "ipv4",                0, NULL,     "Pool start address"           },
+	{ "network_dhcp-server", "end-ip",      "ipv4",                0, NULL,     "Pool end address"             },
+	{ "network_dhcp-server", "netmask",     "ipv4",                0, NULL,     "Subnet mask for clients"      },
+	{ "network_dhcp-server", "gateway",     "ipv4",                1, NULL,     "Default gateway for clients"  },
+	{ "network_dhcp-server", "dns-server",  "ipv4",                1, NULL,     "DNS server for clients"       },
+	{ "network_dhcp-server", "domain-name", "safe-id",             1, NULL,     "Domain name for clients"      },
+	{ "network_dhcp-server", "lease-time",  "uint:60:604800",      0, "86400",  "Lease time in seconds"        },
+	{ "network_dhcp-server", "status",      "enum:enable,disable", 0, "enable", "Enable or disable this pool"  },
 
 	/* system_ntp */
 	{ "system_ntp", "server", "ipv4",                0, NULL, "NTP server address"          },

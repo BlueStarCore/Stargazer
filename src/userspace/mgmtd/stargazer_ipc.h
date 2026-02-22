@@ -95,6 +95,9 @@ typedef enum {
 	SG_CMD_SHOW_STATS    = 614,
 	SG_CMD_WHOAMI        = 620,   /* Get caller's profile+permissions */
 
+	/* DNS/DHCP — Member A (7xx): SG_CMD_DNS_* 700-749, SG_CMD_DHCP_* 750-799 */
+	/* NAT — Member B (8xx): SG_CMD_NAT_* 800-849 */
+
 	/* Keepalive / ping (9xx) */
 	SG_CMD_PING          = 900,
 } sg_cmd_t;

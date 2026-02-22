@@ -45,6 +45,7 @@
 #include "password_policy.h"
 #include "sg_db.h"
 #include "sg_validate.h"
+#include "mgmtd_apply.h"
 
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
@@ -68,7 +69,7 @@ static volatile sig_atomic_t g_running = 1;
 
 /* ── Interface existence check ─────────────────────────────────────────── */
 
-static int iface_exists(const char *name)
+int iface_exists(const char *name)
 {
 	char path[256];
 	snprintf(path, sizeof(path), "/sys/class/net/%s", name);
@@ -81,7 +82,7 @@ static int iface_exists(const char *name)
  * safe_exec: fork + execvp with argument array. No shell interpretation.
  * Returns dynamically allocated stdout output (caller frees), or NULL.
  */
-static char *safe_exec(const char *const argv[])
+char *safe_exec(const char *const argv[])
 {
 	int pipefd[2];
 	if (pipe(pipefd) < 0) return NULL;
@@ -163,7 +164,7 @@ static int mgmtd_debug_enabled(void)
 
 /* ── Logging ────────────────────────────────────────────────────────────── */
 
-static void mgmt_log(const char *level, const char *fmt, ...)
+void mgmt_log(const char *level, const char *fmt, ...)
 {
 	if ((strcmp(level, "INFO") == 0 || strcmp(level, "WARN") == 0) &&
 	    !mgmtd_debug_enabled())
@@ -386,8 +387,8 @@ static int read_iface_mtu(const char *name)
  * Query the driver-reported min/max MTU for an interface via netlink
  * (ip -d link show <name>).  Falls back to 68/65535 if unavailable.
  */
-static void read_iface_mtu_limits(const char *name,
-				  int *out_min, int *out_max)
+void read_iface_mtu_limits(const char *name,
+			   int *out_min, int *out_max)
 {
 	*out_min = 68;
 	*out_max = 65535;
@@ -687,6 +688,7 @@ static void mgmtd_replay_config(void)
 	/* Single config types (id="0") */
 	static const char *single_types[] = {
 		"system_settings",
+		"network_dns",
 		NULL
 	};
 	for (int i = 0; single_types[i]; i++) {
@@ -706,6 +708,7 @@ static void mgmtd_replay_config(void)
 		"system_interface",
 		"network_route_static",
 		"network_nat",
+		"network_dhcp-server",
 		NULL
 	};
 	for (int i = 0; table_types[i]; i++) {
@@ -1233,9 +1236,8 @@ static char *run_cmd(const char *cmd)
  * Copies result into caller-provided buffer 'out' of size 'outsz'.
  * Sets out[0]='\0' if key not found.  Always NUL-terminates.
  */
-#define VALBUFSZ 128
-static void extract_val(const char *data, const char *key,
-			char *out, size_t outsz)
+void extract_val(const char *data, const char *key,
+		 char *out, size_t outsz)
 {
 	out[0] = '\0';
 	if (!data || !key || outsz == 0) return;
@@ -1338,227 +1340,26 @@ static sg_status_t apply_config(const char *type, const char *id,
 {
 	result[0] = '\0';
 
-	if (strcmp(type, "network_route_static") == 0) {
-		char dst[VALBUFSZ], gw[VALBUFSZ], dev[VALBUFSZ];
-		char dist[VALBUFSZ], status[VALBUFSZ];
-		extract_val(data, "dst", dst, sizeof(dst));
-		extract_val(data, "gateway", gw, sizeof(gw));
-		extract_val(data, "device", dev, sizeof(dev));
-		extract_val(data, "distance", dist, sizeof(dist));
-		extract_val(data, "status", status, sizeof(status));
+	/* ── Dispatched handlers (each in its own .c file) ───────────── */
+	if (strcmp(type, "network_route_static") == 0)
+		return apply_route_static(id, data, result, rsize);
 
-		/* Validate all inputs before any system call */
-		if (dst[0] && !sg_is_cidr(dst)) {
-			snprintf(result, rsize, "Invalid dst '%s'.", dst);
-			return SG_ERR_INVALID_VAL;
-		}
-		if (gw[0] && !sg_is_ipv4(gw)) {
-			snprintf(result, rsize, "Invalid gateway '%s'.", gw);
-			return SG_ERR_INVALID_VAL;
-		}
-		if (dev[0] && !sg_is_iface_name(dev)) {
-			snprintf(result, rsize, "Invalid device '%s'.", dev);
-			return SG_ERR_INVALID_VAL;
-		}
-		if (dist[0] && !sg_is_uint_range(dist, 1, 255)) {
-			snprintf(result, rsize, "Invalid distance '%s'.", dist);
-			return SG_ERR_INVALID_VAL;
-		}
-		if (dev[0] && !iface_exists(dev)) {
-			snprintf(result, rsize,
-				 "Device '%s' not present, route not applied.", dev);
-			return SG_ERR_NOT_FOUND;
-		}
+	if (strcmp(type, "system_settings") == 0)
+		return apply_settings(id, data, result, rsize);
 
-		if (strcmp(status, "disable") == 0) {
-			if (dst[0]) {
-				const char *argv[] = {"ip", "route", "del", dst, NULL};
-				free(safe_exec(argv));
-			}
-			snprintf(result, rsize, "Route %s disabled.", id);
-			return SG_OK;
-		}
-		if (dst[0] == '\0') {
-			snprintf(result, rsize, "'dst' not set, route not applied.");
-			return SG_ERR_MISSING_ARG;
-		}
+	if (strcmp(type, "system_interface") == 0)
+		return apply_interface(id, data, result, rsize);
 
-		/*
-		 * Build argv for ip route replace.
-		 * Assemble pieces into a flat array (max 12 args).
-		 * "ip route replace DST [via GW] [dev DEV] [metric DIST]"
-		 */
-		const char *argv[14];
-		int argc = 0;
-		argv[argc++] = "ip";
-		argv[argc++] = "route";
-		argv[argc++] = "replace";
-		argv[argc++] = dst;
-		if (gw[0])  { argv[argc++] = "via";    argv[argc++] = gw;   }
-		if (dev[0]) { argv[argc++] = "dev";    argv[argc++] = dev;  }
-		if (dist[0]){ argv[argc++] = "metric"; argv[argc++] = dist; }
-		argv[argc] = NULL;
-		free(safe_exec(argv));
+	if (strcmp(type, "network_nat") == 0)
+		return apply_nat(id, data, result, rsize);
 
-		snprintf(result, rsize, "Route %s applied: %s", id, dst);
-		return SG_OK;
-	}
+	if (strcmp(type, "network_dns") == 0)
+		return apply_dns(id, data, result, rsize);
 
-	if (strcmp(type, "system_settings") == 0) {
-		char hostname[VALBUFSZ], ipfwd[VALBUFSZ];
-		extract_val(data, "hostname", hostname, sizeof(hostname));
-		extract_val(data, "ip-forward", ipfwd, sizeof(ipfwd));
+	if (strcmp(type, "network_dhcp-server") == 0)
+		return apply_dhcp(id, data, result, rsize);
 
-		if (hostname[0]) {
-			if (!sg_is_safe_id(hostname)) {
-				snprintf(result, rsize, "Invalid hostname '%s'.", hostname);
-				return SG_ERR_INVALID_VAL;
-			}
-			/* Use sethostname() syscall — no shell (VULN-09) */
-			if (sethostname(hostname, strlen(hostname)) != 0)
-				mgmt_log("WARN", "sethostname: %s", strerror(errno));
-			FILE *fp = fopen("/etc/hostname", "w");
-			if (fp) { fprintf(fp, "%s\n", hostname); fclose(fp); }
-		}
-		if (strcmp(ipfwd, "enable") == 0) {
-			FILE *fp = fopen("/proc/sys/net/ipv4/ip_forward", "w");
-			if (fp) { fprintf(fp, "1\n"); fclose(fp); }
-		} else if (strcmp(ipfwd, "disable") == 0) {
-			FILE *fp = fopen("/proc/sys/net/ipv4/ip_forward", "w");
-			if (fp) { fprintf(fp, "0\n"); fclose(fp); }
-		}
-
-		snprintf(result, rsize, "System settings applied.");
-		return SG_OK;
-	}
-
-	if (strcmp(type, "system_interface") == 0) {
-		char ip[VALBUFSZ], status[VALBUFSZ], mtu[VALBUFSZ], desc[VALBUFSZ];
-		extract_val(data, "ip", ip, sizeof(ip));
-		extract_val(data, "status", status, sizeof(status));
-		extract_val(data, "mtu", mtu, sizeof(mtu));
-		extract_val(data, "description", desc, sizeof(desc));
-
-		/* Validate inputs */
-		if (!sg_is_iface_name(id)) {
-			snprintf(result, rsize, "Invalid interface '%s'.", id);
-			return SG_ERR_INVALID_VAL;
-		}
-		if (!iface_exists(id)) {
-			snprintf(result, rsize,
-				 "Interface '%s' not present, skipping.", id);
-			return SG_ERR_NOT_FOUND;
-		}
-		if (ip[0] && !sg_is_cidr(ip)) {
-			snprintf(result, rsize, "Invalid IP '%s'.", ip);
-			return SG_ERR_INVALID_VAL;
-		}
-		if (mtu[0]) {
-			int min_mtu, max_mtu;
-			read_iface_mtu_limits(id, &min_mtu, &max_mtu);
-			if (!sg_is_uint_range(mtu, min_mtu, max_mtu)) {
-				snprintf(result, rsize,
-					 "MTU '%s' out of range (%d-%d) for %s.",
-					 mtu, min_mtu, max_mtu, id);
-				return SG_ERR_INVALID_VAL;
-			}
-		}
-
-		if (ip[0]) {
-			const char *a1[] = {"ip", "addr", "flush", "dev", id, NULL};
-			free(safe_exec(a1));
-			const char *a2[] = {"ip", "addr", "add", ip, "dev", id, NULL};
-			free(safe_exec(a2));
-		}
-		if (strcmp(status, "up") == 0) {
-			const char *a[] = {"ip", "link", "set", id, "up", NULL};
-			free(safe_exec(a));
-		} else if (strcmp(status, "down") == 0) {
-			const char *a[] = {"ip", "link", "set", id, "down", NULL};
-			free(safe_exec(a));
-		}
-		if (mtu[0]) {
-			const char *a[] = {"ip", "link", "set", id, "mtu", mtu, NULL};
-			free(safe_exec(a));
-		}
-		snprintf(result, rsize, "Interface %s configured.", id);
-		return SG_OK;
-	}
-
-	if (strcmp(type, "network_nat") == 0) {
-		char nattype[VALBUFSZ], srcintf[VALBUFSZ], dstport[VALBUFSZ];
-		char mapped_ip[VALBUFSZ], mapped_port[VALBUFSZ], status[VALBUFSZ];
-		extract_val(data, "type", nattype, sizeof(nattype));
-		extract_val(data, "srcintf", srcintf, sizeof(srcintf));
-		extract_val(data, "dstport", dstport, sizeof(dstport));
-		extract_val(data, "mapped-ip", mapped_ip, sizeof(mapped_ip));
-		extract_val(data, "mapped-port", mapped_port, sizeof(mapped_port));
-		extract_val(data, "status", status, sizeof(status));
-
-		/* Validate inputs */
-		if (srcintf[0] && !sg_is_iface_name(srcintf)) {
-			snprintf(result, rsize, "Invalid srcintf '%s'.", srcintf);
-			return SG_ERR_INVALID_VAL;
-		}
-		if (mapped_ip[0] && !sg_is_ipv4(mapped_ip)) {
-			snprintf(result, rsize, "Invalid mapped-ip '%s'.", mapped_ip);
-			return SG_ERR_INVALID_VAL;
-		}
-		if (dstport[0] && !sg_is_uint_range(dstport, 1, 65535)) {
-			snprintf(result, rsize, "Invalid dstport '%s'.", dstport);
-			return SG_ERR_INVALID_VAL;
-		}
-		if (mapped_port[0] && !sg_is_uint_range(mapped_port, 1, 65535)) {
-			snprintf(result, rsize, "Invalid mapped-port '%s'.", mapped_port);
-			return SG_ERR_INVALID_VAL;
-		}
-
-		if (strcmp(status, "disable") == 0) {
-			snprintf(result, rsize, "NAT rule %s disabled.", id);
-			return SG_OK;
-		}
-		if (strcmp(nattype, "snat") == 0 && srcintf[0]) {
-			/* Check if rule already exists before adding */
-			const char *chk[] = {"iptables", "-t", "nat", "-C", "POSTROUTING",
-					     "-o", srcintf, "-j", "MASQUERADE", NULL};
-			char *out = safe_exec(chk);
-			int exists = (out && strstr(out, "iptables") == NULL);
-			/* -C returns 0 (empty output) if exists, error text if not */
-			if (out && out[0] == '\0') exists = 1;
-			free(out);
-
-			if (!exists) {
-				const char *a[] = {"iptables", "-t", "nat", "-A", "POSTROUTING",
-						   "-o", srcintf, "-j", "MASQUERADE", NULL};
-				free(safe_exec(a));
-			}
-			snprintf(result, rsize, "SNAT rule %s applied.", id);
-		} else if (strcmp(nattype, "dnat") == 0 && dstport[0] && mapped_ip[0]) {
-			char target[VALBUFSZ * 2 + 4];
-			if (mapped_port[0])
-				snprintf(target, sizeof(target), "%s:%s", mapped_ip, mapped_port);
-			else
-				snprintf(target, sizeof(target), "%s", mapped_ip);
-
-			/* Check if rule already exists before adding */
-			const char *chk[] = {"iptables", "-t", "nat", "-C", "PREROUTING",
-					     "-p", "tcp", "--dport", dstport,
-					     "-j", "DNAT", "--to-destination", target, NULL};
-			char *out = safe_exec(chk);
-			int exists = (out && out[0] == '\0');
-			free(out);
-
-			if (!exists) {
-				const char *a[] = {"iptables", "-t", "nat", "-A", "PREROUTING",
-						   "-p", "tcp", "--dport", dstport,
-						   "-j", "DNAT", "--to-destination", target, NULL};
-				free(safe_exec(a));
-			}
-			snprintf(result, rsize, "DNAT rule %s applied.", id);
-		}
-		return SG_OK;
-	}
-
+	/* ── Inline handlers (tightly coupled to monolith statics) ───── */
 	if (strcmp(type, "system_admin-profile") == 0) {
 		char perms[VALBUFSZ];
 		extract_val(data, "permissions", perms, sizeof(perms));

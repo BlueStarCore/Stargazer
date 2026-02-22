@@ -22,12 +22,18 @@ $(BUILD_DIR)/sqlite3.o: sqlite3.c sqlite3.h
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(SQLITE_CFLAGS) -c -o $@ sqlite3.c
 
-$(BUILD_DIR)/stargazer-mgmtd: stargazer-mgmtd.c stargazer_ipc.h sg_db.c sg_db.h \
+MGMTD_APPLY_SRCS := mgmtd_apply_route.c mgmtd_apply_iface.c \
+                     mgmtd_apply_nat.c mgmtd_apply_dns.c mgmtd_apply_dhcp.c
+
+$(BUILD_DIR)/stargazer-mgmtd: stargazer-mgmtd.c stargazer_ipc.h mgmtd_apply.h \
+                               $(MGMTD_APPLY_SRCS) \
+                               sg_db.c sg_db.h \
                                $(COMMON_DIR)/password_policy.c $(COMMON_DIR)/password_policy.h \
                                $(COMMON_DIR)/sg_validate.c $(COMMON_DIR)/sg_validate.h \
                                $(BUILD_DIR)/sqlite3.o
 	@mkdir -p $(BUILD_DIR)
-	$(CC) $(CFLAGS) -o $@ stargazer-mgmtd.c sg_db.c $(COMMON_DIR)/password_policy.c \
+	$(CC) $(CFLAGS) -o $@ stargazer-mgmtd.c $(MGMTD_APPLY_SRCS) \
+		sg_db.c $(COMMON_DIR)/password_policy.c \
 		$(COMMON_DIR)/sg_validate.c $(BUILD_DIR)/sqlite3.o $(LDFLAGS) -lcrypt
 
 $(BUILD_DIR)/stargazer-ipc-cli: stargazer-ipc-cli.c stargazer_ipc.h
