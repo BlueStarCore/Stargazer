@@ -4,6 +4,12 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      upload_release:
+        description: "Upload kernel artifact to GitHub Release"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   build:
@@ -26,3 +32,27 @@ jobs:
 
       - name: Run make
         run: make
+
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-build
+          path: |
+            build/kernel.img
+            build/dtbs/
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.upload_release == 'true' }}
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            build/kernel.img
+            build/dtbs/*
+          tag_name: release-${{ github.run_number }}
+          body: |
+            BPI-R4 Kernel Build
+            - Kernel Image: kernel.img
+            - Device Trees: dtbs/
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
