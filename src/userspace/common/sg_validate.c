@@ -71,7 +71,7 @@ static const struct field_entry field_table[] = {
 	/* system_interface */
 	{ "system_interface", "ip",          "cidr",          0, NULL,   "Interface IP address and mask" },
 	{ "system_interface", "status",      "enum:up,down",  0, "up",   "Administrative state"          },
-	{ "system_interface", "mtu",         "uint:576:9200", 0, "1500", "Maximum transmission unit"     },
+	{ "system_interface", "mtu",         "uint:68:65535", 0, "1500", "MTU (driver limits checked on apply)" },
 	{ "system_interface", "description", "string",        1, NULL,   "Interface description"         },
 
 	/* system_settings */

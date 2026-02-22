@@ -365,6 +365,54 @@ static int read_net_type(const char *name)
 }
 
 /*
+ * Read /sys/class/net/<name>/mtu and return the current MTU value.
+ * Returns -1 on error.
+ */
+static int read_iface_mtu(const char *name)
+{
+	char path[48];
+	snprintf(path, sizeof(path), "/sys/class/net/%.15s/mtu", name);
+	FILE *fp = fopen(path, "r");
+	if (!fp)
+		return -1;
+	int val = -1;
+	if (fscanf(fp, "%d", &val) != 1)
+		val = -1;
+	fclose(fp);
+	return val;
+}
+
+/*
+ * Query the driver-reported min/max MTU for an interface via netlink
+ * (ip -d link show <name>).  Falls back to 68/65535 if unavailable.
+ */
+static void read_iface_mtu_limits(const char *name,
+				  int *out_min, int *out_max)
+{
+	*out_min = 68;
+	*out_max = 65535;
+
+	const char *argv[] = {"ip", "-d", "link", "show", name, NULL};
+	char *out = safe_exec(argv);
+	if (!out)
+		return;
+
+	char *p = strstr(out, "minmtu ");
+	if (p) {
+		int v = atoi(p + 7);
+		if (v > 0)
+			*out_min = v;
+	}
+	p = strstr(out, "maxmtu ");
+	if (p) {
+		int v = atoi(p + 7);
+		if (v > 0)
+			*out_max = v;
+	}
+	free(out);
+}
+
+/*
  * Sync interface config entries with actual hardware on every boot.
  *
  * - Scans /sys/class/net for Ethernet NICs (type == 1), skips lo and dotfiles
@@ -421,23 +469,32 @@ static void mgmtd_sync_interfaces(void)
 		char *existing = sg_db_get("system_interface", nics[i]);
 
 		if (!existing) {
-			/* New NIC — create entry */
+			/* New NIC — create entry with current MTU from driver */
+			int cur_mtu = read_iface_mtu(nics[i]);
+			if (cur_mtu <= 0)
+				cur_mtu = 1500;
+
+			char seed[256];
 			if (first_boot && i == 0) {
-				sg_db_set("system_interface", nics[i],
-					  "ip=192.168.99.99/24\n"
-					  "allowaccess=ping\n"
-					  "status=up\n"
-					  "builtin=yes\n");
+				snprintf(seed, sizeof(seed),
+					 "ip=192.168.99.99/24\n"
+					 "allowaccess=ping\n"
+					 "status=up\n"
+					 "mtu=%d\n"
+					 "builtin=yes\n", cur_mtu);
+				sg_db_set("system_interface", nics[i], seed);
 				mgmt_log("INFO",
-					 "interface %s: created (management IP 192.168.99.99/24)",
-					 nics[i]);
+					 "interface %s: created (management IP 192.168.99.99/24, mtu %d)",
+					 nics[i], cur_mtu);
 			} else {
-				sg_db_set("system_interface", nics[i],
-					  "allowaccess=ping\n"
-					  "status=up\n"
-					  "builtin=yes\n");
-				mgmt_log("INFO", "interface %s: created",
-					 nics[i]);
+				snprintf(seed, sizeof(seed),
+					 "allowaccess=ping\n"
+					 "status=up\n"
+					 "mtu=%d\n"
+					 "builtin=yes\n", cur_mtu);
+				sg_db_set("system_interface", nics[i], seed);
+				mgmt_log("INFO", "interface %s: created (mtu %d)",
+					 nics[i], cur_mtu);
 			}
 		} else {
 			/* Existing NIC — ensure builtin=yes */
@@ -498,6 +555,124 @@ static void mgmtd_sync_interfaces(void)
 	mgmt_log("INFO", "interface sync complete: %d NIC(s) discovered",
 		 nic_count);
 #undef MAX_NICS
+}
+
+/*
+ * Build a formatted table of network interfaces with status, IP, and
+ * description from the config database. Returns heap-allocated string.
+ */
+static char *mgmtd_show_interfaces(void)
+{
+#define MAX_SHOW_NICS 16
+	char *nics[MAX_SHOW_NICS];
+	int nic_count = 0;
+
+	DIR *d = opendir("/sys/class/net");
+	if (!d)
+		return strdup("(cannot read interfaces)\n");
+
+	struct dirent *ent;
+	while ((ent = readdir(d)) != NULL && nic_count < MAX_SHOW_NICS) {
+		if (ent->d_name[0] == '.')
+			continue;
+		if (strcmp(ent->d_name, "lo") == 0)
+			continue;
+		if (read_net_type(ent->d_name) != 1)
+			continue;
+		nics[nic_count] = strdup(ent->d_name);
+		if (!nics[nic_count])
+			continue;
+		nic_count++;
+	}
+	closedir(d);
+
+	/* Sort alphabetically (insertion sort) */
+	for (int i = 1; i < nic_count; i++) {
+		char *key = nics[i];
+		int j = i - 1;
+		while (j >= 0 && strcmp(nics[j], key) > 0) {
+			nics[j + 1] = nics[j];
+			j--;
+		}
+		nics[j + 1] = key;
+	}
+
+	size_t bufsz = 4096, used = 0;
+	char *buf = malloc(bufsz);
+	if (!buf) {
+		for (int i = 0; i < nic_count; i++)
+			free(nics[i]);
+		return NULL;
+	}
+
+	/* Header */
+	used += (size_t)snprintf(buf, bufsz,
+		"%-16s %-8s %-21s %s\n", "Name", "Status", "IP", "Description");
+
+	for (int i = 0; i < nic_count; i++) {
+		/* Read operstate from sysfs */
+		char state[16] = "unknown";
+		char spath[64];
+		snprintf(spath, sizeof(spath), "/sys/class/net/%.15s/operstate",
+			 nics[i]);
+		FILE *fp = fopen(spath, "r");
+		if (fp) {
+			if (fgets(state, sizeof(state), fp)) {
+				char *nl = strchr(state, '\n');
+				if (nl) *nl = '\0';
+			}
+			fclose(fp);
+		}
+
+		/* Get IP address via ip command */
+		char ip[32] = "-";
+		const char *argv[] = {
+			"ip", "-4", "-o", "addr", "show", nics[i], NULL
+		};
+		char *ipout = safe_exec(argv);
+		if (ipout && ipout[0]) {
+			char *inet = strstr(ipout, "inet ");
+			if (inet) {
+				inet += 5;
+				char *end = strchr(inet, ' ');
+				if (end) *end = '\0';
+				snprintf(ip, sizeof(ip), "%s", inet);
+			}
+		}
+		free(ipout);
+
+		/* Get description from config DB */
+		char *desc = sg_db_get_val("system_interface", nics[i],
+					   "description");
+
+		/* Format row */
+		char line[256];
+		int n = snprintf(line, sizeof(line), "%-16s %-8s %-21s %s\n",
+				 nics[i], state, ip, desc ? desc : "");
+
+		/* Grow buffer if needed */
+		while (used + (size_t)n + 1 > bufsz) {
+			bufsz *= 2;
+			char *nb = realloc(buf, bufsz);
+			if (!nb) {
+				free(buf);
+				free(desc);
+				for (int k = i; k < nic_count; k++)
+					free(nics[k]);
+				return NULL;
+			}
+			buf = nb;
+		}
+		memcpy(buf + used, line, (size_t)n);
+		used += (size_t)n;
+
+		free(desc);
+		free(nics[i]);
+	}
+
+	buf[used] = '\0';
+	return buf;
+#undef MAX_SHOW_NICS
 }
 
 /*
@@ -1164,10 +1339,12 @@ static sg_status_t apply_config(const char *type, const char *id,
 	result[0] = '\0';
 
 	if (strcmp(type, "network_route_static") == 0) {
-		char dst[VALBUFSZ], gw[VALBUFSZ], dev[VALBUFSZ], status[VALBUFSZ];
+		char dst[VALBUFSZ], gw[VALBUFSZ], dev[VALBUFSZ];
+		char dist[VALBUFSZ], status[VALBUFSZ];
 		extract_val(data, "dst", dst, sizeof(dst));
 		extract_val(data, "gateway", gw, sizeof(gw));
 		extract_val(data, "device", dev, sizeof(dev));
+		extract_val(data, "distance", dist, sizeof(dist));
 		extract_val(data, "status", status, sizeof(status));
 
 		/* Validate all inputs before any system call */
@@ -1181,6 +1358,10 @@ static sg_status_t apply_config(const char *type, const char *id,
 		}
 		if (dev[0] && !sg_is_iface_name(dev)) {
 			snprintf(result, rsize, "Invalid device '%s'.", dev);
+			return SG_ERR_INVALID_VAL;
+		}
+		if (dist[0] && !sg_is_uint_range(dist, 1, 255)) {
+			snprintf(result, rsize, "Invalid distance '%s'.", dist);
 			return SG_ERR_INVALID_VAL;
 		}
 		if (dev[0] && !iface_exists(dev)) {
@@ -1202,20 +1383,22 @@ static sg_status_t apply_config(const char *type, const char *id,
 			return SG_ERR_MISSING_ARG;
 		}
 
-		/* Build argv for ip route replace — no shell interpretation */
-		if (gw[0] && dev[0]) {
-			const char *argv[] = {"ip", "route", "replace", dst, "via", gw, "dev", dev, NULL};
-			free(safe_exec(argv));
-		} else if (gw[0]) {
-			const char *argv[] = {"ip", "route", "replace", dst, "via", gw, NULL};
-			free(safe_exec(argv));
-		} else if (dev[0]) {
-			const char *argv[] = {"ip", "route", "replace", dst, "dev", dev, NULL};
-			free(safe_exec(argv));
-		} else {
-			const char *argv[] = {"ip", "route", "replace", dst, NULL};
-			free(safe_exec(argv));
-		}
+		/*
+		 * Build argv for ip route replace.
+		 * Assemble pieces into a flat array (max 12 args).
+		 * "ip route replace DST [via GW] [dev DEV] [metric DIST]"
+		 */
+		const char *argv[14];
+		int argc = 0;
+		argv[argc++] = "ip";
+		argv[argc++] = "route";
+		argv[argc++] = "replace";
+		argv[argc++] = dst;
+		if (gw[0])  { argv[argc++] = "via";    argv[argc++] = gw;   }
+		if (dev[0]) { argv[argc++] = "dev";    argv[argc++] = dev;  }
+		if (dist[0]){ argv[argc++] = "metric"; argv[argc++] = dist; }
+		argv[argc] = NULL;
+		free(safe_exec(argv));
 
 		snprintf(result, rsize, "Route %s applied: %s", id, dst);
 		return SG_OK;
@@ -1270,9 +1453,15 @@ static sg_status_t apply_config(const char *type, const char *id,
 			snprintf(result, rsize, "Invalid IP '%s'.", ip);
 			return SG_ERR_INVALID_VAL;
 		}
-		if (mtu[0] && !sg_is_uint_range(mtu, 576, 9200)) {
-			snprintf(result, rsize, "Invalid MTU '%s'.", mtu);
-			return SG_ERR_INVALID_VAL;
+		if (mtu[0]) {
+			int min_mtu, max_mtu;
+			read_iface_mtu_limits(id, &min_mtu, &max_mtu);
+			if (!sg_is_uint_range(mtu, min_mtu, max_mtu)) {
+				snprintf(result, rsize,
+					 "MTU '%s' out of range (%d-%d) for %s.",
+					 mtu, min_mtu, max_mtu, id);
+				return SG_ERR_INVALID_VAL;
+			}
 		}
 
 		if (ip[0]) {
@@ -1329,9 +1518,20 @@ static sg_status_t apply_config(const char *type, const char *id,
 			return SG_OK;
 		}
 		if (strcmp(nattype, "snat") == 0 && srcintf[0]) {
-			const char *a[] = {"iptables", "-t", "nat", "-A", "POSTROUTING",
-					   "-o", srcintf, "-j", "MASQUERADE", NULL};
-			free(safe_exec(a));
+			/* Check if rule already exists before adding */
+			const char *chk[] = {"iptables", "-t", "nat", "-C", "POSTROUTING",
+					     "-o", srcintf, "-j", "MASQUERADE", NULL};
+			char *out = safe_exec(chk);
+			int exists = (out && strstr(out, "iptables") == NULL);
+			/* -C returns 0 (empty output) if exists, error text if not */
+			if (out && out[0] == '\0') exists = 1;
+			free(out);
+
+			if (!exists) {
+				const char *a[] = {"iptables", "-t", "nat", "-A", "POSTROUTING",
+						   "-o", srcintf, "-j", "MASQUERADE", NULL};
+				free(safe_exec(a));
+			}
 			snprintf(result, rsize, "SNAT rule %s applied.", id);
 		} else if (strcmp(nattype, "dnat") == 0 && dstport[0] && mapped_ip[0]) {
 			char target[VALBUFSZ * 2 + 4];
@@ -1340,10 +1540,20 @@ static sg_status_t apply_config(const char *type, const char *id,
 			else
 				snprintf(target, sizeof(target), "%s", mapped_ip);
 
-			const char *a[] = {"iptables", "-t", "nat", "-A", "PREROUTING",
-					   "-p", "tcp", "--dport", dstport,
-					   "-j", "DNAT", "--to-destination", target, NULL};
-			free(safe_exec(a));
+			/* Check if rule already exists before adding */
+			const char *chk[] = {"iptables", "-t", "nat", "-C", "PREROUTING",
+					     "-p", "tcp", "--dport", dstport,
+					     "-j", "DNAT", "--to-destination", target, NULL};
+			char *out = safe_exec(chk);
+			int exists = (out && out[0] == '\0');
+			free(out);
+
+			if (!exists) {
+				const char *a[] = {"iptables", "-t", "nat", "-A", "PREROUTING",
+						   "-p", "tcp", "--dport", dstport,
+						   "-j", "DNAT", "--to-destination", target, NULL};
+				free(safe_exec(a));
+			}
 			snprintf(result, rsize, "DNAT rule %s applied.", id);
 		}
 		return SG_OK;
@@ -2279,7 +2489,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 	}
 
 	case SG_CMD_SHOW_IFACES: {
-		char *out = run_cmd("ip -brief link 2>/dev/null || ifconfig -a 2>/dev/null");
+		char *out = mgmtd_show_interfaces();
 		send_ok(client_fd, NULL, out ? out : "");
 		free(out);
 		return;
