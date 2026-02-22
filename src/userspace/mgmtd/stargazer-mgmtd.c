@@ -332,39 +332,172 @@ static void mgmtd_seed_defaults(void)
 		  "status=enable\n"
 		  "comment=Default deny all traffic\n");
 
-	/* ── Default network interfaces ────────────────────────────── */
-	sg_db_set("system_interface", "eth0",
-		  "ip=10.0.1.2/24\nstatus=up\nmtu=1500\ndescription=WAN\n");
-	sg_db_set("system_interface", "eth1",
-		  "ip=192.168.99.254/24\nstatus=up\nmtu=1500\ndescription=LAN\n");
+	/* Interfaces and routes are handled by mgmtd_sync_interfaces() */
 
-	/* Also detect any additional interfaces from /sys/class/net */
-	{
-		DIR *d = opendir("/sys/class/net");
-		if (d) {
-			struct dirent *ent;
-			while ((ent = readdir(d)) != NULL) {
-				if (ent->d_name[0] == '.')
-					continue;
-				if (strcmp(ent->d_name, "lo") == 0)
-					continue;
-				if (strcmp(ent->d_name, "eth0") == 0 ||
-				    strcmp(ent->d_name, "eth1") == 0)
-					continue;
-				sg_db_set("system_interface", ent->d_name,
-					  "status=up\n");
-				mgmt_log("INFO", "detected interface: %s",
-					 ent->d_name);
+	mgmt_log("INFO", "default configuration seeded successfully");
+}
+
+/* ── Interface discovery and protection ─────────────────────────────────── */
+
+/*
+ * Read /sys/class/net/<name>/type and return the value (1 = Ethernet).
+ * Returns -1 on error.
+ */
+static int read_net_type(const char *name)
+{
+	/* IFNAMSIZ is 16; interface names are always short */
+	char nmbuf[16];
+	size_t nlen = strlen(name);
+	if (nlen >= sizeof(nmbuf))
+		return -1;
+	memcpy(nmbuf, name, nlen + 1);
+
+	char path[48]; /* "/sys/class/net/" (15) + name (15) + "/type" (5) + NUL */
+	snprintf(path, sizeof(path), "/sys/class/net/%.15s/type", nmbuf);
+	FILE *fp = fopen(path, "r");
+	if (!fp)
+		return -1;
+	int val = -1;
+	if (fscanf(fp, "%d", &val) != 1)
+		val = -1;
+	fclose(fp);
+	return val;
+}
+
+/*
+ * Sync interface config entries with actual hardware on every boot.
+ *
+ * - Scans /sys/class/net for Ethernet NICs (type == 1), skips lo and dotfiles
+ * - Creates DB entries for new NICs with builtin=yes
+ * - Assigns management IP (192.168.99.99/24) to first NIC on first boot
+ * - Marks existing NICs as builtin=yes (protects from deletion)
+ * - Clears builtin flag from DB entries whose hardware was removed
+ */
+static void mgmtd_sync_interfaces(void)
+{
+#define MAX_NICS 16
+	char *nics[MAX_NICS];
+	int nic_count = 0;
+
+	/* 1. Scan /sys/class/net for Ethernet NICs */
+	DIR *d = opendir("/sys/class/net");
+	if (!d) {
+		mgmt_log("WARN", "sync_interfaces: cannot open /sys/class/net");
+		return;
+	}
+
+	struct dirent *ent;
+	while ((ent = readdir(d)) != NULL && nic_count < MAX_NICS) {
+		if (ent->d_name[0] == '.')
+			continue;
+		if (strcmp(ent->d_name, "lo") == 0)
+			continue;
+		if (read_net_type(ent->d_name) != 1)
+			continue;
+
+		nics[nic_count] = strdup(ent->d_name);
+		if (!nics[nic_count])
+			continue;
+		nic_count++;
+	}
+	closedir(d);
+
+	/* 2. Sort alphabetically (insertion sort) */
+	for (int i = 1; i < nic_count; i++) {
+		char *key = nics[i];
+		int j = i - 1;
+		while (j >= 0 && strcmp(nics[j], key) > 0) {
+			nics[j + 1] = nics[j];
+			j--;
+		}
+		nics[j + 1] = key;
+	}
+
+	/* 3. Detect first boot: no interface entries in DB yet */
+	int first_boot = (sg_db_count("system_interface") == 0);
+
+	/* 4. Create/protect entries for each discovered NIC */
+	for (int i = 0; i < nic_count; i++) {
+		char *existing = sg_db_get("system_interface", nics[i]);
+
+		if (!existing) {
+			/* New NIC — create entry */
+			if (first_boot && i == 0) {
+				sg_db_set("system_interface", nics[i],
+					  "ip=192.168.99.99/24\n"
+					  "allowaccess=ping\n"
+					  "status=up\n"
+					  "builtin=yes\n");
+				mgmt_log("INFO",
+					 "interface %s: created (management IP 192.168.99.99/24)",
+					 nics[i]);
+			} else {
+				sg_db_set("system_interface", nics[i],
+					  "allowaccess=ping\n"
+					  "status=up\n"
+					  "builtin=yes\n");
+				mgmt_log("INFO", "interface %s: created",
+					 nics[i]);
 			}
-			closedir(d);
+		} else {
+			/* Existing NIC — ensure builtin=yes */
+			sg_db_set_val("system_interface", nics[i],
+				      "builtin", "yes");
+			free(existing);
+			mgmt_log("INFO", "interface %s: protected (builtin)",
+				 nics[i]);
 		}
 	}
 
-	/* ── Default route ─────────────────────────────────────────── */
-	sg_db_set("network_route_static", "default",
-		  "dst=0.0.0.0/0\ngateway=10.0.1.1\ndevice=eth0\nstatus=enable\n");
+	/* 5. Stale interface cleanup: clear builtin from removed hardware */
+	char *list = sg_db_list("system_interface");
+	if (list) {
+		const char *p = list;
+		while (*p) {
+			const char *eol = strchr(p, '\n');
+			size_t len = eol ? (size_t)(eol - p) : strlen(p);
+			if (len == 0) { p++; continue; }
 
-	mgmt_log("INFO", "default configuration seeded successfully");
+			char name[256];
+			if (len >= sizeof(name)) len = sizeof(name) - 1;
+			memcpy(name, p, len);
+			name[len] = '\0';
+
+			/* Check if this DB entry has builtin=yes */
+			char *bi = sg_db_get_val("system_interface", name,
+						 "builtin");
+			if (bi && strcmp(bi, "yes") == 0) {
+				/* Check if still in discovered NIC list */
+				int found = 0;
+				for (int i = 0; i < nic_count; i++) {
+					if (strcmp(nics[i], name) == 0) {
+						found = 1;
+						break;
+					}
+				}
+				if (!found) {
+					sg_db_set_val("system_interface", name,
+						      "builtin", "no");
+					mgmt_log("INFO",
+						 "interface %s: hardware removed, builtin cleared",
+						 name);
+				}
+			}
+			free(bi);
+
+			p += len;
+			if (eol) p++;
+		}
+		free(list);
+	}
+
+	/* Cleanup */
+	for (int i = 0; i < nic_count; i++)
+		free(nics[i]);
+
+	mgmt_log("INFO", "interface sync complete: %d NIC(s) discovered",
+		 nic_count);
+#undef MAX_NICS
 }
 
 /*
@@ -2273,6 +2406,9 @@ int main(void)
 
 	/* Seed defaults on first boot (no-op if already seeded) */
 	mgmtd_seed_defaults();
+
+	/* Discover NICs, create/protect interface entries */
+	mgmtd_sync_interfaces();
 
 	/* Apply saved configuration to running system */
 	mgmtd_replay_config();

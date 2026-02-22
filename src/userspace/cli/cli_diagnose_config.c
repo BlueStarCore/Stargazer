@@ -1504,7 +1504,100 @@ static void test_ref_metadata(void)
 	}
 }
 
-/* ── Section 21: IPC referential integrity guard (full mode) ──────────── */
+/* ── Section 21: IPC interface builtin protection (full mode) ─────────── */
+
+static void test_ipc_interface_protection(void)
+{
+	struct ipc_response resp;
+	int conn;
+
+	printf(C_CYAN "\n  --- IPC: interface builtin protection ---"
+	       C_NC "\n");
+
+	/*
+	 * Find an existing interface with builtin=yes by listing all
+	 * system_interface entries and checking each one.
+	 */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_LIST, "system_interface", &resp);
+	if (conn < 0 || resp.status != SG_OK || !resp.payload) {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [iface-prot] cannot list interfaces"
+		       " (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+		ipc_resp_free(&resp);
+		return;
+	}
+
+	/* Find first interface with builtin=yes */
+	char builtin_iface[64] = {0};
+	const char *p = resp.payload;
+	while (*p && !builtin_iface[0]) {
+		const char *eol = strchr(p, '\n');
+		size_t len = eol ? (size_t)(eol - p) : strlen(p);
+		if (len == 0) { p++; continue; }
+
+		char name[64];
+		if (len >= sizeof(name)) len = sizeof(name) - 1;
+		memcpy(name, p, len);
+		name[len] = '\0';
+
+		/* Query this interface's data */
+		char section[128];
+		snprintf(section, sizeof(section),
+			 "system_interface:%s", name);
+		struct ipc_response r2;
+		int c2 = ipc_send_str(SG_CMD_CFG_GET, section, &r2);
+		if (c2 == 0 && r2.status == SG_OK && r2.payload &&
+		    strstr(r2.payload, "builtin=yes")) {
+			snprintf(builtin_iface, sizeof(builtin_iface),
+				 "%s", name);
+		}
+		ipc_resp_free(&r2);
+
+		p += len;
+		if (eol) p++;
+	}
+	ipc_resp_free(&resp);
+
+	if (!builtin_iface[0]) {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [iface-prot] no builtin interface found"
+		       " (sync may not have run)\n");
+		return;
+	}
+	tc_pass++;
+	printf(C_GREEN "  PASS" C_NC
+	       " [iface-prot] found builtin interface: %s\n",
+	       builtin_iface);
+
+	/* Try to delete the builtin interface — expect SG_ERR_BUILTIN */
+	char del_section[128];
+	snprintf(del_section, sizeof(del_section),
+		 "system_interface:%s", builtin_iface);
+	ipc_check("delete builtin interface -> BUILTIN",
+		  SG_CMD_CFG_DEL, del_section, SG_ERR_BUILTIN);
+
+	/* Verify it still exists */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_GET, del_section, &resp);
+	if (conn == 0 && resp.status == SG_OK && resp.payload) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [iface-prot] %s still exists after delete attempt\n",
+		       builtin_iface);
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [iface-prot] %s was deleted despite builtin=yes\n",
+		       builtin_iface);
+	}
+	ipc_resp_free(&resp);
+}
+
+/* ── Section 22: IPC referential integrity guard (full mode) ──────────── */
 
 static void test_ipc_refguard(void)
 {
@@ -1662,6 +1755,7 @@ int cli_diagnose_test_configure(int mode)
 			test_ipc_cfg_reject();
 			test_ipc_admin_reject();
 			test_ipc_builtin_protect();
+			test_ipc_interface_protection();
 			test_ipc_roundtrip();
 			test_ipc_apply();
 			test_ipc_not_found();
