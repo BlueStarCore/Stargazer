@@ -75,7 +75,7 @@ MUSL_CROSS     := $(MUSL_CROSS_DIR)/bin/aarch64-linux-musl-
 # Main targets
 # =============================================================================
 
-.PHONY: all kernel modules busybox musl-toolchain dash logind mgmtd cli rootfs iso test clean help
+.PHONY: all kernel modules busybox musl-toolchain dash logind mgmtd cli rootfs iso test-build test lanvm clean help
 
 all: iso
 	@echo ""
@@ -407,8 +407,8 @@ $(ISO_FILE): $(ROOTFS_DIR)/.stamp
 # Test in QEMU
 # =============================================================================
 
-test: modules busybox dash logind mgmtd cli
-	@echo "Starting QEMU test..."
+test-build: modules busybox dash logind mgmtd cli
+	@echo "Building test initramfs..."
 	@mkdir -p $(BUILD_DIR)/test
 
 	# Create minimal initramfs for testing
@@ -500,7 +500,9 @@ test: modules busybox dash logind mgmtd cli
 
 	# Pack initramfs
 	cd $(BUILD_DIR)/test/initramfs && find . | cpio -o -H newc 2>/dev/null | gzip -9 > $(BUILD_DIR)/test/initramfs.gz
+	@echo "Test initramfs ready: $(BUILD_DIR)/test/initramfs.gz"
 
+test: test-build
 	# Run QEMU
 	qemu-system-aarch64 \
 		-machine virt -cpu cortex-a72 -smp 4 -m 2G \
@@ -508,6 +510,46 @@ test: modules busybox dash logind mgmtd cli
 		-initrd $(BUILD_DIR)/test/initramfs.gz \
 		-append "console=ttyAMA0 rw" \
 		-nographic -no-reboot
+
+# =============================================================================
+# LAN VM (minimal BusyBox client for network testing)
+# =============================================================================
+
+lanvm: busybox dash
+	@echo "Building LAN VM initramfs..."
+	@rm -rf $(BUILD_DIR)/lanvm/initramfs
+	@mkdir -p $(BUILD_DIR)/lanvm/initramfs
+
+	# Minimal filesystem
+	@mkdir -p $(BUILD_DIR)/lanvm/initramfs/bin
+	@mkdir -p $(BUILD_DIR)/lanvm/initramfs/sbin
+	@mkdir -p $(BUILD_DIR)/lanvm/initramfs/etc
+	@mkdir -p $(BUILD_DIR)/lanvm/initramfs/proc
+	@mkdir -p $(BUILD_DIR)/lanvm/initramfs/sys
+	@mkdir -p $(BUILD_DIR)/lanvm/initramfs/dev
+	@mkdir -p $(BUILD_DIR)/lanvm/initramfs/tmp
+
+	# Install BusyBox and create applet symlinks
+	cp $(BUSYBOX_BIN) $(BUILD_DIR)/lanvm/initramfs/bin/busybox
+	@chmod +x $(BUILD_DIR)/lanvm/initramfs/bin/busybox
+	@while IFS= read -r link; do \
+		dir=$$(dirname "$(BUILD_DIR)/lanvm/initramfs$$link"); \
+		mkdir -p "$$dir"; \
+		ln -sf /bin/busybox "$(BUILD_DIR)/lanvm/initramfs$$link"; \
+	done < $(BUSYBOX_DIR)/busybox.links
+
+	# Install dash as /bin/sh
+	cp $(DASH_BIN) $(BUILD_DIR)/lanvm/initramfs/bin/dash
+	@chmod +x $(BUILD_DIR)/lanvm/initramfs/bin/dash
+	@ln -sf dash $(BUILD_DIR)/lanvm/initramfs/bin/sh
+
+	# Install LAN VM init script
+	@cp $(USERSPACE_DIR)/lanvm/init $(BUILD_DIR)/lanvm/initramfs/init
+	@chmod +x $(BUILD_DIR)/lanvm/initramfs/init
+
+	# Pack initramfs
+	cd $(BUILD_DIR)/lanvm/initramfs && find . | cpio -o -H newc 2>/dev/null | gzip -9 > $(BUILD_DIR)/lanvm/initramfs.gz
+	@echo "LAN VM initramfs ready: $(BUILD_DIR)/lanvm/initramfs.gz"
 
 # =============================================================================
 # Utilities
@@ -538,7 +580,9 @@ help:
 	@echo "  make cli      - Cross-compile C CLI binary"
 	@echo "  make rootfs   - Create userspace rootfs"
 	@echo "  make iso      - Create bootable ISO"
-	@echo "  make test     - Test in QEMU"
+	@echo "  make test-build - Build test initramfs (no QEMU)"
+	@echo "  make test     - Build + launch in QEMU (serial only)"
+	@echo "  make lanvm    - Build LAN VM initramfs"
 	@echo "  make clean    - Remove all artifacts"
 	@echo "                 (keeps source caches in .cache/)"
 	@echo ""

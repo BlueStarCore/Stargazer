@@ -134,7 +134,25 @@ static size_t kv_serialize(const struct kv_buf *b, char *out, size_t out_sz)
 	return pos;
 }
 
+/* Check whether a value should be quoted in FortiGate-style output.
+ * Free-text "string" kind → quoted; structured kinds (enum, uint, etc.) → bare. */
+static int value_needs_quote(const char *type, const char *key)
+{
+	const char *kind = sg_reg_value_kind(type, key);
+	return strcmp(kind, "string") == 0;
+}
+
 /* ── Helpers ──────────────────────────────────────────────────────────── */
+
+/* Strip surrounding double quotes in-place: "foo" → foo */
+static void strip_quotes(char *s)
+{
+	size_t len = strlen(s);
+	if (len >= 2 && s[0] == '"' && s[len - 1] == '"') {
+		memmove(s, s + 1, len - 2);
+		s[len - 2] = '\0';
+	}
+}
 
 static void parse_line(const char *line,
 		       char *cmd, size_t cmd_sz,
@@ -178,6 +196,9 @@ static void parse_line(const char *line,
 	const char *v = sp + 1;
 	while (*v == ' ') v++;
 	if (*v) snprintf(val, val_sz, "%s", v);
+
+	strip_quotes(key);
+	strip_quotes(val);
 }
 
 /* Trim leading and trailing whitespace in-place */
@@ -443,9 +464,9 @@ static void register_set_cmds(const char *type_name)
 		*end = '\0';
 
 		char regpath[CLI_MAX_LINE], regdesc[CLI_MAX_LINE];
-		const char *rule = sg_reg_value_rule(type_name, tok);
+		const char *desc = sg_reg_field_desc(type_name, tok);
 		snprintf(regpath, sizeof(regpath), "set %s", tok);
-		snprintf(regdesc, sizeof(regdesc), "Set %s (%s)", tok, rule);
+		snprintf(regdesc, sizeof(regdesc), "%s", desc);
 		cli_register(regpath, regdesc);
 
 		/* Register value-level completions based on kind */
@@ -745,17 +766,32 @@ static int context_entry(const char *type_name, const char *label,
 			}
 		} else if (strcmp(cmd, "show") == 0) {
 			if (data.count > 0) {
-				printf("  == Entry %s ==\n", entry_id);
+				printf("    edit \"%s\"\n", entry_id);
 				for (int i = 0; i < data.count; i++) {
-					if (strcmp(type_name, "system_admin") == 0 &&
-					    strcmp(data.entries[i].key, "password") == 0)
-						printf("    %s=********\n",
-						       data.entries[i].key);
-					else
-						printf("    %s=%s\n",
+					if (strcmp(data.entries[i].key,
+						   "builtin") == 0)
+						continue;
+					if (strcmp(type_name,
+						   "system_admin") == 0 &&
+					    strcmp(data.entries[i].key,
+						   "password") == 0) {
+						printf("        set password"
+						       " ********\n");
+					} else if (value_needs_quote(
+							type_name,
+							data.entries[i].key)) {
+						printf("        set %s"
+						       " \"%s\"\n",
 						       data.entries[i].key,
 						       data.entries[i].val);
+					} else {
+						printf("        set %s"
+						       " %s\n",
+						       data.entries[i].key,
+						       data.entries[i].val);
+					}
 				}
+				printf("    next\n");
 			} else {
 				printf("  (empty -- use 'set <key> <value>')\n");
 			}
@@ -923,17 +959,16 @@ static int context_table(const char *type_name, const char *label)
 			if (ipc_send_str(SG_CMD_CFG_LIST, type_name,
 					 &resp) == 0 &&
 			    resp.status == SG_OK && resp.payload) {
-				/* Parse ID list (newline-separated) */
 				char *ids = resp.payload;
 				char *id = ids;
 				int found = 0;
 
+				printf("config %s\n", label);
 				while (id && *id) {
 					char *nl = strchr(id, '\n');
 					if (nl) *nl = '\0';
 					if (*id) {
 						found = 1;
-						/* Get entry data */
 						char section[512];
 						snprintf(section,
 							 sizeof(section),
@@ -946,28 +981,60 @@ static int context_table(const char *type_name, const char *label)
 							&dr) == 0 &&
 						    dr.status == SG_OK &&
 						    dr.payload) {
-							printf("  == Entry"
-							       " %s ==\n",
+							printf("    edit"
+							       " \"%s\"\n",
 							       id);
-							/* Print indented */
 							const char *p =
 								dr.payload;
 							while (*p) {
 								const char *eol =
 									strchr(p,
 									       '\n');
-								if (eol) {
-									printf("    %.*s\n",
-									       (int)(eol - p),
-									       p);
-									p = eol + 1;
-								} else {
-									printf("    %s\n",
-									       p);
-									break;
+								size_t llen = eol
+									? (size_t)(eol - p)
+									: strlen(p);
+								if (llen > 0) {
+									const char *eq =
+										memchr(p, '=', llen);
+									if (eq) {
+										size_t klen =
+											(size_t)(eq - p);
+										if (klen == 7 &&
+										    strncmp(p, "builtin", 7) == 0) {
+											p += llen;
+											if (eol) p++;
+											continue;
+										}
+										if (klen == 8 &&
+										    strncmp(p, "password", 8) == 0) {
+											printf("        set password"
+											       " ********\n");
+										} else {
+											char kbuf[64];
+											if (klen >= sizeof(kbuf))
+												klen = sizeof(kbuf) - 1;
+											memcpy(kbuf, p, klen);
+											kbuf[klen] = '\0';
+											if (value_needs_quote(type_name,
+													      kbuf))
+												printf("        set %.*s"
+												       " \"%.*s\"\n",
+												       (int)klen, p,
+												       (int)(llen - klen - 1),
+												       eq + 1);
+											else
+												printf("        set %.*s"
+												       " %.*s\n",
+												       (int)klen, p,
+												       (int)(llen - klen - 1),
+												       eq + 1);
+										}
+									}
 								}
+								p += llen;
+								if (eol) p++;
 							}
-							printf("\n");
+							printf("    next\n");
 						}
 						ipc_resp_free(&dr);
 					}
@@ -976,6 +1043,8 @@ static int context_table(const char *type_name, const char *label)
 				}
 				if (!found)
 					printf("  No entries configured.\n");
+				else
+					printf("end\n");
 			} else {
 				printf("  No entries configured.\n");
 			}
@@ -1200,11 +1269,22 @@ static int context_single(const char *type_name, const char *label)
 				printf("  %s: (not set)\n", key);
 		} else if (strcmp(cmd, "show") == 0) {
 			if (data.count > 0) {
-				printf("  == %s ==\n", label);
-				for (int i = 0; i < data.count; i++)
-					printf("    %s=%s\n",
-					       data.entries[i].key,
-					       data.entries[i].val);
+				printf("config %s\n", label);
+				for (int i = 0; i < data.count; i++) {
+					if (value_needs_quote(
+						    type_name,
+						    data.entries[i].key))
+						printf("    set %s"
+						       " \"%s\"\n",
+						       data.entries[i].key,
+						       data.entries[i].val);
+					else
+						printf("    set %s"
+						       " %s\n",
+						       data.entries[i].key,
+						       data.entries[i].val);
+				}
+				printf("end\n");
 			} else {
 				printf("  (empty -- use"
 				       " 'set <key> <value>')\n");

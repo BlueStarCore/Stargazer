@@ -11,6 +11,16 @@
 
 typedef enum { CFG_TABLE, CFG_SINGLE } cfg_mode_t;
 
+typedef struct {
+	const char *name;   /* e.g. "firewall_policy" */
+	cfg_mode_t  mode;   /* CFG_TABLE or CFG_SINGLE */
+	const char *perm;   /* "configure" or "admin" */
+	const char *desc;   /* CLI help text */
+} sg_type_info_t;
+
+/* NULL-terminated array of all config types. */
+const sg_type_info_t *sg_reg_types(void);
+
 /* ── Pure validators ──────────────────────────────────────────────────── */
 
 int sg_is_safe_id(const char *s);
@@ -48,6 +58,9 @@ const char *sg_reg_value_kind(const char *type_name, const char *key);
 
 /* Get human-readable validation rule description. */
 const char *sg_reg_value_rule(const char *type_name, const char *key);
+
+/* Get custom human-readable description for a type:key pair. */
+const char *sg_reg_field_desc(const char *type_name, const char *key);
 
 /* Get entry ID rule for a type ("uint" or "safe-id"). */
 const char *sg_reg_entry_id_kind(const char *type_name);

@@ -673,7 +673,155 @@ static void test_value_validation(void)
 		 sg_reg_validate_value("firewall_policy", "comment", "$(whoami)"), 1);
 }
 
-/* ── Section 13: command abbreviation resolution ──────────────────────── */
+/* ── Section 13: field descriptions ────────────────────────────────────── */
+
+/*
+ * tc_str — compare two strings (for use with tc_check pattern).
+ */
+static void tc_str(const char *section, const char *desc,
+		   const char *actual, const char *expected)
+{
+	tc_total++;
+	if (actual && expected && strcmp(actual, expected) == 0) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC " [%s] %s\n", section, desc);
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC " [%s] %s (got '%s', expected '%s')\n",
+		       section, desc,
+		       actual ? actual : "(null)",
+		       expected ? expected : "(null)");
+	}
+}
+
+static void test_field_desc(void)
+{
+	printf(C_CYAN "\n  --- field descriptions ---" C_NC "\n");
+
+	/* Known descriptions */
+	tc_str("field-desc",
+	       "network_route_static.dst = 'Destination network'",
+	       sg_reg_field_desc("network_route_static", "dst"),
+	       "Destination network");
+	tc_str("field-desc",
+	       "network_route_static.gateway = 'Next-hop gateway address'",
+	       sg_reg_field_desc("network_route_static", "gateway"),
+	       "Next-hop gateway address");
+	tc_str("field-desc",
+	       "network_route_static.status = 'Enable or disable this route'",
+	       sg_reg_field_desc("network_route_static", "status"),
+	       "Enable or disable this route");
+	tc_str("field-desc",
+	       "system_interface.mtu = 'Maximum transmission unit'",
+	       sg_reg_field_desc("system_interface", "mtu"),
+	       "Maximum transmission unit");
+	tc_str("field-desc",
+	       "firewall_policy.action = 'Matching traffic action'",
+	       sg_reg_field_desc("firewall_policy", "action"),
+	       "Matching traffic action");
+	tc_str("field-desc",
+	       "firewall_policy.comment = 'Optional description'",
+	       sg_reg_field_desc("firewall_policy", "comment"),
+	       "Optional description");
+	tc_str("field-desc",
+	       "system_settings.hostname = 'System hostname'",
+	       sg_reg_field_desc("system_settings", "hostname"),
+	       "System hostname");
+	tc_str("field-desc",
+	       "network_dns.primary = 'Primary DNS server'",
+	       sg_reg_field_desc("network_dns", "primary"),
+	       "Primary DNS server");
+	tc_str("field-desc",
+	       "system_admin.password = 'Account password'",
+	       sg_reg_field_desc("system_admin", "password"),
+	       "Account password");
+	tc_str("field-desc",
+	       "system_password-policy.min-length = 'Minimum password length'",
+	       sg_reg_field_desc("system_password-policy", "min-length"),
+	       "Minimum password length");
+	tc_str("field-desc",
+	       "firewall_service.port-range = 'Port or port range'",
+	       sg_reg_field_desc("firewall_service", "port-range"),
+	       "Port or port range");
+	tc_str("field-desc",
+	       "network_nat.mapped-ip = 'Translated IP address'",
+	       sg_reg_field_desc("network_nat", "mapped-ip"),
+	       "Translated IP address");
+
+	/* Unknown type or key returns empty string */
+	tc_str("field-desc",
+	       "unknown type returns ''",
+	       sg_reg_field_desc("nonexistent_type", "dst"),
+	       "");
+	tc_str("field-desc",
+	       "unknown key returns ''",
+	       sg_reg_field_desc("firewall_policy", "nonexistent_key"),
+	       "");
+	tc_str("field-desc",
+	       "NULL type returns ''",
+	       sg_reg_field_desc(NULL, "dst"),
+	       "");
+	tc_str("field-desc",
+	       "NULL key returns ''",
+	       sg_reg_field_desc("firewall_policy", NULL),
+	       "");
+}
+
+/* ── Section 14: quoted value detection ───────────────────────────────── */
+
+static void test_value_quoting(void)
+{
+	printf(C_CYAN "\n  --- value quoting (string kind detection) ---"
+	       C_NC "\n");
+
+	/* "string" kind fields — should be quoted in show output */
+	tc_check("quoting", "firewall_policy.comment kind is 'string'",
+		 strcmp(sg_reg_value_kind("firewall_policy", "comment"),
+			"string") == 0, 1);
+	tc_check("quoting", "firewall_address.comment kind is 'string'",
+		 strcmp(sg_reg_value_kind("firewall_address", "comment"),
+			"string") == 0, 1);
+	tc_check("quoting", "firewall_service.comment kind is 'string'",
+		 strcmp(sg_reg_value_kind("firewall_service", "comment"),
+			"string") == 0, 1);
+	tc_check("quoting", "system_interface.description kind is 'string'",
+		 strcmp(sg_reg_value_kind("system_interface", "description"),
+			"string") == 0, 1);
+	tc_check("quoting", "system_admin-profile.description kind is 'string'",
+		 strcmp(sg_reg_value_kind("system_admin-profile", "description"),
+			"string") == 0, 1);
+	tc_check("quoting", "network_route_static.comment kind is 'string'",
+		 strcmp(sg_reg_value_kind("network_route_static", "comment"),
+			"string") == 0, 1);
+
+	/* Non-string kind fields — should NOT be quoted */
+	tc_check("quoting", "firewall_policy.action kind is NOT 'string'",
+		 strcmp(sg_reg_value_kind("firewall_policy", "action"),
+			"string") != 0, 1);
+	tc_check("quoting", "firewall_policy.status kind is NOT 'string'",
+		 strcmp(sg_reg_value_kind("firewall_policy", "status"),
+			"string") != 0, 1);
+	tc_check("quoting", "system_interface.mtu kind is NOT 'string'",
+		 strcmp(sg_reg_value_kind("system_interface", "mtu"),
+			"string") != 0, 1);
+	tc_check("quoting", "network_route_static.dst kind is NOT 'string'",
+		 strcmp(sg_reg_value_kind("network_route_static", "dst"),
+			"string") != 0, 1);
+	tc_check("quoting", "network_route_static.gateway kind is NOT 'string'",
+		 strcmp(sg_reg_value_kind("network_route_static", "gateway"),
+			"string") != 0, 1);
+	tc_check("quoting", "system_settings.hostname kind is NOT 'string'",
+		 strcmp(sg_reg_value_kind("system_settings", "hostname"),
+			"string") != 0, 1);
+	tc_check("quoting", "network_nat.dstport kind is NOT 'string'",
+		 strcmp(sg_reg_value_kind("network_nat", "dstport"),
+			"string") != 0, 1);
+	tc_check("quoting", "system_admin.profile kind is NOT 'string'",
+		 strcmp(sg_reg_value_kind("system_admin", "profile"),
+			"string") != 0, 1);
+}
+
+/* ── Section 15: command abbreviation resolution ──────────────────────── */
 
 static void tc_resolve(const char *desc, const char *input,
 		       int expect_rc, const char *expect_out)
@@ -890,7 +1038,7 @@ static void test_cmd_resolve(void)
 	cli_pop();
 }
 
-/* ── Section 14: IPC validation (full mode) ───────────────────────────── */
+/* ── Section 16: IPC validation (full mode) ───────────────────────────── */
 
 /*
  * ipc_check — send IPC request and check status matches expected.
@@ -1040,7 +1188,7 @@ static void test_ipc_builtin_protect(void)
 		  SG_ERR_BUILTIN);
 }
 
-/* ── Section 15: IPC round-trip (full mode) ───────────────────────────── */
+/* ── Section 17: IPC round-trip (full mode) ───────────────────────────── */
 
 static void test_ipc_roundtrip(void)
 {
@@ -1180,7 +1328,7 @@ static void test_ipc_roundtrip(void)
 	ipc_resp_free(&resp);
 }
 
-/* ── Section 16: IPC static route round-trip with apply ───────────────── */
+/* ── Section 18: IPC static route round-trip with apply ───────────────── */
 
 static void test_ipc_apply(void)
 {
@@ -1231,7 +1379,7 @@ static void test_ipc_apply(void)
 	ipc_resp_free(&resp);
 }
 
-/* ── Section 17: Nonexistent entry operations ─────────────────────────── */
+/* ── Section 19: Nonexistent entry operations ─────────────────────────── */
 
 static void test_ipc_not_found(void)
 {
@@ -1288,6 +1436,8 @@ int cli_diagnose_test_configure(int mode)
 	test_entry_id();
 	test_registry();
 	test_value_validation();
+	test_field_desc();
+	test_value_quoting();
 	test_cmd_resolve();
 
 	if (mode == 1) {

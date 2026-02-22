@@ -228,6 +228,13 @@ static void show_routes(void)
 			     "=== Routing Table ===", fallback);
 }
 
+/* Check whether a value should be quoted in FortiGate-style output. */
+static int value_needs_quote(const char *type, const char *key)
+{
+	const char *kind = sg_reg_value_kind(type, key);
+	return strcmp(kind, "string") == 0;
+}
+
 /* ── show configure (FortiGate-style dump) ────────────────────────────── */
 
 /*
@@ -240,23 +247,11 @@ static void show_configure(void)
 	printf("  === Running Configuration ===\n\n");
 
 	/* Walk all types known to the registry */
-	static const char *all_types[] = {
-		"network_route_static", "network_route_policy",
-		"network_ospf", "network_rip", "network_bgp",
-		"network_nat", "network_dns",
-		"system_settings", "system_interface",
-		"system_hostname", "system_ntp",
-		"firewall_policy", "firewall_address", "firewall_service",
-		"system_password-policy",
-		"system_admin-profile", "system_admin",
-		NULL
-	};
+	const sg_type_info_t *types = sg_reg_types();
 
-	for (int t = 0; all_types[t]; t++) {
-		const char *type = all_types[t];
-		int mode = sg_reg_type_mode(type);
-		if (mode < 0)
-			continue;
+	for (int t = 0; types[t].name; t++) {
+		const char *type = types[t].name;
+		int mode = (int)types[t].mode;
 
 		const char *label = sg_reg_type_label(type);
 
@@ -281,7 +276,7 @@ static void show_configure(void)
 				if (nl) *nl = '\0';
 				if (!*id) { if (nl) id = nl + 1; else break; continue; }
 
-				printf("  edit %s\n", id);
+				printf("  edit \"%s\"\n", id);
 
 				/* Get entry data */
 				char section[512];
@@ -310,9 +305,20 @@ static void show_configure(void)
 								if (klen == 8 && strncmp(p, "password", 8) == 0) {
 									printf("    set password ********\n");
 								} else {
-									printf("    set %.*s %.*s\n",
-									       (int)klen, p,
-									       (int)(llen - klen - 1), eq + 1);
+									char kbuf[64];
+									size_t kl = klen;
+									if (kl >= sizeof(kbuf))
+										kl = sizeof(kbuf) - 1;
+									memcpy(kbuf, p, kl);
+									kbuf[kl] = '\0';
+									if (value_needs_quote(type, kbuf))
+										printf("    set %.*s \"%.*s\"\n",
+										       (int)klen, p,
+										       (int)(llen - klen - 1), eq + 1);
+									else
+										printf("    set %.*s %.*s\n",
+										       (int)klen, p,
+										       (int)(llen - klen - 1), eq + 1);
 								}
 							}
 						}
@@ -356,9 +362,20 @@ static void show_configure(void)
 							if (eol) p++;
 							continue;
 						}
-						printf("  set %.*s %.*s\n",
-						       (int)klen, p,
-						       (int)(llen - klen - 1), eq + 1);
+						char kbuf[64];
+						size_t kl = klen;
+						if (kl >= sizeof(kbuf))
+							kl = sizeof(kbuf) - 1;
+						memcpy(kbuf, p, kl);
+						kbuf[kl] = '\0';
+						if (value_needs_quote(type, kbuf))
+							printf("  set %.*s \"%.*s\"\n",
+							       (int)klen, p,
+							       (int)(llen - klen - 1), eq + 1);
+						else
+							printf("  set %.*s %.*s\n",
+							       (int)klen, p,
+							       (int)(llen - klen - 1), eq + 1);
 					}
 				}
 				p += llen;

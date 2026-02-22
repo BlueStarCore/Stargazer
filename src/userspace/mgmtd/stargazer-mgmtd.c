@@ -66,6 +66,15 @@ static volatile sig_atomic_t g_running = 1;
 /* ── Input validation ───────────────────────────────────────────────────── */
 /* Validators now live in common/sg_validate.c — included via sg_validate.h */
 
+/* ── Interface existence check ─────────────────────────────────────────── */
+
+static int iface_exists(const char *name)
+{
+	char path[256];
+	snprintf(path, sizeof(path), "/sys/class/net/%s", name);
+	return access(path, F_OK) == 0;
+}
+
 /* ── Safe command execution (replaces popen) ──────────────────────────── */
 
 /*
@@ -323,7 +332,13 @@ static void mgmtd_seed_defaults(void)
 		  "status=enable\n"
 		  "comment=Default deny all traffic\n");
 
-	/* ── Auto-detect network interfaces ────────────────────────── */
+	/* ── Default network interfaces ────────────────────────────── */
+	sg_db_set("system_interface", "eth0",
+		  "ip=10.0.1.2/24\nstatus=up\nmtu=1500\ndescription=WAN\n");
+	sg_db_set("system_interface", "eth1",
+		  "ip=192.168.99.254/24\nstatus=up\nmtu=1500\ndescription=LAN\n");
+
+	/* Also detect any additional interfaces from /sys/class/net */
 	{
 		DIR *d = opendir("/sys/class/net");
 		if (d) {
@@ -333,6 +348,9 @@ static void mgmtd_seed_defaults(void)
 					continue;
 				if (strcmp(ent->d_name, "lo") == 0)
 					continue;
+				if (strcmp(ent->d_name, "eth0") == 0 ||
+				    strcmp(ent->d_name, "eth1") == 0)
+					continue;
 				sg_db_set("system_interface", ent->d_name,
 					  "status=up\n");
 				mgmt_log("INFO", "detected interface: %s",
@@ -341,6 +359,10 @@ static void mgmtd_seed_defaults(void)
 			closedir(d);
 		}
 	}
+
+	/* ── Default route ─────────────────────────────────────────── */
+	sg_db_set("network_route_static", "default",
+		  "dst=0.0.0.0/0\ngateway=10.0.1.1\ndevice=eth0\nstatus=enable\n");
 
 	mgmt_log("INFO", "default configuration seeded successfully");
 }
@@ -362,10 +384,11 @@ static void mgmtd_replay_config(void)
 	for (int i = 0; single_types[i]; i++) {
 		char *data = sg_db_get(single_types[i], "0");
 		if (data) {
-			apply_config(single_types[i], "0", data,
-				     result, sizeof(result));
-			mgmt_log("INFO", "replay %s: %s",
-				 single_types[i], result);
+			sg_status_t rc = apply_config(single_types[i], "0",
+						      data, result,
+						      sizeof(result));
+			mgmt_log(rc == SG_OK ? "INFO" : "WARN",
+				 "replay %s: %s", single_types[i], result);
 			free(data);
 		}
 	}
@@ -406,9 +429,11 @@ static void mgmtd_replay_config(void)
 
 			char *data = sg_db_get(table_types[i], id);
 			if (data) {
-				apply_config(table_types[i], id, data,
-					     result, sizeof(result));
-				mgmt_log("INFO", "replay %s:%s: %s",
+				sg_status_t rc = apply_config(
+					table_types[i], id, data,
+					result, sizeof(result));
+				mgmt_log(rc == SG_OK ? "INFO" : "WARN",
+					 "replay %s:%s: %s",
 					 table_types[i], id, result);
 				free(data);
 			}
@@ -1025,6 +1050,11 @@ static sg_status_t apply_config(const char *type, const char *id,
 			snprintf(result, rsize, "Invalid device '%s'.", dev);
 			return SG_ERR_INVALID_VAL;
 		}
+		if (dev[0] && !iface_exists(dev)) {
+			snprintf(result, rsize,
+				 "Device '%s' not present, route not applied.", dev);
+			return SG_ERR_NOT_FOUND;
+		}
 
 		if (strcmp(status, "disable") == 0) {
 			if (dst[0]) {
@@ -1086,34 +1116,22 @@ static sg_status_t apply_config(const char *type, const char *id,
 		return SG_OK;
 	}
 
-	if (strcmp(type, "system_hostname") == 0) {
-		char name[VALBUFSZ];
-		extract_val(data, "hostname", name, sizeof(name));
-		if (name[0]) {
-			if (!sg_is_safe_id(name)) {
-				snprintf(result, rsize, "Invalid hostname '%s'.", name);
-				return SG_ERR_INVALID_VAL;
-			}
-			/* Use sethostname() syscall — no shell (VULN-09) */
-			if (sethostname(name, strlen(name)) != 0)
-				mgmt_log("WARN", "sethostname: %s", strerror(errno));
-			FILE *fp = fopen("/etc/hostname", "w");
-			if (fp) { fprintf(fp, "%s\n", name); fclose(fp); }
-			snprintf(result, rsize, "Hostname set to '%s'.", name);
-		}
-		return SG_OK;
-	}
-
 	if (strcmp(type, "system_interface") == 0) {
-		char ip[VALBUFSZ], status[VALBUFSZ], mtu[VALBUFSZ];
+		char ip[VALBUFSZ], status[VALBUFSZ], mtu[VALBUFSZ], desc[VALBUFSZ];
 		extract_val(data, "ip", ip, sizeof(ip));
 		extract_val(data, "status", status, sizeof(status));
 		extract_val(data, "mtu", mtu, sizeof(mtu));
+		extract_val(data, "description", desc, sizeof(desc));
 
 		/* Validate inputs */
 		if (!sg_is_iface_name(id)) {
 			snprintf(result, rsize, "Invalid interface '%s'.", id);
 			return SG_ERR_INVALID_VAL;
+		}
+		if (!iface_exists(id)) {
+			snprintf(result, rsize,
+				 "Interface '%s' not present, skipping.", id);
+			return SG_ERR_NOT_FOUND;
 		}
 		if (ip[0] && !sg_is_cidr(ip)) {
 			snprintf(result, rsize, "Invalid IP '%s'.", ip);

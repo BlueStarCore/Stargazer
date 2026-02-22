@@ -2,9 +2,8 @@
 /*
  * sg_validate.c — Shared config registry and input validators for Stargazer
  *
- * Static tables of config types, valid keys, default values, required
- * fields, and validation rules.  Shared by CLI and mgmtd.
- * Extracted from cli_registry.c.
+ * Unified field_table describes every config field (key, kind, required,
+ * default) in one place.  Shared by CLI and mgmtd.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -18,186 +17,118 @@
 
 /* ── Type registry ───────────────────────────────────────────────────────── */
 
-struct type_entry {
-	const char *name;
-	cfg_mode_t  mode;
+static const sg_type_info_t type_table[] = {
+	{ "network_route_static",   CFG_TABLE,  "configure", "Configure static routes"             },
+	{ "network_route_policy",   CFG_TABLE,  "configure", "Configure policy-based routing"      },
+	{ "network_ospf",           CFG_SINGLE, "configure", "Configure OSPF dynamic routing"      },
+	{ "network_rip",            CFG_SINGLE, "configure", "Configure RIP dynamic routing"       },
+	{ "network_bgp",            CFG_SINGLE, "configure", "Configure BGP dynamic routing"       },
+	{ "network_nat",            CFG_TABLE,  "configure", "Configure NAT rules (SNAT/DNAT)"     },
+	{ "network_dns",            CFG_SINGLE, "configure", "Configure DNS settings"              },
+	{ "system_settings",        CFG_SINGLE, "configure", "System general settings"              },
+	{ "system_interface",       CFG_TABLE,  "configure", "Configure network interfaces"        },
+	{ "system_ntp",             CFG_SINGLE, "configure", "Configure NTP time sync"             },
+	{ "firewall_policy",        CFG_TABLE,  "configure", "Configure firewall policies"         },
+	{ "firewall_address",       CFG_TABLE,  "configure", "Configure address objects"           },
+	{ "firewall_service",       CFG_TABLE,  "configure", "Configure service objects"           },
+	{ "system_password-policy", CFG_SINGLE, "admin",     "Configure global password policy"    },
+	{ "system_admin-profile",   CFG_TABLE,  "admin",     "Configure admin permission profiles" },
+	{ "system_admin",           CFG_TABLE,  "admin",     "Configure admin accounts"            },
+	{ NULL, 0, NULL, NULL }
 };
 
-static const struct type_entry type_table[] = {
-	{ "network_route_static",   CFG_TABLE  },
-	{ "network_route_policy",   CFG_TABLE  },
-	{ "network_ospf",           CFG_SINGLE },
-	{ "network_rip",            CFG_SINGLE },
-	{ "network_bgp",            CFG_SINGLE },
-	{ "network_nat",            CFG_TABLE  },
-	{ "network_dns",            CFG_SINGLE },
-	{ "system_settings",        CFG_SINGLE },
-	{ "system_interface",       CFG_TABLE  },
-	{ "system_hostname",        CFG_SINGLE },
-	{ "system_ntp",             CFG_SINGLE },
-	{ "firewall_policy",        CFG_TABLE  },
-	{ "firewall_address",       CFG_TABLE  },
-	{ "firewall_service",       CFG_TABLE  },
-	{ "system_password-policy", CFG_SINGLE },
-	{ "system_admin-profile",   CFG_TABLE  },
-	{ "system_admin",           CFG_TABLE  },
-	{ NULL, 0 }
-};
+/* ── Unified field table ─────────────────────────────────────────────────── */
 
-/* ── Valid keys per type ─────────────────────────────────────────────────── */
-
-struct keys_entry {
-	const char *type;
-	const char *keys;  /* space-separated */
-};
-
-static const struct keys_entry keys_table[] = {
-	{ "network_route_static",   "dst gateway device distance status comment" },
-	{ "network_nat",            "type srcintf dstintf srcaddr dstaddr dstport mapped-ip mapped-port status" },
-	{ "system_interface",       "ip status mtu description" },
-	{ "system_settings",        "hostname ip-forward timezone" },
-	{ "system_hostname",        "hostname" },
-	{ "network_dns",            "primary secondary" },
-	{ "system_ntp",             "server status" },
-	{ "firewall_policy",        "name srcintf dstintf srcaddr dstaddr action service schedule status comment" },
-	{ "firewall_address",       "name subnet type comment" },
-	{ "firewall_service",       "name protocol port-range comment" },
-	{ "system_password-policy", "min-length min-uppercase min-lowercase min-digit min-special" },
-	{ "system_admin-profile",   "permissions description" },
-	{ "system_admin",           "profile password enforce-change-password enforce-password-policy" },
-	{ NULL, NULL }
-};
-
-/* ── Required keys per type ──────────────────────────────────────────────── */
-
-struct required_entry {
-	const char *type;
-	const char *keys;
-};
-
-static const struct required_entry required_table[] = {
-	{ "network_route_static",   "dst" },
-	{ "firewall_policy",        "name srcintf dstintf srcaddr dstaddr action status" },
-	{ "firewall_address",       "name subnet type" },
-	{ "firewall_service",       "name protocol port-range" },
-	{ "system_admin",           "profile" },
-	{ "system_admin-profile",   "permissions" },
-	{ NULL, NULL }
-};
-
-/* ── Default values per type ─────────────────────────────────────────────── */
-
-struct defaults_entry {
-	const char *type;
-	const char *defaults;  /* "key=val\nkey=val\n..." */
-};
-
-static const struct defaults_entry defaults_table[] = {
-	{ "firewall_policy",
-	  "status=enable\naction=deny\nsrcintf=any\ndstintf=any\nsrcaddr=all\ndstaddr=all" },
-	{ "system_admin",
-	  "enforce-change-password=enable\nenforce-password-policy=enable" },
-	{ "system_interface",
-	  "status=up\nmtu=1500" },
-	{ "network_route_static",
-	  "status=enable\ndistance=10" },
-	{ "firewall_address",
-	  "type=ipmask" },
-	{ "firewall_service",
-	  "protocol=tcp" },
-	{ "system_password-policy",
-	  "min-length=8\nmin-uppercase=0\nmin-lowercase=0\nmin-digit=0\nmin-special=0" },
-	{ NULL, NULL }
-};
-
-/* ── type:key → kind mapping ─────────────────────────────────────────────── */
-
-struct kind_entry {
+struct field_entry {
 	const char *type;
 	const char *key;
 	const char *kind;
+	int         optional;   /* 0 = required, 1 = optional */
+	const char *defval;     /* default value, or NULL */
+	const char *desc;       /* human-readable help text */
 };
 
-static const struct kind_entry kind_table[] = {
-	/* cidr */
-	{ "network_route_static", "dst",                     "cidr" },
-	{ "system_interface",     "ip",                      "cidr" },
-	{ "firewall_address",     "subnet",                  "cidr" },
+static const struct field_entry field_table[] = {
+	/* network_route_static */
+	{ "network_route_static", "dst",      "cidr",                0, NULL,     "Destination network"          },
+	{ "network_route_static", "gateway",  "ipv4",                0, NULL,     "Next-hop gateway address"     },
+	{ "network_route_static", "device",   "iface",               0, NULL,     "Outgoing interface"           },
+	{ "network_route_static", "distance", "uint:1:255",          0, "10",     "Administrative distance"      },
+	{ "network_route_static", "status",   "enum:enable,disable", 0, "enable", "Enable or disable this route" },
+	{ "network_route_static", "comment",  "string",              1, NULL,     "Optional description"         },
 
-	/* ipv4 */
-	{ "network_route_static", "gateway",                 "ipv4" },
-	{ "network_nat",          "mapped-ip",               "ipv4" },
-	{ "network_dns",          "primary",                 "ipv4" },
-	{ "network_dns",          "secondary",               "ipv4" },
-	{ "system_ntp",           "server",                  "ipv4" },
+	/* network_nat */
+	{ "network_nat", "type",        "enum:snat,dnat",        0, NULL,     "NAT type"                    },
+	{ "network_nat", "srcintf",     "iface",                 0, NULL,     "Source interface"             },
+	{ "network_nat", "dstintf",     "iface",                 0, NULL,     "Destination interface"        },
+	{ "network_nat", "srcaddr",     "cidr-or:any,all",       0, NULL,     "Source address or subnet"     },
+	{ "network_nat", "dstaddr",     "cidr-or:any,all",       0, NULL,     "Destination address or subnet" },
+	{ "network_nat", "dstport",     "uint:1:65535",          0, NULL,     "Destination port"             },
+	{ "network_nat", "mapped-ip",   "ipv4",                  0, NULL,     "Translated IP address"        },
+	{ "network_nat", "mapped-port", "uint:1:65535",          0, NULL,     "Translated port"              },
+	{ "network_nat", "status",      "enum:enable,disable",   0, "enable", "Enable or disable this rule"  },
 
-	/* iface */
-	{ "network_route_static", "device",                  "iface" },
-	{ "network_nat",          "srcintf",                 "iface" },
-	{ "network_nat",          "dstintf",                 "iface" },
-	{ "firewall_policy",      "srcintf",                 "iface" },
-	{ "firewall_policy",      "dstintf",                 "iface" },
+	/* system_interface */
+	{ "system_interface", "ip",          "cidr",          0, NULL,   "Interface IP address and mask" },
+	{ "system_interface", "status",      "enum:up,down",  0, "up",   "Administrative state"          },
+	{ "system_interface", "mtu",         "uint:576:9200", 0, "1500", "Maximum transmission unit"     },
+	{ "system_interface", "description", "string",        1, NULL,   "Interface description"         },
 
-	/* uint ranges */
-	{ "network_route_static",  "distance",               "uint:1:255" },
-	{ "system_password-policy","min-length",              "uint:0:128" },
-	{ "system_password-policy","min-uppercase",           "uint:0:128" },
-	{ "system_password-policy","min-lowercase",           "uint:0:128" },
-	{ "system_password-policy","min-digit",               "uint:0:128" },
-	{ "system_password-policy","min-special",             "uint:0:128" },
-	{ "network_nat",           "dstport",                "uint:1:65535" },
-	{ "network_nat",           "mapped-port",            "uint:1:65535" },
-	{ "system_interface",      "mtu",                    "uint:576:9200" },
+	/* system_settings */
+	{ "system_settings", "hostname",   "safe-id",             0, "stargazer", "System hostname"      },
+	{ "system_settings", "ip-forward", "enum:enable,disable", 0, "enable",    "IPv4 packet forwarding" },
+	{ "system_settings", "timezone",   "tz-token",            0, "UTC",       "System timezone"      },
 
-	/* enum */
-	{ "network_route_static", "status",                  "enum:enable,disable" },
-	{ "network_nat",          "status",                  "enum:enable,disable" },
-	{ "system_settings",      "ip-forward",              "enum:enable,disable" },
-	{ "system_ntp",           "status",                  "enum:enable,disable" },
-	{ "firewall_policy",      "status",                  "enum:enable,disable" },
-	{ "system_admin",         "enforce-change-password",  "enum:enable,disable" },
-	{ "system_admin",         "enforce-password-policy",  "enum:enable,disable" },
-	{ "network_nat",          "type",                    "enum:snat,dnat" },
-	{ "system_interface",     "status",                  "enum:up,down" },
-	{ "firewall_policy",      "action",                  "enum:accept,deny,drop" },
-	{ "firewall_address",     "type",                    "enum:ipmask,iprange,fqdn" },
-	{ "firewall_service",     "protocol",                "enum:tcp,udp,icmp" },
+	/* network_dns */
+	{ "network_dns", "primary",   "ipv4", 0, NULL, "Primary DNS server"   },
+	{ "network_dns", "secondary", "ipv4", 0, NULL, "Secondary DNS server" },
 
-	/* cidr-or */
-	{ "network_nat",          "srcaddr",                 "cidr-or:any,all" },
-	{ "network_nat",          "dstaddr",                 "cidr-or:any,all" },
+	/* system_ntp */
+	{ "system_ntp", "server", "ipv4",                0, NULL, "NTP server address"          },
+	{ "system_ntp", "status", "enum:enable,disable", 0, NULL, "Enable or disable NTP sync"  },
 
-	/* safe-id */
-	{ "system_settings",      "hostname",                "safe-id" },
-	{ "system_hostname",      "hostname",                "safe-id" },
-	{ "firewall_policy",      "name",                    "safe-id" },
-	{ "firewall_address",     "name",                    "safe-id" },
-	{ "firewall_service",     "name",                    "safe-id" },
+	/* firewall_policy */
+	{ "firewall_policy", "name",     "safe-id",                         0, NULL,     "Policy name"                },
+	{ "firewall_policy", "srcintf",  "iface",                           0, "any",    "Source interface"           },
+	{ "firewall_policy", "dstintf",  "iface",                           0, "any",    "Destination interface"      },
+	{ "firewall_policy", "srcaddr",  "ref-or:firewall_address:all,any", 0, "all",    "Source address object"      },
+	{ "firewall_policy", "dstaddr",  "ref-or:firewall_address:all,any", 0, "all",    "Destination address object" },
+	{ "firewall_policy", "action",   "enum:accept,deny,drop",           0, "deny",   "Matching traffic action"    },
+	{ "firewall_policy", "service",  "ref-or:firewall_service:all,any", 0, "all",    "Service object"             },
+	{ "firewall_policy", "schedule", "safe-id-or:all,any",              0, "all",    "Schedule object"            },
+	{ "firewall_policy", "status",   "enum:enable,disable",             0, "enable", "Enable or disable this policy" },
+	{ "firewall_policy", "comment",  "string",                          1, NULL,     "Optional description"       },
 
-	/* tz-token */
-	{ "system_settings",      "timezone",                "tz-token" },
+	/* firewall_address */
+	{ "firewall_address", "name",    "safe-id",                  0, NULL,     "Address object name"  },
+	{ "firewall_address", "subnet",  "cidr",                     0, NULL,     "Network address and mask" },
+	{ "firewall_address", "type",    "enum:ipmask,iprange,fqdn", 0, "ipmask", "Address type"         },
+	{ "firewall_address", "comment", "string",                   1, NULL,     "Optional description" },
 
-	/* permissions-csv */
-	{ "system_admin-profile",  "permissions",            "permissions-csv" },
+	/* firewall_service */
+	{ "firewall_service", "name",       "safe-id",           0, NULL,  "Service object name"  },
+	{ "firewall_service", "protocol",   "enum:tcp,udp,icmp", 0, "tcp", "IP protocol"          },
+	{ "firewall_service", "port-range", "port-or-range",     0, NULL,  "Port or port range"   },
+	{ "firewall_service", "comment",    "string",            1, NULL,  "Optional description" },
 
-	/* ref */
-	{ "system_admin",          "profile",                "ref:system_admin-profile" },
+	/* system_password-policy */
+	{ "system_password-policy", "min-length",    "uint:0:128", 0, "8", "Minimum password length"      },
+	{ "system_password-policy", "min-uppercase", "uint:0:128", 0, "0", "Required uppercase characters" },
+	{ "system_password-policy", "min-lowercase", "uint:0:128", 0, "0", "Required lowercase characters" },
+	{ "system_password-policy", "min-digit",     "uint:0:128", 0, "0", "Required digit characters"    },
+	{ "system_password-policy", "min-special",   "uint:0:128", 0, "0", "Required special characters"  },
 
-	/* password-interactive */
-	{ "system_admin",          "password",               "password-interactive" },
+	/* system_admin-profile */
+	{ "system_admin-profile", "permissions", "permissions-csv", 0, NULL, "Granted permissions"  },
+	{ "system_admin-profile", "description", "string",          1, NULL, "Profile description"  },
 
-	/* ref-or */
-	{ "firewall_policy",       "srcaddr",                "ref-or:firewall_address:all,any" },
-	{ "firewall_policy",       "dstaddr",                "ref-or:firewall_address:all,any" },
-	{ "firewall_policy",       "service",                "ref-or:firewall_service:all,any" },
+	/* system_admin */
+	{ "system_admin", "profile",                  "ref:system_admin-profile", 0, NULL,     "Admin permission profile"            },
+	{ "system_admin", "password",                 "password-interactive",     1, NULL,     "Account password"                    },
+	{ "system_admin", "enforce-change-password",  "enum:enable,disable",     0, "enable", "Force password change on first login" },
+	{ "system_admin", "enforce-password-policy",  "enum:enable,disable",     0, "enable", "Apply password policy rules"         },
 
-	/* safe-id-or */
-	{ "firewall_policy",       "schedule",               "safe-id-or:all,any" },
-
-	/* port-or-range */
-	{ "firewall_service",      "port-range",             "port-or-range" },
-
-	{ NULL, NULL, NULL }
+	{ NULL, NULL, NULL, 0, NULL, NULL }
 };
 
 /* ── Pure validation helpers ─────────────────────────────────────────────── */
@@ -455,11 +386,17 @@ sg_reg_type_mode(const char *type_name)
 {
 	if (!type_name)
 		return -1;
-	for (const struct type_entry *e = type_table; e->name; e++) {
+	for (const sg_type_info_t *e = type_table; e->name; e++) {
 		if (strcmp(e->name, type_name) == 0)
 			return (int)e->mode;
 	}
 	return -1;
+}
+
+const sg_type_info_t *
+sg_reg_types(void)
+{
+	return type_table;
 }
 
 /*
@@ -492,13 +429,25 @@ sg_reg_type_label(const char *type_name)
 const char *
 sg_reg_valid_keys(const char *type_name)
 {
+	static char buf[512];
 	if (!type_name)
 		return "";
-	for (const struct keys_entry *e = keys_table; e->type; e++) {
-		if (strcmp(e->type, type_name) == 0)
-			return e->keys;
+
+	buf[0] = '\0';
+	size_t pos = 0;
+	for (const struct field_entry *f = field_table; f->type; f++) {
+		if (strcmp(f->type, type_name) != 0)
+			continue;
+		if (pos > 0 && pos < sizeof(buf) - 1)
+			buf[pos++] = ' ';
+		size_t klen = strlen(f->key);
+		if (pos + klen < sizeof(buf)) {
+			memcpy(buf + pos, f->key, klen);
+			pos += klen;
+		}
 	}
-	return "";
+	buf[pos] = '\0';
+	return buf;
 }
 
 int
@@ -506,27 +455,9 @@ sg_reg_is_valid_key(const char *type_name, const char *key)
 {
 	if (!type_name || !key)
 		return 0;
-
-	const char *keys = sg_reg_valid_keys(type_name);
-	if (!*keys)
-		return 0;
-
-	size_t key_len = strlen(key);
-	const char *p = keys;
-
-	while (*p) {
-		/* Skip spaces */
-		while (*p == ' ')
-			p++;
-		if (!*p)
-			break;
-
-		const char *start = p;
-		while (*p && *p != ' ')
-			p++;
-		size_t span = (size_t)(p - start);
-
-		if (span == key_len && strncmp(start, key, span) == 0)
+	for (const struct field_entry *f = field_table; f->type; f++) {
+		if (strcmp(f->type, type_name) == 0 &&
+		    strcmp(f->key, key) == 0)
 			return 1;
 	}
 	return 0;
@@ -535,25 +466,45 @@ sg_reg_is_valid_key(const char *type_name, const char *key)
 const char *
 sg_reg_required_keys(const char *type_name)
 {
+	static char buf[512];
 	if (!type_name)
 		return "";
-	for (const struct required_entry *e = required_table; e->type; e++) {
-		if (strcmp(e->type, type_name) == 0)
-			return e->keys;
+
+	buf[0] = '\0';
+	size_t pos = 0;
+	for (const struct field_entry *f = field_table; f->type; f++) {
+		if (strcmp(f->type, type_name) != 0 || f->optional)
+			continue;
+		if (pos > 0 && pos < sizeof(buf) - 1)
+			buf[pos++] = ' ';
+		size_t klen = strlen(f->key);
+		if (pos + klen < sizeof(buf)) {
+			memcpy(buf + pos, f->key, klen);
+			pos += klen;
+		}
 	}
-	return "";
+	buf[pos] = '\0';
+	return buf;
 }
 
 const char *
 sg_reg_default_values(const char *type_name)
 {
+	static char buf[1024];
 	if (!type_name)
 		return "";
-	for (const struct defaults_entry *e = defaults_table; e->type; e++) {
-		if (strcmp(e->type, type_name) == 0)
-			return e->defaults;
+
+	buf[0] = '\0';
+	size_t pos = 0;
+	for (const struct field_entry *f = field_table; f->type; f++) {
+		if (strcmp(f->type, type_name) != 0 || !f->defval)
+			continue;
+		int n = snprintf(buf + pos, sizeof(buf) - pos,
+				 "%s=%s\n", f->key, f->defval);
+		if (n > 0 && pos + (size_t)n < sizeof(buf))
+			pos += (size_t)n;
 	}
-	return "";
+	return buf;
 }
 
 const char *
@@ -561,10 +512,10 @@ sg_reg_value_kind(const char *type_name, const char *key)
 {
 	if (!type_name || !key)
 		return "string";
-	for (const struct kind_entry *e = kind_table; e->type; e++) {
-		if (strcmp(e->type, type_name) == 0 &&
-		    strcmp(e->key, key) == 0)
-			return e->kind;
+	for (const struct field_entry *f = field_table; f->type; f++) {
+		if (strcmp(f->type, type_name) == 0 &&
+		    strcmp(f->key, key) == 0)
+			return f->kind;
 	}
 	return "string";
 }
@@ -692,6 +643,19 @@ sg_reg_value_rule(const char *type_name, const char *key)
 	}
 
 	return "string";
+}
+
+const char *
+sg_reg_field_desc(const char *type_name, const char *key)
+{
+	if (!type_name || !key)
+		return "";
+	for (const struct field_entry *f = field_table; f->type; f++) {
+		if (strcmp(f->type, type_name) == 0 &&
+		    strcmp(f->key, key) == 0)
+			return f->desc ? f->desc : "";
+	}
+	return "";
 }
 
 const char *

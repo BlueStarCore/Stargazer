@@ -16,6 +16,7 @@
 #include "cli_show.h"
 #include "cli_execute.h"
 #include "cli_ipc.h"
+#include "sg_validate.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -104,30 +105,21 @@ void register_commands(const char *permissions)
 	}
 
 	if (has_permission(permissions, "configure")) {
-		cli_register("configure",                      "Configure firewall");
-		cli_register("configure commit",               "Save a configuration revision");
-		cli_register("configure revisions",            "List configuration revisions");
-		cli_register("configure rollback",             "Rollback configuration to revision");
-		cli_register("configure network route static", "Configure static routes");
-		cli_register("configure network route policy", "Configure policy-based routing");
-		cli_register("configure network ospf",         "Configure OSPF dynamic routing");
-		cli_register("configure network rip",          "Configure RIP dynamic routing");
-		cli_register("configure network bgp",          "Configure BGP dynamic routing");
-		cli_register("configure network nat",          "Configure NAT rules (SNAT/DNAT)");
-		cli_register("configure network dns",          "Configure DNS settings");
-		cli_register("configure system settings",      "System general settings");
-		cli_register("configure system interface",     "Configure network interfaces");
-		cli_register("configure system hostname",      "Set system hostname");
-		cli_register("configure system ntp",           "Configure NTP time sync");
-		cli_register("configure firewall policy",      "Configure firewall policies");
-		cli_register("configure firewall address",     "Configure address objects");
-		cli_register("configure firewall service",     "Configure service objects");
+		cli_register("configure",           "Configure firewall");
+		cli_register("configure commit",    "Save a configuration revision");
+		cli_register("configure revisions", "List configuration revisions");
+		cli_register("configure rollback",  "Rollback configuration to revision");
 	}
 
-	if (has_permission(permissions, "admin")) {
-		cli_register("configure system password-policy", "Configure global password policy");
-		cli_register("configure system admin-profile",   "Configure admin permission profiles");
-		cli_register("configure system admin",           "Configure admin accounts");
+	/* Auto-register configure commands from registry */
+	const sg_type_info_t *types = sg_reg_types();
+	for (int i = 0; types[i].name; i++) {
+		if (!has_permission(permissions, types[i].perm))
+			continue;
+		const char *label = sg_reg_type_label(types[i].name);
+		char path[256];
+		snprintf(path, sizeof(path), "configure %s", label);
+		cli_register(path, types[i].desc);
 	}
 }
 
