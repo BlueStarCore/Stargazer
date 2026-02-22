@@ -767,6 +767,81 @@ sg_reg_validate_value(const char *type_name, const char *key, const char *val)
 	return *val != '\0';
 }
 
+/* ── Reference metadata ──────────────────────────────────────────────────── */
+
+int
+sg_parse_ref_kind(const char *kind,
+                  char *ref_type, size_t ref_sz,
+                  char *opts, size_t opts_sz)
+{
+	if (!kind)
+		return 0;
+
+	ref_type[0] = '\0';
+	opts[0] = '\0';
+
+	/* ref:TYPE */
+	if (strncmp(kind, "ref:", 4) == 0) {
+		const char *t = kind + 4;
+		size_t tlen = strlen(t);
+		if (tlen >= ref_sz) tlen = ref_sz - 1;
+		memcpy(ref_type, t, tlen);
+		ref_type[tlen] = '\0';
+		return 1;
+	}
+
+	/* ref-or:TYPE:opts */
+	if (strncmp(kind, "ref-or:", 7) == 0) {
+		const char *rest = kind + 7;
+		const char *colon = strchr(rest, ':');
+		if (colon) {
+			size_t tlen = (size_t)(colon - rest);
+			if (tlen >= ref_sz) tlen = ref_sz - 1;
+			memcpy(ref_type, rest, tlen);
+			ref_type[tlen] = '\0';
+
+			const char *o = colon + 1;
+			size_t olen = strlen(o);
+			if (olen >= opts_sz) olen = opts_sz - 1;
+			memcpy(opts, o, olen);
+			opts[olen] = '\0';
+		} else {
+			size_t tlen = strlen(rest);
+			if (tlen >= ref_sz) tlen = ref_sz - 1;
+			memcpy(ref_type, rest, tlen);
+			ref_type[tlen] = '\0';
+		}
+		return 1;
+	}
+
+	return 0;
+}
+
+int
+sg_reg_find_referencing(const char *target_type,
+                        sg_ref_entry_t *out, int max)
+{
+	if (!target_type || !out || max <= 0)
+		return 0;
+
+	int count = 0;
+	char rt[64], ro[64];
+
+	for (const struct field_entry *f = field_table; f->type; f++) {
+		if (!sg_parse_ref_kind(f->kind, rt, sizeof(rt),
+		                       ro, sizeof(ro)))
+			continue;
+		if (strcmp(rt, target_type) == 0) {
+			if (count < max) {
+				out[count].type = f->type;
+				out[count].key = f->key;
+				count++;
+			}
+		}
+	}
+	return count;
+}
+
 int
 sg_reg_validate_entry_id(const char *type_name, const char *id)
 {

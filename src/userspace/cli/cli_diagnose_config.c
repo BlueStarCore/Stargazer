@@ -1398,6 +1398,202 @@ static void test_ipc_not_found(void)
 		  SG_ERR_USER_NOT_FOUND);
 }
 
+/* ── Section 20: reference metadata (unit tests) ──────────────────────── */
+
+static void test_ref_metadata(void)
+{
+	printf(C_CYAN "\n  --- reference metadata ---" C_NC "\n");
+
+	/* sg_parse_ref_kind: ref:TYPE */
+	{
+		char rt[64], ro[64];
+		int rc = sg_parse_ref_kind("ref:system_admin-profile",
+					   rt, sizeof(rt), ro, sizeof(ro));
+		tc_check("ref-meta", "parse ref:system_admin-profile -> 1",
+			 rc, 1);
+		tc_str("ref-meta", "ref:system_admin-profile type",
+		       rt, "system_admin-profile");
+		tc_str("ref-meta", "ref:system_admin-profile opts empty",
+		       ro, "");
+	}
+
+	/* sg_parse_ref_kind: ref-or:TYPE:opts */
+	{
+		char rt[64], ro[64];
+		int rc = sg_parse_ref_kind("ref-or:firewall_address:all,any",
+					   rt, sizeof(rt), ro, sizeof(ro));
+		tc_check("ref-meta",
+			 "parse ref-or:firewall_address:all,any -> 1",
+			 rc, 1);
+		tc_str("ref-meta", "ref-or type = firewall_address",
+		       rt, "firewall_address");
+		tc_str("ref-meta", "ref-or opts = all,any",
+		       ro, "all,any");
+	}
+
+	/* sg_parse_ref_kind: non-ref kinds return 0 */
+	{
+		char rt[64], ro[64];
+		tc_check("ref-meta", "parse enum:a,b -> 0",
+			 sg_parse_ref_kind("enum:a,b", rt, sizeof(rt),
+					   ro, sizeof(ro)), 0);
+		tc_check("ref-meta", "parse safe-id -> 0",
+			 sg_parse_ref_kind("safe-id", rt, sizeof(rt),
+					   ro, sizeof(ro)), 0);
+		tc_check("ref-meta", "parse cidr -> 0",
+			 sg_parse_ref_kind("cidr", rt, sizeof(rt),
+					   ro, sizeof(ro)), 0);
+	}
+
+	/* sg_reg_find_referencing: firewall_address -> 2 fields */
+	{
+		sg_ref_entry_t refs[16];
+		int n = sg_reg_find_referencing("firewall_address",
+						refs, 16);
+		tc_check("ref-meta",
+			 "firewall_address referenced by 2 fields",
+			 n, 2);
+		if (n >= 2) {
+			tc_str("ref-meta", "ref[0].type = firewall_policy",
+			       refs[0].type, "firewall_policy");
+			tc_str("ref-meta", "ref[0].key = srcaddr",
+			       refs[0].key, "srcaddr");
+			tc_str("ref-meta", "ref[1].type = firewall_policy",
+			       refs[1].type, "firewall_policy");
+			tc_str("ref-meta", "ref[1].key = dstaddr",
+			       refs[1].key, "dstaddr");
+		}
+	}
+
+	/* sg_reg_find_referencing: firewall_service -> 1 field */
+	{
+		sg_ref_entry_t refs[16];
+		int n = sg_reg_find_referencing("firewall_service",
+						refs, 16);
+		tc_check("ref-meta",
+			 "firewall_service referenced by 1 field",
+			 n, 1);
+		if (n >= 1) {
+			tc_str("ref-meta", "ref[0].key = service",
+			       refs[0].key, "service");
+		}
+	}
+
+	/* sg_reg_find_referencing: system_admin-profile -> 1 field */
+	{
+		sg_ref_entry_t refs[16];
+		int n = sg_reg_find_referencing("system_admin-profile",
+						refs, 16);
+		tc_check("ref-meta",
+			 "system_admin-profile referenced by 1 field",
+			 n, 1);
+		if (n >= 1) {
+			tc_str("ref-meta", "ref[0].key = profile",
+			       refs[0].key, "profile");
+		}
+	}
+
+	/* sg_reg_find_referencing: network_route_static -> 0 fields */
+	{
+		sg_ref_entry_t refs[16];
+		int n = sg_reg_find_referencing("network_route_static",
+						refs, 16);
+		tc_check("ref-meta",
+			 "network_route_static referenced by 0 fields",
+			 n, 0);
+	}
+}
+
+/* ── Section 21: IPC referential integrity guard (full mode) ──────────── */
+
+static void test_ipc_refguard(void)
+{
+	struct ipc_response resp;
+	int conn;
+
+	printf(C_CYAN "\n  --- IPC: referential integrity guard ---"
+	       C_NC "\n");
+
+	/* 1. Create firewall_address:__diag_refaddr */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_SET,
+			    "firewall_address:__diag_refaddr\n"
+			    "name=__diag_refaddr\n"
+			    "subnet=10.88.88.0/24\n"
+			    "type=ipmask\n",
+			    &resp);
+	if (conn == 0 && resp.status == SG_OK) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [refguard] create firewall_address __diag_refaddr\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [refguard] create __diag_refaddr (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+		ipc_resp_free(&resp);
+		return;
+	}
+	ipc_resp_free(&resp);
+
+	/* 2. Create firewall_policy:99 referencing __diag_refaddr */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_SET,
+			    "firewall_policy:99\n"
+			    "name=__diag_refpol\n"
+			    "srcaddr=__diag_refaddr\n"
+			    "dstaddr=all\n"
+			    "srcintf=any\n"
+			    "dstintf=any\n"
+			    "action=deny\n"
+			    "service=all\n"
+			    "status=enable\n",
+			    &resp);
+	if (conn == 0 && resp.status == SG_OK) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [refguard] create firewall_policy:99"
+		       " with srcaddr=__diag_refaddr\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [refguard] create policy:99 (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+		ipc_resp_free(&resp);
+		goto cleanup;
+	}
+	ipc_resp_free(&resp);
+
+	/* 3. Delete __diag_refaddr → expect SG_ERR_IN_USE */
+	ipc_check("delete referenced __diag_refaddr -> IN_USE",
+		  SG_CMD_CFG_DEL,
+		  "firewall_address:__diag_refaddr",
+		  SG_ERR_IN_USE);
+
+	/* 4. Delete policy:99 → expect SG_OK */
+	ipc_check("delete referencing policy:99 -> OK",
+		  SG_CMD_CFG_DEL,
+		  "firewall_policy:99",
+		  SG_OK);
+
+	/* 5. Delete __diag_refaddr → now expect SG_OK */
+	ipc_check("delete unreferenced __diag_refaddr -> OK",
+		  SG_CMD_CFG_DEL,
+		  "firewall_address:__diag_refaddr",
+		  SG_OK);
+
+	return;
+
+cleanup:
+	/* Best-effort cleanup on early exit */
+	if (ipc_send_str(SG_CMD_CFG_DEL,
+			 "firewall_policy:99", &resp) == 0)
+		ipc_resp_free(&resp);
+	if (ipc_send_str(SG_CMD_CFG_DEL,
+			 "firewall_address:__diag_refaddr", &resp) == 0)
+		ipc_resp_free(&resp);
+}
+
 /* ── Cleanup helper ───────────────────────────────────────────────────── */
 
 static void cleanup_test_entries(void)
@@ -1409,6 +1605,18 @@ static void cleanup_test_entries(void)
 			 "firewall_address:__diag_cfgtest", &resp) == 0 &&
 	    resp.status == SG_OK)
 		printf("  cleanup: deleted __diag_cfgtest\n");
+	ipc_resp_free(&resp);
+
+	if (ipc_send_str(SG_CMD_CFG_DEL,
+			 "firewall_policy:99", &resp) == 0 &&
+	    resp.status == SG_OK)
+		printf("  cleanup: deleted firewall_policy:99\n");
+	ipc_resp_free(&resp);
+
+	if (ipc_send_str(SG_CMD_CFG_DEL,
+			 "firewall_address:__diag_refaddr", &resp) == 0 &&
+	    resp.status == SG_OK)
+		printf("  cleanup: deleted __diag_refaddr\n");
 	ipc_resp_free(&resp);
 }
 
@@ -1439,6 +1647,7 @@ int cli_diagnose_test_configure(int mode)
 	test_field_desc();
 	test_value_quoting();
 	test_cmd_resolve();
+	test_ref_metadata();
 
 	if (mode == 1) {
 		/* Full mode: IPC round-trip tests */
@@ -1456,6 +1665,7 @@ int cli_diagnose_test_configure(int mode)
 			test_ipc_roundtrip();
 			test_ipc_apply();
 			test_ipc_not_found();
+			test_ipc_refguard();
 			cleanup_test_entries();
 		}
 	}

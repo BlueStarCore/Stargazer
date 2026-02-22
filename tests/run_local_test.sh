@@ -13,7 +13,6 @@ BUILD_DIR="$PROJECT_ROOT/build/native"
 MGMTD_BIN="$BUILD_DIR/stargazer-mgmtd"
 IPC_BIN="$BUILD_DIR/stargazer-ipc-cli"
 CONFIG_DIR="/etc/stargazer"
-DEFAULT_CONF="$PROJECT_ROOT/src/userspace/etc/stargazer/default.conf"
 TEST_SCRIPT="${1:-$PROJECT_ROOT/tests/test_experience.sh}"
 
 # Colors
@@ -102,37 +101,8 @@ if [ ! -d "$CONFIG_DIR" ]; then
 	printf "  Created %s\n" "$CONFIG_DIR"
 fi
 
-# Seed config from default.conf (split by ### DOMAIN: markers)
-if [ -f "$DEFAULT_CONF" ]; then
-	# Parse default.conf into domain-specific files
-	current_domain=""
-	while IFS= read -r line; do
-		case "$line" in
-			"### DOMAIN:"*)
-				current_domain="${line#*DOMAIN:}"
-				current_domain="${current_domain%% *}"
-				current_domain="${current_domain% ###}"
-				# Only create if file doesn't exist (don't overwrite)
-				if [ ! -f "$CONFIG_DIR/$current_domain.conf" ]; then
-					: > "$CONFIG_DIR/$current_domain.conf"
-				fi
-				;;
-			*)
-				if [ -n "$current_domain" ] && [ ! -s "$CONFIG_DIR/$current_domain.conf" ]; then
-					echo "$line" >> "$CONFIG_DIR/$current_domain.conf"
-				fi
-				;;
-		esac
-	done < "$DEFAULT_CONF"
-	printf "  ✓ Seeded config from default.conf\n"
-else
-	printf "  ${YELLOW}WARNING: default.conf not found, mgmtd will start with empty config${NC}\n"
-fi
-
-# Show what we have
-for f in "$CONFIG_DIR"/*.conf; do
-	[ -f "$f" ] && printf "    %s (%d lines)\n" "$f" "$(wc -l < "$f")"
-done
+# mgmtd seeds defaults on first boot (no default.conf needed)
+printf "  mgmtd will seed defaults on first boot\n"
 
 # ── Start mgmtd ─────────────────────────────────────────────────────────
 

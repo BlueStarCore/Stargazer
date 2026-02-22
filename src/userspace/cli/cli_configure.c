@@ -547,6 +547,40 @@ static void register_single_cmds(const char *type_name)
 	register_unset_get_cmds(type_name);
 }
 
+/* ── Reference existence check ────────────────────────────────────────── */
+
+/*
+ * Check if a ref: or ref-or: value actually exists.
+ * Returns 1 if OK (not a ref, or is a hardcoded option, or entry exists).
+ * Returns 0 if the referenced entry does not exist.
+ */
+static int check_ref_exists(const char *type_name, const char *key,
+			    const char *val)
+{
+	const char *kind = sg_reg_value_kind(type_name, key);
+	char rt[64], ro[64];
+
+	if (!sg_parse_ref_kind(kind, rt, sizeof(rt), ro, sizeof(ro)))
+		return 1; /* not a ref kind — always valid */
+
+	/* Check hardcoded options (e.g. "all", "any") */
+	if (ro[0] && sg_match_csv_option(ro, val))
+		return 1;
+
+	/* Check if entry exists via IPC */
+	char section[512];
+	snprintf(section, sizeof(section), "%s:%s", rt, val);
+
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_CFG_GET, section, &resp) == 0 &&
+	    resp.status == SG_OK) {
+		ipc_resp_free(&resp);
+		return 1;
+	}
+	ipc_resp_free(&resp);
+	return 0;
+}
+
 /* ── Apply config via IPC ─────────────────────────────────────────────── */
 
 static int apply_config(const char *type_name, const char *id,
@@ -721,6 +755,16 @@ static int context_entry(const char *type_name, const char *label,
 				       key, val);
 				printf("  Expected: %s\n",
 				       sg_reg_value_rule(type_name, key));
+				continue;
+			}
+			if (!check_ref_exists(type_name, key, val)) {
+				char rt[64], ro[64];
+				sg_parse_ref_kind(
+					sg_reg_value_kind(type_name, key),
+					rt, sizeof(rt), ro, sizeof(ro));
+				printf("  Error: '%s' does not exist"
+				       " as a %s entry\n",
+				       val, sg_reg_type_label(rt));
 				continue;
 			}
 			if (kv_set(&data, key, val) != 0) {
@@ -1152,7 +1196,13 @@ static int context_table(const char *type_name, const char *label)
 				    dresp.status == SG_OK) {
 					printf("  Entry %s deleted.\n", arg);
 				} else {
-					printf("  Entry %s not found.\n", arg);
+					if (dresp.extra[0])
+						printf("  Error: %s\n",
+						       dresp.extra);
+					else
+						printf("  Entry %s"
+						       " not found.\n",
+						       arg);
 				}
 				ipc_resp_free(&dresp);
 			}
@@ -1234,6 +1284,16 @@ static int context_single(const char *type_name, const char *label)
 				       " '%s'\n", key, val);
 				printf("  Expected: %s\n",
 				       sg_reg_value_rule(type_name, key));
+				continue;
+			}
+			if (!check_ref_exists(type_name, key, val)) {
+				char rt[64], ro[64];
+				sg_parse_ref_kind(
+					sg_reg_value_kind(type_name, key),
+					rt, sizeof(rt), ro, sizeof(ro));
+				printf("  Error: '%s' does not exist"
+				       " as a %s entry\n",
+				       val, sg_reg_type_label(rt));
 				continue;
 			}
 			if (kv_set(&data, key, val) != 0) {

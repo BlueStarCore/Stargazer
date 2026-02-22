@@ -85,4 +85,12 @@ int sg_db_count(const char *type);
 void sg_db_parse_section(const char *section, char *type, size_t tsz,
 			 char *id, size_t isz);
 
+/*
+ * Find all entries of a given type where a key matches a value.
+ * Returns heap-allocated "type:id\n..." string of matching entries,
+ * or NULL if none found.  Caller must free().
+ */
+char *sg_db_find_referencing(const char *ref_type, const char *ref_key,
+			     const char *target_value);
+
 #endif /* SG_DB_H */

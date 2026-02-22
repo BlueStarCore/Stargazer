@@ -348,10 +348,8 @@ $(ROOTFS_DIR)/.stamp: modules busybox dash logind mgmtd cli
 	@cp $(PROJECT_ROOT)/tests/test_suite.sh $(ROOTFS_DIR)/usr/libexec/stargazer/test_suite.sh
 	@chmod +x $(ROOTFS_DIR)/usr/libexec/stargazer/test_suite.sh
 
-	# Create stargazer config directory and copy default config template
+	# Create stargazer config directory (mgmtd seeds defaults on first boot)
 	@mkdir -p $(ROOTFS_DIR)/etc/stargazer
-	@[ -f "$(USERSPACE_DIR)/etc/stargazer/default.conf" ] && \
-		cp $(USERSPACE_DIR)/etc/stargazer/default.conf $(ROOTFS_DIR)/etc/stargazer/default.conf || true
 
 	@touch $@
 	@echo "[4/5] Rootfs ready: $(ROOTFS_DIR)"
@@ -493,10 +491,8 @@ test-build: modules busybox dash logind mgmtd cli
 	@cp $(USERSPACE_DIR)/usr/libexec/stargazer/* $(BUILD_DIR)/test/initramfs/usr/libexec/stargazer/
 	@chmod +x $(BUILD_DIR)/test/initramfs/usr/libexec/stargazer/*
 
-	# Create stargazer config directory and copy default config template
+	# Create stargazer config directory (mgmtd seeds defaults on first boot)
 	@mkdir -p $(BUILD_DIR)/test/initramfs/etc/stargazer
-	@[ -f "$(USERSPACE_DIR)/etc/stargazer/default.conf" ] && \
-		cp $(USERSPACE_DIR)/etc/stargazer/default.conf $(BUILD_DIR)/test/initramfs/etc/stargazer/default.conf || true
 
 	# Pack initramfs
 	cd $(BUILD_DIR)/test/initramfs && find . | cpio -o -H newc 2>/dev/null | gzip -9 > $(BUILD_DIR)/test/initramfs.gz

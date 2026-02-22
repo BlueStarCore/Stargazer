@@ -360,6 +360,55 @@ int sg_db_set_val(const char *type, const char *id, const char *key,
 	return (rc == SQLITE_DONE) ? 0 : -1;
 }
 
+/* ── sg_db_find_referencing ───────────────────────────────────────────────── */
+
+char *sg_db_find_referencing(const char *ref_type, const char *ref_key,
+			     const char *target_value)
+{
+	if (!g_db || !ref_type || !ref_key || !target_value) return NULL;
+
+	sqlite3_stmt *stmt;
+	const char *sql = "SELECT DISTINCT id FROM config "
+			  "WHERE type=?1 AND key=?2 AND value=?3;";
+	if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK)
+		return NULL;
+
+	sqlite3_bind_text(stmt, 1, ref_type, -1, SQLITE_STATIC);
+	sqlite3_bind_text(stmt, 2, ref_key, -1, SQLITE_STATIC);
+	sqlite3_bind_text(stmt, 3, target_value, -1, SQLITE_STATIC);
+
+	size_t bufsz = 256, used = 0;
+	char *buf = malloc(bufsz);
+	if (!buf) { sqlite3_finalize(stmt); return NULL; }
+	buf[0] = '\0';
+
+	while (sqlite3_step(stmt) == SQLITE_ROW) {
+		const char *id = (const char *)sqlite3_column_text(stmt, 0);
+		if (!id) continue;
+
+		/* Append "type:id\n" */
+		size_t tlen = strlen(ref_type);
+		size_t ilen = strlen(id);
+
+		if (buf_append(&buf, &used, &bufsz, ref_type, tlen) < 0 ||
+		    buf_append(&buf, &used, &bufsz, ":", 1) < 0 ||
+		    buf_append(&buf, &used, &bufsz, id, ilen) < 0 ||
+		    buf_append(&buf, &used, &bufsz, "\n", 1) < 0) {
+			free(buf);
+			sqlite3_finalize(stmt);
+			return NULL;
+		}
+	}
+
+	sqlite3_finalize(stmt);
+
+	if (used == 0) {
+		free(buf);
+		return NULL;
+	}
+	return buf;
+}
+
 /* ── sg_db_count ─────────────────────────────────────────────────────────── */
 
 int sg_db_count(const char *type)

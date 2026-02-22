@@ -1366,6 +1366,39 @@ static int has_permission(const char *perms_csv, const char *perm)
 	return 0;
 }
 
+/* ── Referential integrity check ────────────────────────────────────────── */
+
+/*
+ * Check if any config entries reference this object by its ID.
+ * Returns 0 if safe to delete, -1 if referenced (errbuf filled).
+ */
+static int check_references(const char *type, const char *id,
+			    char *errbuf, size_t errsz)
+{
+	sg_ref_entry_t refs[16];
+	int nrefs = sg_reg_find_referencing(type, refs, 16);
+
+	for (int i = 0; i < nrefs; i++) {
+		char *found = sg_db_find_referencing(refs[i].type,
+						     refs[i].key, id);
+		if (found) {
+			/* Extract first referencing entry for the message */
+			const char *nl = strchr(found, '\n');
+			size_t flen = nl ? (size_t)(nl - found) : strlen(found);
+			char first[128];
+			if (flen >= sizeof(first)) flen = sizeof(first) - 1;
+			memcpy(first, found, flen);
+			first[flen] = '\0';
+
+			snprintf(errbuf, errsz,
+				 "Referenced by %s (%s)", first, refs[i].key);
+			free(found);
+			return -1;
+		}
+	}
+	return 0;
+}
+
 /* ── Request handler ────────────────────────────────────────────────────── */
 
 static void handle_request(int client_fd, sg_request_hdr_t *hdr,
@@ -1602,6 +1635,13 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 			free(existing);
 		}
 
+		/* Check referential integrity */
+		char ref_err[SG_EXTRA_MAX];
+		if (check_references(db_type, db_id, ref_err, sizeof(ref_err)) != 0) {
+			send_error(client_fd, SG_ERR_IN_USE, ref_err);
+			return;
+		}
+
 		/* If deleting admin, bump session and delete system user */
 		if (strcmp(db_type, "system_admin") == 0) {
 			session_rev_bump(db_id);
@@ -1778,6 +1818,16 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 			send_error(client_fd, SG_ERR_IN_USE,
 				   "Cannot delete your own account");
 			return;
+		}
+
+		/* Check referential integrity */
+		{
+			char ref_err[SG_EXTRA_MAX];
+			if (check_references("system_admin", target,
+					     ref_err, sizeof(ref_err)) != 0) {
+				send_error(client_fd, SG_ERR_IN_USE, ref_err);
+				return;
+			}
 		}
 
 		sg_db_del("system_admin", target);

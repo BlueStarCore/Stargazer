@@ -9,6 +9,8 @@
 #ifndef SG_VALIDATE_H
 #define SG_VALIDATE_H
 
+#include <stddef.h>
+
 typedef enum { CFG_TABLE, CFG_SINGLE } cfg_mode_t;
 
 typedef struct {
@@ -73,5 +75,23 @@ int sg_reg_validate_value(const char *type_name, const char *key, const char *va
 
 /* Validate an entry ID. Returns 1 if valid, 0 if not. */
 int sg_reg_validate_entry_id(const char *type_name, const char *id);
+
+/* ── Reference metadata ──────────────────────────────────────────────── */
+
+typedef struct {
+	const char *type;      /* referencing type, e.g. "firewall_policy" */
+	const char *key;       /* referencing field, e.g. "srcaddr" */
+} sg_ref_entry_t;
+
+/* Find all fields that reference target_type via ref: or ref-or: kinds.
+ * Fills 'out' up to 'max' entries. Returns count written. */
+int sg_reg_find_referencing(const char *target_type,
+                            sg_ref_entry_t *out, int max);
+
+/* Parse "ref:TYPE" or "ref-or:TYPE:opts" kind string.
+ * Returns 1 if kind is a ref kind, 0 otherwise. */
+int sg_parse_ref_kind(const char *kind,
+                      char *ref_type, size_t ref_sz,
+                      char *opts, size_t opts_sz);
 
 #endif /* SG_VALIDATE_H */
