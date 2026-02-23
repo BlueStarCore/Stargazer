@@ -100,6 +100,7 @@ typedef enum {
 
 	/* Keepalive / ping (9xx) */
 	SG_CMD_PING          = 900,
+	SG_CMD_DEBUG_FETCH   = 901,   /* Fetch buffered debug traces    */
 } sg_cmd_t;
 
 /* ── Message header ─────────────────────────────────────────────────────── */
@@ -114,12 +115,12 @@ typedef enum {
  * Request: CLI → mgmtd
  *
  * Wire format (fixed header + variable payload):
- *   [ magic:2 | version:1 | _pad:1 | cmd:4 | user[64] | payload_len:4 | payload[...] ]
+ *   [ magic:2 | version:1 | debug_flags:1 | cmd:4 | user[64] | payload_len:4 | payload[...] ]
  */
 typedef struct {
 	uint16_t  magic;                     /* SG_MSG_MAGIC               */
 	uint8_t   version;                   /* SG_MSG_VERSION             */
-	uint8_t   _pad;
+	uint8_t   debug_flags;               /* bit0=mgmtd bit1=auth       */
 	uint32_t  cmd;                       /* sg_cmd_t                   */
 	char      username[SG_USERNAME_MAX]; /* authenticated user         */
 	uint32_t  payload_len;               /* length of payload data     */

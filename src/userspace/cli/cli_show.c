@@ -131,7 +131,7 @@ static void show_ipc_or_fallback(uint32_t cmd, const char *payload_str,
 
 /* ── show status ──────────────────────────────────────────────────────── */
 
-static void show_status(void)
+void show_status(void)
 {
 	struct ipc_response resp;
 	if (ipc_available() &&
@@ -169,7 +169,7 @@ static void show_status(void)
 
 /* ── show sessions ────────────────────────────────────────────────────── */
 
-static void show_sessions(void)
+void show_sessions(void)
 {
 	FILE *fp = fopen("/proc/stargazer/sessions", "r");
 	if (fp) {
@@ -185,7 +185,7 @@ static void show_sessions(void)
 
 /* ── show stats ───────────────────────────────────────────────────────── */
 
-static void show_stats(void)
+void show_stats(void)
 {
 	printf("  === Packet Statistics ===\n");
 
@@ -212,7 +212,7 @@ static void show_stats(void)
 
 /* ── show interfaces ──────────────────────────────────────────────────── */
 
-static void show_interfaces(void)
+void show_interfaces(void)
 {
 	const char *fallback[] = {"ip", "-brief", "link", NULL};
 	show_ipc_or_fallback(SG_CMD_SHOW_IFACES, "",
@@ -221,7 +221,7 @@ static void show_interfaces(void)
 
 /* ── show routes ──────────────────────────────────────────────────────── */
 
-static void show_routes(void)
+void show_routes(void)
 {
 	const char *fallback[] = {"ip", "route", NULL};
 	show_ipc_or_fallback(SG_CMD_SHOW_ROUTES, "",
@@ -242,7 +242,7 @@ static int value_needs_quote(const char *type, const char *key)
  * For each, query mgmtd via IPC to get entries, then format in
  * FortiGate "config ... / edit ... / set ... / next / end" style.
  */
-static void show_configure(void)
+void show_configure(void)
 {
 	printf("  === Running Configuration ===\n\n");
 
@@ -389,7 +389,7 @@ static void show_configure(void)
 
 /* ── show config (modules + sysctl) ───────────────────────────────────── */
 
-static void show_config(void)
+void show_config(void)
 {
 	printf("  === Stargazer Configuration ===\n");
 	printf("  Modules:\n");
@@ -416,38 +416,3 @@ static void show_config(void)
 	}
 }
 
-/* ── Main dispatch ────────────────────────────────────────────────────── */
-
-void cli_show(const char *subcmd)
-{
-	if (!subcmd || !*subcmd) {
-		printf("  Usage: show <subcommand>\n");
-		printf("  Subcommands: status sessions stats"
-		       " interfaces routes configure config\n");
-		return;
-	}
-
-	/* Skip leading whitespace */
-	while (*subcmd == ' ')
-		subcmd++;
-
-	if (strcmp(subcmd, "status") == 0) {
-		show_status();
-	} else if (strcmp(subcmd, "sessions") == 0) {
-		show_sessions();
-	} else if (strcmp(subcmd, "stats") == 0) {
-		show_stats();
-	} else if (strcmp(subcmd, "interfaces") == 0) {
-		show_interfaces();
-	} else if (strcmp(subcmd, "routes") == 0) {
-		show_routes();
-	} else if (strcmp(subcmd, "configure") == 0) {
-		show_configure();
-	} else if (strcmp(subcmd, "config") == 0) {
-		show_config();
-	} else {
-		printf("  Unknown subcommand: %s\n", subcmd);
-		printf("  Subcommands: status sessions stats"
-		       " interfaces routes configure config\n");
-	}
-}

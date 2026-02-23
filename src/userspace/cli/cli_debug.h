@@ -2,7 +2,6 @@
 /*
  * cli_debug.h — Debug state manager for Stargazer CLI
  *
- * Replaces the debug portion of cmd_execute shell script.
  * Manages /tmp/stargazer-debug.conf key=value state file.
  */
 
@@ -15,17 +14,15 @@ void dbg_set(const char *key, const char *val);
 void dbg_reset(void);
 int  dbg_enabled(void);
 
-/* Debug subcommand dispatch: "execute debug <args>" */
-void cli_debug_dispatch(const char *args);
-
-/* Resource monitoring subcommands */
-void dbg_show_cpu(void);
-void dbg_show_ram(void);
-void dbg_show_disk(void);
-void dbg_show_interface(void);
-void dbg_show_resources(const char *which);
-
-/* Top/process snapshot */
-void dbg_show_top(void);
+/* Debug command handlers (table-driven dispatch) */
+int cmd_debug_enable(const char *args, const char *permissions);
+int cmd_debug_disable(const char *args, const char *permissions);
+int cmd_debug_reset(const char *args, const char *permissions);
+int cmd_debug_status(const char *args, const char *permissions);
+int cmd_debug_option(const char *args, const char *permissions);
+int cmd_debug_cli(const char *args, const char *permissions);
+int cmd_debug_mgmtd(const char *args, const char *permissions);
+int cmd_debug_auth(const char *args, const char *permissions);
+int cmd_debug_flow(const char *args, const char *permissions);
 
 #endif /* CLI_DEBUG_H */

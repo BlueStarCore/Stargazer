@@ -6,7 +6,12 @@
 #ifndef CLI_SHOW_H
 #define CLI_SHOW_H
 
-/* Dispatch "show <subcmd>" — replaces cmd_show shell script. */
-void cli_show(const char *subcmd);
+void show_status(void);
+void show_sessions(void);
+void show_stats(void);
+void show_interfaces(void);
+void show_routes(void);
+void show_configure(void);
+void show_config(void);
 
 #endif /* CLI_SHOW_H */

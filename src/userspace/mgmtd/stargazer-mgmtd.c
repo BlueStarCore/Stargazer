@@ -62,6 +62,26 @@
 #define BUF_SIZE         (sizeof(sg_request_hdr_t) + SG_PAYLOAD_MAX)
 #define DEBUG_STATE_FILE  "/tmp/stargazer-debug.conf"
 
+#define DEBUG_BUF_SIZE 4096
+static char debug_buf[DEBUG_BUF_SIZE];
+static int  debug_buf_used;
+
+/* Per-request debug flags (set from request header) */
+static uint8_t g_debug_flags;
+
+static void debug_buf_push(const char *fmt, ...)
+{
+	int avail = DEBUG_BUF_SIZE - debug_buf_used - 1;
+	if (avail <= 0)
+		return;
+	va_list ap;
+	va_start(ap, fmt);
+	int n = vsnprintf(debug_buf + debug_buf_used, avail, fmt, ap);
+	va_end(ap);
+	if (n > 0 && n < avail)
+		debug_buf_used += n;
+}
+
 static volatile sig_atomic_t g_running = 1;
 
 /* ── Input validation ───────────────────────────────────────────────────── */
@@ -254,6 +274,10 @@ static void send_response(int fd, sg_status_t status, const char *extra,
 	if (extra)
 		snprintf(resp.extra, sizeof(resp.extra), "%s", extra);
 	resp.payload_len = payload_len;
+
+	if (g_debug_flags & 0x01)
+		debug_buf_push("[MGMTD-DBG] -> status=%u\n",
+			       (unsigned)status);
 
 	safe_write(fd, &resp, sizeof(resp));
 	if (payload_len > 0 && payload)
@@ -1551,8 +1575,15 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 	sg_cmd_t cmd = (sg_cmd_t)hdr->cmd;
 	const char *user = hdr->username;
 
+	/* Latch per-request debug flags from CLI header */
+	g_debug_flags = hdr->debug_flags;
+
 	mgmt_log("INFO", "cmd=%u user=%s payload_len=%u",
 		 hdr->cmd, user, hdr->payload_len);
+
+	if (g_debug_flags & 0x01)
+		debug_buf_push("[MGMTD-DBG] user=%s cmd=%u payload_len=%u\n",
+			       user, hdr->cmd, hdr->payload_len);
 
 	switch (cmd) {
 
@@ -1916,6 +1947,9 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		}
 
 		audit_log(user, "admin_create", newuser);
+		if (g_debug_flags & 0x02)
+			debug_buf_push("[AUTH-DBG] create user=%s result=ok\n",
+				       newuser);
 		char msg[CMD_BUF_SIZE];
 		snprintf(msg, sizeof(msg), "User '%s' created with profile '%s'", newuser, newprof);
 		send_ok(client_fd, msg, NULL);
@@ -1979,6 +2013,9 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		session_rev_bump(target);
 
 		audit_log(user, "admin_delete", target);
+		if (g_debug_flags & 0x02)
+			debug_buf_push("[AUTH-DBG] delete user=%s result=ok\n",
+				       target);
 		char msg[CMD_BUF_SIZE];
 		snprintf(msg, sizeof(msg), "User '%s' deleted", target);
 		send_ok(client_fd, msg, NULL);
@@ -2042,6 +2079,9 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		}
 		explicit_bzero(pw, sizeof(pw));
 		audit_log(user, "admin_password_set", target);
+		if (g_debug_flags & 0x02)
+			debug_buf_push("[AUTH-DBG] set_password user=%s result=ok\n",
+				       target);
 		send_ok(client_fd, "Password updated", NULL);
 		return;
 	}
@@ -2163,9 +2203,15 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		explicit_bzero(chk_pw, sizeof(chk_pw));
 
 		if (rc > 0) {
+			if (g_debug_flags & 0x02)
+				debug_buf_push("[AUTH-DBG] check_password user=%s result=fail\n",
+					       chk_user);
 			send_error(client_fd, SG_ERR_POLICY_FAIL,
 				   reason ? reason : "Policy violation");
 		} else {
+			if (g_debug_flags & 0x02)
+				debug_buf_push("[AUTH-DBG] check_password user=%s result=ok\n",
+					       chk_user);
 			send_ok(client_fd, "Password meets policy", NULL);
 		}
 		return;
@@ -2199,6 +2245,9 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 			return;
 		}
 		audit_log(user, "admin_password_locked", lock_target);
+		if (g_debug_flags & 0x02)
+			debug_buf_push("[AUTH-DBG] lock_password user=%s result=ok\n",
+				       lock_target);
 		send_ok(client_fd, "Password locked", NULL);
 		return;
 	}
@@ -2342,6 +2391,17 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 	case SG_CMD_PING:
 		send_ok(client_fd, "pong", NULL);
 		return;
+
+	case SG_CMD_DEBUG_FETCH: {
+		if (debug_buf_used > 0) {
+			send_ok(client_fd, NULL, debug_buf);
+			debug_buf_used = 0;
+			debug_buf[0] = '\0';
+		} else {
+			send_ok(client_fd, NULL, NULL);
+		}
+		return;
+	}
 
 	default:
 		send_error(client_fd, SG_ERR_INVALID_CMD, "Unknown command");

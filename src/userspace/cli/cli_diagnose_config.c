@@ -12,6 +12,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "cli_diagnose.h"
+#include "cli_cmd_table.h"
 #include "cli_readline.h"
 #include "cli_ipc.h"
 #include "sg_validate.h"
@@ -1504,7 +1505,272 @@ static void test_ref_metadata(void)
 	}
 }
 
-/* ── Section 21: IPC interface builtin protection (full mode) ─────────── */
+/* ── Section 21: dispatch table verification ──────────────────────────── */
+
+static void test_dispatch_table(void)
+{
+	printf(C_CYAN "\n  --- dispatch table verification ---" C_NC "\n");
+
+	/* Return values: exit/logout→1, unknown/empty/NULL→0 */
+	tc_check("dispatch", "exit returns 1",
+		 cmd_dispatch("exit", "monitor,configure,admin"), 1);
+	tc_check("dispatch", "logout returns 1",
+		 cmd_dispatch("logout", "monitor,configure,admin"), 1);
+	tc_check("dispatch", "unknown returns 0",
+		 cmd_dispatch("nonexistent_command_xyz", "admin"), 0);
+	tc_check("dispatch", "empty returns 0",
+		 cmd_dispatch("", "admin"), 0);
+	tc_check("dispatch", "NULL returns 0",
+		 cmd_dispatch(NULL, "admin"), 0);
+
+	/* Leading whitespace stripped */
+	tc_check("dispatch", "leading spaces '  exit' returns 1",
+		 cmd_dispatch("  exit", "monitor,configure,admin"), 1);
+
+	/* Auto-usage prefixes: print children, return 0 */
+	tc_check("dispatch", "'show' auto-usage returns 0",
+		 cmd_dispatch("show", "monitor,configure,admin"), 0);
+	tc_check("dispatch", "'execute system' auto-usage returns 0",
+		 cmd_dispatch("execute system", "admin"), 0);
+	tc_check("dispatch", "'execute diagnose' auto-usage returns 0",
+		 cmd_dispatch("execute diagnose", "admin"), 0);
+
+	/* Permission denial: no matching permission → prints denied, returns 0 */
+	tc_check("dispatch", "show status with empty perms → denied",
+		 cmd_dispatch("show status", ""), 0);
+	tc_check("dispatch", "execute debug enable with monitor-only → denied",
+		 cmd_dispatch("execute debug enable", "monitor"), 0);
+	tc_check("dispatch", "configure with monitor-only → denied",
+		 cmd_dispatch("configure", "monitor"), 0);
+	tc_check("dispatch", "execute system shutdown with monitor-only → denied",
+		 cmd_dispatch("execute system shutdown", "monitor"), 0);
+
+	/* Permission OR: 'admin' alone (no 'monitor') → denied for show */
+	tc_check("dispatch", "show status with 'admin' (no monitor) → denied",
+		 cmd_dispatch("show status", "admin"), 0);
+}
+
+/* ── Section 22: registry completeness ────────────────────────────────── */
+
+static void test_registry_completeness(void)
+{
+	printf(C_CYAN "\n  --- registry completeness ---" C_NC "\n");
+
+	const sg_type_info_t *types = sg_reg_types();
+	int count = 0;
+	int wired = 0;
+	int all_labels = 1;
+	int all_domains = 1;
+	int all_modes = 1;
+	int all_req_in_valid = 1;
+
+	for (int i = 0; types[i].name; i++) {
+		const char *name = types[i].name;
+		count++;
+
+		const char *keys = sg_reg_valid_keys(name);
+		if (keys && keys[0])
+			wired++;
+
+		const char *label = sg_reg_type_label(name);
+		if (!label || !label[0])
+			all_labels = 0;
+
+		const char *domain = sg_reg_domain_for(name);
+		if (!domain || !domain[0])
+			all_domains = 0;
+
+		int mode = sg_reg_type_mode(name);
+		if (mode != CFG_TABLE && mode != CFG_SINGLE)
+			all_modes = 0;
+
+		/* Check required keys are subset of valid keys */
+		const char *req = sg_reg_required_keys(name);
+		if (req && req[0]) {
+			char buf[512];
+			snprintf(buf, sizeof(buf), "%s", req);
+			char *tok = buf;
+			while (*tok) {
+				while (*tok == ' ')
+					tok++;
+				if (!*tok)
+					break;
+				char *end = tok;
+				while (*end && *end != ' ')
+					end++;
+				char save = *end;
+				*end = '\0';
+				if (!sg_reg_is_valid_key(name, tok))
+					all_req_in_valid = 0;
+				*end = save;
+				tok = end;
+			}
+		}
+	}
+
+	tc_check("reg-complete", "wired types have valid keys (>=12)",
+		 wired >= 12, 1);
+	tc_check("reg-complete", "all types have labels",
+		 all_labels, 1);
+	tc_check("reg-complete", "all types have domain files",
+		 all_domains, 1);
+	tc_check("reg-complete", "all types have valid mode (TABLE or SINGLE)",
+		 all_modes, 1);
+	tc_check("reg-complete", "all required keys are registered as valid",
+		 all_req_in_valid, 1);
+	tc_check("reg-complete", "at least 15 types registered",
+		 count >= 15, 1);
+}
+
+/* ── Section 23: default value self-validation ────────────────────────── */
+
+static void test_default_roundtrip(void)
+{
+	printf(C_CYAN "\n  --- default value self-validation ---" C_NC "\n");
+
+	const sg_type_info_t *types = sg_reg_types();
+
+	for (int i = 0; types[i].name; i++) {
+		const char *name = types[i].name;
+		const char *defaults = sg_reg_default_values(name);
+		if (!defaults || !defaults[0])
+			continue;
+
+		char buf[1024];
+		snprintf(buf, sizeof(buf), "%s", defaults);
+		char *line = buf;
+
+		while (*line) {
+			/* Find end of line */
+			char *eol = strchr(line, '\n');
+			if (eol)
+				*eol = '\0';
+
+			/* Skip empty lines */
+			if (!*line) {
+				if (eol)
+					line = eol + 1;
+				else
+					break;
+				continue;
+			}
+
+			/* Parse key=value */
+			char *eq = strchr(line, '=');
+			if (eq) {
+				*eq = '\0';
+				const char *key = line;
+				const char *val = eq + 1;
+
+				char desc[256];
+				snprintf(desc, sizeof(desc),
+					 "%.40s.%.30s default '%.40s' validates",
+					 name, key, val);
+				tc_check("defaults", desc,
+					 sg_reg_validate_value(name, key, val),
+					 1);
+			}
+
+			if (eol)
+				line = eol + 1;
+			else
+				break;
+		}
+	}
+}
+
+/* ── Section 24: numeric boundary exhaustive ──────────────────────────── */
+
+static void test_boundary_values(void)
+{
+	printf(C_CYAN "\n  --- numeric boundary exhaustive ---" C_NC "\n");
+
+	/* system_interface.mtu: 576-65535 */
+	tc_check("boundary", "system_interface.mtu = '576' (min)",
+		 sg_reg_validate_value("system_interface", "mtu", "576"), 1);
+	tc_check("boundary", "system_interface.mtu = '65535' (max)",
+		 sg_reg_validate_value("system_interface", "mtu", "65535"), 1);
+	tc_check("boundary", "system_interface.mtu = '575' (below min)",
+		 sg_reg_validate_value("system_interface", "mtu", "575"), 0);
+	tc_check("boundary", "system_interface.mtu = '65536' (above max)",
+		 sg_reg_validate_value("system_interface", "mtu", "65536"), 0);
+
+	/* network_nat.dstport: 1-65535 */
+	tc_check("boundary", "network_nat.dstport = '1' (min)",
+		 sg_reg_validate_value("network_nat", "dstport", "1"), 1);
+	tc_check("boundary", "network_nat.dstport = '65535' (max)",
+		 sg_reg_validate_value("network_nat", "dstport", "65535"), 1);
+
+	/* network_nat.mapped-port: 1-65535 */
+	tc_check("boundary", "network_nat.mapped-port = '1' (min)",
+		 sg_reg_validate_value("network_nat", "mapped-port", "1"), 1);
+	tc_check("boundary", "network_nat.mapped-port = '65535' (max)",
+		 sg_reg_validate_value("network_nat", "mapped-port", "65535"), 1);
+
+	/* network_dns.port: 1-65535 */
+	tc_check("boundary", "network_dns.port = '1' (min)",
+		 sg_reg_validate_value("network_dns", "port", "1"), 1);
+	tc_check("boundary", "network_dns.port = '65535' (max)",
+		 sg_reg_validate_value("network_dns", "port", "65535"), 1);
+	tc_check("boundary", "network_dns.port = '0' (below min)",
+		 sg_reg_validate_value("network_dns", "port", "0"), 0);
+	tc_check("boundary", "network_dns.port = '65536' (above max)",
+		 sg_reg_validate_value("network_dns", "port", "65536"), 0);
+
+	/* network_dns.cache-size: 0-100000 */
+	tc_check("boundary", "network_dns.cache-size = '0' (min)",
+		 sg_reg_validate_value("network_dns", "cache-size", "0"), 1);
+	tc_check("boundary", "network_dns.cache-size = '100000' (max)",
+		 sg_reg_validate_value("network_dns", "cache-size", "100000"), 1);
+	tc_check("boundary", "network_dns.cache-size = '100001' (above max)",
+		 sg_reg_validate_value("network_dns", "cache-size", "100001"), 0);
+
+	/* network_dhcp-server.lease-time: 60-604800 */
+	tc_check("boundary", "network_dhcp-server.lease-time = '60' (min)",
+		 sg_reg_validate_value("network_dhcp-server", "lease-time", "60"), 1);
+	tc_check("boundary", "network_dhcp-server.lease-time = '604800' (max)",
+		 sg_reg_validate_value("network_dhcp-server", "lease-time", "604800"), 1);
+	tc_check("boundary", "network_dhcp-server.lease-time = '59' (below min)",
+		 sg_reg_validate_value("network_dhcp-server", "lease-time", "59"), 0);
+	tc_check("boundary", "network_dhcp-server.lease-time = '604801' (above max)",
+		 sg_reg_validate_value("network_dhcp-server", "lease-time", "604801"), 0);
+
+	/* system_password-policy.min-uppercase: 0-128 */
+	tc_check("boundary", "system_password-policy.min-uppercase = '0' (min)",
+		 sg_reg_validate_value("system_password-policy", "min-uppercase", "0"), 1);
+	tc_check("boundary", "system_password-policy.min-uppercase = '128' (max)",
+		 sg_reg_validate_value("system_password-policy", "min-uppercase", "128"), 1);
+	tc_check("boundary", "system_password-policy.min-uppercase = '129' (above max)",
+		 sg_reg_validate_value("system_password-policy", "min-uppercase", "129"), 0);
+
+	/* Overflow: huge number for mtu */
+	tc_check("boundary", "system_interface.mtu = '99999999999' (overflow)",
+		 sg_reg_validate_value("system_interface", "mtu", "99999999999"), 0);
+
+	/* Leading zeros: "01500" — all digits, parses to valid value */
+	tc_check("boundary", "system_interface.mtu = '01500' (leading zeros)",
+		 sg_reg_validate_value("system_interface", "mtu", "01500"), 1);
+}
+
+/* ── Section 25: cross-type key isolation ─────────────────────────────── */
+
+static void test_cross_type_keys(void)
+{
+	printf(C_CYAN "\n  --- cross-type key isolation ---" C_NC "\n");
+
+	tc_check("key-iso", "'action' invalid for system_interface",
+		 sg_reg_is_valid_key("system_interface", "action"), 0);
+	tc_check("key-iso", "'mtu' invalid for firewall_policy",
+		 sg_reg_is_valid_key("firewall_policy", "mtu"), 0);
+	tc_check("key-iso", "'hostname' invalid for network_nat",
+		 sg_reg_is_valid_key("network_nat", "hostname"), 0);
+	tc_check("key-iso", "'subnet' invalid for system_settings",
+		 sg_reg_is_valid_key("system_settings", "subnet"), 0);
+	tc_check("key-iso", "'protocol' invalid for network_dns",
+		 sg_reg_is_valid_key("network_dns", "protocol"), 0);
+}
+
+/* ── Section 26: IPC interface builtin protection (full mode) ─────────── */
 
 static void test_ipc_interface_protection(void)
 {
@@ -1687,6 +1953,191 @@ cleanup:
 		ipc_resp_free(&resp);
 }
 
+/* ── Section 29: IPC firewall_service CRUD (full mode) ────────────────── */
+
+static void test_ipc_cfg_service_roundtrip(void)
+{
+	struct ipc_response resp;
+	int conn;
+	const char *test_section = "firewall_service:__diag_svctest";
+
+	printf(C_CYAN "\n  --- IPC: firewall_service CRUD round-trip ---"
+	       C_NC "\n");
+
+	/* 1. Create entry */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_SET,
+			    "firewall_service:__diag_svctest\n"
+			    "name=__diag_svctest\n"
+			    "protocol=tcp\n"
+			    "port-range=8080\n",
+			    &resp);
+	if (conn == 0 && resp.status == SG_OK) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [IPC/200] create firewall_service __diag_svctest\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [IPC/200] create __diag_svctest (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+		ipc_resp_free(&resp);
+		return;
+	}
+	ipc_resp_free(&resp);
+
+	/* 2. Read back */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_GET, test_section, &resp);
+	if (conn == 0 && resp.status == SG_OK && resp.payload &&
+	    strstr(resp.payload, "protocol=tcp") &&
+	    strstr(resp.payload, "port-range=8080")) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [IPC/100] read back __diag_svctest (data matches)\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [IPC/100] read back __diag_svctest (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+	}
+	ipc_resp_free(&resp);
+
+	/* 3. Idempotent overwrite with different port */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_SET,
+			    "firewall_service:__diag_svctest\n"
+			    "name=__diag_svctest\n"
+			    "protocol=tcp\n"
+			    "port-range=9090\n",
+			    &resp);
+	if (conn == 0 && resp.status == SG_OK) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [IPC/200] overwrite __diag_svctest (idempotent)\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [IPC/200] overwrite __diag_svctest (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+	}
+	ipc_resp_free(&resp);
+
+	/* 4. Verify overwrite */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_GET, test_section, &resp);
+	if (conn == 0 && resp.status == SG_OK && resp.payload &&
+	    strstr(resp.payload, "port-range=9090")) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [IPC/100] overwrite verified (port-range=9090)\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [IPC/100] overwrite data mismatch (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+	}
+	ipc_resp_free(&resp);
+
+	/* 5. Delete */
+	ipc_check("delete __diag_svctest",
+		  SG_CMD_CFG_DEL, test_section, SG_OK);
+}
+
+/* ── Section 30: IPC network_nat CRUD (full mode) ────────────────────── */
+
+static void test_ipc_cfg_nat_roundtrip(void)
+{
+	struct ipc_response resp;
+	int conn;
+	const char *test_section = "network_nat:__diag_nattest";
+
+	printf(C_CYAN "\n  --- IPC: network_nat CRUD round-trip ---"
+	       C_NC "\n");
+
+	/* 1. Create entry */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_SET,
+			    "network_nat:__diag_nattest\n"
+			    "name=__diag_nattest\n"
+			    "type=dnat\n"
+			    "srcaddr=any\n"
+			    "dstaddr=10.0.0.0/24\n"
+			    "mapped-ip=192.168.1.100\n"
+			    "dstport=443\n"
+			    "mapped-port=8443\n"
+			    "srcintf=any\n"
+			    "status=enable\n",
+			    &resp);
+	if (conn == 0 && resp.status == SG_OK) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [IPC/200] create network_nat __diag_nattest\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [IPC/200] create __diag_nattest (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+		ipc_resp_free(&resp);
+		return;
+	}
+	ipc_resp_free(&resp);
+
+	/* 2. Read back */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_GET, test_section, &resp);
+	if (conn == 0 && resp.status == SG_OK && resp.payload &&
+	    strstr(resp.payload, "type=dnat") &&
+	    strstr(resp.payload, "mapped-ip=192.168.1.100") &&
+	    strstr(resp.payload, "dstport=443")) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [IPC/100] read back __diag_nattest (data matches)\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [IPC/100] read back __diag_nattest (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+	}
+	ipc_resp_free(&resp);
+
+	/* 3. Delete */
+	ipc_check("delete __diag_nattest",
+		  SG_CMD_CFG_DEL, test_section, SG_OK);
+}
+
+/* ── Section 31: IPC entry ID type enforcement (full mode) ────────────── */
+
+static void test_ipc_entry_id_enforcement(void)
+{
+	printf(C_CYAN "\n  --- IPC: entry ID type enforcement ---"
+	       C_NC "\n");
+
+	/* firewall_policy with non-uint ID "abc" */
+	ipc_check("firewall_policy with ID 'abc' (not uint)",
+		  SG_CMD_CFG_SET,
+		  "firewall_policy:abc\nname=test\naction=deny\n",
+		  SG_ERR_INVALID_ARG);
+
+	/* firewall_policy with injection ID "../etc" */
+	ipc_check("firewall_policy with ID '../etc' (injection)",
+		  SG_CMD_CFG_SET,
+		  "firewall_policy:../etc\nname=test\naction=deny\n",
+		  SG_ERR_INVALID_ARG);
+
+	/* firewall_address with colon ID "a:b" */
+	ipc_check("firewall_address with ID 'a:b' (colon)",
+		  SG_CMD_CFG_SET,
+		  "firewall_address:a:b\nname=test\ntype=ipmask\n",
+		  SG_ERR_INVALID_ARG);
+
+	/* firewall_service with semicolon ID "a;rm" */
+	ipc_check("firewall_service with ID 'a;rm' (semicolon)",
+		  SG_CMD_CFG_SET,
+		  "firewall_service:a;rm\nname=test\nprotocol=tcp\n",
+		  SG_ERR_INVALID_ARG);
+}
+
 /* ── Cleanup helper ───────────────────────────────────────────────────── */
 
 static void cleanup_test_entries(void)
@@ -1710,6 +2161,18 @@ static void cleanup_test_entries(void)
 			 "firewall_address:__diag_refaddr", &resp) == 0 &&
 	    resp.status == SG_OK)
 		printf("  cleanup: deleted __diag_refaddr\n");
+	ipc_resp_free(&resp);
+
+	if (ipc_send_str(SG_CMD_CFG_DEL,
+			 "firewall_service:__diag_svctest", &resp) == 0 &&
+	    resp.status == SG_OK)
+		printf("  cleanup: deleted __diag_svctest\n");
+	ipc_resp_free(&resp);
+
+	if (ipc_send_str(SG_CMD_CFG_DEL,
+			 "network_nat:__diag_nattest", &resp) == 0 &&
+	    resp.status == SG_OK)
+		printf("  cleanup: deleted __diag_nattest\n");
 	ipc_resp_free(&resp);
 }
 
@@ -1741,6 +2204,11 @@ int cli_diagnose_test_configure(int mode)
 	test_value_quoting();
 	test_cmd_resolve();
 	test_ref_metadata();
+	test_dispatch_table();
+	test_registry_completeness();
+	test_default_roundtrip();
+	test_boundary_values();
+	test_cross_type_keys();
 
 	if (mode == 1) {
 		/* Full mode: IPC round-trip tests */
@@ -1760,6 +2228,9 @@ int cli_diagnose_test_configure(int mode)
 			test_ipc_apply();
 			test_ipc_not_found();
 			test_ipc_refguard();
+			test_ipc_cfg_service_roundtrip();
+			test_ipc_cfg_nat_roundtrip();
+			test_ipc_entry_id_enforcement();
 			cleanup_test_entries();
 		}
 	}

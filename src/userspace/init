@@ -7,7 +7,7 @@ export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 mount -t proc none /proc
 mount -t sysfs none /sys
 mount -t devtmpfs none /dev 2>/dev/null || true
-mount -t tmpfs none /tmp 2>/dev/null || true
+mount -t tmpfs -o mode=1777 none /tmp 2>/dev/null || true
 mkdir -p /run 2>/dev/null
 # Ensure /dev/tty is accessible by non-root users (for readline terminal I/O)
 [ -c /dev/tty ] && chmod 0666 /dev/tty 2>/dev/null

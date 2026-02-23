@@ -11,8 +11,8 @@
 
 #include "cli_readline.h"
 #include "cli_ipc.h"
-#include "cli_dispatch.h"
-#include "cli_configure.h"
+#include "cli_cmd_table.h"
+#include "cli_debug.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -109,7 +109,7 @@ int main(void)
 	}
 
 	/* 4. Register commands based on permissions */
-	register_commands(permissions);
+	cmd_register_all(permissions);
 
 	/* 5. Load history */
 	char hist_path[256];
@@ -154,37 +154,42 @@ int main(void)
 				    sizeof(resolved)) != 0)
 			continue;
 
+		if (dbg_enabled() &&
+		    strcmp(dbg_get("cli_debug", "0"), "1") == 0 &&
+		    strcmp(trimmed, resolved) != 0)
+			fprintf(stderr,
+				"[CLI-DBG] resolve: \"%s\""
+				" -> \"%s\"\n", trimmed, resolved);
+
 		/* Session check — detect external account/profile changes */
 		session_rev_cached = get_session_rev(user);
 		if (session_rev_cached != session_rev_start) {
+			if (dbg_enabled() &&
+			    strcmp(dbg_get("cli_debug", "0"), "1") == 0)
+				fprintf(stderr,
+					"[CLI-DBG] session expired:"
+					" rev %d -> %d\n",
+					session_rev_start,
+					session_rev_cached);
 			printf("  Session expired due to account/profile change.\n");
 			printf("  Please login again.\n");
 			break;
 		}
 
-		/* Extract command and args (zero forks) */
-		char cmd[CLI_MAX_LINE];
-		const char *args = "";
-		const char *sp = strchr(resolved, ' ');
-		if (sp) {
-			size_t clen = (size_t)(sp - resolved);
-			if (clen >= sizeof(cmd))
-				clen = sizeof(cmd) - 1;
-			memcpy(cmd, resolved, clen);
-			cmd[clen] = '\0';
-			args = sp + 1;
-			while (*args == ' ')
-				args++;
-		} else {
-			snprintf(cmd, sizeof(cmd), "%s", resolved);
-		}
-
 		/* Dispatch */
-		int rc = dispatch_command(cmd, args, permissions);
+		int rc = cmd_dispatch(resolved, permissions);
+
+		/* Fetch mgmtd/auth debug traces after each command */
+		ipc_fetch_debug();
+
+		if (dbg_enabled() &&
+		    strcmp(dbg_get("cli_debug", "0"), "1") == 0)
+			fprintf(stderr,
+				"[CLI-DBG] dispatch rc=%d\n", rc);
 
 		/* Refresh session baseline after commands that modify config */
-		if (strcmp(cmd, "configure") == 0 ||
-		    strcmp(cmd, "execute") == 0) {
+		if (strncmp(resolved, "configure", 9) == 0 ||
+		    strncmp(resolved, "execute", 7) == 0) {
 			session_rev_start = get_session_rev(user);
 		}
 

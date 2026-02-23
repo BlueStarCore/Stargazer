@@ -37,4 +37,7 @@ int ipc_available(void);
 /* Free response payload if allocated. */
 void ipc_resp_free(struct ipc_response *resp);
 
+/* Fetch and print buffered mgmtd/auth debug traces (if active). */
+void ipc_fetch_debug(void);
+
 #endif /* CLI_IPC_H */
