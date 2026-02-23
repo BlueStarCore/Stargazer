@@ -1,0 +1,45 @@
+#!/bin/sh
+# =============================================================================
+# LAN VM init — minimal BusyBox client for Stargazer network testing
+# =============================================================================
+#
+# IP:      192.168.99.100/24
+# Gateway: 192.168.99.99 (Stargazer management IP)
+# DNS:     8.8.8.8
+#
+# Note: Stargazer assigns 192.168.99.99/24 to its first NIC on first boot.
+#       In the test topology, assign this IP to the LAN-facing interface
+#       (eth1) via: configure system interface → edit eth1 → set ip 192.168.99.99/24
+#
+# =============================================================================
+
+echo "LAN VM booting..."
+
+# Mount virtual filesystems
+mount -t proc     proc     /proc
+mount -t sysfs    sysfs    /sys
+mount -t devtmpfs devtmpfs /dev
+
+# Configure network
+echo "Configuring network..."
+ip link set lo up
+ip link set eth0 up
+ip addr add 192.168.99.100/24 dev eth0
+ip route add default via 192.168.99.99
+
+# DNS
+echo "nameserver 8.8.8.8" > /etc/resolv.conf
+
+echo ""
+echo "========================================"
+echo " LAN VM ready"
+echo " IP:      192.168.99.100/24"
+echo " Gateway: 192.168.99.99 (Stargazer)"
+echo "========================================"
+echo ""
+echo "Test connectivity:"
+echo "  ping -c 3 192.168.99.99    # Stargazer LAN"
+echo "  ping -c 3 8.8.8.8          # Internet (if forwarding enabled)"
+echo ""
+
+exec /bin/sh
