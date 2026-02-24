@@ -28,8 +28,10 @@ sg_status_t apply_settings(const char *id, const char *data,
 			return SG_ERR_INVALID_VAL;
 		}
 		/* Use sethostname() syscall — no shell (VULN-09) */
-		if (sethostname(hostname, strlen(hostname)) != 0)
-			mgmt_log("WARN", "sethostname: %s", strerror(errno));
+		if (sethostname(hostname, strlen(hostname)) != 0) {
+			snprintf(result, rsize, "sethostname failed: %s", strerror(errno));
+			return SG_ERR_SYSTEM_FAIL;
+		}
 		FILE *fp = fopen("/etc/hostname", "w");
 		if (fp) { fprintf(fp, "%s\n", hostname); fclose(fp); }
 	}

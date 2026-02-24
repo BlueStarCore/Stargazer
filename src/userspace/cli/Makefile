@@ -12,16 +12,18 @@ SRCS := stargazer-cli.c \
         cli_readline.c \
         cli_ipc.c \
         cli_configure.c \
+        cli_cmd_table.c \
         cli_dispatch.c \
         cli_diagnose.c \
         cli_diagnose_config.c \
+        cli_diagnose_sys.c \
         cli_show.c \
-        cli_execute.c \
         cli_debug.c \
         $(COMMON_DIR)/sg_validate.c
 
-HEADERS := cli_readline.h cli_ipc.h cli_configure.h cli_dispatch.h \
-           cli_diagnose.h cli_show.h cli_execute.h cli_debug.h \
+HEADERS := cli_readline.h cli_ipc.h cli_configure.h cli_cmd_table.h \
+           cli_dispatch.h cli_diagnose.h cli_diagnose_sys.h cli_show.h \
+           cli_debug.h \
            $(COMMON_DIR)/sg_validate.h ../mgmtd/stargazer_ipc.h
 
 TARGET := $(BUILD_DIR)/stargazer-cli

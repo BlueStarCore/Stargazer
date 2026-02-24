@@ -182,7 +182,8 @@ int sg_db_set(const char *type, const char *id, const char *data)
 {
 	if (!g_db || !type || !id) return -1;
 
-	sqlite3_exec(g_db, "BEGIN;", NULL, NULL, NULL);
+	if (sqlite3_exec(g_db, "BEGIN;", NULL, NULL, NULL) != SQLITE_OK)
+		return -1;
 
 	/* Delete existing rows for this entry */
 	sqlite3_stmt *del;
@@ -193,7 +194,11 @@ int sg_db_set(const char *type, const char *id, const char *data)
 	}
 	sqlite3_bind_text(del, 1, type, -1, SQLITE_STATIC);
 	sqlite3_bind_text(del, 2, id, -1, SQLITE_STATIC);
-	sqlite3_step(del);
+	if (sqlite3_step(del) != SQLITE_DONE) {
+		sqlite3_finalize(del);
+		sqlite3_exec(g_db, "ROLLBACK;", NULL, NULL, NULL);
+		return -1;
+	}
 	sqlite3_finalize(del);
 
 	/* Insert new rows from "key=val\nkey=val\n" data */
@@ -242,7 +247,10 @@ int sg_db_set(const char *type, const char *id, const char *data)
 		sqlite3_finalize(ins);
 	}
 
-	sqlite3_exec(g_db, "COMMIT;", NULL, NULL, NULL);
+	if (sqlite3_exec(g_db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+		sqlite3_exec(g_db, "ROLLBACK;", NULL, NULL, NULL);
+		return -1;
+	}
 	return 0;
 }
 

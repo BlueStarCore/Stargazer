@@ -88,6 +88,13 @@ typedef enum {
 	/* System operations (6xx) */
 	SG_CMD_SYS_POWEROFF  = 600,
 	SG_CMD_SYS_REBOOT    = 601,
+	SG_CMD_FW_UPGRADE    = 602,   /* Download + install firmware    */
+	SG_CMD_FW_STATUS     = 603,   /* Show firmware version/status   */
+	SG_CMD_FW_PROGRESS   = 604,   /* Poll firmware upgrade progress */
+	SG_CMD_NET_PING      = 605,   /* Network ping (ICMP echo)       */
+	SG_CMD_NET_TRACEROUTE = 606,  /* Network traceroute             */
+	SG_CMD_NET_NSLOOKUP  = 607,   /* DNS lookup                     */
+	SG_CMD_NET_ARPING    = 608,   /* ARP ping (L2 reachability)     */
 	SG_CMD_SHOW_STATUS   = 610,
 	SG_CMD_SHOW_IFACES   = 611,
 	SG_CMD_SHOW_ROUTES   = 612,
@@ -100,6 +107,7 @@ typedef enum {
 
 	/* Keepalive / ping (9xx) */
 	SG_CMD_PING          = 900,
+	SG_CMD_DEBUG_FETCH   = 901,   /* Fetch buffered debug traces    */
 } sg_cmd_t;
 
 /* ── Message header ─────────────────────────────────────────────────────── */
@@ -110,16 +118,20 @@ typedef enum {
 #define SG_USERNAME_MAX  64
 #define SG_EXTRA_MAX     256
 
+/* Debug flag bits in sg_request_hdr_t.debug_flags */
+#define SG_DBG_FLAG_MGMTD  0x01  /* Enable mgmtd request/response tracing */
+#define SG_DBG_FLAG_AUTH    0x02  /* Enable auth operation tracing         */
+
 /*
  * Request: CLI → mgmtd
  *
  * Wire format (fixed header + variable payload):
- *   [ magic:2 | version:1 | _pad:1 | cmd:4 | user[64] | payload_len:4 | payload[...] ]
+ *   [ magic:2 | version:1 | debug_flags:1 | cmd:4 | user[64] | payload_len:4 | payload[...] ]
  */
 typedef struct {
 	uint16_t  magic;                     /* SG_MSG_MAGIC               */
 	uint8_t   version;                   /* SG_MSG_VERSION             */
-	uint8_t   _pad;
+	uint8_t   debug_flags;               /* SG_DBG_FLAG_* bits         */
 	uint32_t  cmd;                       /* sg_cmd_t                   */
 	char      username[SG_USERNAME_MAX]; /* authenticated user         */
 	uint32_t  payload_len;               /* length of payload data     */

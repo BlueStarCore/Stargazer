@@ -25,6 +25,8 @@ const sg_type_info_t *sg_reg_types(void);
 
 /* ── Pure validators ──────────────────────────────────────────────────── */
 
+#define SG_SAFE_ID_MAX  64
+
 int sg_is_safe_id(const char *s);
 int sg_is_ipv4(const char *s);
 int sg_is_cidr(const char *s);
@@ -42,6 +44,9 @@ int sg_reg_type_mode(const char *type_name);
 
 /* Get human-readable label for type (e.g. "firewall policy"). */
 const char *sg_reg_type_label(const char *type_name);
+
+/* Get required permission for type ("configure" or "admin"). NULL if unknown. */
+const char *sg_reg_type_perm(const char *type_name);
 
 /* Get space-separated list of valid keys for a type. Returns "" if unknown. */
 const char *sg_reg_valid_keys(const char *type_name);

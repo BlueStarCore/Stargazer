@@ -7,7 +7,7 @@
 #   2. make modules    - Build kernel modules
 #   3. make busybox    - Cross-compile BusyBox for ARM64
 #   4. make rootfs     - Create userspace rootfs
-#   5. make iso        - Create bootable ISO for BPI-R4
+#   5. make image      - Create partitioned disk image for BPI-R4
 #
 # Quick commands:
 #   make all           - Build everything
@@ -39,6 +39,7 @@ KERNEL_DTB     := $(BUILD_DIR)/bpi-r4.dtb
 
 # Output
 ISO_FILE       := $(BUILD_DIR)/stargazer-bpi-r4.iso
+IMG_FILE       := $(BUILD_DIR)/stargazer-bpi-r4.img
 MODULE_NAME    := pkt_forward
 
 # BusyBox settings
@@ -71,16 +72,17 @@ MUSL_CROSS_DIR := $(BUSYBOX_CACHE_DIR)/aarch64-linux-musl-cross
 MUSL_CC        := $(MUSL_CROSS_DIR)/bin/aarch64-linux-musl-gcc
 MUSL_CROSS     := $(MUSL_CROSS_DIR)/bin/aarch64-linux-musl-
 
+# U-Boot bootloader (pre-built from Ubuntu u-boot-qemu package)
+UBOOT_DEB_URL  := http://archive.ubuntu.com/ubuntu/pool/main/u/u-boot/u-boot-qemu_2022.01+dfsg-2ubuntu2.6_all.deb
+UBOOT_BIN      := $(BUILD_DIR)/u-boot/u-boot.bin
+
 # =============================================================================
 # Main targets
 # =============================================================================
 
-.PHONY: all kernel modules busybox musl-toolchain dash logind mgmtd cli rootfs iso test-build test lanvm clean help
+.PHONY: all kernel modules busybox musl-toolchain dash logind mgmtd cli uboot rootfs iso image firmware test-build test test-run lanvm clean help
 
-all: iso
-	@echo ""
-	@echo "Build complete: $(ISO_FILE)"
-	@echo "Deploy: dd if=$(ISO_FILE) of=/dev/sdX bs=4M status=progress"
+all: image
 
 # =============================================================================
 # 1. Kernel
@@ -109,6 +111,7 @@ kernel-config:
 		$(KERNEL_DIR)/scripts/config --file $(KERNEL_DIR)/.config \
 			--enable NETFILTER --enable NF_CONNTRACK \
 			--enable VIRTIO --enable VIRTIO_PCI --enable VIRTIO_NET \
+			--enable VIRTIO_BLK --enable VIRTIO_MMIO \
 			--enable MODULES --enable MODULE_UNLOAD \
 			--enable EXT4_FS --enable SQUASHFS; \
 		$(MAKE) -C $(KERNEL_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) olddefconfig; \
@@ -152,6 +155,11 @@ $(BUSYBOX_BIN):
 	fi
 	$(MAKE) -C $(BUSYBOX_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) defconfig
 	@sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/# CONFIG_TFTP is not set/CONFIG_TFTP=y/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/# CONFIG_FEATURE_TFTP_GET is not set/CONFIG_FEATURE_TFTP_GET=y/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/# CONFIG_TRACEROUTE is not set/CONFIG_TRACEROUTE=y/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/# CONFIG_NSLOOKUP is not set/CONFIG_NSLOOKUP=y/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/# CONFIG_ARPING is not set/CONFIG_ARPING=y/' $(BUSYBOX_DIR)/.config
 	$(MAKE) -C $(BUSYBOX_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) -j$$(nproc)
 	$(MAKE) -C $(BUSYBOX_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) busybox.links
 	@mkdir -p $(BUILD_DIR)/busybox
@@ -166,6 +174,11 @@ $(BUSYBOX_LINKS):
 	fi
 	$(MAKE) -C $(BUSYBOX_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) defconfig
 	@sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/# CONFIG_TFTP is not set/CONFIG_TFTP=y/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/# CONFIG_FEATURE_TFTP_GET is not set/CONFIG_FEATURE_TFTP_GET=y/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/# CONFIG_TRACEROUTE is not set/CONFIG_TRACEROUTE=y/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/# CONFIG_NSLOOKUP is not set/CONFIG_NSLOOKUP=y/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/# CONFIG_ARPING is not set/CONFIG_ARPING=y/' $(BUSYBOX_DIR)/.config
 	$(MAKE) -C $(BUSYBOX_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) busybox.links
 
 # =============================================================================
@@ -257,6 +270,22 @@ $(BUILD_DIR)/cli/stargazer-cli: $(MUSL_CC)
 	@echo "[3f/5] CLI binary ready."
 
 # =============================================================================
+# 3g. U-Boot bootloader (for QEMU disk-based boot)
+# =============================================================================
+
+uboot: $(UBOOT_BIN)
+
+$(UBOOT_BIN):
+	@echo "[3g/5] Fetching pre-built U-Boot for QEMU ARM64..."
+	@mkdir -p $(BUILD_DIR)/u-boot
+	@TMPDIR=$$(mktemp -d); \
+	curl -fSL "$(UBOOT_DEB_URL)" -o "$$TMPDIR/u-boot-qemu.deb"; \
+	cd "$$TMPDIR" && ar x u-boot-qemu.deb && tar xf data.tar.* 2>/dev/null; \
+	cp "$$TMPDIR/usr/lib/u-boot/qemu_arm64/u-boot.bin" $(UBOOT_BIN); \
+	rm -rf "$$TMPDIR"
+	@echo "[3g/5] U-Boot ready: $(UBOOT_BIN)"
+
+# =============================================================================
 # 4. Rootfs (userspace)
 # =============================================================================
 
@@ -344,6 +373,11 @@ $(ROOTFS_DIR)/.stamp: modules busybox dash logind mgmtd cli
 	@cp $(USERSPACE_DIR)/usr/libexec/stargazer/* $(ROOTFS_DIR)/usr/libexec/stargazer/
 	@chmod +x $(ROOTFS_DIR)/usr/libexec/stargazer/*
 
+	# Install udhcpc default script (for DHCP network configuration)
+	@mkdir -p $(ROOTFS_DIR)/usr/share/udhcpc
+	@cp $(USERSPACE_DIR)/usr/share/udhcpc/default.script $(ROOTFS_DIR)/usr/share/udhcpc/
+	@chmod +x $(ROOTFS_DIR)/usr/share/udhcpc/default.script
+
 	# Copy automated test suite (for test_mode=1 boots)
 	@cp $(PROJECT_ROOT)/tests/test_suite.sh $(ROOTFS_DIR)/usr/libexec/stargazer/test_suite.sh
 	@chmod +x $(ROOTFS_DIR)/usr/libexec/stargazer/test_suite.sh
@@ -369,7 +403,7 @@ $(ISO_FILE): $(ROOTFS_DIR)/.stamp
 	@if [ -f "$(KERNEL_DTB)" ]; then cp $(KERNEL_DTB) $(BUILD_DIR)/iso/boot/; fi
 
 	# Create initramfs from rootfs
-	cd $(ROOTFS_DIR) && find . | cpio -o -H newc 2>/dev/null | gzip -9 > $(BUILD_DIR)/iso/boot/initramfs.gz
+	cd $(ROOTFS_DIR) && find . | sort | cpio -o -H newc 2>/dev/null | gzip -n -9 > $(BUILD_DIR)/iso/boot/initramfs.gz
 
 	# Create ISO (for UEFI boot on BPI-R4)
 	@if command -v xorriso >/dev/null 2>&1; then \
@@ -402,10 +436,83 @@ $(ISO_FILE): $(ROOTFS_DIR)/.stamp
 	@echo "============================================"
 
 # =============================================================================
+# Disk Image (for real hardware — persistent config partition)
+# =============================================================================
+
+image: rootfs
+	@echo "[5/5] Creating disk image with persistent storage..."
+	@mkdir -p $(BUILD_DIR)/image/boot/extlinux
+
+	# Prepare boot partition contents (with extlinux.conf for U-Boot)
+	cp $(KERNEL_IMAGE) $(BUILD_DIR)/image/boot/kernel
+	@if [ -f "$(KERNEL_DTB)" ]; then cp $(KERNEL_DTB) $(BUILD_DIR)/image/boot/; fi
+	cd $(ROOTFS_DIR) && find . | sort | cpio -o -H newc 2>/dev/null | gzip -n -9 > $(BUILD_DIR)/image/boot/initramfs.gz
+	cp $(USERSPACE_DIR)/boot/extlinux.conf $(BUILD_DIR)/image/boot/extlinux/extlinux.conf
+
+	# Create boot partition image (64MB ext2, populated with kernel+initramfs+extlinux)
+	mke2fs -t ext2 -L boot -d $(BUILD_DIR)/image/boot \
+		$(BUILD_DIR)/image/boot.img 64M 2>/dev/null
+
+	# Create data partition image (512MB ext2, empty)
+	mke2fs -t ext2 -L sgdata $(BUILD_DIR)/image/data.img 512M 2>/dev/null
+
+	# Assemble: empty image → GPT → partitions
+	# Boot: 64MB (131072 sectors), Data: 512MB (1048576 sectors), 1MB GPT header
+	dd if=/dev/zero of=$(IMG_FILE) bs=1M count=578 2>/dev/null
+	printf 'label: gpt\nfirst-lba: 2048\n\n' > $(BUILD_DIR)/image/sfdisk.script
+	printf 'start=2048, size=131072, type=linux, name="boot"\n' >> $(BUILD_DIR)/image/sfdisk.script
+	printf 'start=133120, size=1048576, type=linux, name="data"\n' >> $(BUILD_DIR)/image/sfdisk.script
+	sfdisk $(IMG_FILE) < $(BUILD_DIR)/image/sfdisk.script
+	dd if=$(BUILD_DIR)/image/boot.img of=$(IMG_FILE) bs=512 seek=2048 conv=notrunc 2>/dev/null
+	dd if=$(BUILD_DIR)/image/data.img of=$(IMG_FILE) bs=512 seek=133120 conv=notrunc 2>/dev/null
+
+	@echo ""
+	@echo "============================================"
+	@echo " Build Complete!"
+	@echo "============================================"
+	@echo " Image: $(IMG_FILE)"
+	@echo ""
+	@echo " Deploy to BPI-R4 SD/eMMC:"
+	@echo "   dd if=$(IMG_FILE) of=/dev/mmcblk0 bs=4M status=progress"
+	@echo "============================================"
+
+# =============================================================================
+# Firmware upgrade package (for in-place upgrades on running devices)
+# =============================================================================
+
+FW_PKG := $(BUILD_DIR)/stargazer-fw-$(VERSION).tar.gz
+
+firmware: rootfs
+	@echo "Building firmware upgrade package..."
+	@mkdir -p $(BUILD_DIR)/firmware
+	cp $(KERNEL_IMAGE) $(BUILD_DIR)/firmware/kernel
+	cd $(ROOTFS_DIR) && find . | sort | cpio -o -H newc 2>/dev/null | gzip -n -9 > $(BUILD_DIR)/firmware/initramfs.gz
+	@# Generate manifest with checksums
+	@KSHA=$$(sha256sum $(BUILD_DIR)/firmware/kernel | cut -d' ' -f1); \
+	ISHA=$$(sha256sum $(BUILD_DIR)/firmware/initramfs.gz | cut -d' ' -f1); \
+	printf 'version=%s\nbuild_date=%s\nkernel_sha256=%s\ninitramfs_sha256=%s\n' \
+		"$(VERSION)" "$$(date -u +%Y-%m-%dT%H:%M:%S)" "$$KSHA" "$$ISHA" \
+		> $(BUILD_DIR)/firmware/manifest.txt
+	@# Package into tar.gz
+	cd $(BUILD_DIR)/firmware && tar -czf $(FW_PKG) manifest.txt kernel initramfs.gz
+	@# Clean staging
+	@rm -rf $(BUILD_DIR)/firmware
+	@echo ""
+	@echo "============================================"
+	@echo " Firmware Package Ready"
+	@echo "============================================"
+	@echo " Package: $(FW_PKG)"
+	@echo " Version: $(VERSION)"
+	@echo ""
+	@echo " Deploy: host on HTTP server, then on device:"
+	@echo "   execute firmware upgrade http://<server>/stargazer-fw-$(VERSION).tar.gz"
+	@echo "============================================"
+
+# =============================================================================
 # Test in QEMU
 # =============================================================================
 
-test-build: modules busybox dash logind mgmtd cli
+test-build: modules busybox dash logind mgmtd cli uboot
 	@echo "Building test initramfs..."
 	@mkdir -p $(BUILD_DIR)/test
 
@@ -491,21 +598,65 @@ test-build: modules busybox dash logind mgmtd cli
 	@cp $(USERSPACE_DIR)/usr/libexec/stargazer/* $(BUILD_DIR)/test/initramfs/usr/libexec/stargazer/
 	@chmod +x $(BUILD_DIR)/test/initramfs/usr/libexec/stargazer/*
 
+	# Install udhcpc default script (for DHCP network configuration)
+	@mkdir -p $(BUILD_DIR)/test/initramfs/usr/share/udhcpc
+	@cp $(USERSPACE_DIR)/usr/share/udhcpc/default.script $(BUILD_DIR)/test/initramfs/usr/share/udhcpc/
+	@chmod +x $(BUILD_DIR)/test/initramfs/usr/share/udhcpc/default.script
+
 	# Create stargazer config directory (mgmtd seeds defaults on first boot)
 	@mkdir -p $(BUILD_DIR)/test/initramfs/etc/stargazer
 
 	# Pack initramfs
-	cd $(BUILD_DIR)/test/initramfs && find . | cpio -o -H newc 2>/dev/null | gzip -9 > $(BUILD_DIR)/test/initramfs.gz
+	cd $(BUILD_DIR)/test/initramfs && find . | sort | cpio -o -H newc 2>/dev/null | gzip -n -9 > $(BUILD_DIR)/test/initramfs.gz
 	@echo "Test initramfs ready: $(BUILD_DIR)/test/initramfs.gz"
 
+	# Create persistent data disk for QEMU (only if not already present)
+	@if [ ! -f $(BUILD_DIR)/test/data.img ]; then \
+		mke2fs -t ext2 -L sgdata $(BUILD_DIR)/test/data.img 64M 2>/dev/null; \
+		echo "Test data disk created: $(BUILD_DIR)/test/data.img"; \
+	else \
+		echo "Test data disk exists (preserving config): $(BUILD_DIR)/test/data.img"; \
+	fi
+
+	# Create boot partition disk (with MBR so U-Boot distro boot finds it)
+	@mkdir -p $(BUILD_DIR)/test/boot-contents/extlinux
+	cp $(KERNEL_IMAGE) $(BUILD_DIR)/test/boot-contents/kernel
+	cd $(BUILD_DIR)/test/initramfs && find . | sort | cpio -o -H newc 2>/dev/null | gzip -n -9 > $(BUILD_DIR)/test/boot-contents/initramfs.gz
+	cp $(USERSPACE_DIR)/boot/extlinux.conf $(BUILD_DIR)/test/boot-contents/extlinux/extlinux.conf
+	mke2fs -t ext2 -L boot -d $(BUILD_DIR)/test/boot-contents \
+		$(BUILD_DIR)/test/boot-fs.img 64M 2>/dev/null
+	@# Wrap filesystem in a partitioned image (1MB MBR + 64MB partition)
+	dd if=/dev/zero of=$(BUILD_DIR)/test/boot.img bs=1M count=65 2>/dev/null
+	printf 'start=2048, type=linux\n' | sfdisk $(BUILD_DIR)/test/boot.img >/dev/null 2>&1
+	dd if=$(BUILD_DIR)/test/boot-fs.img of=$(BUILD_DIR)/test/boot.img \
+		bs=512 seek=2048 conv=notrunc 2>/dev/null
+	@rm -f $(BUILD_DIR)/test/boot-fs.img
+	@rm -rf $(BUILD_DIR)/test/boot-contents
+	@echo "Test boot disk created: $(BUILD_DIR)/test/boot.img"
+
 test: test-build
-	# Run QEMU
+	@$(MAKE) --no-print-directory test-run
+
+test-run:
+	@if [ ! -f $(UBOOT_BIN) ]; then \
+		echo "Error: u-boot.bin not found, run 'make test-build' first"; exit 1; \
+	fi
+	@if [ ! -f $(BUILD_DIR)/test/boot.img ]; then \
+		echo "Error: boot.img not found, run 'make test-build' first"; exit 1; \
+	fi
+	@if [ ! -f $(BUILD_DIR)/test/data.img ]; then \
+		mke2fs -t ext2 -L sgdata $(BUILD_DIR)/test/data.img 64M 2>/dev/null; \
+		echo "Test data disk created: $(BUILD_DIR)/test/data.img"; \
+	fi
+	# Run QEMU — U-Boot loads kernel+initramfs from boot.img (virtio0)
 	qemu-system-aarch64 \
 		-machine virt -cpu cortex-a72 -smp 4 -m 2G \
-		-kernel $(KERNEL_IMAGE) \
-		-initrd $(BUILD_DIR)/test/initramfs.gz \
-		-append "console=ttyAMA0 rw" \
-		-nographic -no-reboot
+		-bios $(UBOOT_BIN) \
+		-drive file=$(BUILD_DIR)/test/boot.img,format=raw,if=virtio \
+		-drive file=$(BUILD_DIR)/test/data.img,format=raw,if=virtio \
+		-netdev user,id=net0,hostfwd=tcp::2222-:22 \
+		-device virtio-net-device,netdev=net0 \
+		-nographic
 
 # =============================================================================
 # LAN VM (minimal BusyBox client for network testing)
@@ -544,7 +695,7 @@ lanvm: busybox dash
 	@chmod +x $(BUILD_DIR)/lanvm/initramfs/init
 
 	# Pack initramfs
-	cd $(BUILD_DIR)/lanvm/initramfs && find . | cpio -o -H newc 2>/dev/null | gzip -9 > $(BUILD_DIR)/lanvm/initramfs.gz
+	cd $(BUILD_DIR)/lanvm/initramfs && find . | sort | cpio -o -H newc 2>/dev/null | gzip -n -9 > $(BUILD_DIR)/lanvm/initramfs.gz
 	@echo "LAN VM initramfs ready: $(BUILD_DIR)/lanvm/initramfs.gz"
 
 # =============================================================================
@@ -563,7 +714,7 @@ clean:
 help:
 	@echo "Stargazer NGFW Build System"
 	@echo ""
-	@echo "Build flow: kernel -> modules -> busybox/dash/logind -> rootfs -> iso"
+	@echo "Build flow: kernel -> modules -> busybox/dash/logind -> rootfs -> image"
 	@echo ""
 	@echo "Targets:"
 	@echo "  make all      - Build everything (default)"
@@ -574,12 +725,16 @@ help:
 	@echo "  make logind   - Cross-compile logind + C helpers"
 	@echo "  make mgmtd    - Cross-compile mgmtd daemon + IPC client"
 	@echo "  make cli      - Cross-compile C CLI binary"
+	@echo "  make uboot    - Fetch pre-built U-Boot bootloader (QEMU ARM64)"
 	@echo "  make rootfs   - Create userspace rootfs"
 	@echo "  make iso      - Create bootable ISO"
+	@echo "  make image    - Create partitioned disk image (persistent config)"
+	@echo "  make firmware - Build firmware upgrade package (tar.gz)"
 	@echo "  make test-build - Build test initramfs (no QEMU)"
 	@echo "  make test     - Build + launch in QEMU (serial only)"
+	@echo "  make test-run - Re-launch QEMU without rebuilding"
 	@echo "  make lanvm    - Build LAN VM initramfs"
 	@echo "  make clean    - Remove all artifacts"
 	@echo "                 (keeps source caches in .cache/)"
 	@echo ""
-	@echo "Output: $(ISO_FILE)"
+	@echo "Output: $(IMG_FILE)"

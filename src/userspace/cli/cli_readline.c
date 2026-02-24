@@ -63,6 +63,12 @@ static int tty_fd = -1;
 /* Internal static buffer returned by cli_readline() */
 static char line_buf[CLI_MAX_LINE];
 
+/* Paste buffer: captures remaining tty input before TCSAFLUSH discards it */
+#define PASTE_BUF_SIZE (CLI_MAX_LINE * 8)	/* 32 KiB */
+static char paste_buf[PASTE_BUF_SIZE];
+static int  paste_len = 0;
+static int  paste_pos = 0;
+
 /* ── Terminal ─────────────────────────────────────────────────────────── */
 
 /*
@@ -88,7 +94,7 @@ static int open_terminal(void)
 static void disable_raw(void)
 {
 	if (raw_mode && tty_fd >= 0) {
-		tcsetattr(tty_fd, TCSAFLUSH, &orig_termios);
+		tcsetattr(tty_fd, TCSANOW, &orig_termios);
 		raw_mode = 0;
 	}
 }
@@ -112,10 +118,104 @@ static int enable_raw(void)
 	t.c_cc[VMIN] = 1;
 	t.c_cc[VTIME] = 0;
 
-	if (tcsetattr(tty_fd, TCSAFLUSH, &t) != 0)
+	if (tcsetattr(tty_fd, TCSANOW, &t) != 0)
 		return -1;
 
 	raw_mode = 1;
+	return 0;
+}
+
+/*
+ * drain_pending() — capture remaining bytes from the tty buffer.
+ *
+ * When the user pastes multiple lines, the kernel tty buffer holds
+ * lines 2..N while we process line 1 char-by-char.  Before calling
+ * disable_raw() (which uses TCSAFLUSH and would discard them), we
+ * drain everything into paste_buf so subsequent cli_readline() calls
+ * can serve those lines without touching the tty.
+ *
+ * Must be called while still in raw mode.
+ */
+static void drain_pending(void)
+{
+	if (tty_fd < 0)
+		return;
+
+	/* Compact: shift unread data to front */
+	if (paste_pos > 0 && paste_pos < paste_len) {
+		memmove(paste_buf, paste_buf + paste_pos,
+			(size_t)(paste_len - paste_pos));
+		paste_len -= paste_pos;
+		paste_pos = 0;
+	} else if (paste_pos >= paste_len) {
+		paste_len = 0;
+		paste_pos = 0;
+	}
+
+	/* Switch to non-blocking so we can drain without stalling */
+	int flags = fcntl(tty_fd, F_GETFL, 0);
+	if (flags < 0)
+		return;
+	fcntl(tty_fd, F_SETFL, flags | O_NONBLOCK);
+
+	while (paste_len < PASTE_BUF_SIZE) {
+		ssize_t n = read(tty_fd, paste_buf + paste_len,
+				 (size_t)(PASTE_BUF_SIZE - paste_len));
+		if (n <= 0)
+			break;	/* EAGAIN or real error */
+		paste_len += (int)n;
+	}
+
+	/* Restore blocking mode */
+	fcntl(tty_fd, F_SETFL, flags);
+}
+
+/*
+ * paste_extract_line() — pull the next complete line from paste_buf.
+ *
+ * Scans for \n or \r, strips leading whitespace (indentation from
+ * pasted config blocks), skips empty lines, copies result into
+ * line_buf, advances paste_pos.
+ *
+ * Returns 1 if a line was extracted, 0 if no complete line available.
+ */
+static int paste_extract_line(void)
+{
+	while (paste_pos < paste_len) {
+		/* Find next newline */
+		int start = paste_pos;
+		int eol = -1;
+		for (int i = start; i < paste_len; i++) {
+			if (paste_buf[i] == '\n' || paste_buf[i] == '\r') {
+				eol = i;
+				break;
+			}
+		}
+		if (eol < 0)
+			return 0;	/* no complete line yet */
+
+		/* Advance past the newline (and optional \r\n pair) */
+		paste_pos = eol + 1;
+		if (paste_pos < paste_len &&
+		    paste_buf[eol] == '\r' &&
+		    paste_buf[paste_pos] == '\n')
+			paste_pos++;
+
+		/* Strip leading whitespace */
+		while (start < eol &&
+		       (paste_buf[start] == ' ' || paste_buf[start] == '\t'))
+			start++;
+
+		int llen = eol - start;
+		if (llen <= 0)
+			continue;	/* skip empty lines */
+
+		if (llen >= CLI_MAX_LINE)
+			llen = CLI_MAX_LINE - 1;
+		memcpy(line_buf, paste_buf + start, (size_t)llen);
+		line_buf[llen] = '\0';
+		return 1;
+	}
 	return 0;
 }
 
@@ -755,6 +855,41 @@ const char *cli_readline(const char *prompt)
 	if (tty_fd < 0)
 		return NULL;
 
+	/* Fast-path: serve lines from paste buffer before touching tty */
+	if (paste_extract_line()) {
+		printf("%s%s\n", prompt, line_buf);
+		fflush(stdout);
+		hist_add(line_buf);
+		return line_buf;
+	}
+
+	/*
+	 * If the paste buffer has a partial line (no trailing newline),
+	 * seed the char-by-char buffer with it.  Without this, the
+	 * fragment stays in paste_buf and drain_pending() would later
+	 * compact it to the front, merging it with the NEXT line's data
+	 * (because the continuation was already consumed by char-by-char
+	 * reading).
+	 */
+	if (paste_pos < paste_len) {
+		int remaining = paste_len - paste_pos;
+		if (remaining > 0 && remaining < CLI_MAX_LINE - 1) {
+			/* Strip leading whitespace like paste_extract_line */
+			int s = paste_pos;
+			while (s < paste_len &&
+			       (paste_buf[s] == ' ' || paste_buf[s] == '\t'))
+				s++;
+			int frag_len = paste_len - s;
+			if (frag_len > 0 && frag_len < CLI_MAX_LINE - 1) {
+				memcpy(buf, paste_buf + s, (size_t)frag_len);
+				buf[frag_len] = '\0';
+				pos = frag_len;
+				cursor = frag_len;
+			}
+		}
+		paste_pos = paste_len = 0;
+	}
+
 	if (enable_raw() != 0) {
 		/* Fallback: just read a line in cooked mode.
 		 * Arrow keys and history will NOT work. */
@@ -784,11 +919,14 @@ const char *cli_readline(const char *prompt)
 	}
 
 	tty_write(tty_fd, prompt, strlen(prompt));
+	if (pos > 0)
+		tty_write(tty_fd, buf, (size_t)pos);
 
 	while (1) {
 		char c;
 		ssize_t n = read(tty_fd, &c, 1);
 		if (n <= 0) {
+			paste_pos = paste_len = 0;
 			disable_raw();
 			return NULL;	/* EOF */
 		}
@@ -798,6 +936,7 @@ const char *cli_readline(const char *prompt)
 		case '\n':
 			tty_write(tty_fd, "\r\n", 2);
 			hist_add(buf);
+			drain_pending();
 			disable_raw();
 			snprintf(line_buf, sizeof(line_buf), "%s", buf);
 			return line_buf;
@@ -806,17 +945,41 @@ const char *cli_readline(const char *prompt)
 			buf[0] = '\0';
 			pos = 0;
 			cursor = 0;
+			paste_pos = paste_len = 0;	/* cancel entire paste */
+			tcflush(tty_fd, TCIFLUSH);	/* discard tty input */
 			tty_write(tty_fd, "\r\n", 2);
 			disable_raw();
 			line_buf[0] = '\0';
 			return line_buf;
 
-		case 4: /* Ctrl-D */
+		case 1: /* Ctrl-A — move cursor to start of line */
+			cursor = 0;
+			redraw_at(prompt, buf, cursor);
+			break;
+
+		case 4: /* Ctrl-D — EOF on empty line, delete char otherwise */
 			if (pos == 0) {
+				paste_pos = paste_len = 0;
+				tcflush(tty_fd, TCIFLUSH);
 				tty_write(tty_fd, "\r\n", 2);
 				disable_raw();
 				return NULL;	/* EOF on empty line */
 			}
+			if (cursor < pos) {
+				int next = cursor + 1;
+				while (next < pos &&
+				       (buf[next] & 0xC0) == 0x80)
+					next++;
+				memmove(buf + cursor, buf + next,
+					(size_t)(pos - next + 1));
+				pos -= (next - cursor);
+				redraw_at(prompt, buf, cursor);
+			}
+			break;
+
+		case 5: /* Ctrl-E — move cursor to end of line */
+			cursor = pos;
+			redraw_at(prompt, buf, cursor);
 			break;
 
 		case 21: /* Ctrl-U — clear line */

@@ -13,6 +13,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "cli_ipc.h"
+#include "cli_debug.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -25,6 +26,83 @@
 /* ── Static state ──────────────────────────────────────────────────────── */
 
 static char ipc_username[SG_USERNAME_MAX];
+
+/* ── Debug helpers ─────────────────────────────────────────────────────── */
+
+static int ipc_dbg(void)
+{
+	return dbg_enabled() &&
+	       strcmp(dbg_get("cli_debug", "0"), "1") == 0;
+}
+
+static const char *cmd_name(uint32_t cmd)
+{
+	switch (cmd) {
+	case SG_CMD_CFG_GET:        return "CFG_GET";
+	case SG_CMD_CFG_LIST:       return "CFG_LIST";
+	case SG_CMD_CFG_LIST_TYPES: return "CFG_LIST_TYPES";
+	case SG_CMD_CFG_SET:        return "CFG_SET";
+	case SG_CMD_CFG_DEL:        return "CFG_DEL";
+	case SG_CMD_CFG_APPLY:      return "CFG_APPLY";
+	case SG_CMD_ADMIN_CREATE:   return "ADMIN_CREATE";
+	case SG_CMD_ADMIN_DELETE:   return "ADMIN_DELETE";
+	case SG_CMD_ADMIN_SET_PW:   return "ADMIN_SET_PW";
+	case SG_CMD_ADMIN_SET_ENF:  return "ADMIN_SET_ENF";
+	case SG_CMD_ADMIN_CHECK_PW: return "ADMIN_CHECK_PW";
+	case SG_CMD_ADMIN_LOCK_PW:  return "ADMIN_LOCK_PW";
+	case SG_CMD_SESSION_REV:    return "SESSION_REV";
+	case SG_CMD_SESSION_BUMP:   return "SESSION_BUMP";
+	case SG_CMD_COMMIT:         return "COMMIT";
+	case SG_CMD_REVISIONS:      return "REVISIONS";
+	case SG_CMD_ROLLBACK:       return "ROLLBACK";
+	case SG_CMD_SYS_POWEROFF:   return "SYS_POWEROFF";
+	case SG_CMD_SYS_REBOOT:     return "SYS_REBOOT";
+	case SG_CMD_FW_UPGRADE:     return "FW_UPGRADE";
+	case SG_CMD_FW_STATUS:      return "FW_STATUS";
+	case SG_CMD_FW_PROGRESS:    return "FW_PROGRESS";
+	case SG_CMD_NET_PING:       return "NET_PING";
+	case SG_CMD_NET_TRACEROUTE: return "NET_TRACEROUTE";
+	case SG_CMD_NET_NSLOOKUP:  return "NET_NSLOOKUP";
+	case SG_CMD_NET_ARPING:    return "NET_ARPING";
+	case SG_CMD_SHOW_STATUS:    return "SHOW_STATUS";
+	case SG_CMD_SHOW_IFACES:    return "SHOW_IFACES";
+	case SG_CMD_SHOW_ROUTES:    return "SHOW_ROUTES";
+	case SG_CMD_SHOW_CONFIG:    return "SHOW_CONFIG";
+	case SG_CMD_SHOW_STATS:     return "SHOW_STATS";
+	case SG_CMD_WHOAMI:         return "WHOAMI";
+	case SG_CMD_PING:           return "PING";
+	case SG_CMD_DEBUG_FETCH:    return "DEBUG_FETCH";
+	default:                    return "?";
+	}
+}
+
+static const char *status_name(uint32_t s)
+{
+	switch (s) {
+	case SG_OK:                    return "OK";
+	case SG_ERR_INVALID_CMD:       return "INVALID_CMD";
+	case SG_ERR_INVALID_ARG:       return "INVALID_ARG";
+	case SG_ERR_INVALID_VAL:       return "INVALID_VAL";
+	case SG_ERR_MISSING_ARG:       return "MISSING_ARG";
+	case SG_ERR_POLICY_FAIL:       return "POLICY_FAIL";
+	case SG_ERR_PERM_DENIED:       return "PERM_DENIED";
+	case SG_ERR_AUTH_FAIL:         return "AUTH_FAIL";
+	case SG_ERR_LOCKED:            return "LOCKED";
+	case SG_ERR_PROFILE_DENY:      return "PROFILE_DENY";
+	case SG_ERR_NOT_FOUND:         return "NOT_FOUND";
+	case SG_ERR_USER_NOT_FOUND:    return "USER_NOT_FOUND";
+	case SG_ERR_PROFILE_NOT_FOUND: return "PROFILE_NOT_FOUND";
+	case SG_ERR_ENTRY_NOT_FOUND:   return "ENTRY_NOT_FOUND";
+	case SG_ERR_ALREADY_EXISTS:    return "ALREADY_EXISTS";
+	case SG_ERR_IN_USE:            return "IN_USE";
+	case SG_ERR_BUILTIN:           return "BUILTIN";
+	case SG_ERR_SYSTEM_FAIL:       return "SYSTEM_FAIL";
+	case SG_ERR_IO_FAIL:           return "IO_FAIL";
+	case SG_ERR_DISK_FULL:         return "DISK_FULL";
+	case SG_ERR_INTERNAL:          return "INTERNAL";
+	default:                       return "?";
+	}
+}
 
 /* ── I/O helpers ───────────────────────────────────────────────────────── */
 
@@ -104,6 +182,14 @@ int ipc_send(uint32_t cmd, const char *payload, size_t payload_len,
 	snprintf(hdr.username, sizeof(hdr.username), "%s", ipc_username);
 	hdr.payload_len = (uint32_t)payload_len;
 
+	/* Pass debug flags to mgmtd so it knows to buffer traces */
+	if (dbg_enabled()) {
+		if (strcmp(dbg_get("mgmtd_debug", "0"), "1") == 0)
+			hdr.debug_flags |= SG_DBG_FLAG_MGMTD;
+		if (strcmp(dbg_get("auth_admin", "0"), "1") == 0)
+			hdr.debug_flags |= SG_DBG_FLAG_AUTH;
+	}
+
 	if (safe_write(fd, &hdr, sizeof(hdr)) < 0)
 		goto out;
 
@@ -111,6 +197,11 @@ int ipc_send(uint32_t cmd, const char *payload, size_t payload_len,
 		if (safe_write(fd, payload, payload_len) < 0)
 			goto out;
 	}
+
+	/* IPC debug trace: request sent (suppress for DEBUG_FETCH) */
+	if (ipc_dbg() && cmd != SG_CMD_DEBUG_FETCH)
+		fprintf(stderr, "[IPC-DBG] -> cmd=%u(%s) len=%u\n",
+			cmd, cmd_name(cmd), (unsigned)payload_len);
 
 	/* Read response header */
 	sg_response_hdr_t rhdr;
@@ -133,7 +224,7 @@ int ipc_send(uint32_t cmd, const char *payload, size_t payload_len,
 			goto out;
 
 		n = safe_read(fd, resp->payload, rhdr.payload_len);
-		if (n < 0) {
+		if (n < (ssize_t)rhdr.payload_len) {
 			free(resp->payload);
 			resp->payload = NULL;
 			goto out;
@@ -141,6 +232,12 @@ int ipc_send(uint32_t cmd, const char *payload, size_t payload_len,
 		resp->payload[n]  = '\0';
 		resp->payload_len = (size_t)n;
 	}
+
+	/* IPC debug trace: response received (suppress for DEBUG_FETCH) */
+	if (ipc_dbg() && cmd != SG_CMD_DEBUG_FETCH)
+		fprintf(stderr, "[IPC-DBG] <- status=%u(%s) len=%u\n",
+			resp->status, status_name(resp->status),
+			(unsigned)resp->payload_len);
 
 	ret = 0;
 
@@ -167,5 +264,22 @@ void ipc_resp_free(struct ipc_response *resp)
 		free(resp->payload);
 		resp->payload     = NULL;
 		resp->payload_len = 0;
+	}
+}
+
+void ipc_fetch_debug(void)
+{
+	if (!dbg_enabled())
+		return;
+	if (strcmp(dbg_get("mgmtd_debug", "0"), "1") != 0 &&
+	    strcmp(dbg_get("auth_admin", "0"), "1") != 0 &&
+	    strcmp(dbg_get("auth_user", "0"), "1") != 0)
+		return;
+
+	struct ipc_response resp;
+	if (ipc_send(SG_CMD_DEBUG_FETCH, NULL, 0, &resp) == 0) {
+		if (resp.payload && resp.payload_len > 0)
+			fprintf(stderr, "%s", resp.payload);
+		ipc_resp_free(&resp);
 	}
 }

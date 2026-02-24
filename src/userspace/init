@@ -7,8 +7,55 @@ export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 mount -t proc none /proc
 mount -t sysfs none /sys
 mount -t devtmpfs none /dev 2>/dev/null || true
-mount -t tmpfs none /tmp 2>/dev/null || true
+mount -t tmpfs -o mode=1777 none /tmp 2>/dev/null || true
 mkdir -p /run 2>/dev/null
+
+# Mount persistent data partition for config DB
+mkdir -p /etc/stargazer
+_sg_dev=""
+
+# Find sgdata partition (try multiple methods)
+_sg_dev=$(findfs LABEL=sgdata 2>/dev/null)
+[ -z "$_sg_dev" ] && _sg_dev=$(blkid -L sgdata 2>/dev/null)
+if [ -z "$_sg_dev" ]; then
+	# Fallback: scan block devices for sgdata label
+	for _d in /dev/vda /dev/vdb /dev/sda /dev/sdb \
+		  /dev/mmcblk0p2 /dev/mmcblk1p2; do
+		[ -b "$_d" ] || continue
+		_lbl=$(blkid -s LABEL -o value "$_d" 2>/dev/null)
+		if [ "$_lbl" = "sgdata" ]; then
+			_sg_dev="$_d"
+			break
+		fi
+	done
+fi
+
+if [ -n "$_sg_dev" ]; then
+	echo "[INIT] Found data partition: $_sg_dev"
+	if mount "$_sg_dev" /etc/stargazer 2>/tmp/sg_mount.log; then
+		echo "[INIT] Persistent storage: $_sg_dev -> /etc/stargazer"
+		# Restore saved auth files (shadow/passwd) from persistent storage
+		if [ -f /etc/stargazer/shadow ]; then
+			cp /etc/stargazer/shadow /etc/shadow
+			chmod 640 /etc/shadow
+			echo "[INIT] Restored /etc/shadow from persistent storage"
+		fi
+		if [ -f /etc/stargazer/passwd ]; then
+			cp /etc/stargazer/passwd /etc/passwd
+			echo "[INIT] Restored /etc/passwd from persistent storage"
+		fi
+	else
+		echo "[INIT] ERROR: mount $_sg_dev failed:"
+		cat /tmp/sg_mount.log 2>/dev/null
+		echo "[INIT] Block devices: $(cat /proc/partitions 2>/dev/null | tail -n +3)"
+		echo "[INIT] blkid output: $(blkid 2>/dev/null)"
+	fi
+else
+	echo "[INIT] WARNING: sgdata partition not found, config will not survive reboot"
+	echo "[INIT] Block devices: $(cat /proc/partitions 2>/dev/null | tail -n +3)"
+	echo "[INIT] blkid output: $(blkid 2>/dev/null)"
+fi
+
 # Ensure /dev/tty is accessible by non-root users (for readline terminal I/O)
 [ -c /dev/tty ] && chmod 0666 /dev/tty 2>/dev/null
 echo 1 > /proc/sys/kernel/sysrq
@@ -29,6 +76,9 @@ cat << 'EOF'
 EOF
 echo "Kernel: $(uname -r) | Arch: $(uname -m)"
 
+# Write firmware version for runtime queries (substituted at build time)
+echo "@VERSION@" > /tmp/stargazer-fw-version
+
 # Ensure stargazer system group exists (used for socket + config file ACL)
 if ! grep -q '^stargazer:' /etc/group 2>/dev/null; then
 	# Find a free GID in system range
@@ -41,6 +91,23 @@ fi
 
 # Start services
 [ -x /etc/init.d/stargazer ] && /etc/init.d/stargazer start
+
+# Auto-configure network: bring up first available NIC with DHCP
+# (covers QEMU user-mode networking and real hardware with DHCP)
+_nic=""
+for _if in eth0 enp0s1 enp0s2; do
+	if [ -d "/sys/class/net/$_if" ]; then
+		_nic="$_if"
+		break
+	fi
+done
+if [ -n "$_nic" ]; then
+	ip link set "$_nic" up 2>/dev/null
+	if command -v udhcpc >/dev/null 2>&1; then
+		udhcpc -i "$_nic" -q -s /usr/share/udhcpc/default.script 2>/dev/null &
+		echo "[INIT] DHCP request sent on $_nic"
+	fi
+fi
 
 # Start management daemon (privilege separation)
 if [ -x /sbin/stargazer-mgmtd ]; then
@@ -70,13 +137,31 @@ SVC
 cat > /sbin/poweroff << 'PWR'
 #!/bin/sh
 for s in /etc/init.d/*; do [ -x "$s" ] && "$s" stop 2>/dev/null; done
-sync; echo o > /proc/sysrq-trigger
+# Stop mgmtd to release DB file handles on /etc/stargazer
+killall stargazer-mgmtd 2>/dev/null; sleep 1
+# Save auth files to persistent storage before unmount
+if mountpoint -q /etc/stargazer 2>/dev/null; then
+	cp /etc/shadow /etc/stargazer/shadow 2>/dev/null
+	cp /etc/passwd /etc/stargazer/passwd 2>/dev/null
+	sync
+	umount /etc/stargazer 2>/dev/null
+fi
+sync; sleep 1; echo o > /proc/sysrq-trigger
 PWR
 
 cat > /sbin/reboot << 'RBT'
 #!/bin/sh
 for s in /etc/init.d/*; do [ -x "$s" ] && "$s" stop 2>/dev/null; done
-sync; echo b > /proc/sysrq-trigger
+# Stop mgmtd to release DB file handles on /etc/stargazer
+killall stargazer-mgmtd 2>/dev/null; sleep 1
+# Save auth files to persistent storage before unmount
+if mountpoint -q /etc/stargazer 2>/dev/null; then
+	cp /etc/shadow /etc/stargazer/shadow 2>/dev/null
+	cp /etc/passwd /etc/stargazer/passwd 2>/dev/null
+	sync
+	umount /etc/stargazer 2>/dev/null
+fi
+sync; sleep 1; echo b > /proc/sysrq-trigger
 RBT
 
 chmod +x /sbin/service /sbin/poweroff /sbin/reboot

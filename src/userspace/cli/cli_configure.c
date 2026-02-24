@@ -16,6 +16,7 @@
 #include "cli_configure.h"
 #include "cli_readline.h"
 #include "cli_ipc.h"
+#include "cli_debug.h"
 #include "sg_validate.h"
 
 #include <fcntl.h>
@@ -41,6 +42,12 @@ struct kv_buf {
 	int count;
 	int modified;
 };
+
+static int cfg_dbg(void)
+{
+	return dbg_enabled() &&
+	       strcmp(dbg_get("cli_debug", "0"), "1") == 0;
+}
 
 static void kv_init(struct kv_buf *b)
 {
@@ -221,7 +228,18 @@ static int read_password(const char *prompt, char *buf, size_t buf_sz)
 	printf("%s", prompt);
 	fflush(stdout);
 
-	tcgetattr(tty, &old);
+	if (tcgetattr(tty, &old) != 0) {
+		/* Can't control echo — fall back to visible read */
+		if (fgets(buf, (int)buf_sz, stdin)) {
+			size_t len = strlen(buf);
+			if (len > 0 && buf[len - 1] == '\n')
+				buf[--len] = '\0';
+			if (tty != STDIN_FILENO) close(tty);
+			return (int)len;
+		}
+		if (tty != STDIN_FILENO) close(tty);
+		return 0;
+	}
 	noecho = old;
 	noecho.c_lflag &= ~(tcflag_t)ECHO;
 	noecho.c_lflag |= ICANON;
@@ -564,8 +582,13 @@ static int check_ref_exists(const char *type_name, const char *key,
 		return 1; /* not a ref kind — always valid */
 
 	/* Check hardcoded options (e.g. "all", "any") */
-	if (ro[0] && sg_match_csv_option(ro, val))
+	if (ro[0] && sg_match_csv_option(ro, val)) {
+		if (cfg_dbg())
+			fprintf(stderr,
+				"[CFG-DBG] ref check: %s=%s"
+				" (hardcoded option)\n", key, val);
 		return 1;
+	}
 
 	/* Check if entry exists via IPC */
 	char section[512];
@@ -574,9 +597,17 @@ static int check_ref_exists(const char *type_name, const char *key,
 	struct ipc_response resp;
 	if (ipc_send_str(SG_CMD_CFG_GET, section, &resp) == 0 &&
 	    resp.status == SG_OK) {
+		if (cfg_dbg())
+			fprintf(stderr,
+				"[CFG-DBG] ref check: %s=%s"
+				" (exists in %s)\n", key, val, rt);
 		ipc_resp_free(&resp);
 		return 1;
 	}
+	if (cfg_dbg())
+		fprintf(stderr,
+			"[CFG-DBG] ref check: %s=%s"
+			" (NOT FOUND in %s)\n", key, val, rt);
 	ipc_resp_free(&resp);
 	return 0;
 }
@@ -586,10 +617,15 @@ static int check_ref_exists(const char *type_name, const char *key,
 static int apply_config(const char *type_name, const char *id,
 			const struct kv_buf *b)
 {
+	if (cfg_dbg())
+		fprintf(stderr,
+			"[CFG-DBG] apply: sending CFG_APPLY"
+			" type=%s id=%s\n", type_name, id);
+
 	char payload[4096];
 	int hdr_len = snprintf(payload, sizeof(payload), "%s\n%s\n",
 			       type_name, id);
-	if (hdr_len < 0) return -1;
+	if (hdr_len < 0 || (size_t)hdr_len >= sizeof(payload)) return -1;
 
 	char data[2048];
 	kv_serialize(b, data, sizeof(data));
@@ -599,10 +635,18 @@ static int apply_config(const char *type_name, const char *id,
 	memcpy(payload + hdr_len, data, strlen(data) + 1);
 
 	struct ipc_response resp;
-	if (ipc_send(SG_CMD_CFG_APPLY, payload, total, &resp) != 0)
+	if (ipc_send(SG_CMD_CFG_APPLY, payload, total, &resp) != 0) {
+		if (cfg_dbg())
+			fprintf(stderr,
+				"[CFG-DBG] apply: IPC send failed\n");
 		return -1;
+	}
 
 	if (resp.status != SG_OK) {
+		if (cfg_dbg())
+			fprintf(stderr,
+				"[CFG-DBG] apply: FAILED status=%u\n",
+				resp.status);
 		if (resp.extra[0])
 			printf("  Error: %s\n", resp.extra);
 		else
@@ -611,6 +655,8 @@ static int apply_config(const char *type_name, const char *id,
 		return -1;
 	}
 
+	if (cfg_dbg())
+		fprintf(stderr, "[CFG-DBG] apply: OK\n");
 	if (resp.payload && resp.payload[0])
 		printf("%s", resp.payload);
 	ipc_resp_free(&resp);
@@ -640,10 +686,12 @@ static int handle_password(const char *entry_id, struct kv_buf *b)
 			else
 				printf("  Error: password does not meet policy\n");
 			ipc_resp_free(&resp);
+			explicit_bzero(policy_payload, sizeof(policy_payload));
 			return -1;
 		}
 		ipc_resp_free(&resp);
 	}
+	explicit_bzero(policy_payload, sizeof(policy_payload));
 
 	read_password("  Retype password: ", pw2, sizeof(pw2));
 
@@ -679,6 +727,11 @@ static int context_entry(const char *type_name, const char *label,
 	int is_new = 0;
 	int password_cleared = 0;
 
+	if (cfg_dbg())
+		fprintf(stderr,
+			"[CFG-DBG] enter entry: %s:%s\n",
+			type_name, entry_id);
+
 	/* Load existing data via IPC */
 	char section[512];
 	snprintf(section, sizeof(section), "%s:%s", type_name, entry_id);
@@ -687,6 +740,11 @@ static int context_entry(const char *type_name, const char *label,
 	if (ipc_send_str(SG_CMD_CFG_GET, section, &resp) == 0 &&
 	    resp.status == SG_OK && resp.payload) {
 		kv_parse(&data, resp.payload);
+		if (cfg_dbg())
+			fprintf(stderr,
+				"[CFG-DBG] loaded existing entry"
+				" %s (%d keys)\n",
+				entry_id, data.count);
 		printf("  Editing entry %s.\n", entry_id);
 	} else {
 		is_new = 1;
@@ -695,9 +753,19 @@ static int context_entry(const char *type_name, const char *label,
 		if (defs && *defs) {
 			kv_parse(&data, defs);
 			data.modified = 1;
+			if (cfg_dbg())
+				fprintf(stderr,
+					"[CFG-DBG] new entry %s"
+					" (defaults: %d keys)\n",
+					entry_id, data.count);
 			printf("  Creating new entry %s (defaults applied).\n",
 			       entry_id);
 		} else {
+			if (cfg_dbg())
+				fprintf(stderr,
+					"[CFG-DBG] new entry %s"
+					" (no defaults)\n",
+					entry_id);
 			printf("  Creating new entry %s.\n", entry_id);
 		}
 	}
@@ -725,12 +793,23 @@ static int context_entry(const char *type_name, const char *label,
 		parse_line(resolved, cmd, sizeof(cmd),
 			   key, sizeof(key), val, sizeof(val));
 
+		if (cfg_dbg())
+			fprintf(stderr,
+				"[CFG-DBG] entry cmd: %s%s%s%s%s\n",
+				cmd,
+				key[0] ? " " : "", key,
+				val[0] ? " " : "", val);
+
 		if (strcmp(cmd, "set") == 0) {
 			if (!key[0]) {
 				printf("  Usage: set <key> <value>\n");
 				continue;
 			}
 			if (!sg_reg_is_valid_key(type_name, key)) {
+				if (cfg_dbg())
+					fprintf(stderr,
+						"[CFG-DBG] set: invalid"
+						" key '%s'\n", key);
 				printf("  Error: invalid key '%s' for %s\n",
 				       key, type_name);
 				printf("  Valid: %s\n",
@@ -751,6 +830,12 @@ static int context_entry(const char *type_name, const char *label,
 				continue;
 			}
 			if (!sg_reg_validate_value(type_name, key, val)) {
+				if (cfg_dbg())
+					fprintf(stderr,
+						"[CFG-DBG] set:"
+						" invalid value"
+						" %s='%s'\n",
+						key, val);
 				printf("  Error: invalid value for '%s': '%s'\n",
 				       key, val);
 				printf("  Expected: %s\n",
@@ -772,6 +857,10 @@ static int context_entry(const char *type_name, const char *label,
 				       KV_MAX_ENTRIES);
 				continue;
 			}
+			if (cfg_dbg())
+				fprintf(stderr,
+					"[CFG-DBG] set: %s=%s"
+					" (valid)\n", key, val);
 		} else if (strcmp(cmd, "unset") == 0) {
 			if (!key[0]) {
 				printf("  Usage: unset <key>\n");
@@ -788,6 +877,10 @@ static int context_entry(const char *type_name, const char *label,
 				data.modified = 1;
 			}
 			kv_unset(&data, key);
+			if (cfg_dbg())
+				fprintf(stderr,
+					"[CFG-DBG] unset: %s\n",
+					key);
 		} else if (strcmp(cmd, "get") == 0) {
 			if (!key[0]) {
 				printf("  Usage: get <key>\n");
@@ -852,6 +945,12 @@ static int context_entry(const char *type_name, const char *label,
 				const char *miss = validate_required(
 					type_name, &data);
 				if (miss) {
+					if (cfg_dbg())
+						fprintf(stderr,
+							"[CFG-DBG] save:"
+							" missing"
+							" required:%s\n",
+							miss);
 					printf("  Error: missing required"
 					       " field(s):%s\n", miss);
 					printf("  Use 'set <key> <value>' to"
@@ -859,6 +958,10 @@ static int context_entry(const char *type_name, const char *label,
 					       " to discard.\n");
 					continue;
 				}
+				if (cfg_dbg())
+					fprintf(stderr,
+						"[CFG-DBG] save:"
+						" required fields OK\n");
 				/* New admin must have password */
 				if (is_new &&
 				    strcmp(type_name, "system_admin") == 0 &&
@@ -951,15 +1054,42 @@ static int context_entry(const char *type_name, const char *label,
 					memcpy(payload + hdr_len, serial,
 					       strlen(serial) + 1);
 					struct ipc_response sresp;
-					ipc_send(SG_CMD_CFG_SET, payload,
-						 total, &sresp);
+					int rc = ipc_send(SG_CMD_CFG_SET,
+						payload, total, &sresp);
+					if (rc != 0 ||
+					    sresp.status != SG_OK) {
+						printf("  WARNING: applied"
+						       " but failed to"
+						       " save config.\n");
+						if (sresp.extra[0])
+							printf("  %s\n",
+							       sresp.extra);
+					}
+					if (cfg_dbg())
+						fprintf(stderr,
+							"[CFG-DBG]"
+							" persist:"
+							" %s\n",
+							(rc == 0 &&
+							 sresp.status
+							 == SG_OK)
+							? "OK"
+							: "FAILED");
 					ipc_resp_free(&sresp);
+				} else {
+					printf("  WARNING: config too"
+					       " large to save.\n");
 				}
 			}
 			if (strcmp(cmd, "end") == 0 && exit_all)
 				*exit_all = 1;
 			break;
 		} else if (strcmp(cmd, "abort") == 0) {
+			if (cfg_dbg())
+				fprintf(stderr,
+					"[CFG-DBG] abort entry:"
+					" %s:%s\n",
+					type_name, entry_id);
 			printf("  Changes discarded.\n");
 			break;
 		} else {
@@ -967,6 +1097,14 @@ static int context_entry(const char *type_name, const char *label,
 		}
 	}
 
+	/* Clear any sensitive data (passwords) from memory */
+	if (strcmp(type_name, "system_admin") == 0)
+		explicit_bzero(&data, sizeof(data));
+
+	if (cfg_dbg())
+		fprintf(stderr,
+			"[CFG-DBG] exit entry: %s:%s\n",
+			type_name, entry_id);
 	cli_pop();
 	return 0;
 }
@@ -975,6 +1113,11 @@ static int context_entry(const char *type_name, const char *label,
 
 static int context_table(const char *type_name, const char *label)
 {
+	if (cfg_dbg())
+		fprintf(stderr,
+			"[CFG-DBG] enter table: %s (%s)\n",
+			type_name, label);
+
 	cli_push();
 	register_table_cmds(type_name);
 
@@ -996,6 +1139,11 @@ static int context_table(const char *type_name, const char *label)
 
 		parse_line(resolved, cmd, sizeof(cmd),
 			   arg, sizeof(arg), dummy, sizeof(dummy));
+
+		if (cfg_dbg())
+			fprintf(stderr,
+				"[CFG-DBG] table cmd: %s%s%s\n",
+				cmd, arg[0] ? " " : "", arg);
 
 		if (strcmp(cmd, "show") == 0) {
 			/* List all entries via IPC */
@@ -1214,6 +1362,9 @@ static int context_table(const char *type_name, const char *label)
 		}
 	}
 
+	if (cfg_dbg())
+		fprintf(stderr,
+			"[CFG-DBG] exit table: %s\n", type_name);
 	cli_pop();
 	return 0;
 }
@@ -1225,17 +1376,32 @@ static int context_single(const char *type_name, const char *label)
 	struct kv_buf data;
 	kv_init(&data);
 
+	if (cfg_dbg())
+		fprintf(stderr,
+			"[CFG-DBG] enter single: %s (%s)\n",
+			type_name, label);
+
 	/* Load existing data via IPC */
 	struct ipc_response resp;
 	if (ipc_send_str(SG_CMD_CFG_GET, type_name, &resp) == 0 &&
 	    resp.status == SG_OK && resp.payload) {
 		kv_parse(&data, resp.payload);
+		if (cfg_dbg())
+			fprintf(stderr,
+				"[CFG-DBG] loaded single %s"
+				" (%d keys)\n",
+				type_name, data.count);
 	} else {
 		/* Apply defaults */
 		const char *defs = sg_reg_default_values(type_name);
 		if (defs && *defs) {
 			kv_parse(&data, defs);
 			data.modified = 1;
+			if (cfg_dbg())
+				fprintf(stderr,
+					"[CFG-DBG] single %s"
+					" defaults (%d keys)\n",
+					type_name, data.count);
 		}
 	}
 	ipc_resp_free(&resp);
@@ -1262,6 +1428,13 @@ static int context_single(const char *type_name, const char *label)
 		parse_line(resolved, cmd, sizeof(cmd),
 			   key, sizeof(key), val, sizeof(val));
 
+		if (cfg_dbg())
+			fprintf(stderr,
+				"[CFG-DBG] single cmd: %s%s%s%s%s\n",
+				cmd,
+				key[0] ? " " : "", key,
+				val[0] ? " " : "", val);
+
 		if (strcmp(cmd, "set") == 0) {
 			if (!key[0] || !val[0]) {
 				if (key[0]) {
@@ -1273,6 +1446,10 @@ static int context_single(const char *type_name, const char *label)
 				continue;
 			}
 			if (!sg_reg_is_valid_key(type_name, key)) {
+				if (cfg_dbg())
+					fprintf(stderr,
+						"[CFG-DBG] set: invalid"
+						" key '%s'\n", key);
 				printf("  Error: invalid key '%s'"
 				       " for %s\n", key, type_name);
 				printf("  Valid: %s\n",
@@ -1280,6 +1457,12 @@ static int context_single(const char *type_name, const char *label)
 				continue;
 			}
 			if (!sg_reg_validate_value(type_name, key, val)) {
+				if (cfg_dbg())
+					fprintf(stderr,
+						"[CFG-DBG] set:"
+						" invalid value"
+						" %s='%s'\n",
+						key, val);
 				printf("  Error: invalid value for '%s':"
 				       " '%s'\n", key, val);
 				printf("  Expected: %s\n",
@@ -1301,6 +1484,10 @@ static int context_single(const char *type_name, const char *label)
 				       KV_MAX_ENTRIES);
 				continue;
 			}
+			if (cfg_dbg())
+				fprintf(stderr,
+					"[CFG-DBG] set: %s=%s"
+					" (valid)\n", key, val);
 		} else if (strcmp(cmd, "unset") == 0) {
 			if (!key[0]) {
 				printf("  Usage: unset <key>\n");
@@ -1312,6 +1499,10 @@ static int context_single(const char *type_name, const char *label)
 				continue;
 			}
 			kv_unset(&data, key);
+			if (cfg_dbg())
+				fprintf(stderr,
+					"[CFG-DBG] unset: %s\n",
+					key);
 		} else if (strcmp(cmd, "get") == 0) {
 			if (!key[0]) {
 				printf("  Usage: get <key>\n");
@@ -1355,11 +1546,21 @@ static int context_single(const char *type_name, const char *label)
 				const char *miss = validate_required(
 					type_name, &data);
 				if (miss) {
+					if (cfg_dbg())
+						fprintf(stderr,
+							"[CFG-DBG] save:"
+							" missing"
+							" required:%s\n",
+							miss);
 					printf("  Error: missing required"
 					       " field(s):%s\n", miss);
 					printf("  Use 'set' or 'abort'.\n");
 					continue;
 				}
+				if (cfg_dbg())
+					fprintf(stderr,
+						"[CFG-DBG] save:"
+						" required fields OK\n");
 				/* Apply via IPC */
 				if (apply_config(type_name, "0",
 						 &data) != 0) {
@@ -1379,13 +1580,39 @@ static int context_single(const char *type_name, const char *label)
 					memcpy(payload + hdr_len, serial,
 					       strlen(serial) + 1);
 					struct ipc_response sresp;
-					ipc_send(SG_CMD_CFG_SET, payload,
-						 total, &sresp);
+					int rc = ipc_send(SG_CMD_CFG_SET,
+						payload, total, &sresp);
+					if (rc != 0 ||
+					    sresp.status != SG_OK) {
+						printf("  WARNING: applied"
+						       " but failed to"
+						       " save config.\n");
+						if (sresp.extra[0])
+							printf("  %s\n",
+							       sresp.extra);
+					}
+					if (cfg_dbg())
+						fprintf(stderr,
+							"[CFG-DBG]"
+							" persist:"
+							" %s\n",
+							(rc == 0 &&
+							 sresp.status
+							 == SG_OK)
+							? "OK"
+							: "FAILED");
 					ipc_resp_free(&sresp);
+				} else {
+					printf("  WARNING: config too"
+					       " large to save.\n");
 				}
 			}
 			break;
 		} else if (strcmp(cmd, "abort") == 0) {
+			if (cfg_dbg())
+				fprintf(stderr,
+					"[CFG-DBG] abort single:"
+					" %s\n", type_name);
 			printf("  Changes discarded.\n");
 			break;
 		} else {
@@ -1393,6 +1620,9 @@ static int context_single(const char *type_name, const char *label)
 		}
 	}
 
+	if (cfg_dbg())
+		fprintf(stderr,
+			"[CFG-DBG] exit single: %s\n", type_name);
 	cli_pop();
 	return 0;
 }
@@ -1508,12 +1738,22 @@ int cli_configure(int argc, const char **argv)
 	/* Look up type mode */
 	int mode = sg_reg_type_mode(type_key);
 	if (mode < 0) {
+		if (cfg_dbg())
+			fprintf(stderr,
+				"[CFG-DBG] configure: unknown"
+				" type_key=%s\n", type_key);
 		printf("  Unknown config path:");
 		for (int i = 0; i < argc; i++)
 			printf(" %s", argv[i]);
 		printf("\n  Run 'configure ?' to see available options.\n");
 		return 0;
 	}
+
+	if (cfg_dbg())
+		fprintf(stderr,
+			"[CFG-DBG] configure: type=%s mode=%s\n",
+			type_key,
+			mode == CFG_TABLE ? "TABLE" : "SINGLE");
 
 	const char *label = sg_reg_type_label(type_key);
 

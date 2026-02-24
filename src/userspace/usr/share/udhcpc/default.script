@@ -1,0 +1,28 @@
+#!/bin/sh
+# Minimal udhcpc default script for Stargazer
+# Called by BusyBox udhcpc with $1 = action
+
+case "$1" in
+	deconfig)
+		ip addr flush dev "$interface" 2>/dev/null
+		ip link set "$interface" up
+		;;
+	bound|renew)
+		ip addr flush dev "$interface" 2>/dev/null
+		ip addr add "$ip/${mask:-24}" dev "$interface"
+		if [ -n "$router" ]; then
+			ip route del default 2>/dev/null
+			for r in $router; do
+				ip route add default via "$r" dev "$interface"
+			done
+		fi
+		# DNS
+		if [ -n "$dns" ]; then
+			: > /tmp/resolv.conf
+			for d in $dns; do
+				echo "nameserver $d" >> /tmp/resolv.conf
+			done
+			cp /tmp/resolv.conf /etc/resolv.conf
+		fi
+		;;
+esac

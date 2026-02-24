@@ -421,7 +421,7 @@ auth_debug() {
 # ── SQLite sync helpers (Phase C bootstrap) ─────────────────────────────────
 
 STARGAZER_DB_PATH="${STARGAZER_CONF_DIR}/stargazer.db"
-STARGAZER_SESSION_REV_FILE="/tmp/stargazer-session.rev"
+STARGAZER_SESSION_REV_FILE="/run/stargazer-session.rev"
 
 _db_ready() {
 	command -v sqlite3 >/dev/null 2>&1 || return 1

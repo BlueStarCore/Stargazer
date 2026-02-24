@@ -72,7 +72,7 @@ static const struct field_entry field_table[] = {
 	/* system_interface */
 	{ "system_interface", "ip",          "cidr",          0, NULL,   "Interface IP address and mask" },
 	{ "system_interface", "status",      "enum:up,down",  0, "up",   "Administrative state"          },
-	{ "system_interface", "mtu",         "uint:68:65535", 0, "1500", "MTU (driver limits checked on apply)" },
+	{ "system_interface", "mtu",         "uint:576:65535", 0, "1500", "Maximum transmission unit" },
 	{ "system_interface", "description", "string",        1, NULL,   "Interface description"         },
 
 	/* system_settings */
@@ -153,6 +153,8 @@ int
 sg_is_safe_id(const char *s)
 {
 	if (!s || !*s)
+		return 0;
+	if (strlen(s) > SG_SAFE_ID_MAX)
 		return 0;
 	for (const char *p = s; *p; p++) {
 		if (isalnum((unsigned char)*p))
@@ -413,6 +415,18 @@ const sg_type_info_t *
 sg_reg_types(void)
 {
 	return type_table;
+}
+
+const char *
+sg_reg_type_perm(const char *type_name)
+{
+	if (!type_name)
+		return NULL;
+	for (const sg_type_info_t *e = type_table; e->name; e++) {
+		if (strcmp(e->name, type_name) == 0)
+			return e->perm;
+	}
+	return NULL;
 }
 
 /*

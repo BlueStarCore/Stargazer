@@ -96,6 +96,9 @@ static void audit_log(const char *user, const char *event, const char *msg)
 			ts, user, event, msg, (int)getpid(),
 			tty ? tty : "unknown");
 		fclose(fp);
+	} else {
+		fprintf(stderr, "[logind] audit_log: cannot write to %s: %s (event=%s user=%s)\n",
+			path, strerror(errno), event, user);
 	}
 }
 
@@ -310,15 +313,15 @@ static void read_password_policy(struct password_policy *pol)
 	pol->min_special = 0;
 
 	v = sg_db_get_val("system_password-policy", "0", "min-length");
-	if (v) { int n = atoi(v); pol->min_length = (n > 0) ? n : 0; free(v); }
+	if (v) { int n = atoi(v); pol->min_length = (n > 0 && n <= 256) ? n : 0; free(v); }
 	v = sg_db_get_val("system_password-policy", "0", "min-uppercase");
-	if (v) { int n = atoi(v); pol->min_uppercase = (n > 0) ? n : 0; free(v); }
+	if (v) { int n = atoi(v); pol->min_uppercase = (n > 0 && n <= 128) ? n : 0; free(v); }
 	v = sg_db_get_val("system_password-policy", "0", "min-lowercase");
-	if (v) { int n = atoi(v); pol->min_lowercase = (n > 0) ? n : 0; free(v); }
+	if (v) { int n = atoi(v); pol->min_lowercase = (n > 0 && n <= 128) ? n : 0; free(v); }
 	v = sg_db_get_val("system_password-policy", "0", "min-digit");
-	if (v) { int n = atoi(v); pol->min_digit = (n > 0) ? n : 0; free(v); }
+	if (v) { int n = atoi(v); pol->min_digit = (n > 0 && n <= 128) ? n : 0; free(v); }
 	v = sg_db_get_val("system_password-policy", "0", "min-special");
-	if (v) { int n = atoi(v); pol->min_special = (n > 0) ? n : 0; free(v); }
+	if (v) { int n = atoi(v); pol->min_special = (n > 0 && n <= 128) ? n : 0; free(v); }
 }
 
 /*
