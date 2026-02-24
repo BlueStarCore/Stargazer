@@ -91,6 +91,7 @@ static void debug_buf_push(const char *fmt, ...)
 }
 
 static volatile sig_atomic_t g_running = 1;
+static int g_listen_fd = -1;  /* listen socket fd, for child to close after fork */
 
 /* ── Input validation ───────────────────────────────────────────────────── */
 /* Validators now live in common/sg_validate.c — included via sg_validate.h */
@@ -1625,6 +1626,28 @@ static int check_references(const char *type, const char *id,
 	return 0;
 }
 
+/* ── Firmware upgrade state file ─────────────────────────────────────────── */
+
+#define FW_STATE_FILE     "/tmp/sg-fw-upgrade.state"
+#define FW_STATE_FILE_TMP "/tmp/sg-fw-upgrade.state.tmp"
+
+/*
+ * Write firmware upgrade progress to state file atomically.
+ * The child process calls this at each step so the parent (serving
+ * FW_PROGRESS polls) always reads a complete, consistent file.
+ */
+static void fw_write_state(int step, int total, const char *status,
+			   const char *message, const char *version)
+{
+	FILE *fp = fopen(FW_STATE_FILE_TMP, "w");
+	if (!fp)
+		return;
+	fprintf(fp, "step=%d\ntotal=%d\nstatus=%s\nmessage=%s\nversion=%s\n",
+		step, total, status, message, version ? version : "");
+	fclose(fp);
+	rename(FW_STATE_FILE_TMP, FW_STATE_FILE);
+}
+
 /* ── Request handler ────────────────────────────────────────────────────── */
 
 static void handle_request(int client_fd, sg_request_hdr_t *hdr,
@@ -2392,6 +2415,470 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		return;
 	}
 
+	case SG_CMD_FW_STATUS: {
+		char result[2048];
+		int off = 0;
+
+		off += snprintf(result + off, sizeof(result) - off,
+				"  === Firmware Status ===\n");
+
+		/* Running version from build-time define or runtime file */
+#ifdef VERSION
+		off += snprintf(result + off, sizeof(result) - off,
+				"  Running version: %s\n", VERSION);
+#else
+		{
+			char verbuf[64] = {0};
+			FILE *vf = fopen("/tmp/stargazer-fw-version", "r");
+			if (vf) {
+				if (fgets(verbuf, sizeof(verbuf), vf)) {
+					char *nl = strchr(verbuf, '\n');
+					if (nl) *nl = '\0';
+				}
+				fclose(vf);
+			}
+			off += snprintf(result + off, sizeof(result) - off,
+					"  Running version: %s\n",
+					verbuf[0] ? verbuf : "unknown");
+		}
+#endif
+
+		/* Check for staged firmware */
+		FILE *mf = fopen("/tmp/sg-fw-staged/manifest.txt", "r");
+		if (mf) {
+			char line[256];
+			char staged_ver[256] = {0};
+			while (fgets(line, sizeof(line), mf)) {
+				if (strncmp(line, "version=", 8) == 0) {
+					char *nl = strchr(line + 8, '\n');
+					if (nl) *nl = '\0';
+					snprintf(staged_ver, sizeof(staged_ver),
+						 "%s", line + 8);
+				}
+			}
+			fclose(mf);
+			if (staged_ver[0])
+				off += snprintf(result + off,
+						sizeof(result) - off,
+						"  Staged version: %s\n",
+						staged_ver);
+		}
+
+		/* Boot partition device */
+		const char *bdev_argv[] = {"findfs", "LABEL=boot", NULL};
+		char *bdev = safe_exec(bdev_argv);
+		if (!bdev || !bdev[0]) {
+			free(bdev);
+			const char *blkid_argv[] = {"blkid", "-L", "boot", NULL};
+			bdev = safe_exec(blkid_argv);
+		}
+		if (bdev && bdev[0]) {
+			char *nl = strchr(bdev, '\n');
+			if (nl) *nl = '\0';
+			off += snprintf(result + off, sizeof(result) - off,
+					"  Boot partition: %s\n", bdev);
+		} else {
+			off += snprintf(result + off, sizeof(result) - off,
+					"  Boot partition: not found\n");
+		}
+		free(bdev);
+
+		(void)off;
+		send_ok(client_fd, NULL, result);
+		return;
+	}
+
+	case SG_CMD_FW_UPGRADE: {
+		const char *perms = get_user_permissions(user);
+		if (!has_permission(perms, "admin")) {
+			send_error(client_fd, SG_ERR_PERM_DENIED,
+				   "Requires 'admin' permission");
+			return;
+		}
+		if (!payload || hdr->payload_len == 0) {
+			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing URL");
+			return;
+		}
+
+		/* Extract URL from payload */
+		char url[1024];
+		extract_val(payload, "url", url, sizeof(url));
+		if (!url[0]) {
+			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing URL");
+			return;
+		}
+
+		/* Validate URL scheme */
+		if (strncmp(url, "http://", 7) != 0 &&
+		    strncmp(url, "https://", 8) != 0 &&
+		    strncmp(url, "tftp://", 7) != 0) {
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "URL must start with http://, https://, or tftp://");
+			return;
+		}
+
+		/* Check if upgrade already running */
+		{
+			char state_check[256] = {0};
+			FILE *sf = fopen(FW_STATE_FILE, "r");
+			if (sf) {
+				size_t rd = fread(state_check, 1, sizeof(state_check) - 1, sf);
+				state_check[rd] = '\0';
+				fclose(sf);
+				if (strstr(state_check, "status=running")) {
+					send_error(client_fd, SG_ERR_IN_USE,
+						   "Firmware upgrade already in progress");
+					return;
+				}
+			}
+		}
+
+		/* Write initial state and respond immediately */
+		fw_write_state(0, 6, "running", "Starting firmware upgrade...", "");
+		send_ok(client_fd, NULL, "Firmware upgrade started\n");
+
+		/* Save username for child audit log */
+		char fw_user[SG_USERNAME_MAX];
+		snprintf(fw_user, sizeof(fw_user), "%s", user);
+
+		/* Fork: parent returns to accept loop, child performs upgrade */
+		pid_t pid = fork();
+		if (pid < 0) {
+			mgmt_log("ERROR", "firmware upgrade fork failed: %s",
+				 strerror(errno));
+			fw_write_state(0, 6, "error", "Internal error: fork failed", "");
+			return;
+		}
+
+		if (pid > 0) {
+			/* Parent — return to main accept loop */
+			return;
+		}
+
+		/* ── Child process ─────────────────────────────────────── */
+
+		/* Close fds we don't need */
+		close(client_fd);
+		if (g_listen_fd >= 0)
+			close(g_listen_fd);
+
+		/* Re-open database (parent keeps its connection) */
+		sg_db_close();
+		if (sg_db_open(SG_DB_PATH) != 0)
+			mgmt_log("WARN", "firmware child: failed to reopen db");
+
+		/* Prepare working directories */
+		(void)run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged /tmp/sg-fw-boot");
+		(void)run_cmd("mkdir -p /tmp/sg-fw-download /tmp/sg-fw-staged /tmp/sg-fw-boot");
+
+		/* Step 1: Download firmware package */
+		fw_write_state(1, 6, "running", "Downloading firmware...", "");
+		mgmt_log("INFO", "firmware upgrade: downloading from %s", url);
+		char dlcmd[2048];
+		if (strncmp(url, "tftp://", 7) == 0) {
+			/* Parse tftp://host/path */
+			const char *hp = url + 7;
+			const char *slash = strchr(hp, '/');
+			if (!slash || !slash[1]) {
+				(void)run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+				fw_write_state(1, 6, "error",
+					       "TFTP URL must be tftp://host/path", "");
+				sg_db_close();
+				_exit(1);
+			}
+			char thost[256];
+			size_t hlen = (size_t)(slash - hp);
+			if (hlen >= sizeof(thost)) hlen = sizeof(thost) - 1;
+			memcpy(thost, hp, hlen);
+			thost[hlen] = '\0';
+			const char *tremote = slash + 1;
+			snprintf(dlcmd, sizeof(dlcmd),
+				 "tftp -g -l /tmp/sg-fw-download/firmware.tar.gz "
+				 "-r '%s' '%s' 2>&1", tremote, thost);
+		} else {
+			snprintf(dlcmd, sizeof(dlcmd),
+				 "wget -q -O /tmp/sg-fw-download/firmware.tar.gz "
+				 "'%s' 2>&1", url);
+		}
+
+		char *dlout = run_cmd(dlcmd);
+		if (access("/tmp/sg-fw-download/firmware.tar.gz", F_OK) != 0) {
+			mgmt_log("ERROR", "firmware download failed: %s",
+				 dlout ? dlout : "(no output)");
+			free(dlout);
+			(void)run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+			fw_write_state(1, 6, "error", "Download failed", "");
+			sg_db_close();
+			_exit(1);
+		}
+		free(dlout);
+
+		/* Step 2: Extract firmware package */
+		fw_write_state(2, 6, "running", "Extracting firmware package...", "");
+		char *exout = run_cmd("tar -xzf /tmp/sg-fw-download/firmware.tar.gz "
+				      "-C /tmp/sg-fw-staged/ 2>&1");
+		if (access("/tmp/sg-fw-staged/manifest.txt", F_OK) != 0) {
+			mgmt_log("ERROR", "firmware extract failed or missing manifest: %s",
+				 exout ? exout : "(no output)");
+			free(exout);
+			(void)run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+			fw_write_state(2, 6, "error",
+				       "Invalid firmware package (missing manifest.txt)", "");
+			sg_db_close();
+			_exit(1);
+		}
+		free(exout);
+
+		/* Read manifest */
+		char manifest[2048] = {0};
+		FILE *mf = fopen("/tmp/sg-fw-staged/manifest.txt", "r");
+		if (mf) {
+			size_t rd = fread(manifest, 1, sizeof(manifest) - 1, mf);
+			manifest[rd] = '\0';
+			fclose(mf);
+		}
+
+		char fw_version[64], kernel_sha[128], initramfs_sha[128];
+		extract_val(manifest, "version", fw_version, sizeof(fw_version));
+		extract_val(manifest, "kernel_sha256", kernel_sha, sizeof(kernel_sha));
+		extract_val(manifest, "initramfs_sha256", initramfs_sha,
+			    sizeof(initramfs_sha));
+
+		if (!fw_version[0] || !kernel_sha[0] || !initramfs_sha[0]) {
+			(void)run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+			fw_write_state(2, 6, "error",
+				       "Incomplete manifest (missing version or checksums)", "");
+			sg_db_close();
+			_exit(1);
+		}
+
+		/* Step 3: Verify checksums */
+		fw_write_state(3, 6, "running", "Verifying checksums...", "");
+		char *ksum = run_cmd("sha256sum /tmp/sg-fw-staged/kernel 2>/dev/null "
+				     "| cut -d' ' -f1");
+		char *isum = run_cmd("sha256sum /tmp/sg-fw-staged/initramfs.gz 2>/dev/null "
+				     "| cut -d' ' -f1");
+
+		/* Trim trailing newlines */
+		if (ksum) { char *nl = strchr(ksum, '\n'); if (nl) *nl = '\0'; }
+		if (isum) { char *nl = strchr(isum, '\n'); if (nl) *nl = '\0'; }
+
+		if (!ksum || !isum ||
+		    strcmp(ksum, kernel_sha) != 0 ||
+		    strcmp(isum, initramfs_sha) != 0) {
+			mgmt_log("ERROR", "firmware checksum mismatch: "
+				 "kernel=%s (expect %s) initramfs=%s (expect %s)",
+				 ksum ? ksum : "null", kernel_sha,
+				 isum ? isum : "null", initramfs_sha);
+			free(ksum);
+			free(isum);
+			(void)run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+			fw_write_state(3, 6, "error",
+				       "Firmware checksum verification failed", "");
+			sg_db_close();
+			_exit(1);
+		}
+		free(ksum);
+		free(isum);
+
+		mgmt_log("INFO", "firmware v%s verified, installing...", fw_version);
+
+		/* Step 4: Find and mount boot partition */
+		fw_write_state(4, 6, "running", "Mounting boot partition...", "");
+		const char *bdev_argv[] = {"findfs", "LABEL=boot", NULL};
+		char *bdev = safe_exec(bdev_argv);
+		if (!bdev || !bdev[0]) {
+			free(bdev);
+			const char *blkid_argv[] = {"blkid", "-L", "boot", NULL};
+			bdev = safe_exec(blkid_argv);
+		}
+		if (!bdev || !bdev[0]) {
+			free(bdev);
+			/* Scan common device paths */
+			const char *candidates[] = {
+				"/dev/mmcblk0p1", "/dev/mmcblk1p1",
+				"/dev/vda1", "/dev/sda1", NULL
+			};
+			for (int i = 0; candidates[i]; i++) {
+				if (access(candidates[i], F_OK) != 0)
+					continue;
+				char bcmd[256];
+				snprintf(bcmd, sizeof(bcmd),
+					 "blkid -s LABEL -o value '%s' 2>/dev/null",
+					 candidates[i]);
+				char *lbl = run_cmd(bcmd);
+				if (lbl) {
+					char *nl = strchr(lbl, '\n');
+					if (nl) *nl = '\0';
+					if (strcmp(lbl, "boot") == 0) {
+						bdev = malloc(strlen(candidates[i]) + 1);
+						if (bdev)
+							strcpy(bdev, candidates[i]);
+						free(lbl);
+						break;
+					}
+					free(lbl);
+				}
+			}
+		}
+
+		if (!bdev || !bdev[0]) {
+			free(bdev);
+			(void)run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+			fw_write_state(4, 6, "error",
+				       "Boot partition (LABEL=boot) not found", "");
+			sg_db_close();
+			_exit(1);
+		}
+
+		/* Trim trailing newline from device path */
+		{
+			char *nl = strchr(bdev, '\n');
+			if (nl) *nl = '\0';
+		}
+
+		/* Mount boot partition */
+		char mntcmd[512];
+		snprintf(mntcmd, sizeof(mntcmd),
+			 "mount '%s' /tmp/sg-fw-boot 2>&1", bdev);
+		char *mntout = run_cmd(mntcmd);
+		if (access("/tmp/sg-fw-boot/kernel", F_OK) != 0 &&
+		    access("/tmp/sg-fw-boot/initramfs.gz", F_OK) != 0) {
+			/* Boot partition mounted but seems empty — still ok
+			 * for first firmware install */
+			mgmt_log("WARN", "boot partition %s appears empty", bdev);
+		}
+		free(mntout);
+
+		/* Verify mount succeeded by checking mountpoint */
+		char *mpcheck = run_cmd("mountpoint -q /tmp/sg-fw-boot && echo ok 2>/dev/null");
+		if (!mpcheck || strncmp(mpcheck, "ok", 2) != 0) {
+			mgmt_log("ERROR", "failed to mount boot partition %s", bdev);
+			free(mpcheck);
+			free(bdev);
+			(void)run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+			fw_write_state(4, 6, "error",
+				       "Failed to mount boot partition", "");
+			sg_db_close();
+			_exit(1);
+		}
+		free(mpcheck);
+
+		/* Log boot partition space before install */
+		char *df_before = run_cmd("df -h /tmp/sg-fw-boot 2>/dev/null | tail -1");
+		mgmt_log("INFO", "boot partition before install: %s",
+			 df_before ? df_before : "(unknown)");
+		free(df_before);
+
+		/* Remove existing files to free space (64MB partition can't
+		 * hold old + new simultaneously with a ~44MB kernel) */
+		(void)run_cmd("rm -f /tmp/sg-fw-boot/kernel "
+			      "/tmp/sg-fw-boot/initramfs.gz "
+			      "/tmp/sg-fw-boot/kernel.bak "
+			      "/tmp/sg-fw-boot/initramfs.gz.bak 2>/dev/null");
+
+		/* Step 5: Install firmware files */
+		fw_write_state(5, 6, "running",
+			       "Installing kernel and initramfs...", "");
+
+		int install_ok = 1;
+
+		char *cpk = run_cmd("cp /tmp/sg-fw-staged/kernel /tmp/sg-fw-boot/kernel 2>&1");
+		if (cpk && cpk[0])
+			mgmt_log("WARN", "kernel copy: %s", cpk);
+		free(cpk);
+
+		char *vk = run_cmd("cmp -s /tmp/sg-fw-staged/kernel /tmp/sg-fw-boot/kernel "
+				   "&& echo ok");
+		if (!vk || strncmp(vk, "ok", 2) != 0) {
+			mgmt_log("ERROR", "kernel verify failed");
+			install_ok = 0;
+		}
+		free(vk);
+
+		char *cpi = run_cmd("cp /tmp/sg-fw-staged/initramfs.gz /tmp/sg-fw-boot/initramfs.gz 2>&1");
+		if (cpi && cpi[0])
+			mgmt_log("WARN", "initramfs copy: %s", cpi);
+		free(cpi);
+
+		char *vi = run_cmd("cmp -s /tmp/sg-fw-staged/initramfs.gz /tmp/sg-fw-boot/initramfs.gz "
+				   "&& echo ok");
+		if (!vi || strncmp(vi, "ok", 2) != 0) {
+			mgmt_log("ERROR", "initramfs verify failed");
+			install_ok = 0;
+		}
+		free(vi);
+
+		if (!install_ok) {
+			char *df_fail = run_cmd("df -h /tmp/sg-fw-boot 2>/dev/null | tail -1");
+			mgmt_log("ERROR", "firmware install failed, boot partition: %s",
+				 df_fail ? df_fail : "(unknown)");
+			free(df_fail);
+			(void)run_cmd("sync");
+			(void)run_cmd("umount /tmp/sg-fw-boot 2>/dev/null");
+			free(bdev);
+			(void)run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+			fw_write_state(5, 6, "error", "Firmware install failed", "");
+			sg_db_close();
+			_exit(1);
+		}
+
+		/* Copy manifest to boot partition for version tracking */
+		(void)run_cmd("cp /tmp/sg-fw-staged/manifest.txt /tmp/sg-fw-boot/manifest.txt 2>/dev/null");
+
+		/* Step 6: Sync, unmount, and finalize */
+		fw_write_state(6, 6, "running",
+			       "Syncing and unmounting boot partition...", "");
+		(void)run_cmd("sync");
+		(void)run_cmd("umount /tmp/sg-fw-boot 2>/dev/null");
+		free(bdev);
+
+		/* Cleanup download artifacts */
+		(void)run_cmd("rm -rf /tmp/sg-fw-download");
+
+		/* Audit log */
+		char audit_msg[1200];
+		snprintf(audit_msg, sizeof(audit_msg),
+			 "version=%s url=%s", fw_version, url);
+		(void)audit_log(fw_user, "firmware_upgrade", audit_msg);
+
+		mgmt_log("INFO", "firmware v%s installed successfully", fw_version);
+
+		char done_msg[256];
+		snprintf(done_msg, sizeof(done_msg),
+			 "Firmware v%s installed successfully. Rebooting...",
+			 fw_version);
+		fw_write_state(6, 6, "done", done_msg, fw_version);
+
+		/* Close DB and reboot */
+		sg_db_close();
+		usleep(100000);
+		(void)run_cmd("/sbin/reboot");
+		_exit(0);
+	}
+
+	case SG_CMD_FW_PROGRESS: {
+		/* Poll firmware upgrade progress from state file */
+		char state[512] = {0};
+		FILE *sf = fopen(FW_STATE_FILE, "r");
+		if (!sf) {
+			send_ok(client_fd, NULL,
+				"step=0\ntotal=0\nstatus=idle\n"
+				"message=No upgrade in progress\nversion=\n");
+			return;
+		}
+		size_t rd = fread(state, 1, sizeof(state) - 1, sf);
+		state[rd] = '\0';
+		fclose(sf);
+
+		/* If terminal state (done/error), clean up the file */
+		if (strstr(state, "status=done") || strstr(state, "status=error"))
+			unlink(FW_STATE_FILE);
+
+		send_ok(client_fd, NULL, state);
+		return;
+	}
+
 	case SG_CMD_SHOW_STATUS: {
 		char *out = run_cmd(
 			"echo '=== Stargazer Status ===';"
@@ -2456,6 +2943,140 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		return;
 	}
 
+	case SG_CMD_NET_PING: {
+		const char *perms = get_user_permissions(user);
+		if (!has_permission(perms, "monitor")) {
+			send_error(client_fd, SG_ERR_PERM_DENIED,
+				   "Requires 'monitor' permission");
+			return;
+		}
+		char target[256];
+		extract_val(payload, "target", target, sizeof(target));
+		if (!target[0]) {
+			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing target");
+			return;
+		}
+		if (!sg_is_safe_id(target)) {
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "Invalid target (use IPv4 address or hostname)");
+			return;
+		}
+		const char *argv[] = {"ping", "-c", "4", "-W", "2", target, NULL};
+		char *out = safe_exec(argv);
+		if (out) {
+			send_ok(client_fd, NULL, out);
+			free(out);
+		} else {
+			send_error(client_fd, SG_ERR_SYSTEM_FAIL,
+				   "Failed to execute ping");
+		}
+		return;
+	}
+
+	case SG_CMD_NET_TRACEROUTE: {
+		const char *perms = get_user_permissions(user);
+		if (!has_permission(perms, "monitor")) {
+			send_error(client_fd, SG_ERR_PERM_DENIED,
+				   "Requires 'monitor' permission");
+			return;
+		}
+		char target[256];
+		extract_val(payload, "target", target, sizeof(target));
+		if (!target[0]) {
+			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing target");
+			return;
+		}
+		if (!sg_is_safe_id(target)) {
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "Invalid target (use IPv4 address or hostname)");
+			return;
+		}
+		const char *argv[] = {"traceroute", "-m", "20", "-w", "2", target, NULL};
+		char *out = safe_exec(argv);
+		if (out) {
+			send_ok(client_fd, NULL, out);
+			free(out);
+		} else {
+			send_error(client_fd, SG_ERR_SYSTEM_FAIL,
+				   "Failed to execute traceroute");
+		}
+		return;
+	}
+
+	case SG_CMD_NET_NSLOOKUP: {
+		const char *perms = get_user_permissions(user);
+		if (!has_permission(perms, "monitor")) {
+			send_error(client_fd, SG_ERR_PERM_DENIED,
+				   "Requires 'monitor' permission");
+			return;
+		}
+		char target[256];
+		extract_val(payload, "target", target, sizeof(target));
+		if (!target[0]) {
+			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing target");
+			return;
+		}
+		if (!sg_is_safe_id(target)) {
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "Invalid target (use hostname or IP address)");
+			return;
+		}
+		const char *argv[] = {"nslookup", target, NULL};
+		char *out = safe_exec(argv);
+		if (out) {
+			send_ok(client_fd, NULL, out);
+			free(out);
+		} else {
+			send_error(client_fd, SG_ERR_SYSTEM_FAIL,
+				   "Failed to execute nslookup");
+		}
+		return;
+	}
+
+	case SG_CMD_NET_ARPING: {
+		const char *perms = get_user_permissions(user);
+		if (!has_permission(perms, "monitor")) {
+			send_error(client_fd, SG_ERR_PERM_DENIED,
+				   "Requires 'monitor' permission");
+			return;
+		}
+		char target[256], iface[64];
+		extract_val(payload, "target", target, sizeof(target));
+		extract_val(payload, "iface", iface, sizeof(iface));
+		if (!target[0]) {
+			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing target");
+			return;
+		}
+		if (!sg_is_safe_id(target)) {
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "Invalid target (use IPv4 address or hostname)");
+			return;
+		}
+		char *out;
+		if (iface[0]) {
+			if (!sg_is_safe_id(iface)) {
+				send_error(client_fd, SG_ERR_INVALID_ARG,
+					   "Invalid interface name");
+				return;
+			}
+			const char *argv[] = {"arping", "-c", "4", "-w", "2",
+					      "-I", iface, target, NULL};
+			out = safe_exec(argv);
+		} else {
+			const char *argv[] = {"arping", "-c", "4", "-w", "2",
+					      target, NULL};
+			out = safe_exec(argv);
+		}
+		if (out) {
+			send_ok(client_fd, NULL, out);
+			free(out);
+		} else {
+			send_error(client_fd, SG_ERR_SYSTEM_FAIL,
+				   "Failed to execute arping");
+		}
+		return;
+	}
+
 	case SG_CMD_PING:
 		send_ok(client_fd, "pong", NULL);
 		return;
@@ -2493,6 +3114,7 @@ int main(void)
 	signal(SIGINT,  sig_handler);
 	signal(SIGTERM, sig_handler);
 	signal(SIGPIPE, SIG_IGN);
+	signal(SIGCHLD, SIG_IGN);  /* auto-reap forked children (fw upgrade) */
 
 	/* Remove stale socket */
 	unlink(SG_MGMTD_SOCK);
@@ -2551,6 +3173,9 @@ int main(void)
 
 	/* Apply saved configuration to running system */
 	mgmtd_replay_config();
+
+	/* Store listen fd for forked children to close */
+	g_listen_fd = sfd;
 
 	/* Main accept loop */
 	while (g_running) {

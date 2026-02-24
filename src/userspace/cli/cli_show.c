@@ -387,6 +387,29 @@ void show_configure(void)
 	}
 }
 
+/* ── show firmware ────────────────────────────────────────────────────── */
+
+void show_firmware(void)
+{
+	struct ipc_response resp = {0};
+	if (ipc_available() &&
+	    ipc_send_str(SG_CMD_FW_STATUS, "", &resp) == 0 &&
+	    resp.status == SG_OK && resp.payload && resp.payload[0]) {
+		printf("%s", resp.payload);
+		ipc_resp_free(&resp);
+		return;
+	}
+	ipc_resp_free(&resp);
+
+	/* Fallback: compiled-in version */
+	printf("  === Firmware Status ===\n");
+#ifdef VERSION
+	printf("  Running version: %s\n", VERSION);
+#else
+	printf("  Running version: unknown\n");
+#endif
+}
+
 /* ── show config (modules + sysctl) ───────────────────────────────────── */
 
 void show_config(void)

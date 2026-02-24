@@ -76,6 +76,9 @@ cat << 'EOF'
 EOF
 echo "Kernel: $(uname -r) | Arch: $(uname -m)"
 
+# Write firmware version for runtime queries (substituted at build time)
+echo "@VERSION@" > /tmp/stargazer-fw-version
+
 # Ensure stargazer system group exists (used for socket + config file ACL)
 if ! grep -q '^stargazer:' /etc/group 2>/dev/null; then
 	# Find a free GID in system range
@@ -88,6 +91,23 @@ fi
 
 # Start services
 [ -x /etc/init.d/stargazer ] && /etc/init.d/stargazer start
+
+# Auto-configure network: bring up first available NIC with DHCP
+# (covers QEMU user-mode networking and real hardware with DHCP)
+_nic=""
+for _if in eth0 enp0s1 enp0s2; do
+	if [ -d "/sys/class/net/$_if" ]; then
+		_nic="$_if"
+		break
+	fi
+done
+if [ -n "$_nic" ]; then
+	ip link set "$_nic" up 2>/dev/null
+	if command -v udhcpc >/dev/null 2>&1; then
+		udhcpc -i "$_nic" -q -s /usr/share/udhcpc/default.script 2>/dev/null &
+		echo "[INIT] DHCP request sent on $_nic"
+	fi
+fi
 
 # Start management daemon (privilege separation)
 if [ -x /sbin/stargazer-mgmtd ]; then

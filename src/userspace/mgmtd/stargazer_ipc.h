@@ -88,6 +88,13 @@ typedef enum {
 	/* System operations (6xx) */
 	SG_CMD_SYS_POWEROFF  = 600,
 	SG_CMD_SYS_REBOOT    = 601,
+	SG_CMD_FW_UPGRADE    = 602,   /* Download + install firmware    */
+	SG_CMD_FW_STATUS     = 603,   /* Show firmware version/status   */
+	SG_CMD_FW_PROGRESS   = 604,   /* Poll firmware upgrade progress */
+	SG_CMD_NET_PING      = 605,   /* Network ping (ICMP echo)       */
+	SG_CMD_NET_TRACEROUTE = 606,  /* Network traceroute             */
+	SG_CMD_NET_NSLOOKUP  = 607,   /* DNS lookup                     */
+	SG_CMD_NET_ARPING    = 608,   /* ARP ping (L2 reachability)     */
 	SG_CMD_SHOW_STATUS   = 610,
 	SG_CMD_SHOW_IFACES   = 611,
 	SG_CMD_SHOW_ROUTES   = 612,

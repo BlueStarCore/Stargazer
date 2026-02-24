@@ -13,5 +13,6 @@ void show_interfaces(void);
 void show_routes(void);
 void show_configure(void);
 void show_config(void);
+void show_firmware(void);
 
 #endif /* CLI_SHOW_H */

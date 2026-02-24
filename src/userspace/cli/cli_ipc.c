@@ -57,6 +57,13 @@ static const char *cmd_name(uint32_t cmd)
 	case SG_CMD_ROLLBACK:       return "ROLLBACK";
 	case SG_CMD_SYS_POWEROFF:   return "SYS_POWEROFF";
 	case SG_CMD_SYS_REBOOT:     return "SYS_REBOOT";
+	case SG_CMD_FW_UPGRADE:     return "FW_UPGRADE";
+	case SG_CMD_FW_STATUS:      return "FW_STATUS";
+	case SG_CMD_FW_PROGRESS:    return "FW_PROGRESS";
+	case SG_CMD_NET_PING:       return "NET_PING";
+	case SG_CMD_NET_TRACEROUTE: return "NET_TRACEROUTE";
+	case SG_CMD_NET_NSLOOKUP:  return "NET_NSLOOKUP";
+	case SG_CMD_NET_ARPING:    return "NET_ARPING";
 	case SG_CMD_SHOW_STATUS:    return "SHOW_STATUS";
 	case SG_CMD_SHOW_IFACES:    return "SHOW_IFACES";
 	case SG_CMD_SHOW_ROUTES:    return "SHOW_ROUTES";

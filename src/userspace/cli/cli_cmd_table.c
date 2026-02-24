@@ -7,6 +7,7 @@
  */
 
 #define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE
 
 #include "cli_cmd_table.h"
 #include "cli_dispatch.h"
@@ -20,7 +21,9 @@
 #include "sg_validate.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* ── Thin handler wrappers ────────────────────────────────────────────── */
 
@@ -126,6 +129,158 @@ static int cmd_configure(const char *args, const char *permissions)
 	return 0;
 }
 
+static int cmd_show_firmware(const char *args, const char *permissions)
+{
+	(void)args;
+	(void)permissions;
+	show_firmware();
+	return 0;
+}
+
+/*
+ * Parse a key=value line from firmware progress state.
+ * Copies the value for 'key' into 'out' (max outsz bytes).
+ */
+static void fw_parse_val(const char *data, const char *key,
+			 char *out, size_t outsz)
+{
+	out[0] = '\0';
+	if (!data || !key || outsz == 0)
+		return;
+	size_t klen = strlen(key);
+	const char *p = data;
+	while ((p = strstr(p, key)) != NULL) {
+		/* Must be at start of line or start of string */
+		if (p != data && *(p - 1) != '\n') {
+			p += klen;
+			continue;
+		}
+		if (p[klen] != '=') {
+			p += klen;
+			continue;
+		}
+		const char *val = p + klen + 1;
+		const char *eol = strchr(val, '\n');
+		size_t vlen = eol ? (size_t)(eol - val) : strlen(val);
+		if (vlen >= outsz)
+			vlen = outsz - 1;
+		memcpy(out, val, vlen);
+		out[vlen] = '\0';
+		return;
+	}
+}
+
+static int cmd_fw_upgrade(const char *args, const char *permissions)
+{
+	(void)permissions;
+
+	/* Require a URL argument */
+	if (!args || !*args) {
+		printf("  Usage: execute firmware upgrade <url>\n");
+		printf("  Supported schemes: http://, https://, tftp://\n");
+		return 0;
+	}
+
+	/* Validate URL scheme */
+	if (strncmp(args, "http://", 7) != 0 &&
+	    strncmp(args, "https://", 8) != 0 &&
+	    strncmp(args, "tftp://", 7) != 0) {
+		printf("  Invalid URL: must start with http://, https://, or tftp://\n");
+		return 0;
+	}
+
+	/* Confirm with admin */
+	printf("  WARNING: This will download firmware, install it, and reboot the device.\n");
+	printf("  Do you want to continue? [y/N] ");
+	fflush(stdout);
+
+	char confirm[16] = {0};
+	if (!fgets(confirm, sizeof(confirm), stdin) ||
+	    (confirm[0] != 'y' && confirm[0] != 'Y')) {
+		printf("  Firmware upgrade cancelled.\n");
+		return 0;
+	}
+
+	/* Build payload and send IPC */
+	char payload[SG_PAYLOAD_MAX];
+	snprintf(payload, sizeof(payload), "url=%s\n", args);
+
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_FW_UPGRADE, payload, &resp) != 0) {
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+
+	if (resp.status != SG_OK) {
+		printf("  Firmware upgrade failed: %s\n",
+		       resp.extra[0] ? resp.extra : sg_status_str(resp.status));
+		ipc_resp_free(&resp);
+		return 0;
+	}
+	ipc_resp_free(&resp);
+
+	/* Poll for progress updates */
+	printf("\n  Starting firmware upgrade...\n\n");
+	fflush(stdout);
+
+	int last_step = -1;
+	for (int i = 0; i < 240; i++) {  /* 240 * 500ms = 120s timeout */
+		usleep(500000);
+
+		struct ipc_response pr;
+		if (ipc_send_str(SG_CMD_FW_PROGRESS, "", &pr) != 0) {
+			printf("  Connection lost — device may be rebooting.\n");
+			break;
+		}
+
+		if (pr.status != SG_OK || !pr.payload) {
+			ipc_resp_free(&pr);
+			continue;
+		}
+
+		char step_s[16], total_s[16], status[32], message[256];
+		fw_parse_val(pr.payload, "step", step_s, sizeof(step_s));
+		fw_parse_val(pr.payload, "total", total_s, sizeof(total_s));
+		fw_parse_val(pr.payload, "status", status, sizeof(status));
+		fw_parse_val(pr.payload, "message", message, sizeof(message));
+
+		int step = atoi(step_s);
+		int total = atoi(total_s);
+
+		if (step > last_step && message[0]) {
+			if (total > 0)
+				printf("  [%d/%d] %s\n", step, total, message);
+			else
+				printf("  %s\n", message);
+			fflush(stdout);
+			last_step = step;
+		}
+
+		if (strcmp(status, "done") == 0) {
+			printf("\n  System is rebooting now...\n");
+			ipc_resp_free(&pr);
+			break;
+		}
+		if (strcmp(status, "error") == 0) {
+			printf("\n  Firmware upgrade failed.\n");
+			ipc_resp_free(&pr);
+			break;
+		}
+		if (strcmp(status, "idle") == 0) {
+			/* Upgrade finished and state was already cleaned up */
+			ipc_resp_free(&pr);
+			break;
+		}
+
+		ipc_resp_free(&pr);
+	}
+
+	if (last_step < 0)
+		printf("  Timed out waiting for upgrade progress.\n");
+
+	return 0;
+}
+
 static int cmd_sys_shutdown(const char *args, const char *permissions)
 {
 	(void)args;
@@ -207,6 +362,168 @@ static int cmd_diag_test_cfg(const char *args, const char *permissions)
 	return 0;
 }
 
+static int cmd_ping(const char *args, const char *permissions)
+{
+	(void)permissions;
+
+	if (!args || !*args) {
+		printf("  Usage: execute ping <IPv4-address-or-hostname>\n");
+		return 0;
+	}
+
+	char payload[SG_PAYLOAD_MAX];
+	snprintf(payload, sizeof(payload), "target=%s\n", args);
+
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_NET_PING, payload, &resp) != 0) {
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+
+	if (resp.status != SG_OK) {
+		printf("  Ping failed: %s\n",
+		       resp.extra[0] ? resp.extra : sg_status_str(resp.status));
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	if (resp.payload && resp.payload_len > 0)
+		printf("%s", resp.payload);
+
+	ipc_resp_free(&resp);
+	return 0;
+}
+
+static int cmd_traceroute(const char *args, const char *permissions)
+{
+	(void)permissions;
+
+	if (!args || !*args) {
+		printf("  Usage: execute traceroute <IPv4-address-or-hostname>\n");
+		return 0;
+	}
+
+	char payload[SG_PAYLOAD_MAX];
+	snprintf(payload, sizeof(payload), "target=%s\n", args);
+
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_NET_TRACEROUTE, payload, &resp) != 0) {
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+
+	if (resp.status != SG_OK) {
+		printf("  Traceroute failed: %s\n",
+		       resp.extra[0] ? resp.extra : sg_status_str(resp.status));
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	if (resp.payload && resp.payload_len > 0)
+		printf("%s", resp.payload);
+
+	ipc_resp_free(&resp);
+	return 0;
+}
+
+static int cmd_nslookup(const char *args, const char *permissions)
+{
+	(void)permissions;
+
+	if (!args || !*args) {
+		printf("  Usage: execute nslookup <hostname-or-IP>\n");
+		return 0;
+	}
+
+	char payload[SG_PAYLOAD_MAX];
+	snprintf(payload, sizeof(payload), "target=%s\n", args);
+
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_NET_NSLOOKUP, payload, &resp) != 0) {
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+
+	if (resp.status != SG_OK) {
+		printf("  Nslookup failed: %s\n",
+		       resp.extra[0] ? resp.extra : sg_status_str(resp.status));
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	if (resp.payload && resp.payload_len > 0)
+		printf("%s", resp.payload);
+
+	ipc_resp_free(&resp);
+	return 0;
+}
+
+static int cmd_arping(const char *args, const char *permissions)
+{
+	(void)permissions;
+
+	if (!args || !*args) {
+		printf("  Usage: execute arping <IPv4-address> [interface]\n");
+		return 0;
+	}
+
+	/* Parse: first word = target, optional second word = interface */
+	char target[256], iface[64];
+	target[0] = '\0';
+	iface[0] = '\0';
+
+	const char *p = args;
+	while (*p == ' ')
+		p++;
+	const char *end = p;
+	while (*end && *end != ' ')
+		end++;
+	size_t tlen = (size_t)(end - p);
+	if (tlen >= sizeof(target))
+		tlen = sizeof(target) - 1;
+	memcpy(target, p, tlen);
+	target[tlen] = '\0';
+
+	if (*end) {
+		p = end + 1;
+		while (*p == ' ')
+			p++;
+		if (*p) {
+			snprintf(iface, sizeof(iface), "%s", p);
+			/* Trim trailing spaces */
+			size_t ilen = strlen(iface);
+			while (ilen > 0 && iface[ilen - 1] == ' ')
+				iface[--ilen] = '\0';
+		}
+	}
+
+	char payload[SG_PAYLOAD_MAX];
+	if (iface[0])
+		snprintf(payload, sizeof(payload),
+			 "target=%s\niface=%s\n", target, iface);
+	else
+		snprintf(payload, sizeof(payload), "target=%s\n", target);
+
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_NET_ARPING, payload, &resp) != 0) {
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+
+	if (resp.status != SG_OK) {
+		printf("  Arping failed: %s\n",
+		       resp.extra[0] ? resp.extra : sg_status_str(resp.status));
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	if (resp.payload && resp.payload_len > 0)
+		printf("%s", resp.payload);
+
+	ipc_resp_free(&resp);
+	return 0;
+}
+
 /* ── Command table ────────────────────────────────────────────────────── */
 
 static const cmd_entry_t cmd_table[] = {
@@ -223,6 +540,7 @@ static const cmd_entry_t cmd_table[] = {
 	{"show routes",                            "Routing table",                           "monitor",        cmd_show_routes},
 	{"show configure",                         "Running configuration (FortiGate-style)", "monitor",        cmd_show_configure},
 	{"show config",                            "Current configuration",                   "monitor",        cmd_show_config},
+	{"show firmware",                          "Firmware version and status",             "monitor",        cmd_show_firmware},
 
 	{"configure",                              "Configure firewall",                      "configure,admin", cmd_configure},
 	{"configure commit",                       "Save a configuration revision",           "configure",      NULL},
@@ -232,6 +550,14 @@ static const cmd_entry_t cmd_table[] = {
 	{"execute system",                         "System management commands",              "admin",          NULL},
 	{"execute system shutdown",                "Shut down the system",                    "admin",          cmd_sys_shutdown},
 	{"execute system reboot",                  "Reboot the system",                       "admin",          cmd_sys_reboot},
+
+	{"execute firmware",                       "Firmware management",                     "admin",          NULL},
+	{"execute firmware upgrade",               "Upgrade firmware from URL",               "admin",          cmd_fw_upgrade},
+
+	{"execute ping",                           "Ping a host (ICMP echo request)",         "monitor",        cmd_ping},
+	{"execute traceroute",                     "Trace route to a host",                   "monitor",        cmd_traceroute},
+	{"execute nslookup",                       "DNS lookup for a host or IP",             "monitor",        cmd_nslookup},
+	{"execute arping",                         "ARP ping a host on local network",        "monitor",        cmd_arping},
 
 	{"execute debug",                          "Runtime debug control",                   "admin",          cmd_debug_status},
 	{"execute debug enable",                   "Enable debug output",                     "admin",          cmd_debug_enable},
