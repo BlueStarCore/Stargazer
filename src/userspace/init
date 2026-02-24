@@ -168,34 +168,9 @@ chmod +x /sbin/service /sbin/poweroff /sbin/reboot
 cp /sbin/poweroff /sbin/halt
 cp /sbin/poweroff /sbin/shutdown
 
-# Check for test mode (boot parameter: test_mode=1)
-_cmdline=$(cat /proc/cmdline 2>/dev/null)
-echo "[INIT] cmdline: ${_cmdline}"
-if echo "${_cmdline}" | grep -q "test_mode=1" || [ -f /.test_mode ]; then
-	echo "[INIT] TEST MODE ENABLED"
-	if [ -f /usr/libexec/stargazer/test_suite.sh ]; then
-		echo "[INIT] Running test suite..."
-		# Run test suite and capture output
-		sh /usr/libexec/stargazer/test_suite.sh 2>&1 | tee /tmp/test_output.log
-		echo "[INIT] Test suite completed."
-		if [ -f /tmp/stargazer_bugs.json ]; then
-			cp /tmp/stargazer_bugs.json /tmp/TEST_RESULTS.json
-			echo "[INIT] Bug report saved to /tmp/TEST_RESULTS.json"
-		fi
-		# Flush output and sync filesystem
-		sleep 2
-		sync
-	else
-		echo "[INIT] ERROR: Test suite not found at /usr/libexec/stargazer/test_suite.sh"
-	fi
-	# After tests, loop forever to keep init alive
-	echo "[INIT] Tests completed. System stable. Ready for external poweroff."
-	while true; do sleep 3600; done
-else
-	# Login loop (normal mode)
-	# -c: set stdin as controlling terminal so Ctrl+C generates SIGINT
-	echo "[INIT] Ready."
-	while true; do
-		setsid -c /sbin/stargazer-login </dev/console >/dev/console 2>&1 || sleep 2
-	done
-fi
+# Login loop
+# -c: set stdin as controlling terminal so Ctrl+C generates SIGINT
+echo "[INIT] Ready."
+while true; do
+	setsid -c /sbin/stargazer-login </dev/console >/dev/console 2>&1 || sleep 2
+done

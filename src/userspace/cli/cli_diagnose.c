@@ -228,7 +228,10 @@ static void diag_self_test(const char *permissions)
 	 */
 	diag_test("CFG_SET write config (firewall_address:__diag_test)",
 		  SG_CMD_CFG_SET,
-		  "firewall_address:__diag_test\nsubnet=10.0.0.0/8\n",
+		  "firewall_address:__diag_test\n"
+		  "name=__diag_test\n"
+		  "subnet=10.0.0.0/8\n"
+		  "type=ipmask\n",
 		  is_cfg || is_adm);
 	diag_test("CFG_DEL delete config (firewall_address:__diag_test)",
 		  SG_CMD_CFG_DEL,
@@ -465,15 +468,12 @@ static void diag_security_tests(void)
 			 SG_CMD_CFG_SET,
 			 "firewall_address:__diag_test\n",
 			 SG_ERR_INVALID_ARG);
-	/* CFG_SET with value but no key= — mgmtd stores as-is */
-	diag_test_status("CFG_SET value with no key= (stored as-is)",
+	/* CFG_SET with value but no key= — server-side validation
+	 * rejects because required fields are missing */
+	diag_test_status("CFG_SET value with no key= (rejected)",
 			 SG_CMD_CFG_SET,
 			 "firewall_address:__diag_test\njust_a_value\n",
-			 SG_OK);
-	/* Clean up the entry we just created */
-	ipc_send_str(SG_CMD_CFG_DEL,
-		     "firewall_address:__diag_test", &resp);
-	ipc_resp_free(&resp);
+			 SG_ERR_MISSING_ARG);
 
 	/* ── SEC-7: Invalid command opcode ────────────────────────────── */
 
@@ -497,7 +497,9 @@ static void diag_security_tests(void)
 	diag_test_status("CFG_SET system_admin (admin can do this)",
 			 SG_CMD_CFG_SET,
 			 "system_admin:__diag_esc\n"
-			 "profile=read-write\n",
+			 "profile=read-write\n"
+			 "enforce-change-password=enable\n"
+			 "enforce-password-policy=enable\n",
 			 SG_OK);
 
 	/* Verify the entry was created */
@@ -528,7 +530,7 @@ static void diag_security_tests(void)
 			 SG_CMD_CFG_SET,
 			 "system_admin-profile:__diag_evil\n"
 			 "permissions=monitor,configure,admin\n"
-			 "builtin=no\n",
+			 "description=evil-test\n",
 			 SG_OK);
 
 	/* Verify evil profile exists */
@@ -681,6 +683,9 @@ static void diag_security_tests(void)
 		/* Test 4: Near-max payload (~4000 bytes) to CFG_SET */
 		{
 			const char *hdr = "firewall_address:__diag_long\n"
+					  "name=__diag_long\n"
+					  "subnet=10.0.0.0/8\n"
+					  "type=ipmask\n"
 					  "comment=";
 			size_t hdr_len = strlen(hdr);
 			size_t fill = 4000 - hdr_len - 1; /* -1 for trailing \n */
@@ -938,7 +943,10 @@ static void diag_full_test(void)
 	 *    CFG_DEL payload: "type:id" */
 	diag_test("CFG_SET firewall_address:__diag_test (admin write)",
 		  SG_CMD_CFG_SET,
-		  "firewall_address:__diag_test\nsubnet=10.0.0.0/8\n", 1);
+		  "firewall_address:__diag_test\n"
+		  "name=__diag_test\n"
+		  "subnet=10.0.0.0/8\n"
+		  "type=ipmask\n", 1);
 	diag_test("CFG_DEL firewall_address:__diag_test (admin delete)",
 		  SG_CMD_CFG_DEL,
 		  "firewall_address:__diag_test", 1);

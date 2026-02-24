@@ -378,10 +378,6 @@ $(ROOTFS_DIR)/.stamp: modules busybox dash logind mgmtd cli
 	@cp $(USERSPACE_DIR)/usr/share/udhcpc/default.script $(ROOTFS_DIR)/usr/share/udhcpc/
 	@chmod +x $(ROOTFS_DIR)/usr/share/udhcpc/default.script
 
-	# Copy automated test suite (for test_mode=1 boots)
-	@cp $(PROJECT_ROOT)/tests/test_suite.sh $(ROOTFS_DIR)/usr/libexec/stargazer/test_suite.sh
-	@chmod +x $(ROOTFS_DIR)/usr/libexec/stargazer/test_suite.sh
-
 	# Create stargazer config directory (mgmtd seeds defaults on first boot)
 	@mkdir -p $(ROOTFS_DIR)/etc/stargazer
 

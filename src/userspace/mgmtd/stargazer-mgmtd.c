@@ -1648,6 +1648,121 @@ static void fw_write_state(int step, int total, const char *status,
 	rename(FW_STATE_FILE_TMP, FW_STATE_FILE);
 }
 
+/* ── Server-side key=value validation for CFG_SET ──────────────────────── */
+
+/*
+ * Validate key=value data against the config type registry before writing
+ * to the database.  Checks:
+ *   1. Every key is known for the type (reject unknown keys)
+ *   2. Every value passes sg_reg_validate_value()
+ *   3. All required keys are present
+ *
+ * Returns SG_OK on success, or an error status with a human-readable
+ * message written to errbuf.
+ */
+static sg_status_t validate_cfg_data(const char *type, const char *data,
+				     char *errbuf, size_t errsz)
+{
+	errbuf[0] = '\0';
+
+	/* --- check each key=value line -------------------------------- */
+	const char *p = data;
+	while (*p) {
+		if (*p == '\n') { p++; continue; }
+
+		const char *eol = strchr(p, '\n');
+		size_t llen = eol ? (size_t)(eol - p) : strlen(p);
+
+		const char *eq = memchr(p, '=', llen);
+		if (eq) {
+			size_t klen = (size_t)(eq - p);
+			if (klen > 63) klen = 63;
+			char key[64];
+			memcpy(key, p, klen);
+			key[klen] = '\0';
+
+			const char *vstart = eq + 1;
+			size_t vlen = llen - (size_t)(eq - p) - 1;
+			if (vlen > 511) vlen = 511;
+			char val[512];
+			memcpy(val, vstart, vlen);
+			val[vlen] = '\0';
+
+			/* 1. reject unknown keys */
+			if (!sg_reg_is_valid_key(type, key)) {
+				snprintf(errbuf, errsz,
+					 "Unknown key '%s'", key);
+				return SG_ERR_INVALID_ARG;
+			}
+
+			/* 2. validate value format */
+			if (!sg_reg_validate_value(type, key, val)) {
+				const char *rule =
+					sg_reg_value_rule(type, key);
+				char t_rule[128];
+				snprintf(t_rule, sizeof(t_rule), "%s",
+					 rule ? rule : "bad value");
+				snprintf(errbuf, errsz,
+					 "Invalid value for '%s': %s",
+					 key, t_rule);
+				return SG_ERR_INVALID_VAL;
+			}
+		}
+
+		p += llen;
+		if (eol) p++;
+	}
+
+	/* --- check required keys are present -------------------------- */
+	const char *req = sg_reg_required_keys(type);
+	if (req && *req) {
+		char reqbuf[512];
+		snprintf(reqbuf, sizeof(reqbuf), "%s", req);
+		char *tok = reqbuf;
+
+		while (*tok) {
+			while (*tok == ' ') tok++;
+			if (!*tok) break;
+
+			char *end = tok;
+			while (*end && *end != ' ') end++;
+			char saved = *end;
+			*end = '\0';
+
+			/* search data for "key=" */
+			int found = 0;
+			const char *s = data;
+			size_t tlen = strlen(tok);
+			while (*s) {
+				if (*s == '\n') { s++; continue; }
+				const char *el = strchr(s, '\n');
+				size_t ll = el ? (size_t)(el - s) : strlen(s);
+				if (ll > tlen &&
+				    memcmp(s, tok, tlen) == 0 &&
+				    s[tlen] == '=') {
+					found = 1;
+					break;
+				}
+				s += ll;
+				if (el) s++;
+			}
+
+			if (!found) {
+				snprintf(errbuf, errsz,
+					 "Missing required field '%.60s'",
+					 tok);
+				*end = saved;
+				return SG_ERR_MISSING_ARG;
+			}
+
+			*end = saved;
+			tok = end;
+		}
+	}
+
+	return SG_OK;
+}
+
 /* ── Request handler ────────────────────────────────────────────────────── */
 
 static void handle_request(int client_fd, sg_request_hdr_t *hdr,
@@ -1778,6 +1893,18 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		}
 		if (!sg_reg_validate_entry_id(db_type, db_id)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid entry ID");
+			return;
+		}
+
+		/* Validate key names, values, and required fields */
+		char val_err[SG_EXTRA_MAX];
+		sg_status_t val_st = validate_cfg_data(db_type, data,
+						       val_err, sizeof(val_err));
+		if (val_st != SG_OK) {
+			if (g_debug_flags & SG_DBG_FLAG_MGMTD)
+				debug_buf_push("[MGMTD-DBG] cfg_set rejected: %s\n",
+					       val_err);
+			send_error(client_fd, val_st, val_err);
 			return;
 		}
 

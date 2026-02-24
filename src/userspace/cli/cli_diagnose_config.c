@@ -1906,6 +1906,7 @@ static void test_ipc_refguard(void)
 			    "dstintf=any\n"
 			    "action=deny\n"
 			    "service=all\n"
+			    "schedule=all\n"
 			    "status=enable\n",
 			    &resp);
 	if (conn == 0 && resp.status == SG_OK) {
@@ -2059,7 +2060,6 @@ static void test_ipc_cfg_nat_roundtrip(void)
 	tc_total++;
 	conn = ipc_send_str(SG_CMD_CFG_SET,
 			    "network_nat:__diag_nattest\n"
-			    "name=__diag_nattest\n"
 			    "type=dnat\n"
 			    "srcaddr=any\n"
 			    "dstaddr=10.0.0.0/24\n"
@@ -2067,6 +2067,7 @@ static void test_ipc_cfg_nat_roundtrip(void)
 			    "dstport=443\n"
 			    "mapped-port=8443\n"
 			    "srcintf=any\n"
+			    "dstintf=any\n"
 			    "status=enable\n",
 			    &resp);
 	if (conn == 0 && resp.status == SG_OK) {
@@ -2136,6 +2137,221 @@ static void test_ipc_entry_id_enforcement(void)
 		  SG_CMD_CFG_SET,
 		  "firewall_service:a;rm\nname=test\nprotocol=tcp\n",
 		  SG_ERR_INVALID_ARG);
+}
+
+/* ── Section 32: IPC server-side CFG_SET data validation (full mode) ── */
+
+static void test_ipc_cfg_set_validation(void)
+{
+	struct ipc_response resp;
+	int conn;
+
+	printf(C_CYAN "\n  --- IPC: CFG_SET server-side data validation ---"
+	       C_NC "\n");
+
+	/*
+	 * 1. Unknown key — mgmtd must reject keys not in the field_table.
+	 *    "bogus_field" is not a valid key for firewall_address.
+	 */
+	ipc_check("reject unknown key 'bogus_field'",
+		  SG_CMD_CFG_SET,
+		  "firewall_address:__diag_valtest\n"
+		  "name=__diag_valtest\n"
+		  "subnet=10.0.0.0/8\n"
+		  "type=ipmask\n"
+		  "bogus_field=injected\n",
+		  SG_ERR_INVALID_ARG);
+
+	/*
+	 * 2. Bad CIDR value — subnet field requires valid CIDR notation.
+	 */
+	ipc_check("reject invalid CIDR 'not-a-cidr'",
+		  SG_CMD_CFG_SET,
+		  "firewall_address:__diag_valtest\n"
+		  "name=__diag_valtest\n"
+		  "subnet=not-a-cidr\n"
+		  "type=ipmask\n",
+		  SG_ERR_INVALID_VAL);
+
+	/*
+	 * 3. Bad enum value — type field must be one of ipmask,iprange,fqdn.
+	 */
+	ipc_check("reject invalid enum 'badtype'",
+		  SG_CMD_CFG_SET,
+		  "firewall_address:__diag_valtest\n"
+		  "name=__diag_valtest\n"
+		  "subnet=10.0.0.0/8\n"
+		  "type=badtype\n",
+		  SG_ERR_INVALID_VAL);
+
+	/*
+	 * 4. Missing required field — firewall_address requires name, subnet, type.
+	 *    Omit 'subnet' to trigger MISSING_ARG.
+	 */
+	ipc_check("reject missing required field 'subnet'",
+		  SG_CMD_CFG_SET,
+		  "firewall_address:__diag_valtest\n"
+		  "name=__diag_valtest\n"
+		  "type=ipmask\n",
+		  SG_ERR_MISSING_ARG);
+
+	/*
+	 * 5. Bad IPv4 value — network_route_static gateway must be valid IPv4.
+	 */
+	ipc_check("reject invalid IPv4 gateway '999.999.999.999'",
+		  SG_CMD_CFG_SET,
+		  "network_route_static:__diag_valtest\n"
+		  "dst=10.0.0.0/8\n"
+		  "gateway=999.999.999.999\n"
+		  "device=eth0\n"
+		  "distance=10\n"
+		  "status=enable\n",
+		  SG_ERR_INVALID_VAL);
+
+	/*
+	 * 6. Bad uint range — distance must be 1-255.
+	 */
+	ipc_check("reject out-of-range uint distance=999",
+		  SG_CMD_CFG_SET,
+		  "network_route_static:__diag_valtest\n"
+		  "dst=10.0.0.0/8\n"
+		  "gateway=10.0.0.1\n"
+		  "device=eth0\n"
+		  "distance=999\n"
+		  "status=enable\n",
+		  SG_ERR_INVALID_VAL);
+
+	/*
+	 * 7. Bad uint value — distance with non-numeric string.
+	 */
+	ipc_check("reject non-numeric uint distance=abc",
+		  SG_CMD_CFG_SET,
+		  "network_route_static:__diag_valtest\n"
+		  "dst=10.0.0.0/8\n"
+		  "gateway=10.0.0.1\n"
+		  "device=eth0\n"
+		  "distance=abc\n"
+		  "status=enable\n",
+		  SG_ERR_INVALID_VAL);
+
+	/*
+	 * 8. Bad safe-id value — name field with shell metacharacters.
+	 */
+	ipc_check("reject unsafe safe-id name='$(rm -rf /)'",
+		  SG_CMD_CFG_SET,
+		  "firewall_address:__diag_valtest\n"
+		  "name=$(rm -rf /)\n"
+		  "subnet=10.0.0.0/8\n"
+		  "type=ipmask\n",
+		  SG_ERR_INVALID_VAL);
+
+	/*
+	 * 9. Bad port-or-range — firewall_service port-range must be valid.
+	 */
+	ipc_check("reject invalid port-range 'abc'",
+		  SG_CMD_CFG_SET,
+		  "firewall_service:__diag_valtest\n"
+		  "name=__diag_valtest\n"
+		  "protocol=tcp\n"
+		  "port-range=abc\n",
+		  SG_ERR_INVALID_VAL);
+
+	/*
+	 * 10. Bad permissions-csv — admin-profile permissions must be valid.
+	 */
+	ipc_check("reject invalid permissions-csv 'root,sudo'",
+		  SG_CMD_CFG_SET,
+		  "system_admin-profile:__diag_valtest\n"
+		  "permissions=root,sudo\n",
+		  SG_ERR_INVALID_VAL);
+
+	/*
+	 * 11. Positive test — valid payload must be accepted.
+	 *     Create, verify, then clean up.
+	 */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_SET,
+			    "firewall_address:__diag_valtest\n"
+			    "name=__diag_valtest\n"
+			    "subnet=10.0.0.0/8\n"
+			    "type=ipmask\n",
+			    &resp);
+	if (conn == 0 && resp.status == SG_OK) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [IPC/200] valid payload accepted\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [IPC/200] valid payload rejected (status=%u",
+		       conn < 0 ? 999 : resp.status);
+		if (resp.extra[0])
+			printf(": %s", resp.extra);
+		printf(")\n");
+	}
+	ipc_resp_free(&resp);
+
+	/* Verify it was actually persisted */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_GET,
+			    "firewall_address:__diag_valtest", &resp);
+	if (conn == 0 && resp.status == SG_OK && resp.payload &&
+	    strstr(resp.payload, "subnet=10.0.0.0/8")) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [IPC/100] valid entry persisted to DB\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [IPC/100] valid entry not in DB (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+	}
+	ipc_resp_free(&resp);
+
+	/*
+	 * 12. Verify rejected payloads were NOT persisted.
+	 *     The unknown-key test used __diag_valtest — the valid test
+	 *     above overwrote it with good data.  Send a bad payload now
+	 *     and confirm the DB still has the old valid data.
+	 */
+	(void)ipc_send_str(SG_CMD_CFG_SET,
+			   "firewall_address:__diag_valtest\n"
+			   "name=__diag_valtest\n"
+			   "subnet=GARBAGE\n"
+			   "type=ipmask\n",
+			   &resp);
+	ipc_resp_free(&resp);
+
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_GET,
+			    "firewall_address:__diag_valtest", &resp);
+	if (conn == 0 && resp.status == SG_OK && resp.payload &&
+	    strstr(resp.payload, "subnet=10.0.0.0/8") &&
+	    !strstr(resp.payload, "GARBAGE")) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [IPC/100] rejected data not persisted"
+		       " (DB unchanged)\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [IPC/100] rejected data leaked into DB\n");
+	}
+	ipc_resp_free(&resp);
+
+	/* Cleanup */
+	ipc_send_str(SG_CMD_CFG_DEL,
+		     "firewall_address:__diag_valtest", &resp);
+	ipc_resp_free(&resp);
+	ipc_send_str(SG_CMD_CFG_DEL,
+		     "network_route_static:__diag_valtest", &resp);
+	ipc_resp_free(&resp);
+	ipc_send_str(SG_CMD_CFG_DEL,
+		     "firewall_service:__diag_valtest", &resp);
+	ipc_resp_free(&resp);
+	ipc_send_str(SG_CMD_CFG_DEL,
+		     "system_admin-profile:__diag_valtest", &resp);
+	ipc_resp_free(&resp);
 }
 
 /* ── Cleanup helper ───────────────────────────────────────────────────── */
@@ -2231,6 +2447,7 @@ int cli_diagnose_test_configure(int mode)
 			test_ipc_cfg_service_roundtrip();
 			test_ipc_cfg_nat_roundtrip();
 			test_ipc_entry_id_enforcement();
+			test_ipc_cfg_set_validation();
 			cleanup_test_entries();
 		}
 	}
