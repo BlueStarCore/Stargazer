@@ -108,7 +108,8 @@ static void mem_persist(void)
 	for (int i = 0; i < mem_count; i++)
 		fprintf(fp, "%s=%s\n", mem_state[i].key, mem_state[i].val);
 	fclose(fp);
-	rename(tmppath, DEBUG_STATE_FILE);
+	if (rename(tmppath, DEBUG_STATE_FILE) != 0)
+		unlink(tmppath);
 }
 
 /* ── Public API ───────────────────────────────────────────────────────── */

@@ -178,9 +178,9 @@ int ipc_send(uint32_t cmd, const char *payload, size_t payload_len,
 	/* Pass debug flags to mgmtd so it knows to buffer traces */
 	if (dbg_enabled()) {
 		if (strcmp(dbg_get("mgmtd_debug", "0"), "1") == 0)
-			hdr.debug_flags |= 0x01;
+			hdr.debug_flags |= SG_DBG_FLAG_MGMTD;
 		if (strcmp(dbg_get("auth_admin", "0"), "1") == 0)
-			hdr.debug_flags |= 0x02;
+			hdr.debug_flags |= SG_DBG_FLAG_AUTH;
 	}
 
 	if (safe_write(fd, &hdr, sizeof(hdr)) < 0)
@@ -217,7 +217,7 @@ int ipc_send(uint32_t cmd, const char *payload, size_t payload_len,
 			goto out;
 
 		n = safe_read(fd, resp->payload, rhdr.payload_len);
-		if (n < 0) {
+		if (n < (ssize_t)rhdr.payload_len) {
 			free(resp->payload);
 			resp->payload = NULL;
 			goto out;

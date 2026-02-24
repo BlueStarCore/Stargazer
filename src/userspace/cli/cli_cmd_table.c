@@ -96,17 +96,20 @@ static int cmd_show_config(const char *args, const char *permissions)
 	return 0;
 }
 
+#define CMD_MAX_ARGS     32  /* max tokens in configure argument list */
+#define CMD_MAX_SHOWN    64  /* max subcommands in auto-usage output  */
+
 static int cmd_configure(const char *args, const char *permissions)
 {
 	(void)permissions;
-	const char *argv[32];
+	const char *argv[CMD_MAX_ARGS];
 	int argc = 0;
 	char args_copy[CLI_MAX_LINE];
 
 	if (args && args[0]) {
 		snprintf(args_copy, sizeof(args_copy), "%s", args);
 		char *tok = args_copy;
-		while (*tok && argc < 31) {
+		while (*tok && argc < CMD_MAX_ARGS - 1) {
 			while (*tok == ' ')
 				tok++;
 			if (!*tok)
@@ -387,7 +390,7 @@ int cmd_dispatch(const char *resolved, const char *permissions)
 	int found_prefix = 0;
 
 	/* Collect direct child subcommands (one level deeper) */
-	const char *shown[64];
+	const char *shown[CMD_MAX_SHOWN];
 	int nshown = 0;
 
 	for (int i = 0; cmd_table[i].path; i++) {
@@ -440,7 +443,7 @@ int cmd_dispatch(const char *resolved, const char *permissions)
 
 		printf("    %-20.*s %s\n", (int)clen, child, desc);
 
-		if (nshown < 63)
+		if (nshown < CMD_MAX_SHOWN - 1)
 			shown[nshown++] = child;
 	}
 

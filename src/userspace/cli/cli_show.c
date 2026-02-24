@@ -105,7 +105,7 @@ static void show_ipc_or_fallback(uint32_t cmd, const char *payload_str,
 				 const char *header,
 				 const char *const fallback_argv[])
 {
-	struct ipc_response resp;
+	struct ipc_response resp = {0};
 	if (ipc_available() &&
 	    ipc_send_str(cmd, payload_str, &resp) == 0 &&
 	    resp.status == SG_OK && resp.payload && resp.payload[0]) {
@@ -133,7 +133,7 @@ static void show_ipc_or_fallback(uint32_t cmd, const char *payload_str,
 
 void show_status(void)
 {
-	struct ipc_response resp;
+	struct ipc_response resp = {0};
 	if (ipc_available() &&
 	    ipc_send_str(SG_CMD_SHOW_STATUS, "", &resp) == 0 &&
 	    resp.status == SG_OK && resp.payload && resp.payload[0]) {
@@ -189,7 +189,7 @@ void show_stats(void)
 {
 	printf("  === Packet Statistics ===\n");
 
-	struct ipc_response resp;
+	struct ipc_response resp = {0};
 	if (ipc_available() &&
 	    ipc_send_str(SG_CMD_SHOW_STATS, "", &resp) == 0 &&
 	    resp.status == SG_OK && resp.payload && resp.payload[0]) {
@@ -257,7 +257,7 @@ void show_configure(void)
 
 		if (mode == CFG_TABLE) {
 			/* Get list of IDs */
-			struct ipc_response lresp;
+			struct ipc_response lresp = {0};
 			if (!ipc_available() ||
 			    ipc_send_str(SG_CMD_CFG_LIST, type, &lresp) != 0 ||
 			    lresp.status != SG_OK || !lresp.payload ||
@@ -336,7 +336,7 @@ void show_configure(void)
 			ipc_resp_free(&lresp);
 		} else {
 			/* CFG_SINGLE — id is implicitly "0" */
-			struct ipc_response gresp;
+			struct ipc_response gresp = {0};
 			char section[256];
 			snprintf(section, sizeof(section), "%s", type);
 			if (!ipc_available() ||

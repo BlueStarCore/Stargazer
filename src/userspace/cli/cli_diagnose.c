@@ -638,11 +638,11 @@ static void diag_security_tests(void)
 	diag_test_status("CFG_APPLY shell chars in type field",
 			 SG_CMD_CFG_APPLY,
 			 "$(reboot)\n0\nx=1\n",
-			 SG_OK);
-	diag_test_status("CFG_APPLY unknown type (no runtime handler)",
+			 SG_ERR_INVALID_ARG);
+	diag_test_status("CFG_APPLY unknown type (rejected by registry)",
 			 SG_CMD_CFG_APPLY,
 			 "bogus_type\ntest\nx=1\n",
-			 SG_OK);
+			 SG_ERR_INVALID_ARG);
 	diag_test_status("CFG_APPLY valid apply (hostname, idempotent)",
 			 SG_CMD_CFG_APPLY,
 			 "system_settings\n0\nhostname=stargazer\n",
@@ -662,7 +662,7 @@ static void diag_security_tests(void)
 		buf[256] = '\0';
 		diag_test_status("ADMIN_DELETE long username (256 chars)",
 				 SG_CMD_ADMIN_DELETE, buf,
-				 SG_ERR_USER_NOT_FOUND);
+				 SG_ERR_INVALID_ARG);
 
 		/* Test 2: Username at SG_USERNAME_MAX (64 chars) to SESSION_REV */
 		memset(buf, 'a', SG_USERNAME_MAX);
@@ -676,7 +676,7 @@ static void diag_security_tests(void)
 		buf[256] = '\0';
 		diag_test_status("CFG_GET long type (256 chars)",
 				 SG_CMD_CFG_GET, buf,
-				 SG_ERR_ENTRY_NOT_FOUND);
+				 SG_ERR_INVALID_ARG);
 
 		/* Test 4: Near-max payload (~4000 bytes) to CFG_SET */
 		{

@@ -111,6 +111,10 @@ typedef enum {
 #define SG_USERNAME_MAX  64
 #define SG_EXTRA_MAX     256
 
+/* Debug flag bits in sg_request_hdr_t.debug_flags */
+#define SG_DBG_FLAG_MGMTD  0x01  /* Enable mgmtd request/response tracing */
+#define SG_DBG_FLAG_AUTH    0x02  /* Enable auth operation tracing         */
+
 /*
  * Request: CLI → mgmtd
  *
@@ -120,7 +124,7 @@ typedef enum {
 typedef struct {
 	uint16_t  magic;                     /* SG_MSG_MAGIC               */
 	uint8_t   version;                   /* SG_MSG_VERSION             */
-	uint8_t   debug_flags;               /* bit0=mgmtd bit1=auth       */
+	uint8_t   debug_flags;               /* SG_DBG_FLAG_* bits         */
 	uint32_t  cmd;                       /* sg_cmd_t                   */
 	char      username[SG_USERNAME_MAX]; /* authenticated user         */
 	uint32_t  payload_len;               /* length of payload data     */

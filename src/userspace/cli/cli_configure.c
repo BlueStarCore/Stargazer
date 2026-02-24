@@ -228,7 +228,18 @@ static int read_password(const char *prompt, char *buf, size_t buf_sz)
 	printf("%s", prompt);
 	fflush(stdout);
 
-	tcgetattr(tty, &old);
+	if (tcgetattr(tty, &old) != 0) {
+		/* Can't control echo — fall back to visible read */
+		if (fgets(buf, (int)buf_sz, stdin)) {
+			size_t len = strlen(buf);
+			if (len > 0 && buf[len - 1] == '\n')
+				buf[--len] = '\0';
+			if (tty != STDIN_FILENO) close(tty);
+			return (int)len;
+		}
+		if (tty != STDIN_FILENO) close(tty);
+		return 0;
+	}
 	noecho = old;
 	noecho.c_lflag &= ~(tcflag_t)ECHO;
 	noecho.c_lflag |= ICANON;
@@ -614,7 +625,7 @@ static int apply_config(const char *type_name, const char *id,
 	char payload[4096];
 	int hdr_len = snprintf(payload, sizeof(payload), "%s\n%s\n",
 			       type_name, id);
-	if (hdr_len < 0) return -1;
+	if (hdr_len < 0 || (size_t)hdr_len >= sizeof(payload)) return -1;
 
 	char data[2048];
 	kv_serialize(b, data, sizeof(data));
@@ -675,10 +686,12 @@ static int handle_password(const char *entry_id, struct kv_buf *b)
 			else
 				printf("  Error: password does not meet policy\n");
 			ipc_resp_free(&resp);
+			explicit_bzero(policy_payload, sizeof(policy_payload));
 			return -1;
 		}
 		ipc_resp_free(&resp);
 	}
+	explicit_bzero(policy_payload, sizeof(policy_payload));
 
 	read_password("  Retype password: ", pw2, sizeof(pw2));
 
@@ -1041,18 +1054,31 @@ static int context_entry(const char *type_name, const char *label,
 					memcpy(payload + hdr_len, serial,
 					       strlen(serial) + 1);
 					struct ipc_response sresp;
-					ipc_send(SG_CMD_CFG_SET, payload,
-						 total, &sresp);
+					int rc = ipc_send(SG_CMD_CFG_SET,
+						payload, total, &sresp);
+					if (rc != 0 ||
+					    sresp.status != SG_OK) {
+						printf("  WARNING: applied"
+						       " but failed to"
+						       " save config.\n");
+						if (sresp.extra[0])
+							printf("  %s\n",
+							       sresp.extra);
+					}
 					if (cfg_dbg())
 						fprintf(stderr,
 							"[CFG-DBG]"
 							" persist:"
 							" %s\n",
-							sresp.status
-							== SG_OK
+							(rc == 0 &&
+							 sresp.status
+							 == SG_OK)
 							? "OK"
 							: "FAILED");
 					ipc_resp_free(&sresp);
+				} else {
+					printf("  WARNING: config too"
+					       " large to save.\n");
 				}
 			}
 			if (strcmp(cmd, "end") == 0 && exit_all)
@@ -1070,6 +1096,10 @@ static int context_entry(const char *type_name, const char *label,
 			printf("  Unknown command: %s (try '?')\n", cmd);
 		}
 	}
+
+	/* Clear any sensitive data (passwords) from memory */
+	if (strcmp(type_name, "system_admin") == 0)
+		explicit_bzero(&data, sizeof(data));
 
 	if (cfg_dbg())
 		fprintf(stderr,
@@ -1550,18 +1580,31 @@ static int context_single(const char *type_name, const char *label)
 					memcpy(payload + hdr_len, serial,
 					       strlen(serial) + 1);
 					struct ipc_response sresp;
-					ipc_send(SG_CMD_CFG_SET, payload,
-						 total, &sresp);
+					int rc = ipc_send(SG_CMD_CFG_SET,
+						payload, total, &sresp);
+					if (rc != 0 ||
+					    sresp.status != SG_OK) {
+						printf("  WARNING: applied"
+						       " but failed to"
+						       " save config.\n");
+						if (sresp.extra[0])
+							printf("  %s\n",
+							       sresp.extra);
+					}
 					if (cfg_dbg())
 						fprintf(stderr,
 							"[CFG-DBG]"
 							" persist:"
 							" %s\n",
-							sresp.status
-							== SG_OK
+							(rc == 0 &&
+							 sresp.status
+							 == SG_OK)
 							? "OK"
 							: "FAILED");
 					ipc_resp_free(&sresp);
+				} else {
+					printf("  WARNING: config too"
+					       " large to save.\n");
 				}
 			}
 			break;

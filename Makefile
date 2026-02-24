@@ -7,7 +7,7 @@
 #   2. make modules    - Build kernel modules
 #   3. make busybox    - Cross-compile BusyBox for ARM64
 #   4. make rootfs     - Create userspace rootfs
-#   5. make iso        - Create bootable ISO for BPI-R4
+#   5. make image      - Create partitioned disk image for BPI-R4
 #
 # Quick commands:
 #   make all           - Build everything
@@ -39,6 +39,7 @@ KERNEL_DTB     := $(BUILD_DIR)/bpi-r4.dtb
 
 # Output
 ISO_FILE       := $(BUILD_DIR)/stargazer-bpi-r4.iso
+IMG_FILE       := $(BUILD_DIR)/stargazer-bpi-r4.img
 MODULE_NAME    := pkt_forward
 
 # BusyBox settings
@@ -75,12 +76,9 @@ MUSL_CROSS     := $(MUSL_CROSS_DIR)/bin/aarch64-linux-musl-
 # Main targets
 # =============================================================================
 
-.PHONY: all kernel modules busybox musl-toolchain dash logind mgmtd cli rootfs iso test-build test lanvm clean help
+.PHONY: all kernel modules busybox musl-toolchain dash logind mgmtd cli rootfs iso image test-build test test-run lanvm clean help
 
-all: iso
-	@echo ""
-	@echo "Build complete: $(ISO_FILE)"
-	@echo "Deploy: dd if=$(ISO_FILE) of=/dev/sdX bs=4M status=progress"
+all: image
 
 # =============================================================================
 # 1. Kernel
@@ -402,6 +400,46 @@ $(ISO_FILE): $(ROOTFS_DIR)/.stamp
 	@echo "============================================"
 
 # =============================================================================
+# Disk Image (for real hardware — persistent config partition)
+# =============================================================================
+
+image: rootfs
+	@echo "[5/5] Creating disk image with persistent storage..."
+	@mkdir -p $(BUILD_DIR)/image/boot
+
+	# Prepare boot partition contents
+	cp $(KERNEL_IMAGE) $(BUILD_DIR)/image/boot/kernel
+	@if [ -f "$(KERNEL_DTB)" ]; then cp $(KERNEL_DTB) $(BUILD_DIR)/image/boot/; fi
+	cd $(ROOTFS_DIR) && find . | cpio -o -H newc 2>/dev/null | gzip -9 > $(BUILD_DIR)/image/boot/initramfs.gz
+
+	# Create boot partition image (64MB ext2, populated with kernel+initramfs)
+	mke2fs -t ext2 -L boot -d $(BUILD_DIR)/image/boot \
+		$(BUILD_DIR)/image/boot.img 64M 2>/dev/null
+
+	# Create data partition image (512MB ext2, empty)
+	mke2fs -t ext2 -L sgdata $(BUILD_DIR)/image/data.img 512M 2>/dev/null
+
+	# Assemble: empty image → GPT → partitions
+	# Boot: 64MB (131072 sectors), Data: 512MB (1048576 sectors), 1MB GPT header
+	dd if=/dev/zero of=$(IMG_FILE) bs=1M count=578 2>/dev/null
+	printf 'label: gpt\nfirst-lba: 2048\n\n' > $(BUILD_DIR)/image/sfdisk.script
+	printf 'start=2048, size=131072, type=linux, name="boot"\n' >> $(BUILD_DIR)/image/sfdisk.script
+	printf 'start=133120, size=1048576, type=linux, name="data"\n' >> $(BUILD_DIR)/image/sfdisk.script
+	sfdisk $(IMG_FILE) < $(BUILD_DIR)/image/sfdisk.script
+	dd if=$(BUILD_DIR)/image/boot.img of=$(IMG_FILE) bs=512 seek=2048 conv=notrunc 2>/dev/null
+	dd if=$(BUILD_DIR)/image/data.img of=$(IMG_FILE) bs=512 seek=133120 conv=notrunc 2>/dev/null
+
+	@echo ""
+	@echo "============================================"
+	@echo " Build Complete!"
+	@echo "============================================"
+	@echo " Image: $(IMG_FILE)"
+	@echo ""
+	@echo " Deploy to BPI-R4 SD/eMMC:"
+	@echo "   dd if=$(IMG_FILE) of=/dev/mmcblk0 bs=4M status=progress"
+	@echo "============================================"
+
+# =============================================================================
 # Test in QEMU
 # =============================================================================
 
@@ -498,14 +536,33 @@ test-build: modules busybox dash logind mgmtd cli
 	cd $(BUILD_DIR)/test/initramfs && find . | cpio -o -H newc 2>/dev/null | gzip -9 > $(BUILD_DIR)/test/initramfs.gz
 	@echo "Test initramfs ready: $(BUILD_DIR)/test/initramfs.gz"
 
+	# Create persistent data disk for QEMU (only if not already present)
+	@if [ ! -f $(BUILD_DIR)/test/data.img ]; then \
+		mke2fs -t ext2 -L sgdata $(BUILD_DIR)/test/data.img 64M 2>/dev/null; \
+		echo "Test data disk created: $(BUILD_DIR)/test/data.img"; \
+	else \
+		echo "Test data disk exists (preserving config): $(BUILD_DIR)/test/data.img"; \
+	fi
+
 test: test-build
+	@$(MAKE) --no-print-directory test-run
+
+test-run:
+	@if [ ! -f $(KERNEL_IMAGE) ] || [ ! -f $(BUILD_DIR)/test/initramfs.gz ]; then \
+		echo "Error: run 'make test-build' first"; exit 1; \
+	fi
+	@if [ ! -f $(BUILD_DIR)/test/data.img ]; then \
+		mke2fs -t ext2 -L sgdata $(BUILD_DIR)/test/data.img 64M 2>/dev/null; \
+		echo "Test data disk created: $(BUILD_DIR)/test/data.img"; \
+	fi
 	# Run QEMU
 	qemu-system-aarch64 \
 		-machine virt -cpu cortex-a72 -smp 4 -m 2G \
 		-kernel $(KERNEL_IMAGE) \
 		-initrd $(BUILD_DIR)/test/initramfs.gz \
+		-drive file=$(BUILD_DIR)/test/data.img,format=raw,if=virtio \
 		-append "console=ttyAMA0 rw" \
-		-nographic -no-reboot
+		-nographic
 
 # =============================================================================
 # LAN VM (minimal BusyBox client for network testing)
@@ -563,7 +620,7 @@ clean:
 help:
 	@echo "Stargazer NGFW Build System"
 	@echo ""
-	@echo "Build flow: kernel -> modules -> busybox/dash/logind -> rootfs -> iso"
+	@echo "Build flow: kernel -> modules -> busybox/dash/logind -> rootfs -> image"
 	@echo ""
 	@echo "Targets:"
 	@echo "  make all      - Build everything (default)"
@@ -576,10 +633,12 @@ help:
 	@echo "  make cli      - Cross-compile C CLI binary"
 	@echo "  make rootfs   - Create userspace rootfs"
 	@echo "  make iso      - Create bootable ISO"
+	@echo "  make image    - Create partitioned disk image (persistent config)"
 	@echo "  make test-build - Build test initramfs (no QEMU)"
 	@echo "  make test     - Build + launch in QEMU (serial only)"
+	@echo "  make test-run - Re-launch QEMU without rebuilding"
 	@echo "  make lanvm    - Build LAN VM initramfs"
 	@echo "  make clean    - Remove all artifacts"
 	@echo "                 (keeps source caches in .cache/)"
 	@echo ""
-	@echo "Output: $(ISO_FILE)"
+	@echo "Output: $(IMG_FILE)"

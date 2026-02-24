@@ -154,6 +154,8 @@ sg_is_safe_id(const char *s)
 {
 	if (!s || !*s)
 		return 0;
+	if (strlen(s) > SG_SAFE_ID_MAX)
+		return 0;
 	for (const char *p = s; *p; p++) {
 		if (isalnum((unsigned char)*p))
 			continue;
@@ -413,6 +415,18 @@ const sg_type_info_t *
 sg_reg_types(void)
 {
 	return type_table;
+}
+
+const char *
+sg_reg_type_perm(const char *type_name)
+{
+	if (!type_name)
+		return NULL;
+	for (const sg_type_info_t *e = type_table; e->name; e++) {
+		if (strcmp(e->name, type_name) == 0)
+			return e->perm;
+	}
+	return NULL;
 }
 
 /*
