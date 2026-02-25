@@ -2339,6 +2339,121 @@ static void test_ipc_cfg_set_validation(void)
 	}
 	ipc_resp_free(&resp);
 
+	/*
+	 * 13. Overlong key name (>= 64 bytes) — must be rejected.
+	 */
+	ipc_check("reject overlong key name (64+ bytes)",
+		  SG_CMD_CFG_SET,
+		  "firewall_address:__diag_valtest\n"
+		  "name=__diag_valtest\n"
+		  "subnet=10.0.0.0/8\n"
+		  "type=ipmask\n"
+		  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		  "aaaaaaaaaaaaaaaaaaaaaaaaa=overflow\n",
+		  SG_ERR_INVALID_ARG);
+
+	/*
+	 * 14. Overlong value (> 511 bytes) — must be rejected.
+	 */
+	{
+		/* Build "firewall_address:__diag_valtest\nname=...\nsubnet=...\ntype=...\ncomment=<600 x's>\n" */
+		char big[1024];
+		const char *pfx = "firewall_address:__diag_valtest\n"
+				  "name=__diag_valtest\n"
+				  "subnet=10.0.0.0/8\n"
+				  "type=ipmask\n"
+				  "comment=";
+		size_t plen = strlen(pfx);
+		memcpy(big, pfx, plen);
+		memset(big + plen, 'x', 600);
+		big[plen + 600] = '\n';
+		big[plen + 601] = '\0';
+
+		ipc_check("reject overlong value (600 bytes)",
+			  SG_CMD_CFG_SET, big, SG_ERR_INVALID_VAL);
+	}
+
+	/*
+	 * 15. Builtin injection — client sends builtin=yes on a
+	 *     non-builtin entry.  The flag must NOT be persisted.
+	 */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_SET,
+			    "firewall_address:__diag_valtest\n"
+			    "name=__diag_valtest\n"
+			    "subnet=10.0.0.0/8\n"
+			    "type=ipmask\n"
+			    "builtin=yes\n",
+			    &resp);
+	if (conn == 0 && resp.status == SG_OK) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [IPC/200] CFG_SET with builtin=yes accepted"
+		       " (flag stripped)\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [IPC/200] CFG_SET with builtin=yes (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+	}
+	ipc_resp_free(&resp);
+
+	/* Verify builtin=yes was NOT stored */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_GET,
+			    "firewall_address:__diag_valtest", &resp);
+	if (conn == 0 && resp.status == SG_OK && resp.payload &&
+	    !strstr(resp.payload, "builtin=yes")) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [IPC/100] builtin=yes not in DB"
+		       " (injection blocked)\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [IPC/100] builtin=yes leaked into DB\n");
+	}
+	ipc_resp_free(&resp);
+
+	/*
+	 * 16. Builtin preservation — updating a builtin entry must
+	 *     retain builtin=yes even if the client doesn't send it.
+	 *     Use system_admin-profile:read-write (seeded as builtin).
+	 */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_SET,
+			    "system_admin-profile:read-write\n"
+			    "permissions=monitor,configure,admin\n"
+			    "description=Full administrative access\n",
+			    &resp);
+	if (conn == 0 && resp.status == SG_OK) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [IPC/200] update builtin profile accepted\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [IPC/200] update builtin profile (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+	}
+	ipc_resp_free(&resp);
+
+	/* Verify builtin=yes was preserved */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_GET,
+			    "system_admin-profile:read-write", &resp);
+	if (conn == 0 && resp.status == SG_OK && resp.payload &&
+	    strstr(resp.payload, "builtin=yes")) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [IPC/100] builtin=yes preserved after update\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [IPC/100] builtin=yes lost after update\n");
+	}
+	ipc_resp_free(&resp);
+
 	/* Cleanup */
 	ipc_send_str(SG_CMD_CFG_DEL,
 		     "firewall_address:__diag_valtest", &resp);

@@ -1676,17 +1676,34 @@ static sg_status_t validate_cfg_data(const char *type, const char *data,
 		const char *eq = memchr(p, '=', llen);
 		if (eq) {
 			size_t klen = (size_t)(eq - p);
-			if (klen > 63) klen = 63;
+			if (klen >= 64) {
+				snprintf(errbuf, errsz,
+					 "Key name too long");
+				return SG_ERR_INVALID_ARG;
+			}
 			char key[64];
 			memcpy(key, p, klen);
 			key[klen] = '\0';
 
 			const char *vstart = eq + 1;
-			size_t vlen = llen - (size_t)(eq - p) - 1;
-			if (vlen > 511) vlen = 511;
+			size_t vlen = llen - klen - 1;
+			if (vlen > 511) {
+				snprintf(errbuf, errsz,
+					 "Value for '%s' too long", key);
+				return SG_ERR_INVALID_VAL;
+			}
 			char val[512];
 			memcpy(val, vstart, vlen);
 			val[vlen] = '\0';
+
+			/* Skip 'builtin' — internal marker managed by
+			 * mgmtd, not a user-settable field.  Handled
+			 * separately in the CFG_SET handler. */
+			if (strcmp(key, "builtin") == 0) {
+				p += llen;
+				if (eol) p++;
+				continue;
+			}
 
 			/* 1. reject unknown keys */
 			if (!sg_reg_is_valid_key(type, key)) {
@@ -1908,7 +1925,55 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 			return;
 		}
 
-		if (sg_db_set(db_type, db_id, data) != 0) {
+		/* Preserve builtin status: clients cannot grant or
+		 * revoke the builtin flag — it is set only by mgmtd
+		 * seed logic.  Read the existing entry's builtin value
+		 * and re-apply it after the write.  Any builtin= line
+		 * in the incoming data is stripped by building a clean
+		 * payload that omits it, then appending the original. */
+		char *existing = sg_db_get(db_type, db_id);
+		int was_builtin = 0;
+		if (existing) {
+			char bi[VALBUFSZ];
+			extract_val(existing, "builtin", bi, sizeof(bi));
+			if (strcmp(bi, "yes") == 0)
+				was_builtin = 1;
+			free(existing);
+		}
+
+		/* Build clean data: strip any client-sent builtin= */
+		char clean[SG_PAYLOAD_MAX];
+		size_t cpos = 0;
+		const char *dp = data;
+		while (*dp) {
+			if (*dp == '\n') { dp++; continue; }
+			const char *el = strchr(dp, '\n');
+			size_t ll = el ? (size_t)(el - dp) : strlen(dp);
+			if (ll >= 8 && memcmp(dp, "builtin=", 8) == 0) {
+				dp += ll;
+				if (el) dp++;
+				continue;
+			}
+			if (cpos + ll + 1 < sizeof(clean)) {
+				memcpy(clean + cpos, dp, ll);
+				cpos += ll;
+				clean[cpos++] = '\n';
+			}
+			dp += ll;
+			if (el) dp++;
+		}
+		/* Re-append original builtin status */
+		if (was_builtin) {
+			const char *tag = "builtin=yes\n";
+			size_t tlen = strlen(tag);
+			if (cpos + tlen < sizeof(clean)) {
+				memcpy(clean + cpos, tag, tlen);
+				cpos += tlen;
+			}
+		}
+		clean[cpos] = '\0';
+
+		if (sg_db_set(db_type, db_id, clean) != 0) {
 			mgmt_log("ERROR", "sg_db_set failed for %s", section);
 			send_error(client_fd, SG_ERR_IO_FAIL, "Failed to write config");
 			return;
