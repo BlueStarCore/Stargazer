@@ -34,6 +34,7 @@ int sg_is_iface_name(const char *s);
 int sg_is_uint_range(const char *s, int min, int max);
 int sg_is_tz_token(const char *s);
 int sg_is_permissions_csv(const char *s);
+int sg_is_access_services(const char *s);
 int sg_is_port_or_range(const char *s);
 int sg_match_csv_option(const char *opts, const char *val);
 

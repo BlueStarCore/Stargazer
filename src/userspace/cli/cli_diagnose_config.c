@@ -2353,10 +2353,10 @@ static void test_ipc_cfg_set_validation(void)
 		  SG_ERR_INVALID_ARG);
 
 	/*
-	 * 14. Overlong value (> 511 bytes) — must be rejected.
+	 * 14. Long value (600 bytes) — accepted; value limit is
+	 *     SG_PAYLOAD_MAX (4096), not 512, to allow long comments.
 	 */
 	{
-		/* Build "firewall_address:__diag_valtest\nname=...\nsubnet=...\ntype=...\ncomment=<600 x's>\n" */
 		char big[1024];
 		const char *pfx = "firewall_address:__diag_valtest\n"
 				  "name=__diag_valtest\n"
@@ -2369,8 +2369,8 @@ static void test_ipc_cfg_set_validation(void)
 		big[plen + 600] = '\n';
 		big[plen + 601] = '\0';
 
-		ipc_check("reject overlong value (600 bytes)",
-			  SG_CMD_CFG_SET, big, SG_ERR_INVALID_VAL);
+		ipc_check("accept long value (600 bytes)",
+			  SG_CMD_CFG_SET, big, SG_OK);
 	}
 
 	/*

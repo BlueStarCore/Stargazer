@@ -1687,12 +1687,12 @@ static sg_status_t validate_cfg_data(const char *type, const char *data,
 
 			const char *vstart = eq + 1;
 			size_t vlen = llen - klen - 1;
-			if (vlen > 511) {
+			if (vlen >= SG_PAYLOAD_MAX) {
 				snprintf(errbuf, errsz,
 					 "Value for '%s' too long", key);
 				return SG_ERR_INVALID_VAL;
 			}
-			char val[512];
+			char val[SG_PAYLOAD_MAX];
 			memcpy(val, vstart, vlen);
 			val[vlen] = '\0';
 
