@@ -40,6 +40,7 @@
 #include <sys/un.h>
 #include <sys/file.h>
 #include <sys/wait.h>
+#include <poll.h>
 
 #include "stargazer_ipc.h"
 #include "password_policy.h"
@@ -308,6 +309,128 @@ static void send_ok(int fd, const char *extra, const char *payload)
 static void send_error(int fd, sg_status_t status, const char *extra)
 {
 	send_response(fd, status, extra, NULL, 0);
+}
+
+/* send_stream_chunk: send one streaming chunk (extra starts with '+').
+ * Returns 0 on success, -1 if the client disconnected. */
+static int send_stream_chunk(int fd, const char *data, size_t len)
+{
+	sg_response_hdr_t resp;
+	memset(&resp, 0, sizeof(resp));
+	resp.magic = SG_MSG_MAGIC;
+	resp.version = SG_MSG_VERSION;
+	resp.status = (uint32_t)SG_OK;
+	snprintf(resp.extra, sizeof(resp.extra), "+");
+	resp.payload_len = (uint32_t)len;
+
+	if (safe_write(fd, &resp, sizeof(resp)) < 0)
+		return -1;
+	if (len > 0 && data && safe_write(fd, data, len) < 0)
+		return -1;
+	return 0;
+}
+
+/*
+ * stream_exec — fork+exec argv, stream child stdout/stderr to client_fd.
+ *
+ * Uses poll() to monitor both the child pipe and the client socket.
+ * If the client disconnects (Ctrl+C), the child is killed immediately
+ * instead of waiting for the next line of output.
+ *
+ * Returns 1 (took ownership of client_fd — caller must not close it).
+ */
+static int stream_exec(int client_fd, const char *const argv[])
+{
+	int pipefd[2];
+	if (pipe(pipefd) < 0) {
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL,
+			   "Failed to create pipe");
+		return 0;
+	}
+	pid_t pid = fork();
+	if (pid < 0) {
+		close(pipefd[0]);
+		close(pipefd[1]);
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL,
+			   "Failed to fork");
+		return 0;
+	}
+	if (pid == 0) {
+		/* Child: redirect stdout+stderr to pipe, exec */
+		close(pipefd[0]);
+		dup2(pipefd[1], STDOUT_FILENO);
+		dup2(pipefd[1], STDERR_FILENO);
+		close(pipefd[1]);
+		execvp(argv[0], (char *const *)argv);
+		_exit(127);
+	}
+	close(pipefd[1]);
+
+	/* Parent: poll pipe (child output) + client socket (disconnect) */
+	struct pollfd pfds[2];
+	pfds[0].fd = pipefd[0];
+	pfds[0].events = POLLIN;
+	pfds[1].fd = client_fd;
+	pfds[1].events = POLLIN;
+
+	int killed = 0;
+	for (;;) {
+		int ret = poll(pfds, 2, 30000);
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			break; /* poll error */
+		}
+		if (ret == 0)
+			break; /* 30s timeout — child stalled */
+
+		/* Check client socket first: disconnect → kill child */
+		if (pfds[1].revents & (POLLIN | POLLHUP | POLLERR)) {
+			kill(pid, SIGTERM);
+			killed = 1;
+			break;
+		}
+
+		/* Child has output ready */
+		if (pfds[0].revents & POLLIN) {
+			char buf[1024];
+			ssize_t n = read(pipefd[0], buf, sizeof(buf));
+			if (n <= 0)
+				break; /* EOF or error */
+			if (send_stream_chunk(client_fd, buf, (size_t)n) < 0) {
+				kill(pid, SIGTERM);
+				killed = 1;
+				break;
+			}
+		}
+
+		/* Child pipe closed (EOF) */
+		if (pfds[0].revents & (POLLHUP | POLLERR)) {
+			/* Drain any remaining data */
+			for (;;) {
+				char buf[1024];
+				ssize_t n = read(pipefd[0], buf, sizeof(buf));
+				if (n <= 0)
+					break;
+				if (send_stream_chunk(client_fd, buf, (size_t)n) < 0) {
+					kill(pid, SIGTERM);
+					killed = 1;
+					break;
+				}
+			}
+			break;
+		}
+	}
+
+	close(pipefd[0]);
+	if (killed)
+		waitpid(pid, NULL, WNOHANG);
+	else
+		waitpid(pid, NULL, 0);
+	if (!killed)
+		send_ok(client_fd, NULL, NULL);
+	close(client_fd);
+	return 1;
 }
 
 /* send_ok with inline audit — appends warning to extra if audit fails */
@@ -1635,15 +1758,41 @@ static int check_references(const char *type, const char *id,
  * Write firmware upgrade progress to state file atomically.
  * The child process calls this at each step so the parent (serving
  * FW_PROGRESS polls) always reads a complete, consistent file.
+ *
+ * A step history log is appended after a "---" separator so the CLI
+ * can print all steps even if polling missed some (fast steps).
  */
+#define FW_STEPS_LOG_MAX 2048
+static char fw_steps_log[FW_STEPS_LOG_MAX];
+static size_t fw_steps_log_len;
+static int fw_last_logged_step = -1;
+
 static void fw_write_state(int step, int total, const char *status,
 			   const char *message, const char *version)
 {
+	/* Only append to step log when step NUMBER changes (not every
+	 * progress message within the same step like download KB updates) */
+	if (strcmp(status, "running") == 0 && message && message[0] &&
+	    step != fw_last_logged_step) {
+		char entry[256];
+		int n = snprintf(entry, sizeof(entry), "[%d/%d] %s\n",
+				 step, total, message);
+		if (n > 0 && fw_steps_log_len + (size_t)n < FW_STEPS_LOG_MAX) {
+			memcpy(fw_steps_log + fw_steps_log_len, entry, (size_t)n);
+			fw_steps_log_len += (size_t)n;
+			fw_steps_log[fw_steps_log_len] = '\0';
+		}
+		fw_last_logged_step = step;
+	}
+
 	FILE *fp = fopen(FW_STATE_FILE_TMP, "w");
 	if (!fp)
 		return;
 	fprintf(fp, "step=%d\ntotal=%d\nstatus=%s\nmessage=%s\nversion=%s\n",
 		step, total, status, message, version ? version : "");
+	/* Append step history log after separator */
+	if (fw_steps_log_len > 0)
+		fprintf(fp, "---\n%s", fw_steps_log);
 	fclose(fp);
 	rename(FW_STATE_FILE_TMP, FW_STATE_FILE);
 }
@@ -1782,8 +1931,8 @@ static sg_status_t validate_cfg_data(const char *type, const char *data,
 
 /* ── Request handler ────────────────────────────────────────────────────── */
 
-static void handle_request(int client_fd, sg_request_hdr_t *hdr,
-			   const char *payload)
+static int handle_request(int client_fd, sg_request_hdr_t *hdr,
+			  const char *payload)
 {
 	sg_cmd_t cmd = (sg_cmd_t)hdr->cmd;
 	const char *user = hdr->username;
@@ -1805,7 +1954,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		/* Payload format: "section\n" (section = "type:id" or "type") */
 		if (!payload || hdr->payload_len == 0) {
 			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing section name");
-			return;
+			return 0;
 		}
 		char section[512] = {0};
 		const char *nl = strchr(payload, '\n');
@@ -1824,11 +1973,11 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 
 		if (!sg_is_safe_id(db_type)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid type name");
-			return;
+			return 0;
 		}
 		if (!check_type_permission(user, db_type)) {
 			send_error(client_fd, SG_ERR_ENTRY_NOT_FOUND, section);
-			return;
+			return 0;
 		}
 
 		char *data = sg_db_get(db_type, db_id);
@@ -1838,14 +1987,14 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		} else {
 			send_error(client_fd, SG_ERR_ENTRY_NOT_FOUND, section);
 		}
-		return;
+		return 0;
 	}
 
 	case SG_CMD_CFG_LIST: {
 		/* Payload: "type\n" — list entry IDs for a config type */
 		if (!payload || hdr->payload_len == 0) {
 			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing type prefix");
-			return;
+			return 0;
 		}
 		char prefix[256] = {0};
 		snprintf(prefix, sizeof(prefix), "%s", payload);
@@ -1854,11 +2003,11 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 
 		if (!sg_is_safe_id(prefix)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid type prefix");
-			return;
+			return 0;
 		}
 		if (!check_type_permission(user, prefix)) {
 			send_ok(client_fd, "No entries", "");
-			return;
+			return 0;
 		}
 
 		char *list = sg_db_list(prefix);
@@ -1868,7 +2017,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		} else {
 			send_ok(client_fd, "No entries", "");
 		}
-		return;
+		return 0;
 	}
 
 	/* ── Config write ───────────────────────────────────────────────── */
@@ -1876,13 +2025,13 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		/* Payload format: "section\nkey=value\nkey=value\n..." */
 		if (!payload || hdr->payload_len == 0) {
 			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing section + data");
-			return;
+			return 0;
 		}
 		char section[256] = {0};
 		const char *nl = strchr(payload, '\n');
 		if (!nl) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Missing data after section");
-			return;
+			return 0;
 		}
 		size_t slen = (size_t)(nl - payload);
 		if (slen >= sizeof(section)) slen = sizeof(section) - 1;
@@ -1892,7 +2041,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		if (*data == '\0') {
 			send_error(client_fd, SG_ERR_INVALID_ARG,
 				   "Missing data after section");
-			return;
+			return 0;
 		}
 
 		/* Parse "type:id" → type + id */
@@ -1902,15 +2051,15 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 
 		if (sg_reg_type_mode(db_type) < 0) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Unknown config type");
-			return;
+			return 0;
 		}
 		if (!check_type_permission(user, db_type)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Unknown config type");
-			return;
+			return 0;
 		}
 		if (!sg_reg_validate_entry_id(db_type, db_id)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid entry ID");
-			return;
+			return 0;
 		}
 
 		/* Validate key names, values, and required fields */
@@ -1922,7 +2071,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 				debug_buf_push("[MGMTD-DBG] cfg_set rejected: %s\n",
 					       val_err);
 			send_error(client_fd, val_st, val_err);
-			return;
+			return 0;
 		}
 
 		/* Preserve builtin status: clients cannot grant or
@@ -1954,11 +2103,14 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 				if (el) dp++;
 				continue;
 			}
-			if (cpos + ll + 1 < sizeof(clean)) {
-				memcpy(clean + cpos, dp, ll);
-				cpos += ll;
-				clean[cpos++] = '\n';
+			if (cpos + ll + 1 >= sizeof(clean)) {
+				send_error(client_fd, SG_ERR_INVALID_ARG,
+					   "Config payload too large");
+				return 0;
 			}
+			memcpy(clean + cpos, dp, ll);
+			cpos += ll;
+			clean[cpos++] = '\n';
 			dp += ll;
 			if (el) dp++;
 		}
@@ -1966,17 +2118,20 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		if (was_builtin) {
 			const char *tag = "builtin=yes\n";
 			size_t tlen = strlen(tag);
-			if (cpos + tlen < sizeof(clean)) {
-				memcpy(clean + cpos, tag, tlen);
-				cpos += tlen;
+			if (cpos + tlen >= sizeof(clean)) {
+				send_error(client_fd, SG_ERR_INVALID_ARG,
+					   "Config payload too large");
+				return 0;
 			}
+			memcpy(clean + cpos, tag, tlen);
+			cpos += tlen;
 		}
 		clean[cpos] = '\0';
 
 		if (sg_db_set(db_type, db_id, clean) != 0) {
 			mgmt_log("ERROR", "sg_db_set failed for %s", section);
 			send_error(client_fd, SG_ERR_IO_FAIL, "Failed to write config");
-			return;
+			return 0;
 		}
 
 		/* Bump session for admin/profile/policy config changes */
@@ -2036,13 +2191,13 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 
 		send_ok_audited(client_fd, "Config saved", NULL,
 				user, "cfg_set", section);
-		return;
+		return 0;
 	}
 
 	case SG_CMD_CFG_DEL: {
 		if (!payload || hdr->payload_len == 0) {
 			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing section");
-			return;
+			return 0;
 		}
 		char section[256] = {0};
 		snprintf(section, sizeof(section), "%s", payload);
@@ -2052,7 +2207,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		if (!strchr(section, ':')) {
 			send_error(client_fd, SG_ERR_INVALID_ARG,
 				   "Missing ':' separator (expected type:id)");
-			return;
+			return 0;
 		}
 
 		/* Parse "type:id" → type + id */
@@ -2062,15 +2217,15 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 
 		if (sg_reg_type_mode(db_type) < 0) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Unknown config type");
-			return;
+			return 0;
 		}
 		if (!check_type_permission(user, db_type)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Unknown config type");
-			return;
+			return 0;
 		}
 		if (db_id[0] == '\0') {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Missing entry ID");
-			return;
+			return 0;
 		}
 
 		/* Check builtin flag */
@@ -2081,7 +2236,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 			if (strcmp(bi, "yes") == 0) {
 				free(existing);
 				send_error(client_fd, SG_ERR_BUILTIN, section);
-				return;
+				return 0;
 			}
 			free(existing);
 		}
@@ -2090,7 +2245,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		char ref_err[SG_EXTRA_MAX];
 		if (check_references(db_type, db_id, ref_err, sizeof(ref_err)) != 0) {
 			send_error(client_fd, SG_ERR_IN_USE, ref_err);
-			return;
+			return 0;
 		}
 
 		/* If deleting admin, bump session and delete system user */
@@ -2101,25 +2256,25 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 
 		if (sg_db_del(db_type, db_id) != 0) {
 			send_error(client_fd, SG_ERR_IO_FAIL, "Failed to delete section");
-			return;
+			return 0;
 		}
 		send_ok_audited(client_fd, "Deleted", NULL,
 				user, "cfg_del", section);
-		return;
+		return 0;
 	}
 
 	case SG_CMD_CFG_APPLY: {
 		/* Payload: "type\nid\nkey=value\n..." */
 		if (!payload || hdr->payload_len == 0) {
 			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing type+id+data");
-			return;
+			return 0;
 		}
 		char type_str[256] = {0}, id_str[256] = {0};
 		const char *p = payload;
 		const char *nl1 = strchr(p, '\n');
 		if (!nl1) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Bad format");
-			return;
+			return 0;
 		}
 		size_t tlen = (size_t)(nl1 - p);
 		if (tlen >= sizeof(type_str)) tlen = sizeof(type_str) - 1;
@@ -2130,7 +2285,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		const char *nl2 = strchr(p, '\n');
 		if (!nl2) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Bad format");
-			return;
+			return 0;
 		}
 		size_t ilen = (size_t)(nl2 - p);
 		if (ilen >= sizeof(id_str)) ilen = sizeof(id_str) - 1;
@@ -2139,7 +2294,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 
 		if (!check_type_permission(user, type_str)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Unknown config type");
-			return;
+			return 0;
 		}
 
 		const char *data = nl2 + 1;
@@ -2154,7 +2309,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		} else {
 			send_error(client_fd, st, result);
 		}
-		return;
+		return 0;
 	}
 
 	/* ── Admin management ───────────────────────────────────────────── */
@@ -2162,18 +2317,18 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		const char *perms = get_user_permissions(user);
 		if (!has_permission(perms, "admin")) {
 			send_error(client_fd, SG_ERR_PERM_DENIED, "Requires 'admin' permission");
-			return;
+			return 0;
 		}
 		/* Payload: "username\nprofile\n" */
 		if (!payload) {
 			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing username+profile");
-			return;
+			return 0;
 		}
 		char newuser[128] = {0}, newprof[128] = {0};
 		const char *nl1 = strchr(payload, '\n');
 		if (!nl1) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Bad format");
-			return;
+			return 0;
 		}
 		size_t ulen = (size_t)(nl1 - payload);
 		if (ulen >= sizeof(newuser)) ulen = sizeof(newuser) - 1;
@@ -2187,18 +2342,18 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 
 		if (!sg_is_safe_id(newuser)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid username");
-			return;
+			return 0;
 		}
 		if (!sg_is_safe_id(newprof)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid profile name");
-			return;
+			return 0;
 		}
 
 		/* Check profile exists */
 		char *pdata = sg_db_get("system_admin-profile", newprof);
 		if (!pdata) {
 			send_error(client_fd, SG_ERR_PROFILE_NOT_FOUND, newprof);
-			return;
+			return 0;
 		}
 		free(pdata);
 
@@ -2207,13 +2362,13 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		if (udata) {
 			free(udata);
 			send_error(client_fd, SG_ERR_ALREADY_EXISTS, newuser);
-			return;
+			return 0;
 		}
 
 		/* Create Linux user */
 		if (create_system_user(newuser, "/sbin/stargazer-cli") != 0) {
 			send_error(client_fd, SG_ERR_SYSTEM_FAIL, "create user failed");
-			return;
+			return 0;
 		}
 
 		/* Add to database */
@@ -2222,7 +2377,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 			 "profile=%s\nenforce-change-password=enable\n", newprof);
 		if (sg_db_set("system_admin", newuser, cfgdata) != 0) {
 			send_error(client_fd, SG_ERR_IO_FAIL, "config write failed");
-			return;
+			return 0;
 		}
 
 		if (g_debug_flags & SG_DBG_FLAG_AUTH)
@@ -2232,18 +2387,18 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		snprintf(msg, sizeof(msg), "User '%s' created with profile '%s'", newuser, newprof);
 		send_ok_audited(client_fd, msg, NULL,
 				user, "admin_create", newuser);
-		return;
+		return 0;
 	}
 
 	case SG_CMD_ADMIN_DELETE: {
 		const char *perms = get_user_permissions(user);
 		if (!has_permission(perms, "admin")) {
 			send_error(client_fd, SG_ERR_PERM_DENIED, "Requires 'admin' permission");
-			return;
+			return 0;
 		}
 		if (!payload) {
 			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing username");
-			return;
+			return 0;
 		}
 		char target[128] = {0};
 		snprintf(target, sizeof(target), "%s", payload);
@@ -2252,21 +2407,21 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 
 		if (!sg_is_safe_id(target)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid username");
-			return;
+			return 0;
 		}
 
 		/* Check builtin */
 		char *existing = sg_db_get("system_admin", target);
 		if (!existing) {
 			send_error(client_fd, SG_ERR_USER_NOT_FOUND, target);
-			return;
+			return 0;
 		}
 		char bi[VALBUFSZ];
 		extract_val(existing, "builtin", bi, sizeof(bi));
 		if (strcmp(bi, "yes") == 0) {
 			free(existing);
 			send_error(client_fd, SG_ERR_BUILTIN, "Cannot delete built-in admin");
-			return;
+			return 0;
 		}
 		free(existing);
 
@@ -2274,7 +2429,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		if (strcmp(target, user) == 0) {
 			send_error(client_fd, SG_ERR_IN_USE,
 				   "Cannot delete your own account");
-			return;
+			return 0;
 		}
 
 		/* Check referential integrity */
@@ -2283,7 +2438,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 			if (check_references("system_admin", target,
 					     ref_err, sizeof(ref_err)) != 0) {
 				send_error(client_fd, SG_ERR_IN_USE, ref_err);
-				return;
+				return 0;
 			}
 		}
 
@@ -2298,20 +2453,20 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		snprintf(msg, sizeof(msg), "User '%s' deleted", target);
 		send_ok_audited(client_fd, msg, NULL,
 				user, "admin_delete", target);
-		return;
+		return 0;
 	}
 
 	case SG_CMD_ADMIN_SET_PW: {
 		/* Payload: "username\npassword\n" */
 		if (!payload) {
 			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing username+password");
-			return;
+			return 0;
 		}
 		char target[128] = {0}, pw[256] = {0};
 		const char *nl1 = strchr(payload, '\n');
 		if (!nl1) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Bad format");
-			return;
+			return 0;
 		}
 		size_t ulen = (size_t)(nl1 - payload);
 		if (ulen >= sizeof(target)) ulen = sizeof(target) - 1;
@@ -2326,7 +2481,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		if (!sg_is_safe_id(target)) {
 			explicit_bzero(pw, sizeof(pw));
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid username");
-			return;
+			return 0;
 		}
 
 		/* Permission: admin can set anyone's password,
@@ -2336,7 +2491,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 			send_error(client_fd, SG_ERR_PERM_DENIED,
 				   "Can only change your own password");
 			explicit_bzero(pw, sizeof(pw));
-			return;
+			return 0;
 		}
 
 		/* Validate against password policy */
@@ -2346,7 +2501,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 			explicit_bzero(pw, sizeof(pw));
 			send_error(client_fd, SG_ERR_POLICY_FAIL,
 				   pw_reason ? pw_reason : "Policy violation");
-			return;
+			return 0;
 		}
 
 		if (set_password(target, pw) != 0) {
@@ -2354,7 +2509,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 			mgmt_log("ERROR", "set_password failed for %s: %s",
 				 target, strerror(errno));
 			send_error(client_fd, SG_ERR_SYSTEM_FAIL, "Password update failed");
-			return;
+			return 0;
 		}
 		explicit_bzero(pw, sizeof(pw));
 		if (g_debug_flags & SG_DBG_FLAG_AUTH)
@@ -2362,23 +2517,23 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 				       target);
 		send_ok_audited(client_fd, "Password updated", NULL,
 				user, "admin_password_set", target);
-		return;
+		return 0;
 	}
 
 	case SG_CMD_ADMIN_SET_ENF: {
 		const char *perms = get_user_permissions(user);
 		if (!has_permission(perms, "admin")) {
 			send_error(client_fd, SG_ERR_PERM_DENIED, "Requires 'admin' permission");
-			return;
+			return 0;
 		}
 		/* Payload: "username\nenable|disable\n" */
 		if (!payload) {
 			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing args");
-			return;
+			return 0;
 		}
 		char target[128] = {0}, val[32] = {0};
 		const char *nl1 = strchr(payload, '\n');
-		if (!nl1) { send_error(client_fd, SG_ERR_INVALID_ARG, "Bad format"); return; }
+		if (!nl1) { send_error(client_fd, SG_ERR_INVALID_ARG, "Bad format"); return 0; }
 		size_t ulen = (size_t)(nl1 - payload);
 		if (ulen >= sizeof(target)) ulen = sizeof(target) - 1;
 		memcpy(target, payload, ulen);
@@ -2388,24 +2543,24 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 
 		if (!sg_is_safe_id(target)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid username");
-			return;
+			return 0;
 		}
 		if (strcmp(val, "enable") != 0 && strcmp(val, "disable") != 0) {
 			send_error(client_fd, SG_ERR_INVALID_VAL,
 				   "Value must be 'enable' or 'disable'");
-			return;
+			return 0;
 		}
 
 		char *existing = sg_db_get("system_admin", target);
 		if (!existing) {
 			send_error(client_fd, SG_ERR_USER_NOT_FOUND, target);
-			return;
+			return 0;
 		}
 
 		/* Rebuild data with updated enforce flag */
 		size_t elen = strlen(existing);
 		char *newdata = malloc(elen + 64);
-		if (!newdata) { free(existing); send_error(client_fd, SG_ERR_INTERNAL, NULL); return; }
+		if (!newdata) { free(existing); send_error(client_fd, SG_ERR_INTERNAL, NULL); return 0; }
 
 		/* Copy lines except enforce-change-password */
 		const char *p = existing;
@@ -2428,7 +2583,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		free(newdata);
 		send_ok_audited(client_fd, "Enforce policy updated", NULL,
 				user, "admin_set_enforce", target);
-		return;
+		return 0;
 	}
 
 	case SG_CMD_ADMIN_CHECK_PW: {
@@ -2437,14 +2592,14 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		if (!payload) {
 			send_error(client_fd, SG_ERR_MISSING_ARG,
 				   "Missing username+password");
-			return;
+			return 0;
 		}
 		char chk_user[128] = {0}, chk_pw[256] = {0};
 		char chk_enforce[32] = {0};
 		const char *nl1 = strchr(payload, '\n');
 		if (!nl1) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Bad format");
-			return;
+			return 0;
 		}
 		size_t ulen = (size_t)(nl1 - payload);
 		if (ulen >= sizeof(chk_user)) ulen = sizeof(chk_user) - 1;
@@ -2472,7 +2627,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		if (!sg_is_safe_id(chk_user)) {
 			explicit_bzero(chk_pw, sizeof(chk_pw));
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid username");
-			return;
+			return 0;
 		}
 
 		const char *reason = NULL;
@@ -2493,7 +2648,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 					       chk_user);
 			send_ok(client_fd, "Password meets policy", NULL);
 		}
-		return;
+		return 0;
 	}
 
 	case SG_CMD_ADMIN_LOCK_PW: {
@@ -2501,11 +2656,11 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		const char *perms = get_user_permissions(user);
 		if (!has_permission(perms, "admin")) {
 			send_error(client_fd, SG_ERR_PERM_DENIED, NULL);
-			return;
+			return 0;
 		}
 		if (!payload) {
 			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing username");
-			return;
+			return 0;
 		}
 		char lock_target[128] = {0};
 		snprintf(lock_target, sizeof(lock_target), "%s", payload);
@@ -2515,25 +2670,25 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 
 		if (!sg_is_safe_id(lock_target)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid username");
-			return;
+			return 0;
 		}
 
 		if (lock_password(lock_target) != 0) {
 			send_error(client_fd, SG_ERR_SYSTEM_FAIL,
 				   "Failed to lock password");
-			return;
+			return 0;
 		}
 		if (g_debug_flags & SG_DBG_FLAG_AUTH)
 			debug_buf_push("[AUTH-DBG] lock_password user=%s result=ok\n",
 				       lock_target);
 		send_ok_audited(client_fd, "Password locked", NULL,
 				user, "admin_password_locked", lock_target);
-		return;
+		return 0;
 	}
 
 	/* ── Session ────────────────────────────────────────────────────── */
 	case SG_CMD_SESSION_REV: {
-		if (!payload) { send_error(client_fd, SG_ERR_MISSING_ARG, NULL); return; }
+		if (!payload) { send_error(client_fd, SG_ERR_MISSING_ARG, NULL); return 0; }
 		char target[128] = {0};
 		snprintf(target, sizeof(target), "%s", payload);
 		size_t tlen = strlen(target);
@@ -2541,23 +2696,23 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 
 		if (!sg_is_safe_id(target)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid username");
-			return;
+			return 0;
 		}
 
 		int rev = session_rev_get(target);
 		char revstr[32];
 		snprintf(revstr, sizeof(revstr), "%d", rev);
 		send_ok(client_fd, NULL, revstr);
-		return;
+		return 0;
 	}
 
 	case SG_CMD_SESSION_BUMP: {
 		const char *perms = get_user_permissions(user);
 		if (!has_permission(perms, "admin")) {
 			send_error(client_fd, SG_ERR_PERM_DENIED, NULL);
-			return;
+			return 0;
 		}
-		if (!payload) { send_error(client_fd, SG_ERR_MISSING_ARG, NULL); return; }
+		if (!payload) { send_error(client_fd, SG_ERR_MISSING_ARG, NULL); return 0; }
 		char target[128] = {0};
 		snprintf(target, sizeof(target), "%s", payload);
 		size_t tlen = strlen(target);
@@ -2565,14 +2720,14 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 
 		if (!sg_is_safe_id(target)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid username");
-			return;
+			return 0;
 		}
 
 		int rev = session_rev_bump(target);
 		char revstr[32];
 		snprintf(revstr, sizeof(revstr), "%d", rev);
 		send_ok(client_fd, NULL, revstr);
-		return;
+		return 0;
 	}
 
 	/* ── System commands ────────────────────────────────────────────── */
@@ -2580,7 +2735,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		const char *perms = get_user_permissions(user);
 		if (!has_permission(perms, "admin")) {
 			send_error(client_fd, SG_ERR_PERM_DENIED, "Requires 'admin' permission");
-			return;
+			return 0;
 		}
 		send_ok(client_fd, "Shutting down...", NULL);
 		(void)audit_log(user, "system_poweroff", "");
@@ -2589,14 +2744,14 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		/* Give time for response to be sent */
 		usleep(100000);
 		(void)run_cmd("/sbin/poweroff");
-		return;
+		return 0;
 	}
 
 	case SG_CMD_SYS_REBOOT: {
 		const char *perms = get_user_permissions(user);
 		if (!has_permission(perms, "admin")) {
 			send_error(client_fd, SG_ERR_PERM_DENIED, "Requires 'admin' permission");
-			return;
+			return 0;
 		}
 		send_ok(client_fd, "Rebooting...", NULL);
 		(void)audit_log(user, "system_reboot", "");
@@ -2604,7 +2759,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		sg_db_close();
 		usleep(100000);
 		(void)run_cmd("/sbin/reboot");
-		return;
+		return 0;
 	}
 
 	case SG_CMD_FW_STATUS: {
@@ -2677,7 +2832,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 
 		(void)off;
 		send_ok(client_fd, NULL, result);
-		return;
+		return 0;
 	}
 
 	case SG_CMD_FW_UPGRADE: {
@@ -2685,11 +2840,11 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		if (!has_permission(perms, "admin")) {
 			send_error(client_fd, SG_ERR_PERM_DENIED,
 				   "Requires 'admin' permission");
-			return;
+			return 0;
 		}
 		if (!payload || hdr->payload_len == 0) {
 			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing URL");
-			return;
+			return 0;
 		}
 
 		/* Extract URL from payload */
@@ -2697,7 +2852,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		extract_val(payload, "url", url, sizeof(url));
 		if (!url[0]) {
 			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing URL");
-			return;
+			return 0;
 		}
 
 		/* Validate URL scheme */
@@ -2706,7 +2861,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		    strncmp(url, "tftp://", 7) != 0) {
 			send_error(client_fd, SG_ERR_INVALID_ARG,
 				   "URL must start with http://, https://, or tftp://");
-			return;
+			return 0;
 		}
 
 		/* Check if upgrade already running */
@@ -2720,10 +2875,15 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 				if (strstr(state_check, "status=running")) {
 					send_error(client_fd, SG_ERR_IN_USE,
 						   "Firmware upgrade already in progress");
-					return;
+					return 0;
 				}
 			}
 		}
+
+		/* Reset step log state for fresh upgrade */
+		fw_steps_log[0] = '\0';
+		fw_steps_log_len = 0;
+		fw_last_logged_step = -1;
 
 		/* Write initial state and respond immediately */
 		fw_write_state(0, 6, "running", "Starting firmware upgrade...", "");
@@ -2739,12 +2899,12 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 			mgmt_log("ERROR", "firmware upgrade fork failed: %s",
 				 strerror(errno));
 			fw_write_state(0, 6, "error", "Internal error: fork failed", "");
-			return;
+			return 0;
 		}
 
 		if (pid > 0) {
 			/* Parent — return to main accept loop */
-			return;
+			return 0;
 		}
 
 		/* ── Child process ─────────────────────────────────────── */
@@ -2753,6 +2913,15 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		close(client_fd);
 		if (g_listen_fd >= 0)
 			close(g_listen_fd);
+
+		/* Redirect stderr to log file to prevent timestamp
+		 * contamination of console output */
+		int logfd = open("/tmp/sg-fw-upgrade.log",
+				 O_WRONLY | O_CREAT | O_TRUNC, 0600);
+		if (logfd >= 0) {
+			dup2(logfd, STDERR_FILENO);
+			close(logfd);
+		}
 
 		/* Re-open database (parent keeps its connection) */
 		sg_db_close();
@@ -2763,10 +2932,74 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		(void)run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged /tmp/sg-fw-boot");
 		(void)run_cmd("mkdir -p /tmp/sg-fw-download /tmp/sg-fw-staged /tmp/sg-fw-boot");
 
-		/* Step 1: Download firmware package */
-		fw_write_state(1, 6, "running", "Downloading firmware...", "");
+		/* Step 1: Download firmware package (non-blocking with progress) */
+		fw_write_state(1, 6, "running", "Downloading firmware... (0 KB)", "");
 		mgmt_log("INFO", "firmware upgrade: downloading from %s", url);
-		char dlcmd[2048];
+
+		#define FW_DL_FILE "/tmp/sg-fw-download/firmware.tar.gz"
+
+		/* Pre-flight: probe remote file size via HTTP HEAD request.
+		 * Uses wget --spider -S to get Content-Length header.
+		 * Falls back to -1 (unknown) for TFTP or if --spider
+		 * is unsupported (minimal BusyBox builds). */
+		long total_bytes = -1;
+		if (strncmp(url, "http", 4) == 0) {
+			int hp[2];
+			if (pipe(hp) == 0) {
+				pid_t hpid = fork();
+				if (hpid == 0) {
+					close(hp[0]);
+					dup2(hp[1], STDOUT_FILENO);
+					dup2(hp[1], STDERR_FILENO);
+					close(hp[1]);
+					execlp("wget", "wget", "--spider",
+					       "-S", "-T", "5", url, NULL);
+					_exit(127);
+				}
+				if (hpid > 0) {
+					close(hp[1]);
+					char hbuf[4096];
+					size_t hused = 0;
+					/* Read with timeout — don't block forever */
+					struct pollfd pfd;
+					pfd.fd = hp[0];
+					pfd.events = POLLIN;
+					while (hused < sizeof(hbuf) - 1 &&
+					       poll(&pfd, 1, 6000) > 0 &&
+					       (pfd.revents & POLLIN)) {
+						ssize_t r = read(hp[0], hbuf + hused,
+								 sizeof(hbuf) - 1 - hused);
+						if (r <= 0) break;
+						hused += (size_t)r;
+					}
+					hbuf[hused] = '\0';
+					close(hp[0]);
+					waitpid(hpid, NULL, 0);
+					/* Parse Content-Length (case-insensitive) */
+					const char *scan = hbuf;
+					while (*scan) {
+						if ((*scan == 'C' || *scan == 'c') &&
+						    strncasecmp(scan, "Content-Length:", 15) == 0) {
+							const char *v = scan + 15;
+							while (*v == ' ') v++;
+							long cl = atol(v);
+							if (cl > 0)
+								total_bytes = cl;
+							break;
+						}
+						scan++;
+					}
+					if (total_bytes > 0)
+						mgmt_log("INFO", "firmware size: %ld bytes",
+							 total_bytes);
+				} else {
+					close(hp[0]);
+					close(hp[1]);
+				}
+			}
+		}
+
+		pid_t dl_pid = -1;
 		if (strncmp(url, "tftp://", 7) == 0) {
 			/* Parse tftp://host/path */
 			const char *hp = url + 7;
@@ -2784,26 +3017,81 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 			memcpy(thost, hp, hlen);
 			thost[hlen] = '\0';
 			const char *tremote = slash + 1;
-			snprintf(dlcmd, sizeof(dlcmd),
-				 "tftp -g -l /tmp/sg-fw-download/firmware.tar.gz "
-				 "-r '%s' '%s' 2>&1", tremote, thost);
+			dl_pid = fork();
+			if (dl_pid == 0) {
+				execlp("tftp", "tftp", "-g",
+				       "-l", FW_DL_FILE,
+				       "-r", tremote, thost, NULL);
+				_exit(127);
+			}
 		} else {
-			snprintf(dlcmd, sizeof(dlcmd),
-				 "wget -q -O /tmp/sg-fw-download/firmware.tar.gz "
-				 "'%s' 2>&1", url);
+			dl_pid = fork();
+			if (dl_pid == 0) {
+				execlp("wget", "wget", "-O", FW_DL_FILE,
+				       url, NULL);
+				_exit(127);
+			}
 		}
 
-		char *dlout = run_cmd(dlcmd);
-		if (access("/tmp/sg-fw-download/firmware.tar.gz", F_OK) != 0) {
-			mgmt_log("ERROR", "firmware download failed: %s",
-				 dlout ? dlout : "(no output)");
-			free(dlout);
+		if (dl_pid < 0) {
+			(void)run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+			fw_write_state(1, 6, "error", "Download fork failed", "");
+			sg_db_close();
+			_exit(1);
+		}
+
+		/* Poll download file size while wget/tftp runs */
+		long total_kb = total_bytes > 0 ? (total_bytes + 1023) / 1024 : -1;
+		int dl_status = 0;
+		for (;;) {
+			int wret = waitpid(dl_pid, &dl_status, WNOHANG);
+			if (wret != 0)
+				break;
+			struct stat st;
+			long kb = 0;
+			if (stat(FW_DL_FILE, &st) == 0)
+				kb = (long)(st.st_size / 1024);
+			char msg[128];
+			if (total_kb > 0) {
+				int pct = (int)(kb * 100 / total_kb);
+				if (pct > 99) pct = 99;
+				snprintf(msg, sizeof(msg),
+					 "Downloading firmware... %d%% (%ld/%ld KB)",
+					 pct, kb, total_kb);
+			} else {
+				snprintf(msg, sizeof(msg),
+					 "Downloading firmware... (%ld KB)", kb);
+			}
+			fw_write_state(1, 6, "running", msg, "");
+			usleep(500000);
+		}
+
+		if (!WIFEXITED(dl_status) || WEXITSTATUS(dl_status) != 0 ||
+		    access(FW_DL_FILE, F_OK) != 0) {
+			mgmt_log("ERROR", "firmware download failed (exit=%d)",
+				 WIFEXITED(dl_status) ? WEXITSTATUS(dl_status) : -1);
 			(void)run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
 			fw_write_state(1, 6, "error", "Download failed", "");
 			sg_db_close();
 			_exit(1);
 		}
-		free(dlout);
+
+		/* Show final download size */
+		{
+			struct stat st;
+			long kb = 0;
+			if (stat(FW_DL_FILE, &st) == 0)
+				kb = (long)(st.st_size / 1024);
+			char msg[128];
+			if (total_kb > 0)
+				snprintf(msg, sizeof(msg),
+					 "Downloading firmware... 100%% (%ld/%ld KB) done",
+					 kb, total_kb);
+			else
+				snprintf(msg, sizeof(msg),
+					 "Downloading firmware... (%ld KB) done", kb);
+			fw_write_state(1, 6, "running", msg, "");
+		}
 
 		/* Step 2: Extract firmware package */
 		fw_write_state(2, 6, "running", "Extracting firmware package...", "");
@@ -3057,7 +3345,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 			send_ok(client_fd, NULL,
 				"step=0\ntotal=0\nstatus=idle\n"
 				"message=No upgrade in progress\nversion=\n");
-			return;
+			return 0;
 		}
 		size_t rd = fread(state, 1, sizeof(state) - 1, sf);
 		state[rd] = '\0';
@@ -3068,7 +3356,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 			unlink(FW_STATE_FILE);
 
 		send_ok(client_fd, NULL, state);
-		return;
+		return 0;
 	}
 
 	case SG_CMD_SHOW_STATUS: {
@@ -3082,21 +3370,21 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 			"echo \"Uptime: $(cut -d' ' -f1 /proc/uptime 2>/dev/null)s\"");
 		send_ok(client_fd, NULL, out ? out : "");
 		free(out);
-		return;
+		return 0;
 	}
 
 	case SG_CMD_SHOW_IFACES: {
 		char *out = mgmtd_show_interfaces();
 		send_ok(client_fd, NULL, out ? out : "");
 		free(out);
-		return;
+		return 0;
 	}
 
 	case SG_CMD_SHOW_ROUTES: {
 		char *out = run_cmd("ip route 2>/dev/null || route -n 2>/dev/null");
 		send_ok(client_fd, NULL, out ? out : "");
 		free(out);
-		return;
+		return 0;
 	}
 
 	case SG_CMD_SHOW_STATS: {
@@ -3104,7 +3392,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 			"dmesg 2>/dev/null | grep -i 'pkt_forward\\|forwarded\\|dropped' | tail -20");
 		send_ok(client_fd, NULL, out ? out : "");
 		free(out);
-		return;
+		return 0;
 	}
 
 	case SG_CMD_WHOAMI: {
@@ -3112,7 +3400,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		char *udata = sg_db_get("system_admin", user);
 		if (!udata) {
 			send_ok(client_fd, NULL, "profile=read-only\npermissions=monitor\n");
-			return;
+			return 0;
 		}
 		char prof[128] = {0}, perm[256] = {0};
 		extract_val(udata, "profile", prof, sizeof(prof));
@@ -3132,7 +3420,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		snprintf(result, sizeof(result),
 			 "profile=%s\npermissions=%s\n", prof, perm);
 		send_ok(client_fd, NULL, result);
-		return;
+		return 0;
 	}
 
 	case SG_CMD_NET_PING: {
@@ -3140,29 +3428,23 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		if (!has_permission(perms, "monitor")) {
 			send_error(client_fd, SG_ERR_PERM_DENIED,
 				   "Requires 'monitor' permission");
-			return;
+			return 0;
 		}
 		char target[256];
 		extract_val(payload, "target", target, sizeof(target));
 		if (!target[0]) {
 			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing target");
-			return;
+			return 0;
 		}
-		if (!sg_is_safe_id(target)) {
+		if (!sg_is_net_target(target)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG,
-				   "Invalid target (use IPv4 address or hostname)");
-			return;
+				   "Invalid target (use IPv4/IPv6 address or hostname)");
+			return 0;
 		}
-		const char *argv[] = {"ping", "-c", "4", "-W", "2", target, NULL};
-		char *out = safe_exec(argv);
-		if (out) {
-			send_ok(client_fd, NULL, out);
-			free(out);
-		} else {
-			send_error(client_fd, SG_ERR_SYSTEM_FAIL,
-				   "Failed to execute ping");
-		}
-		return;
+
+		return stream_exec(client_fd,
+			(const char *[]){"ping", "-c", "4", "-W", "2",
+					 target, NULL});
 	}
 
 	case SG_CMD_NET_TRACEROUTE: {
@@ -3170,29 +3452,23 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		if (!has_permission(perms, "monitor")) {
 			send_error(client_fd, SG_ERR_PERM_DENIED,
 				   "Requires 'monitor' permission");
-			return;
+			return 0;
 		}
 		char target[256];
 		extract_val(payload, "target", target, sizeof(target));
 		if (!target[0]) {
 			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing target");
-			return;
+			return 0;
 		}
-		if (!sg_is_safe_id(target)) {
+		if (!sg_is_net_target(target)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG,
-				   "Invalid target (use IPv4 address or hostname)");
-			return;
+				   "Invalid target (use IPv4/IPv6 address or hostname)");
+			return 0;
 		}
-		const char *argv[] = {"traceroute", "-m", "20", "-w", "2", target, NULL};
-		char *out = safe_exec(argv);
-		if (out) {
-			send_ok(client_fd, NULL, out);
-			free(out);
-		} else {
-			send_error(client_fd, SG_ERR_SYSTEM_FAIL,
-				   "Failed to execute traceroute");
-		}
-		return;
+
+		return stream_exec(client_fd,
+			(const char *[]){"traceroute", "-m", "20", "-w", "2",
+					 target, NULL});
 	}
 
 	case SG_CMD_NET_NSLOOKUP: {
@@ -3200,18 +3476,18 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		if (!has_permission(perms, "monitor")) {
 			send_error(client_fd, SG_ERR_PERM_DENIED,
 				   "Requires 'monitor' permission");
-			return;
+			return 0;
 		}
 		char target[256];
 		extract_val(payload, "target", target, sizeof(target));
 		if (!target[0]) {
 			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing target");
-			return;
+			return 0;
 		}
-		if (!sg_is_safe_id(target)) {
+		if (!sg_is_net_target(target)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG,
 				   "Invalid target (use hostname or IP address)");
-			return;
+			return 0;
 		}
 		const char *argv[] = {"nslookup", target, NULL};
 		char *out = safe_exec(argv);
@@ -3222,7 +3498,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 			send_error(client_fd, SG_ERR_SYSTEM_FAIL,
 				   "Failed to execute nslookup");
 		}
-		return;
+		return 0;
 	}
 
 	case SG_CMD_NET_ARPING: {
@@ -3230,48 +3506,40 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		if (!has_permission(perms, "monitor")) {
 			send_error(client_fd, SG_ERR_PERM_DENIED,
 				   "Requires 'monitor' permission");
-			return;
+			return 0;
 		}
 		char target[256], iface[64];
 		extract_val(payload, "target", target, sizeof(target));
 		extract_val(payload, "iface", iface, sizeof(iface));
 		if (!target[0]) {
 			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing target");
-			return;
+			return 0;
 		}
-		if (!sg_is_safe_id(target)) {
+		if (!sg_is_net_target(target)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG,
-				   "Invalid target (use IPv4 address or hostname)");
-			return;
+				   "Invalid target (use IPv4/IPv6 address or hostname)");
+			return 0;
 		}
-		char *out;
-		if (iface[0]) {
-			if (!sg_is_safe_id(iface)) {
-				send_error(client_fd, SG_ERR_INVALID_ARG,
-					   "Invalid interface name");
-				return;
-			}
-			const char *argv[] = {"arping", "-c", "4", "-w", "2",
-					      "-I", iface, target, NULL};
-			out = safe_exec(argv);
-		} else {
-			const char *argv[] = {"arping", "-c", "4", "-w", "2",
-					      target, NULL};
-			out = safe_exec(argv);
+		if (iface[0] && !sg_is_iface_name(iface)) {
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "Invalid interface name");
+			return 0;
 		}
-		if (out) {
-			send_ok(client_fd, NULL, out);
-			free(out);
-		} else {
-			send_error(client_fd, SG_ERR_SYSTEM_FAIL,
-				   "Failed to execute arping");
-		}
-		return;
+
+		if (iface[0])
+			return stream_exec(client_fd,
+				(const char *[]){"arping", "-c", "4",
+						 "-w", "2", "-I", iface,
+						 target, NULL});
+		else
+			return stream_exec(client_fd,
+				(const char *[]){"arping", "-c", "4",
+						 "-w", "2", target, NULL});
 	}
 
 	case SG_CMD_PING:
 		send_ok(client_fd, "pong", NULL);
-		return;
+		return 0;
 
 	case SG_CMD_DEBUG_FETCH: {
 		if (debug_buf_used > 0) {
@@ -3281,12 +3549,12 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		} else {
 			send_ok(client_fd, NULL, NULL);
 		}
-		return;
+		return 0;
 	}
 
 	default:
 		send_error(client_fd, SG_ERR_INVALID_CMD, "Unknown command");
-		return;
+		return 0;
 	}
 }
 
@@ -3479,11 +3747,14 @@ int main(void)
 		}
 #endif
 
-		/* Handle request (with verified username) */
-		handle_request(cfd, &hdr, payload);
+		/* Handle request (with verified username)
+		 * Return 0 = main loop closes fd (default)
+		 * Return 1 = handler already closed fd (streaming) */
+		int owned = handle_request(cfd, &hdr, payload);
 
 		free(payload);
-		close(cfd);
+		if (!owned)
+			close(cfd);
 	}
 
 	close(sfd);

@@ -629,10 +629,14 @@ int main(int argc, char *argv[])
 	audit_log(username, "login_success", "source=logind");
 
 	/*
-	 * Establish controlling terminal BEFORE dropping privileges.
-	 * /dev/console is mode 0600 root:root — must open while still UID 0.
-	 * After this block, stdin/stdout/stderr point to /dev/console and
-	 * /dev/tty resolves correctly for any UID.
+	 * Establish clean session and redirect stdio to /dev/console.
+	 *
+	 * setsid() creates a new session so the CLI is isolated from the
+	 * login shell's process group.  TIOCSCTTY(0) attempts to set the
+	 * controlling terminal — this may silently fail if the parent
+	 * session (from init's "setsid -c") still owns /dev/console, but
+	 * that is fine: the CLI detects Ctrl+C by polling the tty fd
+	 * directly, without relying on SIGINT from a controlling terminal.
 	 */
 	(void)setsid();
 	int tfd = open("/dev/console", O_RDWR);

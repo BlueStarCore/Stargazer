@@ -53,6 +53,9 @@ const char *cli_readline(const char *prompt);
  */
 int cli_resolve_cmd(const char *input, char *output, size_t out_sz);
 
+/* Return the terminal fd used by readline (-1 if not initialized). */
+int cli_get_tty_fd(void);
+
 /* History management. */
 void cli_hist_load(const char *file);
 void cli_hist_save(const char *file);

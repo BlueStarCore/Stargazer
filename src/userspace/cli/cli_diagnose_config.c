@@ -2454,6 +2454,35 @@ static void test_ipc_cfg_set_validation(void)
 	}
 	ipc_resp_free(&resp);
 
+	/*
+	 * 17. Near-max payload — verify that a payload at exactly
+	 *     SG_PAYLOAD_MAX bytes is accepted without truncation.
+	 *     The clean-buffer overflow guard is defense-in-depth;
+	 *     it cannot trigger through normal IPC because the data
+	 *     portion (after the section line) is always smaller than
+	 *     the clean[] buffer (both are SG_PAYLOAD_MAX).
+	 */
+	{
+		/* Section header + required fields consume ~91 bytes.
+		 * Fill comment= to push total to exactly SG_PAYLOAD_MAX. */
+		char huge[SG_PAYLOAD_MAX + 1];
+		const char *pfx = "firewall_address:__diag_valtest\n"
+				  "name=__diag_valtest\n"
+				  "subnet=10.0.0.0/8\n"
+				  "type=ipmask\n"
+				  "comment=";
+		size_t plen = strlen(pfx);
+		memcpy(huge, pfx, plen);
+		/* fill + trailing newline = SG_PAYLOAD_MAX - plen */
+		size_t fill = SG_PAYLOAD_MAX - plen - 1;
+		memset(huge + plen, 'A', fill);
+		huge[plen + fill] = '\n';
+		huge[plen + fill + 1] = '\0';
+
+		ipc_check("accept near-max payload (no truncation at boundary)",
+			  SG_CMD_CFG_SET, huge, SG_OK);
+	}
+
 	/* Cleanup */
 	ipc_send_str(SG_CMD_CFG_DEL,
 		     "firewall_address:__diag_valtest", &resp);

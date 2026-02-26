@@ -14,6 +14,7 @@
 #include "cli_cmd_table.h"
 #include "cli_debug.h"
 
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -107,6 +108,17 @@ int main(void)
 		fprintf(stderr, "Error: cannot open terminal\n");
 		return 1;
 	}
+
+	/*
+	 * Ignore SIGINT globally.  In raw mode, Ctrl+C is handled as byte
+	 * 0x03 by readline.  During streaming/polling, cli_ipc polls the
+	 * tty directly for 0x03 — no signal needed.  SIG_IGN prevents an
+	 * accidental kill if a stray SIGINT is delivered.
+	 */
+	signal(SIGINT, SIG_IGN);
+
+	/* Tell the IPC layer which fd to poll for Ctrl+C during streaming */
+	ipc_set_interrupt_fd(cli_get_tty_fd());
 
 	/* 4. Register commands based on permissions */
 	cmd_register_all(permissions);

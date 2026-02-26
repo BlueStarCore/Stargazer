@@ -168,6 +168,23 @@ sg_is_safe_id(const char *s)
 }
 
 int
+sg_is_net_target(const char *s)
+{
+	if (!s || !*s)
+		return 0;
+	if (strlen(s) > SG_NET_TARGET_MAX)
+		return 0;
+	for (const char *p = s; *p; p++) {
+		if (isalnum((unsigned char)*p))
+			continue;
+		if (*p == '_' || *p == '.' || *p == '-' || *p == ':')
+			continue;
+		return 0;
+	}
+	return 1;
+}
+
+int
 sg_is_ipv4(const char *s)
 {
 	if (!s || !*s)

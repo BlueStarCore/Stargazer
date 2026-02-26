@@ -611,11 +611,11 @@ static void diag_security_tests(void)
 			 SG_ERR_INVALID_ARG);
 	diag_test_status("CHECK_PW valid user + weak password",
 			 SG_CMD_ADMIN_CHECK_PW,
-			 "admin\nabc\n",
+			 "admin\nabc\nenable\n",
 			 SG_ERR_POLICY_FAIL);
 	diag_test_status("CHECK_PW valid user + compliant password",
 			 SG_CMD_ADMIN_CHECK_PW,
-			 "admin\nAbcdefg1\n",
+			 "admin\nAbcdefg1\nenable\n",
 			 SG_OK);
 	diag_test_status("CHECK_PW nonexistent user (policy not enforced)",
 			 SG_CMD_ADMIN_CHECK_PW,

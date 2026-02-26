@@ -16,9 +16,11 @@
 #include "cli_debug.h"
 
 #include <errno.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <termios.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -26,6 +28,62 @@
 /* ── Static state ──────────────────────────────────────────────────────── */
 
 static char ipc_username[SG_USERNAME_MAX];
+
+/* ── Poll-based Ctrl+C interrupt detection ────────────────────────────── */
+
+static int            g_interrupt_fd = -1;   /* tty fd for Ctrl+C reads  */
+static int            g_stream_interrupted;
+static struct termios g_saved_tty;
+static int            g_tty_saved;
+
+void ipc_set_interrupt_fd(int fd)
+{
+	g_interrupt_fd = fd;
+}
+
+/* Put the tty in raw mode so Ctrl+C (0x03) is readable immediately. */
+static void interrupt_raw_on(void)
+{
+	g_tty_saved = 0;
+	if (g_interrupt_fd < 0)
+		return;
+	struct termios t;
+	if (tcgetattr(g_interrupt_fd, &g_saved_tty) != 0)
+		return;
+	g_tty_saved = 1;
+	t = g_saved_tty;
+	t.c_lflag &= ~(unsigned)(ICANON | ECHO | ISIG);
+	t.c_cc[VMIN] = 0;
+	t.c_cc[VTIME] = 0;
+	tcsetattr(g_interrupt_fd, TCSANOW, &t);
+}
+
+static void interrupt_raw_off(void)
+{
+	if (g_tty_saved && g_interrupt_fd >= 0)
+		tcsetattr(g_interrupt_fd, TCSANOW, &g_saved_tty);
+	g_tty_saved = 0;
+}
+
+/* Non-blocking drain: read any pending bytes and check for 0x03. */
+static int check_ctrl_c(void)
+{
+	if (g_interrupt_fd < 0)
+		return 0;
+	struct pollfd pfd;
+	pfd.fd = g_interrupt_fd;
+	pfd.events = POLLIN;
+	while (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+		char c;
+		if (read(g_interrupt_fd, &c, 1) != 1)
+			break;
+		if (c == 3) { /* Ctrl+C */
+			g_stream_interrupted = 1;
+			return 1;
+		}
+	}
+	return 0;
+}
 
 /* ── Debug helpers ─────────────────────────────────────────────────────── */
 
@@ -110,6 +168,59 @@ static ssize_t safe_read(int fd, void *buf, size_t len)
 {
 	size_t done = 0;
 	while (done < len) {
+		ssize_t n = read(fd, (char *)buf + done, len - done);
+		if (n <= 0) {
+			if (n < 0 && errno == EINTR) {
+				if (g_stream_interrupted)
+					return (ssize_t)done;
+				continue;
+			}
+			return n == 0 ? (ssize_t)done : -1;
+		}
+		done += (size_t)n;
+	}
+	return (ssize_t)done;
+}
+
+/*
+ * stream_read — like safe_read but polls for Ctrl+C between partial reads.
+ * During streaming, the outer poll() guarantees at least 1 byte is ready,
+ * but safe_read() then loops calling blocking read() until it has the full
+ * header/payload.  If mgmtd stalls mid-write, that read() blocks with no
+ * way to detect Ctrl+C (ISIG is off → no SIGINT → no EINTR).
+ *
+ * stream_read() re-polls before every read(), monitoring the tty alongside
+ * the socket so Ctrl+C is always responsive.
+ */
+static ssize_t stream_read(int fd, void *buf, size_t len)
+{
+	size_t done = 0;
+	while (done < len) {
+		if (g_stream_interrupted)
+			return (ssize_t)done;
+
+		struct pollfd pfds[2];
+		int nfds = 1;
+		pfds[0].fd = fd;
+		pfds[0].events = POLLIN;
+		if (g_interrupt_fd >= 0) {
+			pfds[1].fd = g_interrupt_fd;
+			pfds[1].events = POLLIN;
+			nfds = 2;
+		}
+
+		int prc = poll(pfds, (nfds_t)nfds, 30000);
+		if (prc <= 0)
+			return (ssize_t)done; /* timeout or error */
+
+		if (nfds > 1 && (pfds[1].revents & POLLIN))
+			check_ctrl_c();
+		if (g_stream_interrupted)
+			return (ssize_t)done;
+
+		if (!(pfds[0].revents & POLLIN))
+			continue;
+
 		ssize_t n = read(fd, (char *)buf + done, len - done);
 		if (n <= 0) {
 			if (n < 0 && errno == EINTR)
@@ -251,6 +362,162 @@ int ipc_send_str(uint32_t cmd, const char *payload_str,
 {
 	size_t len = payload_str ? strlen(payload_str) : 0;
 	return ipc_send(cmd, payload_str, len, resp);
+}
+
+int ipc_send_stream(uint32_t cmd, const char *payload_str,
+		    void (*on_chunk)(const char *data, size_t len))
+{
+	int ret = -1;
+	size_t payload_len = payload_str ? strlen(payload_str) : 0;
+
+	if (payload_len > SG_PAYLOAD_MAX)
+		return -1;
+
+	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0)
+		return -1;
+
+	struct sockaddr_un addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", SG_MGMTD_SOCK);
+
+	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+		goto out;
+
+	/* Send request header */
+	sg_request_hdr_t hdr;
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.magic       = SG_MSG_MAGIC;
+	hdr.version     = SG_MSG_VERSION;
+	hdr.cmd         = cmd;
+	snprintf(hdr.username, sizeof(hdr.username), "%s", ipc_username);
+	hdr.payload_len = (uint32_t)payload_len;
+
+	if (dbg_enabled()) {
+		if (strcmp(dbg_get("mgmtd_debug", "0"), "1") == 0)
+			hdr.debug_flags |= SG_DBG_FLAG_MGMTD;
+		if (strcmp(dbg_get("auth_admin", "0"), "1") == 0)
+			hdr.debug_flags |= SG_DBG_FLAG_AUTH;
+	}
+
+	if (safe_write(fd, &hdr, sizeof(hdr)) < 0)
+		goto out;
+
+	if (payload_len > 0 && payload_str) {
+		if (safe_write(fd, payload_str, payload_len) < 0)
+			goto out;
+	}
+
+	if (ipc_dbg())
+		fprintf(stderr, "[IPC-DBG] -> cmd=%u(%s) len=%u [stream]\n",
+			cmd, cmd_name(cmd), (unsigned)payload_len);
+
+	/* Enter interruptible mode: tty in raw mode for Ctrl+C polling */
+	g_stream_interrupted = 0;
+	interrupt_raw_on();
+
+	/* Read streaming responses until final (extra[0] != '+') */
+	for (;;) {
+		if (g_stream_interrupted) {
+			ret = SG_OK;
+			goto out;
+		}
+
+		/* Wait for socket data while monitoring tty for Ctrl+C */
+		struct pollfd pfds[2];
+		int nfds = 1;
+		pfds[0].fd = fd;
+		pfds[0].events = POLLIN;
+		if (g_interrupt_fd >= 0) {
+			pfds[1].fd = g_interrupt_fd;
+			pfds[1].events = POLLIN;
+			nfds = 2;
+		}
+
+		int prc = poll(pfds, (nfds_t)nfds, 30000);
+		if (prc <= 0)
+			goto out; /* timeout or error */
+
+		/* Check tty for Ctrl+C */
+		if (nfds > 1 && (pfds[1].revents & POLLIN)) {
+			if (check_ctrl_c()) {
+				ret = SG_OK;
+				goto out;
+			}
+		}
+
+		/* No socket data ready (only tty triggered) */
+		if (!(pfds[0].revents & POLLIN))
+			continue;
+
+		sg_response_hdr_t rhdr;
+		ssize_t n = stream_read(fd, &rhdr, sizeof(rhdr));
+		if (n < (ssize_t)sizeof(rhdr)) {
+			if (g_stream_interrupted)
+				ret = SG_OK;
+			goto out;
+		}
+		if (rhdr.magic != SG_MSG_MAGIC)
+			goto out;
+
+		/* Read payload if present */
+		char *chunk = NULL;
+		if (rhdr.payload_len > 0 && rhdr.payload_len <= SG_PAYLOAD_MAX) {
+			chunk = malloc(rhdr.payload_len + 1);
+			if (!chunk)
+				goto out;
+			n = stream_read(fd, chunk, rhdr.payload_len);
+			if (n < (ssize_t)rhdr.payload_len) {
+				free(chunk);
+				if (g_stream_interrupted)
+					ret = SG_OK;
+				goto out;
+			}
+			chunk[n] = '\0';
+		}
+
+		int is_stream = (rhdr.extra[0] == '+');
+
+		if (is_stream && chunk && on_chunk)
+			on_chunk(chunk, (size_t)rhdr.payload_len);
+
+		free(chunk);
+
+		if (!is_stream) {
+			/* Final response */
+			ret = (int)rhdr.status;
+			break;
+		}
+	}
+
+	if (ipc_dbg())
+		fprintf(stderr, "[IPC-DBG] <- stream done status=%d\n", ret);
+
+out:
+	interrupt_raw_off();
+	if (g_stream_interrupted)
+		printf("\n");
+	close(fd);
+	return ret;
+}
+
+void ipc_install_interrupt_handler(void)
+{
+	g_stream_interrupted = 0;
+	interrupt_raw_on();
+}
+
+void ipc_restore_interrupt_handler(void)
+{
+	interrupt_raw_off();
+}
+
+int ipc_stream_interrupted(void)
+{
+	if (!g_stream_interrupted)
+		check_ctrl_c();
+	return g_stream_interrupted != 0;
 }
 
 int ipc_available(void)
