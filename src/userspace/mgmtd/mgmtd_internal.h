@@ -1,0 +1,119 @@
+/* SPDX-License-Identifier: MIT */
+/*
+ * mgmtd_internal.h — Shared internal declarations for mgmtd modules
+ *
+ * Functions defined in stargazer-mgmtd.c that sub-modules
+ * (mgmtd_user.c, mgmtd_firmware.c, mgmtd_network.c) need to call.
+ *
+ * Follows the same pattern as mgmtd_apply.h.
+ */
+
+#ifndef MGMTD_INTERNAL_H
+#define MGMTD_INTERNAL_H
+
+#include "stargazer_ipc.h"
+#include "sg_db.h"
+#include "sg_validate.h"
+#include "password_policy.h"
+
+#include <stddef.h>
+#include <stdint.h>
+
+/* ── Constants ───────────────────────────────────────────────────────────── */
+
+#define CMD_BUF_SIZE     512
+#define MAX_LINE         1024
+#define MAX_SALT_LEN     32
+#define SHADOW_LOCK_MODE  0600
+#define SHADOW_FILE_MODE  0640
+#define SHADOW_LAST_CHANGED  "19700"
+#define SHADOW_MAX_DAYS      "99999"
+#define SHADOW_WARN_DAYS     "7"
+#define AUDIT_WARN " [WARNING: audit log write failed]"
+
+/* ── Per-request debug flags (defined in stargazer-mgmtd.c) ─────────────── */
+
+extern uint8_t g_debug_flags;
+
+/* ── I/O helpers (defined in stargazer-mgmtd.c) ─────────────────────────── */
+
+void send_ok(int fd, const char *extra, const char *payload);
+void send_error(int fd, sg_status_t status, const char *extra);
+void send_ok_audited(int fd, const char *extra, const char *payload,
+		     const char *user, const char *event, const char *amsg);
+int  send_stream_chunk(int fd, const char *data, size_t len);
+int  stream_exec(int client_fd, const char *const argv[]);
+
+/* ── Logging (defined in stargazer-mgmtd.c) ──────────────────────────────── */
+
+int  audit_log(const char *user, const char *event, const char *msg);
+
+/* ── Debug (defined in stargazer-mgmtd.c) ────────────────────────────────── */
+
+void debug_buf_push(const char *fmt, ...)
+	__attribute__((format(printf, 1, 2)));
+
+/* ── Session (defined in stargazer-mgmtd.c) ──────────────────────────────── */
+
+int  session_rev_get(const char *user);
+int  session_rev_bump(const char *user);
+
+/* ── Auth / permissions (defined in stargazer-mgmtd.c) ───────────────────── */
+
+const char *get_user_permissions(const char *username);
+int  has_permission(const char *perms_csv, const char *perm);
+int  check_type_permission(const char *user, const char *type_name);
+
+/* ── Config validation (defined in stargazer-mgmtd.c) ────────────────────── */
+
+sg_status_t validate_cfg_data(const char *type, const char *data,
+			      char *errbuf, size_t errsz);
+int  check_references(const char *type, const char *id,
+		      char *errbuf, size_t errsz);
+
+/* ── User/password helpers (defined in mgmtd_user.c) ─────────────────────── */
+
+int  set_password(const char *username, const char *password);
+int  create_system_user(const char *username, const char *shell);
+int  delete_system_user(const char *username);
+int  user_has_password(const char *username);
+int  mgmtd_validate_password(const char *username, const char *password,
+			     const char *enforce_override,
+			     const char **reason);
+
+/* ── User management handlers (defined in mgmtd_user.c) ─────────────────── */
+
+int handle_admin_create(int client_fd, const char *user,
+			const char *payload, const sg_request_hdr_t *hdr);
+int handle_admin_delete(int client_fd, const char *user,
+			const char *payload, const sg_request_hdr_t *hdr);
+int handle_admin_set_pw(int client_fd, const char *user,
+			const char *payload, const sg_request_hdr_t *hdr);
+int handle_admin_set_enf(int client_fd, const char *user,
+			 const char *payload, const sg_request_hdr_t *hdr);
+int handle_admin_check_pw(int client_fd, const char *user,
+			  const char *payload, const sg_request_hdr_t *hdr);
+int handle_admin_lock_pw(int client_fd, const char *user,
+			 const char *payload, const sg_request_hdr_t *hdr);
+
+/* ── Firmware handlers (defined in mgmtd_firmware.c) ─────────────────────── */
+
+int handle_fw_status(int client_fd, const char *user,
+		     const char *payload, const sg_request_hdr_t *hdr);
+int handle_fw_upgrade(int client_fd, const char *user,
+		      const char *payload, const sg_request_hdr_t *hdr);
+int handle_fw_progress(int client_fd, const char *user,
+		       const char *payload, const sg_request_hdr_t *hdr);
+
+/* ── Network diagnostic handlers (defined in mgmtd_network.c) ────────────── */
+
+int handle_net_ping(int client_fd, const char *user,
+		    const char *payload, const sg_request_hdr_t *hdr);
+int handle_net_traceroute(int client_fd, const char *user,
+			  const char *payload, const sg_request_hdr_t *hdr);
+int handle_net_nslookup(int client_fd, const char *user,
+			const char *payload, const sg_request_hdr_t *hdr);
+int handle_net_arping(int client_fd, const char *user,
+		      const char *payload, const sg_request_hdr_t *hdr);
+
+#endif /* MGMTD_INTERNAL_H */
