@@ -220,16 +220,33 @@ static int cmd_fw_upgrade(const char *args, const char *permissions)
 	ipc_resp_free(&resp);
 
 	/* Poll for progress updates */
-	printf("\n  Starting firmware upgrade...\n\n");
+	printf("\n");
 	fflush(stdout);
 
+	ipc_install_interrupt_handler();
+
 	int last_step = -1;
+	int lines_printed = 0;
+	int have_inline = 0;   /* true if an in-place progress line is active */
+	char last_msg[256] = {0};
 	for (int i = 0; i < 240; i++) {  /* 240 * 500ms = 120s timeout */
 		usleep(500000);
 
+		if (ipc_stream_interrupted()) {
+			if (have_inline)
+				printf("\n");
+			printf("  Interrupted.\n");
+			break;
+		}
+
 		struct ipc_response pr;
 		if (ipc_send_str(SG_CMD_FW_PROGRESS, "", &pr) != 0) {
-			printf("  Connection lost — device may be rebooting.\n");
+			if (have_inline)
+				printf("\n");
+			if (ipc_stream_interrupted())
+				printf("  Interrupted.\n");
+			else
+				printf("  Connection lost — device may be rebooting.\n");
 			break;
 		}
 
@@ -247,33 +264,72 @@ static int cmd_fw_upgrade(const char *args, const char *permissions)
 		int step = atoi(step_s);
 		int total = atoi(total_s);
 
-		if (step > last_step && message[0]) {
-			if (total > 0)
-				printf("  [%d/%d] %s\n", step, total, message);
-			else
-				printf("  %s\n", message);
-			fflush(stdout);
-			last_step = step;
+		/* Print step log lines (step transitions) as in-place
+		 * lines so that subsequent progress updates within the
+		 * same step can overwrite them via \r. */
+		int new_lines = 0;
+		const char *sep = strstr(pr.payload, "\n---\n");
+		if (sep) {
+			const char *log = sep + 5;
+			int line_num = 0;
+			const char *lp = log;
+			while (*lp) {
+				const char *eol = strchr(lp, '\n');
+				size_t llen = eol ? (size_t)(eol - lp) : strlen(lp);
+				if (llen > 0 && line_num >= lines_printed) {
+					if (have_inline)
+						printf("\n");
+					printf("  %.*s", (int)llen, lp);
+					fflush(stdout);
+					have_inline = 1;
+					lines_printed = line_num + 1;
+					new_lines++;
+				}
+				line_num++;
+				if (!eol) break;
+				lp = eol + 1;
+			}
 		}
 
+		/* For current step's message: update in-place.
+		 * Skip if we just printed new log lines (they already
+		 * show the step transition) or if the message hasn't
+		 * changed since last displayed. */
+		if (message[0] && total > 0 && !new_lines &&
+		    strcmp(message, last_msg) != 0) {
+			printf("\r\033[K  [%d/%d] %s", step, total, message);
+			fflush(stdout);
+			have_inline = 1;
+		}
+
+		last_step = step;
+		snprintf(last_msg, sizeof(last_msg), "%s", message);
+
 		if (strcmp(status, "done") == 0) {
+			if (have_inline)
+				printf("\n");
 			printf("\n  System is rebooting now...\n");
 			ipc_resp_free(&pr);
 			break;
 		}
 		if (strcmp(status, "error") == 0) {
+			if (have_inline)
+				printf("\n");
 			printf("\n  Firmware upgrade failed.\n");
 			ipc_resp_free(&pr);
 			break;
 		}
 		if (strcmp(status, "idle") == 0) {
-			/* Upgrade finished and state was already cleaned up */
+			if (have_inline)
+				printf("\n");
 			ipc_resp_free(&pr);
 			break;
 		}
 
 		ipc_resp_free(&pr);
 	}
+
+	ipc_restore_interrupt_handler();
 
 	if (last_step < 0)
 		printf("  Timed out waiting for upgrade progress.\n");
@@ -362,35 +418,29 @@ static int cmd_diag_test_cfg(const char *args, const char *permissions)
 	return 0;
 }
 
+static void print_chunk(const char *data, size_t len)
+{
+	fwrite(data, 1, len, stdout);
+	fflush(stdout);
+}
+
 static int cmd_ping(const char *args, const char *permissions)
 {
 	(void)permissions;
 
 	if (!args || !*args) {
-		printf("  Usage: execute ping <IPv4-address-or-hostname>\n");
+		printf("  Usage: execute ping <IPv4/IPv6-address-or-hostname>\n");
 		return 0;
 	}
 
 	char payload[SG_PAYLOAD_MAX];
 	snprintf(payload, sizeof(payload), "target=%s\n", args);
 
-	struct ipc_response resp;
-	if (ipc_send_str(SG_CMD_NET_PING, payload, &resp) != 0) {
+	int st = ipc_send_stream(SG_CMD_NET_PING, payload, print_chunk);
+	if (st < 0)
 		printf("  Error: could not contact management daemon.\n");
-		return 0;
-	}
-
-	if (resp.status != SG_OK) {
-		printf("  Ping failed: %s\n",
-		       resp.extra[0] ? resp.extra : sg_status_str(resp.status));
-		ipc_resp_free(&resp);
-		return 0;
-	}
-
-	if (resp.payload && resp.payload_len > 0)
-		printf("%s", resp.payload);
-
-	ipc_resp_free(&resp);
+	else if (st != SG_OK)
+		printf("  Ping failed: %s\n", sg_status_str((sg_status_t)st));
 	return 0;
 }
 
@@ -399,30 +449,18 @@ static int cmd_traceroute(const char *args, const char *permissions)
 	(void)permissions;
 
 	if (!args || !*args) {
-		printf("  Usage: execute traceroute <IPv4-address-or-hostname>\n");
+		printf("  Usage: execute traceroute <IPv4/IPv6-address-or-hostname>\n");
 		return 0;
 	}
 
 	char payload[SG_PAYLOAD_MAX];
 	snprintf(payload, sizeof(payload), "target=%s\n", args);
 
-	struct ipc_response resp;
-	if (ipc_send_str(SG_CMD_NET_TRACEROUTE, payload, &resp) != 0) {
+	int st = ipc_send_stream(SG_CMD_NET_TRACEROUTE, payload, print_chunk);
+	if (st < 0)
 		printf("  Error: could not contact management daemon.\n");
-		return 0;
-	}
-
-	if (resp.status != SG_OK) {
-		printf("  Traceroute failed: %s\n",
-		       resp.extra[0] ? resp.extra : sg_status_str(resp.status));
-		ipc_resp_free(&resp);
-		return 0;
-	}
-
-	if (resp.payload && resp.payload_len > 0)
-		printf("%s", resp.payload);
-
-	ipc_resp_free(&resp);
+	else if (st != SG_OK)
+		printf("  Traceroute failed: %s\n", sg_status_str((sg_status_t)st));
 	return 0;
 }
 
@@ -504,23 +542,11 @@ static int cmd_arping(const char *args, const char *permissions)
 	else
 		snprintf(payload, sizeof(payload), "target=%s\n", target);
 
-	struct ipc_response resp;
-	if (ipc_send_str(SG_CMD_NET_ARPING, payload, &resp) != 0) {
+	int st = ipc_send_stream(SG_CMD_NET_ARPING, payload, print_chunk);
+	if (st < 0)
 		printf("  Error: could not contact management daemon.\n");
-		return 0;
-	}
-
-	if (resp.status != SG_OK) {
-		printf("  Arping failed: %s\n",
-		       resp.extra[0] ? resp.extra : sg_status_str(resp.status));
-		ipc_resp_free(&resp);
-		return 0;
-	}
-
-	if (resp.payload && resp.payload_len > 0)
-		printf("%s", resp.payload);
-
-	ipc_resp_free(&resp);
+	else if (st != SG_OK)
+		printf("  Arping failed: %s\n", sg_status_str((sg_status_t)st));
 	return 0;
 }
 

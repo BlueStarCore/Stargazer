@@ -8,12 +8,14 @@
  */
 
 #define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE
 
 #include "cli_readline.h"
 #include "cli_ipc.h"
 #include "cli_cmd_table.h"
 #include "cli_debug.h"
 
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -87,14 +89,30 @@ int main(void)
 	char profile[128]    = "read-only";
 	char permissions[256] = "monitor";
 
-	if (ipc_init(user) == 0 && ipc_available()) {
-		struct ipc_response resp;
-		if (ipc_send_str(SG_CMD_WHOAMI, "", &resp) == 0 &&
-		    resp.status == SG_OK && resp.payload) {
-			parse_whoami(resp.payload, profile, sizeof(profile),
-				     permissions, sizeof(permissions));
+	if (ipc_init(user) == 0) {
+		/*
+		 * Retry WHOAMI a few times — mgmtd may still be starting.
+		 * Without this, the CLI defaults to read-only for the
+		 * entire session if the socket isn't ready yet.
+		 */
+		for (int attempt = 0; attempt < 5; attempt++) {
+			if (!ipc_available()) {
+				usleep(200000); /* 200ms */
+				continue;
+			}
+			struct ipc_response resp;
+			if (ipc_send_str(SG_CMD_WHOAMI, "", &resp) == 0 &&
+			    resp.status == SG_OK && resp.payload) {
+				parse_whoami(resp.payload, profile,
+					     sizeof(profile),
+					     permissions,
+					     sizeof(permissions));
+				ipc_resp_free(&resp);
+				break;
+			}
+			ipc_resp_free(&resp);
+			usleep(200000);
 		}
-		ipc_resp_free(&resp);
 	}
 
 	/* Export for shell subcommands */
@@ -107,6 +125,17 @@ int main(void)
 		fprintf(stderr, "Error: cannot open terminal\n");
 		return 1;
 	}
+
+	/*
+	 * Ignore SIGINT globally.  In raw mode, Ctrl+C is handled as byte
+	 * 0x03 by readline.  During streaming/polling, cli_ipc polls the
+	 * tty directly for 0x03 — no signal needed.  SIG_IGN prevents an
+	 * accidental kill if a stray SIGINT is delivered.
+	 */
+	signal(SIGINT, SIG_IGN);
+
+	/* Tell the IPC layer which fd to poll for Ctrl+C during streaming */
+	ipc_set_interrupt_fd(cli_get_tty_fd());
 
 	/* 4. Register commands based on permissions */
 	cmd_register_all(permissions);

@@ -250,6 +250,11 @@ void cli_term_cleanup(void)
 	raw_mode = 0;
 }
 
+int cli_get_tty_fd(void)
+{
+	return tty_fd;
+}
+
 /* ── Completion registry ──────────────────────────────────────────────── */
 
 void cli_register(const char *path, const char *desc)

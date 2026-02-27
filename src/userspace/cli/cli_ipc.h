@@ -31,6 +31,22 @@ int ipc_send(uint32_t cmd, const char *payload, size_t payload_len,
 int ipc_send_str(uint32_t cmd, const char *payload_str,
 		 struct ipc_response *resp);
 
+/* Send request and receive streaming response.
+ * on_chunk is called for each chunk; final status is returned.
+ * Returns SG_OK on success, or SG_ERR_* / -1 on error. */
+int ipc_send_stream(uint32_t cmd, const char *payload_str,
+		    void (*on_chunk)(const char *data, size_t len));
+
+/* Set the terminal fd used for Ctrl+C detection during streaming/polling.
+ * Call once at startup with the readline tty fd. */
+void ipc_set_interrupt_fd(int fd);
+
+/* Enter/leave interruptible mode for polling loops (e.g. firmware upgrade).
+ * ipc_send_stream() handles this internally; these are for manual loops. */
+void ipc_install_interrupt_handler(void);
+void ipc_restore_interrupt_handler(void);
+int  ipc_stream_interrupted(void);
+
 /* Check if mgmtd socket exists. */
 int ipc_available(void);
 

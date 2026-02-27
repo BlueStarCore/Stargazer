@@ -8,7 +8,11 @@ LDFLAGS      := -static
 BUILD_DIR    ?= ../../../build/mgmtd
 
 # SQLite amalgamation: third-party, compile without -Werror
+# -U_FORTIFY_SOURCE: musl lacks __memcpy_chk / __memset_chk
+# -Dfcntl64=fcntl:   musl provides fcntl only (already 64-bit)
 SQLITE_CFLAGS := -Wall -Os -static -I. \
+                 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
+                 -Dfcntl64=fcntl \
                  -DSQLITE_THREADSAFE=0 \
                  -DSQLITE_OMIT_LOAD_EXTENSION \
                  -DSQLITE_OMIT_DEPRECATED
@@ -25,14 +29,17 @@ $(BUILD_DIR)/sqlite3.o: sqlite3.c sqlite3.h
 MGMTD_APPLY_SRCS := mgmtd_apply_route.c mgmtd_apply_iface.c \
                      mgmtd_apply_nat.c mgmtd_apply_dns.c mgmtd_apply_dhcp.c
 
+MGMTD_SRCS := mgmtd_user.c mgmtd_firmware.c mgmtd_network.c
+
 $(BUILD_DIR)/stargazer-mgmtd: stargazer-mgmtd.c stargazer_ipc.h mgmtd_apply.h \
-                               $(MGMTD_APPLY_SRCS) \
+                               mgmtd_internal.h \
+                               $(MGMTD_SRCS) $(MGMTD_APPLY_SRCS) \
                                sg_db.c sg_db.h \
                                $(COMMON_DIR)/password_policy.c $(COMMON_DIR)/password_policy.h \
                                $(COMMON_DIR)/sg_validate.c $(COMMON_DIR)/sg_validate.h \
                                $(BUILD_DIR)/sqlite3.o
 	@mkdir -p $(BUILD_DIR)
-	$(CC) $(CFLAGS) -o $@ stargazer-mgmtd.c $(MGMTD_APPLY_SRCS) \
+	$(CC) $(CFLAGS) -o $@ stargazer-mgmtd.c $(MGMTD_SRCS) $(MGMTD_APPLY_SRCS) \
 		sg_db.c $(COMMON_DIR)/password_policy.c \
 		$(COMMON_DIR)/sg_validate.c $(BUILD_DIR)/sqlite3.o $(LDFLAGS) -lcrypt
 

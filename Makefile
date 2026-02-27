@@ -73,8 +73,12 @@ MUSL_CC        := $(MUSL_CROSS_DIR)/bin/aarch64-linux-musl-gcc
 MUSL_CROSS     := $(MUSL_CROSS_DIR)/bin/aarch64-linux-musl-
 
 # U-Boot bootloader (pre-built from Ubuntu u-boot-qemu package)
-UBOOT_DEB_URL  := http://archive.ubuntu.com/ubuntu/pool/main/u/u-boot/u-boot-qemu_2022.01+dfsg-2ubuntu2.6_all.deb
+UBOOT_DEB_URL  := http://archive.ubuntu.com/ubuntu/pool/main/u/u-boot/u-boot-qemu_2022.01+dfsg-2ubuntu2.7_all.deb
 UBOOT_BIN      := $(BUILD_DIR)/u-boot/u-boot.bin
+
+# Source watch: any .c/.h/Makefile change under src/ triggers rebuild.
+# Sub-Makefiles have fine-grained deps; this just ensures they get invoked.
+SRC_WATCH := $(shell find $(PROJECT_ROOT)/src -name '*.c' -o -name '*.h' -o -name 'Makefile' -o -name 'Kbuild' 2>/dev/null)
 
 # =============================================================================
 # Main targets
@@ -123,7 +127,7 @@ kernel-config:
 
 modules: $(BUILD_DIR)/modules/$(MODULE_NAME).ko
 
-$(BUILD_DIR)/modules/$(MODULE_NAME).ko: $(KERNEL_IMAGE)
+$(BUILD_DIR)/modules/$(MODULE_NAME).ko: $(KERNEL_IMAGE) $(SRC_WATCH)
 	@echo "[2/5] Building modules..."
 	$(MAKE) -C $(KERNEL_DIR) M=$(MODULE_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) modules KBUILD_MODPOST_WARN=1
 	@mkdir -p $(BUILD_DIR)/modules
@@ -232,7 +236,7 @@ $(DASH_BIN): $(MUSL_CC)
 
 logind: $(BUILD_DIR)/logind/stargazer-logind $(BUILD_DIR)/logind/stargazer-hashpw $(BUILD_DIR)/logind/stargazer-readline
 
-$(BUILD_DIR)/logind/stargazer-logind $(BUILD_DIR)/logind/stargazer-hashpw $(BUILD_DIR)/logind/stargazer-readline: $(MUSL_CC)
+$(BUILD_DIR)/logind/stargazer-logind $(BUILD_DIR)/logind/stargazer-hashpw $(BUILD_DIR)/logind/stargazer-readline: $(MUSL_CC) $(SRC_WATCH)
 	@echo "[3d/5] Building logind + C helpers (musl static)..."
 	@mkdir -p $(BUILD_DIR)/logind
 	$(MAKE) -C $(LOGIND_DIR) \
@@ -246,7 +250,7 @@ $(BUILD_DIR)/logind/stargazer-logind $(BUILD_DIR)/logind/stargazer-hashpw $(BUIL
 
 mgmtd: $(BUILD_DIR)/mgmtd/stargazer-mgmtd $(BUILD_DIR)/mgmtd/stargazer-ipc-cli
 
-$(BUILD_DIR)/mgmtd/stargazer-mgmtd $(BUILD_DIR)/mgmtd/stargazer-ipc-cli: $(MUSL_CC)
+$(BUILD_DIR)/mgmtd/stargazer-mgmtd $(BUILD_DIR)/mgmtd/stargazer-ipc-cli: $(MUSL_CC) $(SRC_WATCH)
 	@echo "[3e/5] Building mgmtd + IPC client (musl static)..."
 	@mkdir -p $(BUILD_DIR)/mgmtd
 	$(MAKE) -C $(MGMTD_DIR) \
@@ -260,7 +264,7 @@ $(BUILD_DIR)/mgmtd/stargazer-mgmtd $(BUILD_DIR)/mgmtd/stargazer-ipc-cli: $(MUSL_
 
 cli: $(BUILD_DIR)/cli/stargazer-cli
 
-$(BUILD_DIR)/cli/stargazer-cli: $(MUSL_CC)
+$(BUILD_DIR)/cli/stargazer-cli: $(MUSL_CC) $(SRC_WATCH)
 	@echo "[3f/5] Building C CLI binary (musl static)..."
 	@mkdir -p $(BUILD_DIR)/cli
 	$(MAKE) -C $(CLI_DIR) \
@@ -377,10 +381,6 @@ $(ROOTFS_DIR)/.stamp: modules busybox dash logind mgmtd cli
 	@mkdir -p $(ROOTFS_DIR)/usr/share/udhcpc
 	@cp $(USERSPACE_DIR)/usr/share/udhcpc/default.script $(ROOTFS_DIR)/usr/share/udhcpc/
 	@chmod +x $(ROOTFS_DIR)/usr/share/udhcpc/default.script
-
-	# Copy automated test suite (for test_mode=1 boots)
-	@cp $(PROJECT_ROOT)/tests/test_suite.sh $(ROOTFS_DIR)/usr/libexec/stargazer/test_suite.sh
-	@chmod +x $(ROOTFS_DIR)/usr/libexec/stargazer/test_suite.sh
 
 	# Create stargazer config directory (mgmtd seeds defaults on first boot)
 	@mkdir -p $(ROOTFS_DIR)/etc/stargazer

@@ -25,15 +25,18 @@ const sg_type_info_t *sg_reg_types(void);
 
 /* ── Pure validators ──────────────────────────────────────────────────── */
 
-#define SG_SAFE_ID_MAX  64
+#define SG_SAFE_ID_MAX      64
+#define SG_NET_TARGET_MAX  253   /* DNS max hostname length */
 
 int sg_is_safe_id(const char *s);
+int sg_is_net_target(const char *s);
 int sg_is_ipv4(const char *s);
 int sg_is_cidr(const char *s);
 int sg_is_iface_name(const char *s);
 int sg_is_uint_range(const char *s, int min, int max);
 int sg_is_tz_token(const char *s);
 int sg_is_permissions_csv(const char *s);
+int sg_is_access_services(const char *s);
 int sg_is_port_or_range(const char *s);
 int sg_match_csv_option(const char *opts, const char *val);
 

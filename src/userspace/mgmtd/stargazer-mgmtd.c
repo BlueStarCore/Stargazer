@@ -40,44 +40,38 @@
 #include <sys/un.h>
 #include <sys/file.h>
 #include <sys/wait.h>
+#include <poll.h>
 
 #include "stargazer_ipc.h"
 #include "password_policy.h"
 #include "sg_db.h"
 #include "sg_validate.h"
 #include "mgmtd_apply.h"
+#include "mgmtd_internal.h"
 
 /* ── Constants ──────────────────────────────────────────────────────────── */
 
-#define CMD_BUF_SIZE     512
+/* Constants shared with sub-modules are in mgmtd_internal.h.
+ * Below are constants used only in this file. */
 #ifndef CONF_DIR
 #define CONF_DIR         "/etc/stargazer"
 #endif
 #define AUDIT_LOG        "/var/log/stargazer-audit.log"
 #define AUDIT_LOG_FB     "/tmp/stargazer-audit.log"
 #define SESSION_REV_FILE "/run/stargazer-session.rev"
-#define MAX_LINE         1024
-#define MAX_SALT_LEN     32
 #define MAX_CLIENTS_QUEUE 8
 #define BUF_SIZE         (sizeof(sg_request_hdr_t) + SG_PAYLOAD_MAX)
 #define DEBUG_STATE_FILE  "/tmp/stargazer-debug.conf"
 #define MGMT_DEFAULT_IP   "192.168.99.99/24" /* first NIC on first boot */
-#define SHADOW_LOCK_MODE  0600  /* /etc/shadow.lock — owner-only          */
-#define SHADOW_FILE_MODE  0640  /* /etc/shadow — owner rw, group read     */
-
-/* /etc/shadow field values (date fields are in days since epoch) */
-#define SHADOW_LAST_CHANGED  "19700"  /* password last changed (days)   */
-#define SHADOW_MAX_DAYS      "99999"  /* max days before must change    */
-#define SHADOW_WARN_DAYS     "7"      /* days of warning before expiry  */
 
 #define DEBUG_BUF_SIZE 4096
 static char debug_buf[DEBUG_BUF_SIZE];
 static int  debug_buf_used;
 
 /* Per-request debug flags (set from request header) */
-static uint8_t g_debug_flags;
+uint8_t g_debug_flags;
 
-static void debug_buf_push(const char *fmt, ...)
+void debug_buf_push(const char *fmt, ...)
 {
 	int avail = DEBUG_BUF_SIZE - debug_buf_used - 1;
 	if (avail <= 0)
@@ -91,7 +85,7 @@ static void debug_buf_push(const char *fmt, ...)
 }
 
 static volatile sig_atomic_t g_running = 1;
-static int g_listen_fd = -1;  /* listen socket fd, for child to close after fork */
+int g_listen_fd = -1;  /* listen socket fd, for child to close after fork */
 
 /* ── Input validation ───────────────────────────────────────────────────── */
 /* Validators now live in common/sg_validate.c — included via sg_validate.h */
@@ -213,7 +207,7 @@ void mgmt_log(const char *level, const char *fmt, ...)
 	fprintf(stderr, "\n");
 }
 
-static int audit_log(const char *user, const char *event, const char *msg)
+int audit_log(const char *user, const char *event, const char *msg)
 {
 	const char *path = AUDIT_LOG;
 	if (access("/var/log", W_OK) != 0)
@@ -235,8 +229,6 @@ static int audit_log(const char *user, const char *event, const char *msg)
 		 path, strerror(errno), event, user, msg);
 	return -1;
 }
-
-#define AUDIT_WARN " [WARNING: audit log write failed]"
 
 /* ── Signal handling ────────────────────────────────────────────────────── */
 
@@ -299,20 +291,142 @@ static void send_response(int fd, sg_status_t status, const char *extra,
 		safe_write(fd, payload, payload_len);
 }
 
-static void send_ok(int fd, const char *extra, const char *payload)
+void send_ok(int fd, const char *extra, const char *payload)
 {
 	uint32_t plen = payload ? (uint32_t)strlen(payload) : 0;
 	send_response(fd, SG_OK, extra, payload, plen);
 }
 
-static void send_error(int fd, sg_status_t status, const char *extra)
+void send_error(int fd, sg_status_t status, const char *extra)
 {
 	send_response(fd, status, extra, NULL, 0);
 }
 
+/* send_stream_chunk: send one streaming chunk (extra starts with '+').
+ * Returns 0 on success, -1 if the client disconnected. */
+int send_stream_chunk(int fd, const char *data, size_t len)
+{
+	sg_response_hdr_t resp;
+	memset(&resp, 0, sizeof(resp));
+	resp.magic = SG_MSG_MAGIC;
+	resp.version = SG_MSG_VERSION;
+	resp.status = (uint32_t)SG_OK;
+	snprintf(resp.extra, sizeof(resp.extra), "+");
+	resp.payload_len = (uint32_t)len;
+
+	if (safe_write(fd, &resp, sizeof(resp)) < 0)
+		return -1;
+	if (len > 0 && data && safe_write(fd, data, len) < 0)
+		return -1;
+	return 0;
+}
+
+/*
+ * stream_exec — fork+exec argv, stream child stdout/stderr to client_fd.
+ *
+ * Uses poll() to monitor both the child pipe and the client socket.
+ * If the client disconnects (Ctrl+C), the child is killed immediately
+ * instead of waiting for the next line of output.
+ *
+ * Returns 1 (took ownership of client_fd — caller must not close it).
+ */
+int stream_exec(int client_fd, const char *const argv[])
+{
+	int pipefd[2];
+	if (pipe(pipefd) < 0) {
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL,
+			   "Failed to create pipe");
+		return 0;
+	}
+	pid_t pid = fork();
+	if (pid < 0) {
+		close(pipefd[0]);
+		close(pipefd[1]);
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL,
+			   "Failed to fork");
+		return 0;
+	}
+	if (pid == 0) {
+		/* Child: redirect stdout+stderr to pipe, exec */
+		close(pipefd[0]);
+		dup2(pipefd[1], STDOUT_FILENO);
+		dup2(pipefd[1], STDERR_FILENO);
+		close(pipefd[1]);
+		execvp(argv[0], (char *const *)argv);
+		_exit(127);
+	}
+	close(pipefd[1]);
+
+	/* Parent: poll pipe (child output) + client socket (disconnect) */
+	struct pollfd pfds[2];
+	pfds[0].fd = pipefd[0];
+	pfds[0].events = POLLIN;
+	pfds[1].fd = client_fd;
+	pfds[1].events = POLLIN;
+
+	int killed = 0;
+	for (;;) {
+		int ret = poll(pfds, 2, 30000);
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			break; /* poll error */
+		}
+		if (ret == 0)
+			break; /* 30s timeout — child stalled */
+
+		/* Check client socket first: disconnect → kill child */
+		if (pfds[1].revents & (POLLIN | POLLHUP | POLLERR)) {
+			kill(pid, SIGTERM);
+			killed = 1;
+			break;
+		}
+
+		/* Child has output ready */
+		if (pfds[0].revents & POLLIN) {
+			char buf[1024];
+			ssize_t n = read(pipefd[0], buf, sizeof(buf));
+			if (n <= 0)
+				break; /* EOF or error */
+			if (send_stream_chunk(client_fd, buf, (size_t)n) < 0) {
+				kill(pid, SIGTERM);
+				killed = 1;
+				break;
+			}
+		}
+
+		/* Child pipe closed (EOF) */
+		if (pfds[0].revents & (POLLHUP | POLLERR)) {
+			/* Drain any remaining data */
+			for (;;) {
+				char buf[1024];
+				ssize_t n = read(pipefd[0], buf, sizeof(buf));
+				if (n <= 0)
+					break;
+				if (send_stream_chunk(client_fd, buf, (size_t)n) < 0) {
+					kill(pid, SIGTERM);
+					killed = 1;
+					break;
+				}
+			}
+			break;
+		}
+	}
+
+	close(pipefd[0]);
+	if (killed)
+		waitpid(pid, NULL, WNOHANG);
+	else
+		waitpid(pid, NULL, 0);
+	if (!killed)
+		send_ok(client_fd, NULL, NULL);
+	close(client_fd);
+	return 1;
+}
+
 /* send_ok with inline audit — appends warning to extra if audit fails */
-static void send_ok_audited(int fd, const char *extra, const char *payload,
-			    const char *user, const char *event, const char *amsg)
+void send_ok_audited(int fd, const char *extra, const char *payload,
+		     const char *user, const char *event, const char *amsg)
 {
 	if (audit_log(user, event, amsg) != 0) {
 		char warn[SG_EXTRA_MAX];
@@ -809,400 +923,9 @@ static void mgmtd_replay_config(void)
 	}
 }
 
-/* ── Password / Shadow helpers ──────────────────────────────────────────── */
-
-static int generate_salt(char *salt, size_t saltlen)
-{
-	static const char charset[] =
-		"abcdefghijklmnopqrstuvwxyz"
-		"ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-		"0123456789./";
-
-	int fd = open("/dev/urandom", O_RDONLY);
-	if (fd < 0) return -1;
-
-	unsigned char raw[16];
-	ssize_t n = read(fd, raw, sizeof(raw));
-	close(fd);
-	if (n != (ssize_t)sizeof(raw)) return -1;
-
-	size_t off = 0;
-	salt[off++] = '$';
-	salt[off++] = '6';
-	salt[off++] = '$';
-	for (size_t i = 0; i < sizeof(raw) && off < saltlen - 2; i++)
-		salt[off++] = charset[raw[i] % (sizeof(charset) - 1)];
-	salt[off++] = '$';
-	salt[off] = '\0';
-	return 0;
-}
-
-static int set_password(const char *username, const char *password)
-{
-#ifdef STARGAZER_TEST_MODE
-	(void)username; (void)password;
-	return 0;
-#endif
-	char salt[MAX_SALT_LEN];
-	if (generate_salt(salt, sizeof(salt)) != 0)
-		return -1;
-
-	char *hash = crypt(password, salt);
-	if (!hash) return -1;
-
-	/* Acquire advisory lock for shadow file manipulation */
-	int lockfd = open("/etc/shadow.lock", O_CREAT | O_RDWR, SHADOW_LOCK_MODE);
-	if (lockfd < 0) return -1;
-	if (flock(lockfd, LOCK_EX) != 0) {
-		close(lockfd);
-		return -1;
-	}
-
-	/* Update shadow atomically */
-	FILE *fp = fopen("/etc/shadow", "r");
-	if (!fp) { flock(lockfd, LOCK_UN); close(lockfd); return -1; }
-
-	char tmppath[64];
-	snprintf(tmppath, sizeof(tmppath), "/etc/shadow.XXXXXX");
-	int tfd = mkstemp(tmppath);
-	if (tfd < 0) { fclose(fp); flock(lockfd, LOCK_UN); close(lockfd); return -1; }
-	fchmod(tfd, SHADOW_FILE_MODE);
-	FILE *out = fdopen(tfd, "w");
-	if (!out) { close(tfd); unlink(tmppath); fclose(fp); flock(lockfd, LOCK_UN); close(lockfd); return -1; }
-
-	char line[MAX_LINE];
-	size_t ulen = strlen(username);
-	int found = 0;
-
-	while (fgets(line, sizeof(line), fp)) {
-		if (strncmp(line, username, ulen) == 0 && line[ulen] == ':') {
-			char *rest = strchr(line + ulen + 1, ':');
-			if (rest)
-				fprintf(out, "%s:%s%s", username, hash, rest);
-			else
-				fprintf(out, "%s:%s:" SHADOW_LAST_CHANGED ":0:" SHADOW_MAX_DAYS ":" SHADOW_WARN_DAYS ":::\n", username, hash);
-			found = 1;
-		} else {
-			fputs(line, out);
-		}
-	}
-	fclose(fp);
-	fclose(out);
-
-	if (!found) {
-		unlink(tmppath);
-		flock(lockfd, LOCK_UN);
-		close(lockfd);
-		return -1;
-	}
-
-	if (rename(tmppath, "/etc/shadow") != 0) {
-		unlink(tmppath);
-		flock(lockfd, LOCK_UN);
-		close(lockfd);
-		return -1;
-	}
-	flock(lockfd, LOCK_UN);
-	close(lockfd);
-	return 0;
-}
-
-/*
- * Lock a user's password by replacing the hash with '!' in /etc/shadow.
- * This prevents login with any password.
- */
-static int lock_password(const char *username)
-{
-#ifdef STARGAZER_TEST_MODE
-	(void)username;
-	return 0;
-#endif
-	/* Acquire advisory lock for shadow file manipulation */
-	int lockfd = open("/etc/shadow.lock", O_CREAT | O_RDWR, SHADOW_LOCK_MODE);
-	if (lockfd < 0) return -1;
-	if (flock(lockfd, LOCK_EX) != 0) {
-		close(lockfd);
-		return -1;
-	}
-
-	FILE *fp = fopen("/etc/shadow", "r");
-	if (!fp) { flock(lockfd, LOCK_UN); close(lockfd); return -1; }
-
-	char tmppath[64];
-	snprintf(tmppath, sizeof(tmppath), "/etc/shadow.XXXXXX");
-	int tfd = mkstemp(tmppath);
-	if (tfd < 0) { fclose(fp); flock(lockfd, LOCK_UN); close(lockfd); return -1; }
-	fchmod(tfd, SHADOW_FILE_MODE);
-	FILE *out = fdopen(tfd, "w");
-	if (!out) { close(tfd); unlink(tmppath); fclose(fp); flock(lockfd, LOCK_UN); close(lockfd); return -1; }
-
-	char line[MAX_LINE];
-	size_t ulen = strlen(username);
-	int found = 0;
-
-	while (fgets(line, sizeof(line), fp)) {
-		if (strncmp(line, username, ulen) == 0 && line[ulen] == ':') {
-			char *rest = strchr(line + ulen + 1, ':');
-			if (rest)
-				fprintf(out, "%s:!%s", username, rest);
-			else
-				fprintf(out, "%s:!:" SHADOW_LAST_CHANGED ":0:" SHADOW_MAX_DAYS ":" SHADOW_WARN_DAYS ":::\n", username);
-			found = 1;
-		} else {
-			fputs(line, out);
-		}
-	}
-	fclose(fp);
-	fclose(out);
-
-	if (!found) {
-		unlink(tmppath);
-		flock(lockfd, LOCK_UN);
-		close(lockfd);
-		return -1;
-	}
-
-	if (rename(tmppath, "/etc/shadow") != 0) {
-		unlink(tmppath);
-		flock(lockfd, LOCK_UN);
-		close(lockfd);
-		return -1;
-	}
-	flock(lockfd, LOCK_UN);
-	close(lockfd);
-	return 0;
-}
-
-/*
- * Check whether a user has a valid password hash in /etc/shadow.
- * Returns 1 if user has a usable password, 0 if locked/empty/missing.
- */
-static int user_has_password(const char *username)
-{
-#ifdef STARGAZER_TEST_MODE
-	(void)username;
-	return 1;
-#endif
-	FILE *fp = fopen("/etc/shadow", "r");
-	if (!fp) return 0;
-
-	char line[MAX_LINE];
-	size_t ulen = strlen(username);
-
-	while (fgets(line, sizeof(line), fp)) {
-		if (strncmp(line, username, ulen) == 0 && line[ulen] == ':') {
-			fclose(fp);
-			char c = line[ulen + 1];
-			/* Locked (!), disabled (*), or empty field = no password */
-			if (c == '!' || c == '*' || c == ':' || c == '\n' || c == '\0')
-				return 0;
-			return 1;
-		}
-	}
-	fclose(fp);
-	return 0; /* user not found in shadow */
-}
-
-/* ── User management ────────────────────────────────────────────────────── */
-
-/*
- * Add a user to an existing group in /etc/group.
- * Group line format: groupname:x:GID:user1,user2,...
- */
-static void add_user_to_group(const char *username, const char *groupname)
-{
-#ifdef STARGAZER_TEST_MODE
-	(void)username; (void)groupname;
-	return;
-#endif
-	FILE *fp = fopen("/etc/group", "r");
-	if (!fp) return;
-
-	char tmppath[64];
-	snprintf(tmppath, sizeof(tmppath), "/etc/group.XXXXXX");
-	int tfd = mkstemp(tmppath);
-	if (tfd < 0) { fclose(fp); return; }
-	fchmod(tfd, 0644);
-	FILE *out = fdopen(tfd, "w");
-	if (!out) { close(tfd); unlink(tmppath); fclose(fp); return; }
-
-	char line[MAX_LINE];
-	size_t glen = strlen(groupname);
-
-	while (fgets(line, sizeof(line), fp)) {
-		if (strncmp(line, groupname, glen) == 0 && line[glen] == ':') {
-			/* Found the group line — check if user already in it */
-			size_t len = strlen(line);
-			if (len > 0 && line[len - 1] == '\n')
-				line[--len] = '\0';
-
-			/* Check if username already present */
-			char *members = line;
-			int field = 0;
-			for (char *p = line; *p; p++) {
-				if (*p == ':') {
-					field++;
-					if (field == 3) { members = p + 1; break; }
-				}
-			}
-			/* Simple check: is username in the members list? */
-			int found = 0;
-			if (*members) {
-				char *tok = members;
-				while (tok) {
-					char *comma = strchr(tok, ',');
-					size_t tlen = comma ?
-						(size_t)(comma - tok) : strlen(tok);
-					if (tlen == strlen(username) &&
-					    strncmp(tok, username, tlen) == 0) {
-						found = 1;
-						break;
-					}
-					tok = comma ? comma + 1 : NULL;
-				}
-			}
-			if (found) {
-				fprintf(out, "%s\n", line);
-			} else if (*members) {
-				fprintf(out, "%s,%s\n", line, username);
-			} else {
-				fprintf(out, "%s%s\n", line, username);
-			}
-		} else {
-			fputs(line, out);
-		}
-	}
-
-	fclose(fp);
-	fclose(out);
-	rename(tmppath, "/etc/group");
-}
-
-static int create_system_user(const char *username, const char *shell)
-{
-#ifdef STARGAZER_TEST_MODE
-	(void)username; (void)shell;
-	return 0;
-#endif
-	/* Check if already exists */
-	char check[MAX_LINE];
-	snprintf(check, sizeof(check), "%s:", username);
-	FILE *fp = fopen("/etc/passwd", "r");
-	if (fp) {
-		char line[MAX_LINE];
-		while (fgets(line, sizeof(line), fp)) {
-			if (strncmp(line, check, strlen(check)) == 0) {
-				fclose(fp);
-				return 0; /* already exists */
-			}
-		}
-		fclose(fp);
-	}
-
-	/* Find next available UID >= 1000 (track max to handle unsorted passwd) */
-	int uid = 1000;
-	fp = fopen("/etc/passwd", "r");
-	if (fp) {
-		char line[MAX_LINE];
-		while (fgets(line, sizeof(line), fp)) {
-			/* Parse UID field (3rd field) */
-			int field = 0;
-			const char *p = line;
-			int cur_uid = -1;
-			while (*p) {
-				if (*p == ':') {
-					field++;
-					if (field == 2) {
-						cur_uid = atoi(p + 1);
-						break;
-					}
-				}
-				p++;
-			}
-			if (cur_uid >= uid)
-				uid = cur_uid + 1;
-		}
-		fclose(fp);
-	}
-
-	/* Append to /etc/passwd */
-	fp = fopen("/etc/passwd", "a");
-	if (!fp) return -1;
-	fprintf(fp, "%s:x:%d:%d:Stargazer Admin:/home/%s:%s\n",
-		username, uid, uid, username, shell);
-	fclose(fp);
-
-	/* Append to /etc/shadow */
-	fp = fopen("/etc/shadow", "a");
-	if (fp) {
-		fprintf(fp, "%s::" SHADOW_LAST_CHANGED ":0:" SHADOW_MAX_DAYS ":" SHADOW_WARN_DAYS ":::\n", username);
-		fclose(fp);
-	}
-
-	/* Append to /etc/group (user's own group) */
-	fp = fopen("/etc/group", "a");
-	if (fp) {
-		fprintf(fp, "%s:x:%d:\n", username, uid);
-		fclose(fp);
-	}
-
-	/* Add user to 'stargazer' group for socket + config access */
-	add_user_to_group(username, "stargazer");
-
-	/* Create home dir */
-	char homedir[128];
-	snprintf(homedir, sizeof(homedir), "/home/%s", username);
-	mkdir(homedir, 0750);
-	if (chown(homedir, uid, uid) != 0)
-		mgmt_log("WARN", "chown %s: %s", homedir, strerror(errno));
-
-	return 0;
-}
-
-static int delete_system_user(const char *username)
-{
-#ifdef STARGAZER_TEST_MODE
-	(void)username;
-	return 0;
-#endif
-	const char *files[] = { "/etc/passwd", "/etc/shadow", "/etc/group" };
-	char prefix[128];
-	snprintf(prefix, sizeof(prefix), "%s:", username);
-	size_t plen = strlen(prefix);
-
-	for (int i = 0; i < 3; i++) {
-		FILE *in = fopen(files[i], "r");
-		if (!in) continue;
-
-		char tmppath[128];
-		snprintf(tmppath, sizeof(tmppath), "%s.tmp.%d", files[i], (int)getpid());
-		FILE *out = fopen(tmppath, "w");
-		if (!out) { fclose(in); continue; }
-
-		if (i == 1) /* shadow */
-			fchmod(fileno(out), SHADOW_FILE_MODE);
-
-		char line[MAX_LINE];
-		while (fgets(line, sizeof(line), in)) {
-			if (strncmp(line, prefix, plen) != 0)
-				fputs(line, out);
-		}
-
-		fclose(in);
-		fclose(out);
-		if (rename(tmppath, files[i]) != 0) {
-			mgmt_log("WARN", "delete_system_user: rename %s: %s",
-				 files[i], strerror(errno));
-			unlink(tmppath);
-		}
-	}
-
-	return 0;
-}
-
 /* ── Session revision tracking ──────────────────────────────────────────── */
 
-static int session_rev_get(const char *user)
+int session_rev_get(const char *user)
 {
 	FILE *fp = fopen(SESSION_REV_FILE, "r");
 	if (!fp) return 0;
@@ -1248,7 +971,7 @@ static void session_rev_set(const char *user, int rev)
 		unlink(tmppath);
 }
 
-static int session_rev_bump(const char *user)
+int session_rev_bump(const char *user)
 {
 	int rev = session_rev_get(user);
 	session_rev_set(user, rev + 1);
@@ -1320,79 +1043,6 @@ void extract_val(const char *data, const char *key,
 		if (!nl) break;
 		p = nl + 1;
 	}
-}
-
-/* ── Password policy helpers ─────────────────────────────────────────────── */
-
-/*
- * Read global password policy from database (system_password-policy).
- */
-static void mgmtd_read_password_policy(struct password_policy *pol)
-{
-	pol->min_length = 0;
-	pol->min_uppercase = 0;
-	pol->min_lowercase = 0;
-	pol->min_digit = 0;
-	pol->min_special = 0;
-
-	char *v;
-	v = sg_db_get_val("system_password-policy", "0", "min-length");
-	if (v) { int n = atoi(v); pol->min_length = (n > 0 && n <= 256) ? n : 0; free(v); }
-	v = sg_db_get_val("system_password-policy", "0", "min-uppercase");
-	if (v) { int n = atoi(v); pol->min_uppercase = (n > 0 && n <= 128) ? n : 0; free(v); }
-	v = sg_db_get_val("system_password-policy", "0", "min-lowercase");
-	if (v) { int n = atoi(v); pol->min_lowercase = (n > 0 && n <= 128) ? n : 0; free(v); }
-	v = sg_db_get_val("system_password-policy", "0", "min-digit");
-	if (v) { int n = atoi(v); pol->min_digit = (n > 0 && n <= 128) ? n : 0; free(v); }
-	v = sg_db_get_val("system_password-policy", "0", "min-special");
-	if (v) { int n = atoi(v); pol->min_special = (n > 0 && n <= 128) ? n : 0; free(v); }
-}
-
-/*
- * Check if user has enforce-password-policy=enable in their admin config.
- * Returns 1 if enforced, 0 if not.
- */
-static int mgmtd_is_policy_enforced(const char *username)
-{
-	char *val = sg_db_get_val("system_admin", username,
-				  "enforce-password-policy");
-	if (!val) return 0;
-	int enforced = (strcmp(val, "enable") == 0) ? 1 : 0;
-	free(val);
-	return enforced;
-}
-
-/*
- * Validate password against policy.
- * Returns 0 if ok (policy not enforced or satisfied), >0 on violation.
- * Sets *reason to human-readable string on failure.
- *
- * enforce_override: if non-empty, overrides the per-user enforce flag
- *   (used by CFG_APPLY where the value may not be saved yet).
- */
-static int mgmtd_validate_password(const char *username, const char *password,
-				    const char *enforce_override,
-				    const char **reason)
-{
-	int enforced;
-
-	if (enforce_override && enforce_override[0])
-		enforced = (strcmp(enforce_override, "enable") == 0);
-	else
-		enforced = mgmtd_is_policy_enforced(username);
-
-	if (!enforced) return 0;
-
-	struct password_policy pol;
-	mgmtd_read_password_policy(&pol);
-
-	/* Apply MIN_PASS_LEN floor (same as logind) */
-	if (pol.min_length <= 0) pol.min_length = PW_MIN_PASS_LEN;
-
-	int rc = pw_check_policy(password, username, &pol);
-	if (rc == 1) return 0; /* satisfied */
-	if (reason) *reason = pw_policy_reason(rc);
-	return rc;
 }
 
 /* ── Apply config to running system ─────────────────────────────────────── */
@@ -1525,7 +1175,7 @@ static sg_status_t apply_config(const char *type, const char *id,
  * Get user's permissions string from system.conf.
  * Returns statically allocated string.
  */
-static const char *get_user_permissions(const char *username)
+const char *get_user_permissions(const char *username)
 {
 	static char perms[256];
 	perms[0] = '\0';
@@ -1552,7 +1202,7 @@ static const char *get_user_permissions(const char *username)
 	return perms[0] ? perms : "monitor";
 }
 
-static int has_permission(const char *perms_csv, const char *perm)
+int has_permission(const char *perms_csv, const char *perm)
 {
 	if (!perms_csv || !perm) return 0;
 
@@ -1581,7 +1231,7 @@ static int has_permission(const char *perms_csv, const char *perm)
  * "admin" perm types require "admin".
  * "configure" perm types require "configure" OR "admin".
  */
-static int check_type_permission(const char *user, const char *type_name)
+int check_type_permission(const char *user, const char *type_name)
 {
 	const char *required = sg_reg_type_perm(type_name);
 	if (!required)
@@ -1599,8 +1249,8 @@ static int check_type_permission(const char *user, const char *type_name)
  * Check if any config entries reference this object by its ID.
  * Returns 0 if safe to delete, -1 if referenced (errbuf filled).
  */
-static int check_references(const char *type, const char *id,
-			    char *errbuf, size_t errsz)
+int check_references(const char *type, const char *id,
+		     char *errbuf, size_t errsz)
 {
 	sg_ref_entry_t refs[16];
 	int nrefs = sg_reg_find_referencing(type, refs, 16);
@@ -1626,32 +1276,142 @@ static int check_references(const char *type, const char *id,
 	return 0;
 }
 
-/* ── Firmware upgrade state file ─────────────────────────────────────────── */
-
-#define FW_STATE_FILE     "/tmp/sg-fw-upgrade.state"
-#define FW_STATE_FILE_TMP "/tmp/sg-fw-upgrade.state.tmp"
+/* ── Server-side key=value validation for CFG_SET ──────────────────────── */
 
 /*
- * Write firmware upgrade progress to state file atomically.
- * The child process calls this at each step so the parent (serving
- * FW_PROGRESS polls) always reads a complete, consistent file.
+ * Validate key=value data against the config type registry before writing
+ * to the database.  Checks:
+ *   1. Every key is known for the type (reject unknown keys)
+ *   2. Every value passes sg_reg_validate_value()
+ *   3. All required keys are present
+ *
+ * Returns SG_OK on success, or an error status with a human-readable
+ * message written to errbuf.
  */
-static void fw_write_state(int step, int total, const char *status,
-			   const char *message, const char *version)
+sg_status_t validate_cfg_data(const char *type, const char *data,
+			      char *errbuf, size_t errsz)
 {
-	FILE *fp = fopen(FW_STATE_FILE_TMP, "w");
-	if (!fp)
-		return;
-	fprintf(fp, "step=%d\ntotal=%d\nstatus=%s\nmessage=%s\nversion=%s\n",
-		step, total, status, message, version ? version : "");
-	fclose(fp);
-	rename(FW_STATE_FILE_TMP, FW_STATE_FILE);
+	errbuf[0] = '\0';
+
+	/* --- check each key=value line -------------------------------- */
+	const char *p = data;
+	while (*p) {
+		if (*p == '\n') { p++; continue; }
+
+		const char *eol = strchr(p, '\n');
+		size_t llen = eol ? (size_t)(eol - p) : strlen(p);
+
+		const char *eq = memchr(p, '=', llen);
+		if (eq) {
+			size_t klen = (size_t)(eq - p);
+			if (klen >= 64) {
+				snprintf(errbuf, errsz,
+					 "Key name too long");
+				return SG_ERR_INVALID_ARG;
+			}
+			char key[64];
+			memcpy(key, p, klen);
+			key[klen] = '\0';
+
+			const char *vstart = eq + 1;
+			size_t vlen = llen - klen - 1;
+			if (vlen >= SG_PAYLOAD_MAX) {
+				snprintf(errbuf, errsz,
+					 "Value for '%s' too long", key);
+				return SG_ERR_INVALID_VAL;
+			}
+			char val[SG_PAYLOAD_MAX];
+			memcpy(val, vstart, vlen);
+			val[vlen] = '\0';
+
+			/* Skip 'builtin' — internal marker managed by
+			 * mgmtd, not a user-settable field.  Handled
+			 * separately in the CFG_SET handler. */
+			if (strcmp(key, "builtin") == 0) {
+				p += llen;
+				if (eol) p++;
+				continue;
+			}
+
+			/* 1. reject unknown keys */
+			if (!sg_reg_is_valid_key(type, key)) {
+				snprintf(errbuf, errsz,
+					 "Unknown key '%s'", key);
+				return SG_ERR_INVALID_ARG;
+			}
+
+			/* 2. validate value format */
+			if (!sg_reg_validate_value(type, key, val)) {
+				const char *rule =
+					sg_reg_value_rule(type, key);
+				char t_rule[128];
+				snprintf(t_rule, sizeof(t_rule), "%s",
+					 rule ? rule : "bad value");
+				snprintf(errbuf, errsz,
+					 "Invalid value for '%s': %s",
+					 key, t_rule);
+				return SG_ERR_INVALID_VAL;
+			}
+		}
+
+		p += llen;
+		if (eol) p++;
+	}
+
+	/* --- check required keys are present -------------------------- */
+	const char *req = sg_reg_required_keys(type);
+	if (req && *req) {
+		char reqbuf[512];
+		snprintf(reqbuf, sizeof(reqbuf), "%s", req);
+		char *tok = reqbuf;
+
+		while (*tok) {
+			while (*tok == ' ') tok++;
+			if (!*tok) break;
+
+			char *end = tok;
+			while (*end && *end != ' ') end++;
+			char saved = *end;
+			*end = '\0';
+
+			/* search data for "key=" */
+			int found = 0;
+			const char *s = data;
+			size_t tlen = strlen(tok);
+			while (*s) {
+				if (*s == '\n') { s++; continue; }
+				const char *el = strchr(s, '\n');
+				size_t ll = el ? (size_t)(el - s) : strlen(s);
+				if (ll > tlen &&
+				    memcmp(s, tok, tlen) == 0 &&
+				    s[tlen] == '=') {
+					found = 1;
+					break;
+				}
+				s += ll;
+				if (el) s++;
+			}
+
+			if (!found) {
+				snprintf(errbuf, errsz,
+					 "Missing required field '%.60s'",
+					 tok);
+				*end = saved;
+				return SG_ERR_MISSING_ARG;
+			}
+
+			*end = saved;
+			tok = end;
+		}
+	}
+
+	return SG_OK;
 }
 
 /* ── Request handler ────────────────────────────────────────────────────── */
 
-static void handle_request(int client_fd, sg_request_hdr_t *hdr,
-			   const char *payload)
+static int handle_request(int client_fd, sg_request_hdr_t *hdr,
+			  const char *payload)
 {
 	sg_cmd_t cmd = (sg_cmd_t)hdr->cmd;
 	const char *user = hdr->username;
@@ -1673,7 +1433,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		/* Payload format: "section\n" (section = "type:id" or "type") */
 		if (!payload || hdr->payload_len == 0) {
 			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing section name");
-			return;
+			return 0;
 		}
 		char section[512] = {0};
 		const char *nl = strchr(payload, '\n');
@@ -1692,11 +1452,11 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 
 		if (!sg_is_safe_id(db_type)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid type name");
-			return;
+			return 0;
 		}
 		if (!check_type_permission(user, db_type)) {
 			send_error(client_fd, SG_ERR_ENTRY_NOT_FOUND, section);
-			return;
+			return 0;
 		}
 
 		char *data = sg_db_get(db_type, db_id);
@@ -1706,14 +1466,14 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		} else {
 			send_error(client_fd, SG_ERR_ENTRY_NOT_FOUND, section);
 		}
-		return;
+		return 0;
 	}
 
 	case SG_CMD_CFG_LIST: {
 		/* Payload: "type\n" — list entry IDs for a config type */
 		if (!payload || hdr->payload_len == 0) {
 			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing type prefix");
-			return;
+			return 0;
 		}
 		char prefix[256] = {0};
 		snprintf(prefix, sizeof(prefix), "%s", payload);
@@ -1722,11 +1482,11 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 
 		if (!sg_is_safe_id(prefix)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid type prefix");
-			return;
+			return 0;
 		}
 		if (!check_type_permission(user, prefix)) {
 			send_ok(client_fd, "No entries", "");
-			return;
+			return 0;
 		}
 
 		char *list = sg_db_list(prefix);
@@ -1736,7 +1496,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		} else {
 			send_ok(client_fd, "No entries", "");
 		}
-		return;
+		return 0;
 	}
 
 	/* ── Config write ───────────────────────────────────────────────── */
@@ -1744,13 +1504,13 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		/* Payload format: "section\nkey=value\nkey=value\n..." */
 		if (!payload || hdr->payload_len == 0) {
 			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing section + data");
-			return;
+			return 0;
 		}
 		char section[256] = {0};
 		const char *nl = strchr(payload, '\n');
 		if (!nl) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Missing data after section");
-			return;
+			return 0;
 		}
 		size_t slen = (size_t)(nl - payload);
 		if (slen >= sizeof(section)) slen = sizeof(section) - 1;
@@ -1760,7 +1520,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		if (*data == '\0') {
 			send_error(client_fd, SG_ERR_INVALID_ARG,
 				   "Missing data after section");
-			return;
+			return 0;
 		}
 
 		/* Parse "type:id" → type + id */
@@ -1770,21 +1530,87 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 
 		if (sg_reg_type_mode(db_type) < 0) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Unknown config type");
-			return;
+			return 0;
 		}
 		if (!check_type_permission(user, db_type)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Unknown config type");
-			return;
+			return 0;
 		}
 		if (!sg_reg_validate_entry_id(db_type, db_id)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid entry ID");
-			return;
+			return 0;
 		}
 
-		if (sg_db_set(db_type, db_id, data) != 0) {
+		/* Validate key names, values, and required fields */
+		char val_err[SG_EXTRA_MAX];
+		sg_status_t val_st = validate_cfg_data(db_type, data,
+						       val_err, sizeof(val_err));
+		if (val_st != SG_OK) {
+			if (g_debug_flags & SG_DBG_FLAG_MGMTD)
+				debug_buf_push("[MGMTD-DBG] cfg_set rejected: %s\n",
+					       val_err);
+			send_error(client_fd, val_st, val_err);
+			return 0;
+		}
+
+		/* Preserve builtin status: clients cannot grant or
+		 * revoke the builtin flag — it is set only by mgmtd
+		 * seed logic.  Read the existing entry's builtin value
+		 * and re-apply it after the write.  Any builtin= line
+		 * in the incoming data is stripped by building a clean
+		 * payload that omits it, then appending the original. */
+		char *existing = sg_db_get(db_type, db_id);
+		int was_builtin = 0;
+		if (existing) {
+			char bi[VALBUFSZ];
+			extract_val(existing, "builtin", bi, sizeof(bi));
+			if (strcmp(bi, "yes") == 0)
+				was_builtin = 1;
+			free(existing);
+		}
+
+		/* Build clean data: strip any client-sent builtin= */
+		char clean[SG_PAYLOAD_MAX];
+		size_t cpos = 0;
+		const char *dp = data;
+		while (*dp) {
+			if (*dp == '\n') { dp++; continue; }
+			const char *el = strchr(dp, '\n');
+			size_t ll = el ? (size_t)(el - dp) : strlen(dp);
+			if (ll >= 8 && memcmp(dp, "builtin=", 8) == 0) {
+				dp += ll;
+				if (el) dp++;
+				continue;
+			}
+			if (cpos + ll + 1 >= sizeof(clean)) {
+				send_error(client_fd, SG_ERR_INVALID_ARG,
+					   "Config payload too large");
+				return 0;
+			}
+			memcpy(clean + cpos, dp, ll);
+			cpos += ll;
+			clean[cpos++] = '\n';
+			dp += ll;
+			if (el) dp++;
+		}
+		/* Re-append original builtin status */
+		if (was_builtin) {
+			const char *tag = "builtin=yes\n";
+			size_t tlen = strlen(tag);
+			if (cpos + tlen >= sizeof(clean)) {
+				send_error(client_fd, SG_ERR_INVALID_ARG,
+					   "Config payload too large");
+				return 0;
+			}
+			memcpy(clean + cpos, tag, tlen);
+			cpos += tlen;
+		}
+		clean[cpos] = '\0';
+
+		if (sg_db_set(db_type, db_id, clean) != 0) {
 			mgmt_log("ERROR", "sg_db_set failed for %s", section);
 			send_error(client_fd, SG_ERR_IO_FAIL, "Failed to write config");
-			return;
+			return 0;
 		}
 
 		/* Bump session for admin/profile/policy config changes */
@@ -1844,13 +1670,13 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 
 		send_ok_audited(client_fd, "Config saved", NULL,
 				user, "cfg_set", section);
-		return;
+		return 0;
 	}
 
 	case SG_CMD_CFG_DEL: {
 		if (!payload || hdr->payload_len == 0) {
 			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing section");
-			return;
+			return 0;
 		}
 		char section[256] = {0};
 		snprintf(section, sizeof(section), "%s", payload);
@@ -1860,7 +1686,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		if (!strchr(section, ':')) {
 			send_error(client_fd, SG_ERR_INVALID_ARG,
 				   "Missing ':' separator (expected type:id)");
-			return;
+			return 0;
 		}
 
 		/* Parse "type:id" → type + id */
@@ -1870,15 +1696,15 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 
 		if (sg_reg_type_mode(db_type) < 0) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Unknown config type");
-			return;
+			return 0;
 		}
 		if (!check_type_permission(user, db_type)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Unknown config type");
-			return;
+			return 0;
 		}
 		if (db_id[0] == '\0') {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Missing entry ID");
-			return;
+			return 0;
 		}
 
 		/* Check builtin flag */
@@ -1889,7 +1715,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 			if (strcmp(bi, "yes") == 0) {
 				free(existing);
 				send_error(client_fd, SG_ERR_BUILTIN, section);
-				return;
+				return 0;
 			}
 			free(existing);
 		}
@@ -1898,7 +1724,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		char ref_err[SG_EXTRA_MAX];
 		if (check_references(db_type, db_id, ref_err, sizeof(ref_err)) != 0) {
 			send_error(client_fd, SG_ERR_IN_USE, ref_err);
-			return;
+			return 0;
 		}
 
 		/* If deleting admin, bump session and delete system user */
@@ -1909,25 +1735,25 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 
 		if (sg_db_del(db_type, db_id) != 0) {
 			send_error(client_fd, SG_ERR_IO_FAIL, "Failed to delete section");
-			return;
+			return 0;
 		}
 		send_ok_audited(client_fd, "Deleted", NULL,
 				user, "cfg_del", section);
-		return;
+		return 0;
 	}
 
 	case SG_CMD_CFG_APPLY: {
 		/* Payload: "type\nid\nkey=value\n..." */
 		if (!payload || hdr->payload_len == 0) {
 			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing type+id+data");
-			return;
+			return 0;
 		}
 		char type_str[256] = {0}, id_str[256] = {0};
 		const char *p = payload;
 		const char *nl1 = strchr(p, '\n');
 		if (!nl1) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Bad format");
-			return;
+			return 0;
 		}
 		size_t tlen = (size_t)(nl1 - p);
 		if (tlen >= sizeof(type_str)) tlen = sizeof(type_str) - 1;
@@ -1938,7 +1764,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		const char *nl2 = strchr(p, '\n');
 		if (!nl2) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Bad format");
-			return;
+			return 0;
 		}
 		size_t ilen = (size_t)(nl2 - p);
 		if (ilen >= sizeof(id_str)) ilen = sizeof(id_str) - 1;
@@ -1947,7 +1773,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 
 		if (!check_type_permission(user, type_str)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Unknown config type");
-			return;
+			return 0;
 		}
 
 		const char *data = nl2 + 1;
@@ -1962,386 +1788,26 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		} else {
 			send_error(client_fd, st, result);
 		}
-		return;
+		return 0;
 	}
 
-	/* ── Admin management ───────────────────────────────────────────── */
-	case SG_CMD_ADMIN_CREATE: {
-		const char *perms = get_user_permissions(user);
-		if (!has_permission(perms, "admin")) {
-			send_error(client_fd, SG_ERR_PERM_DENIED, "Requires 'admin' permission");
-			return;
-		}
-		/* Payload: "username\nprofile\n" */
-		if (!payload) {
-			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing username+profile");
-			return;
-		}
-		char newuser[128] = {0}, newprof[128] = {0};
-		const char *nl1 = strchr(payload, '\n');
-		if (!nl1) {
-			send_error(client_fd, SG_ERR_INVALID_ARG, "Bad format");
-			return;
-		}
-		size_t ulen = (size_t)(nl1 - payload);
-		if (ulen >= sizeof(newuser)) ulen = sizeof(newuser) - 1;
-		memcpy(newuser, payload, ulen);
-
-		const char *p2 = nl1 + 1;
-		const char *nl2 = strchr(p2, '\n');
-		size_t plen2 = nl2 ? (size_t)(nl2 - p2) : strlen(p2);
-		if (plen2 >= sizeof(newprof)) plen2 = sizeof(newprof) - 1;
-		memcpy(newprof, p2, plen2);
-
-		if (!sg_is_safe_id(newuser)) {
-			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid username");
-			return;
-		}
-		if (!sg_is_safe_id(newprof)) {
-			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid profile name");
-			return;
-		}
-
-		/* Check profile exists */
-		char *pdata = sg_db_get("system_admin-profile", newprof);
-		if (!pdata) {
-			send_error(client_fd, SG_ERR_PROFILE_NOT_FOUND, newprof);
-			return;
-		}
-		free(pdata);
-
-		/* Check user doesn't exist */
-		char *udata = sg_db_get("system_admin", newuser);
-		if (udata) {
-			free(udata);
-			send_error(client_fd, SG_ERR_ALREADY_EXISTS, newuser);
-			return;
-		}
-
-		/* Create Linux user */
-		if (create_system_user(newuser, "/sbin/stargazer-cli") != 0) {
-			send_error(client_fd, SG_ERR_SYSTEM_FAIL, "create user failed");
-			return;
-		}
-
-		/* Add to database */
-		char cfgdata[256];
-		snprintf(cfgdata, sizeof(cfgdata),
-			 "profile=%s\nenforce-change-password=enable\n", newprof);
-		if (sg_db_set("system_admin", newuser, cfgdata) != 0) {
-			send_error(client_fd, SG_ERR_IO_FAIL, "config write failed");
-			return;
-		}
-
-		if (g_debug_flags & SG_DBG_FLAG_AUTH)
-			debug_buf_push("[AUTH-DBG] create user=%s result=ok\n",
-				       newuser);
-		char msg[CMD_BUF_SIZE];
-		snprintf(msg, sizeof(msg), "User '%s' created with profile '%s'", newuser, newprof);
-		send_ok_audited(client_fd, msg, NULL,
-				user, "admin_create", newuser);
-		return;
-	}
-
-	case SG_CMD_ADMIN_DELETE: {
-		const char *perms = get_user_permissions(user);
-		if (!has_permission(perms, "admin")) {
-			send_error(client_fd, SG_ERR_PERM_DENIED, "Requires 'admin' permission");
-			return;
-		}
-		if (!payload) {
-			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing username");
-			return;
-		}
-		char target[128] = {0};
-		snprintf(target, sizeof(target), "%s", payload);
-		size_t tlen = strlen(target);
-		if (tlen > 0 && target[tlen-1] == '\n') target[--tlen] = '\0';
-
-		if (!sg_is_safe_id(target)) {
-			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid username");
-			return;
-		}
-
-		/* Check builtin */
-		char *existing = sg_db_get("system_admin", target);
-		if (!existing) {
-			send_error(client_fd, SG_ERR_USER_NOT_FOUND, target);
-			return;
-		}
-		char bi[VALBUFSZ];
-		extract_val(existing, "builtin", bi, sizeof(bi));
-		if (strcmp(bi, "yes") == 0) {
-			free(existing);
-			send_error(client_fd, SG_ERR_BUILTIN, "Cannot delete built-in admin");
-			return;
-		}
-		free(existing);
-
-		/* Block self-deletion */
-		if (strcmp(target, user) == 0) {
-			send_error(client_fd, SG_ERR_IN_USE,
-				   "Cannot delete your own account");
-			return;
-		}
-
-		/* Check referential integrity */
-		{
-			char ref_err[SG_EXTRA_MAX];
-			if (check_references("system_admin", target,
-					     ref_err, sizeof(ref_err)) != 0) {
-				send_error(client_fd, SG_ERR_IN_USE, ref_err);
-				return;
-			}
-		}
-
-		sg_db_del("system_admin", target);
-		delete_system_user(target);
-		session_rev_bump(target);
-
-		if (g_debug_flags & SG_DBG_FLAG_AUTH)
-			debug_buf_push("[AUTH-DBG] delete user=%s result=ok\n",
-				       target);
-		char msg[CMD_BUF_SIZE];
-		snprintf(msg, sizeof(msg), "User '%s' deleted", target);
-		send_ok_audited(client_fd, msg, NULL,
-				user, "admin_delete", target);
-		return;
-	}
-
-	case SG_CMD_ADMIN_SET_PW: {
-		/* Payload: "username\npassword\n" */
-		if (!payload) {
-			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing username+password");
-			return;
-		}
-		char target[128] = {0}, pw[256] = {0};
-		const char *nl1 = strchr(payload, '\n');
-		if (!nl1) {
-			send_error(client_fd, SG_ERR_INVALID_ARG, "Bad format");
-			return;
-		}
-		size_t ulen = (size_t)(nl1 - payload);
-		if (ulen >= sizeof(target)) ulen = sizeof(target) - 1;
-		memcpy(target, payload, ulen);
-
-		const char *p2 = nl1 + 1;
-		size_t plen2 = strlen(p2);
-		if (plen2 > 0 && p2[plen2-1] == '\n') plen2--;
-		if (plen2 >= sizeof(pw)) plen2 = sizeof(pw) - 1;
-		memcpy(pw, p2, plen2);
-
-		if (!sg_is_safe_id(target)) {
-			explicit_bzero(pw, sizeof(pw));
-			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid username");
-			return;
-		}
-
-		/* Permission: admin can set anyone's password,
-		 * regular user can only set their own */
-		const char *perms = get_user_permissions(user);
-		if (!has_permission(perms, "admin") && strcmp(user, target) != 0) {
-			send_error(client_fd, SG_ERR_PERM_DENIED,
-				   "Can only change your own password");
-			explicit_bzero(pw, sizeof(pw));
-			return;
-		}
-
-		/* Validate against password policy */
-		const char *pw_reason = NULL;
-		int pw_rc = mgmtd_validate_password(target, pw, NULL, &pw_reason);
-		if (pw_rc > 0) {
-			explicit_bzero(pw, sizeof(pw));
-			send_error(client_fd, SG_ERR_POLICY_FAIL,
-				   pw_reason ? pw_reason : "Policy violation");
-			return;
-		}
-
-		if (set_password(target, pw) != 0) {
-			explicit_bzero(pw, sizeof(pw));
-			mgmt_log("ERROR", "set_password failed for %s: %s",
-				 target, strerror(errno));
-			send_error(client_fd, SG_ERR_SYSTEM_FAIL, "Password update failed");
-			return;
-		}
-		explicit_bzero(pw, sizeof(pw));
-		if (g_debug_flags & SG_DBG_FLAG_AUTH)
-			debug_buf_push("[AUTH-DBG] set_password user=%s result=ok\n",
-				       target);
-		send_ok_audited(client_fd, "Password updated", NULL,
-				user, "admin_password_set", target);
-		return;
-	}
-
-	case SG_CMD_ADMIN_SET_ENF: {
-		const char *perms = get_user_permissions(user);
-		if (!has_permission(perms, "admin")) {
-			send_error(client_fd, SG_ERR_PERM_DENIED, "Requires 'admin' permission");
-			return;
-		}
-		/* Payload: "username\nenable|disable\n" */
-		if (!payload) {
-			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing args");
-			return;
-		}
-		char target[128] = {0}, val[32] = {0};
-		const char *nl1 = strchr(payload, '\n');
-		if (!nl1) { send_error(client_fd, SG_ERR_INVALID_ARG, "Bad format"); return; }
-		size_t ulen = (size_t)(nl1 - payload);
-		if (ulen >= sizeof(target)) ulen = sizeof(target) - 1;
-		memcpy(target, payload, ulen);
-		snprintf(val, sizeof(val), "%s", nl1 + 1);
-		size_t vlen = strlen(val);
-		if (vlen > 0 && val[vlen-1] == '\n') val[--vlen] = '\0';
-
-		if (!sg_is_safe_id(target)) {
-			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid username");
-			return;
-		}
-		if (strcmp(val, "enable") != 0 && strcmp(val, "disable") != 0) {
-			send_error(client_fd, SG_ERR_INVALID_VAL,
-				   "Value must be 'enable' or 'disable'");
-			return;
-		}
-
-		char *existing = sg_db_get("system_admin", target);
-		if (!existing) {
-			send_error(client_fd, SG_ERR_USER_NOT_FOUND, target);
-			return;
-		}
-
-		/* Rebuild data with updated enforce flag */
-		size_t elen = strlen(existing);
-		char *newdata = malloc(elen + 64);
-		if (!newdata) { free(existing); send_error(client_fd, SG_ERR_INTERNAL, NULL); return; }
-
-		/* Copy lines except enforce-change-password */
-		const char *p = existing;
-		size_t ndoff = 0;
-		while (*p) {
-			const char *nl = strchr(p, '\n');
-			size_t llen = nl ? (size_t)(nl - p + 1) : strlen(p);
-			if (strncmp(p, "enforce-change-password=", 24) != 0) {
-				memcpy(newdata + ndoff, p, llen);
-				ndoff += llen;
-			}
-			p += llen;
-		}
-		ndoff += (size_t)snprintf(newdata + ndoff, 64,
-					  "enforce-change-password=%s\n", val);
-		newdata[ndoff] = '\0';
-
-		sg_db_set("system_admin", target, newdata);
-		free(existing);
-		free(newdata);
-		send_ok_audited(client_fd, "Enforce policy updated", NULL,
-				user, "admin_set_enforce", target);
-		return;
-	}
-
-	case SG_CMD_ADMIN_CHECK_PW: {
-		/* Validate password against policy without setting it.
-		 * Payload: "username\npassword[\nenforce_override]" */
-		if (!payload) {
-			send_error(client_fd, SG_ERR_MISSING_ARG,
-				   "Missing username+password");
-			return;
-		}
-		char chk_user[128] = {0}, chk_pw[256] = {0};
-		char chk_enforce[32] = {0};
-		const char *nl1 = strchr(payload, '\n');
-		if (!nl1) {
-			send_error(client_fd, SG_ERR_INVALID_ARG, "Bad format");
-			return;
-		}
-		size_t ulen = (size_t)(nl1 - payload);
-		if (ulen >= sizeof(chk_user)) ulen = sizeof(chk_user) - 1;
-		memcpy(chk_user, payload, ulen);
-
-		const char *p2 = nl1 + 1;
-		const char *nl2 = strchr(p2, '\n');
-		if (nl2) {
-			size_t plen2 = (size_t)(nl2 - p2);
-			if (plen2 >= sizeof(chk_pw)) plen2 = sizeof(chk_pw) - 1;
-			memcpy(chk_pw, p2, plen2);
-			/* Third line: enforce override */
-			const char *p3 = nl2 + 1;
-			size_t elen = strlen(p3);
-			if (elen > 0 && p3[elen-1] == '\n') elen--;
-			if (elen >= sizeof(chk_enforce)) elen = sizeof(chk_enforce) - 1;
-			memcpy(chk_enforce, p3, elen);
-		} else {
-			size_t plen2 = strlen(p2);
-			if (plen2 > 0 && p2[plen2-1] == '\n') plen2--;
-			if (plen2 >= sizeof(chk_pw)) plen2 = sizeof(chk_pw) - 1;
-			memcpy(chk_pw, p2, plen2);
-		}
-
-		if (!sg_is_safe_id(chk_user)) {
-			explicit_bzero(chk_pw, sizeof(chk_pw));
-			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid username");
-			return;
-		}
-
-		const char *reason = NULL;
-		int rc = mgmtd_validate_password(chk_user, chk_pw,
-						  chk_enforce[0] ? chk_enforce : NULL,
-						  &reason);
-		explicit_bzero(chk_pw, sizeof(chk_pw));
-
-		if (rc > 0) {
-			if (g_debug_flags & SG_DBG_FLAG_AUTH)
-				debug_buf_push("[AUTH-DBG] check_password user=%s result=fail\n",
-					       chk_user);
-			send_error(client_fd, SG_ERR_POLICY_FAIL,
-				   reason ? reason : "Policy violation");
-		} else {
-			if (g_debug_flags & SG_DBG_FLAG_AUTH)
-				debug_buf_push("[AUTH-DBG] check_password user=%s result=ok\n",
-					       chk_user);
-			send_ok(client_fd, "Password meets policy", NULL);
-		}
-		return;
-	}
-
-	case SG_CMD_ADMIN_LOCK_PW: {
-		/* Lock (invalidate) an admin's password.  Payload: "username\n" */
-		const char *perms = get_user_permissions(user);
-		if (!has_permission(perms, "admin")) {
-			send_error(client_fd, SG_ERR_PERM_DENIED, NULL);
-			return;
-		}
-		if (!payload) {
-			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing username");
-			return;
-		}
-		char lock_target[128] = {0};
-		snprintf(lock_target, sizeof(lock_target), "%s", payload);
-		size_t llen = strlen(lock_target);
-		if (llen > 0 && lock_target[llen - 1] == '\n')
-			lock_target[--llen] = '\0';
-
-		if (!sg_is_safe_id(lock_target)) {
-			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid username");
-			return;
-		}
-
-		if (lock_password(lock_target) != 0) {
-			send_error(client_fd, SG_ERR_SYSTEM_FAIL,
-				   "Failed to lock password");
-			return;
-		}
-		if (g_debug_flags & SG_DBG_FLAG_AUTH)
-			debug_buf_push("[AUTH-DBG] lock_password user=%s result=ok\n",
-				       lock_target);
-		send_ok_audited(client_fd, "Password locked", NULL,
-				user, "admin_password_locked", lock_target);
-		return;
-	}
+	/* ── Admin management (handlers in mgmtd_user.c) ──────────────── */
+	case SG_CMD_ADMIN_CREATE:
+		return handle_admin_create(client_fd, user, payload, hdr);
+	case SG_CMD_ADMIN_DELETE:
+		return handle_admin_delete(client_fd, user, payload, hdr);
+	case SG_CMD_ADMIN_SET_PW:
+		return handle_admin_set_pw(client_fd, user, payload, hdr);
+	case SG_CMD_ADMIN_SET_ENF:
+		return handle_admin_set_enf(client_fd, user, payload, hdr);
+	case SG_CMD_ADMIN_CHECK_PW:
+		return handle_admin_check_pw(client_fd, user, payload, hdr);
+	case SG_CMD_ADMIN_LOCK_PW:
+		return handle_admin_lock_pw(client_fd, user, payload, hdr);
 
 	/* ── Session ────────────────────────────────────────────────────── */
 	case SG_CMD_SESSION_REV: {
-		if (!payload) { send_error(client_fd, SG_ERR_MISSING_ARG, NULL); return; }
+		if (!payload) { send_error(client_fd, SG_ERR_MISSING_ARG, NULL); return 0; }
 		char target[128] = {0};
 		snprintf(target, sizeof(target), "%s", payload);
 		size_t tlen = strlen(target);
@@ -2349,23 +1815,23 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 
 		if (!sg_is_safe_id(target)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid username");
-			return;
+			return 0;
 		}
 
 		int rev = session_rev_get(target);
 		char revstr[32];
 		snprintf(revstr, sizeof(revstr), "%d", rev);
 		send_ok(client_fd, NULL, revstr);
-		return;
+		return 0;
 	}
 
 	case SG_CMD_SESSION_BUMP: {
 		const char *perms = get_user_permissions(user);
 		if (!has_permission(perms, "admin")) {
 			send_error(client_fd, SG_ERR_PERM_DENIED, NULL);
-			return;
+			return 0;
 		}
-		if (!payload) { send_error(client_fd, SG_ERR_MISSING_ARG, NULL); return; }
+		if (!payload) { send_error(client_fd, SG_ERR_MISSING_ARG, NULL); return 0; }
 		char target[128] = {0};
 		snprintf(target, sizeof(target), "%s", payload);
 		size_t tlen = strlen(target);
@@ -2373,14 +1839,14 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 
 		if (!sg_is_safe_id(target)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid username");
-			return;
+			return 0;
 		}
 
 		int rev = session_rev_bump(target);
 		char revstr[32];
 		snprintf(revstr, sizeof(revstr), "%d", rev);
 		send_ok(client_fd, NULL, revstr);
-		return;
+		return 0;
 	}
 
 	/* ── System commands ────────────────────────────────────────────── */
@@ -2388,7 +1854,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		const char *perms = get_user_permissions(user);
 		if (!has_permission(perms, "admin")) {
 			send_error(client_fd, SG_ERR_PERM_DENIED, "Requires 'admin' permission");
-			return;
+			return 0;
 		}
 		send_ok(client_fd, "Shutting down...", NULL);
 		(void)audit_log(user, "system_poweroff", "");
@@ -2397,14 +1863,14 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		/* Give time for response to be sent */
 		usleep(100000);
 		(void)run_cmd("/sbin/poweroff");
-		return;
+		return 0;
 	}
 
 	case SG_CMD_SYS_REBOOT: {
 		const char *perms = get_user_permissions(user);
 		if (!has_permission(perms, "admin")) {
 			send_error(client_fd, SG_ERR_PERM_DENIED, "Requires 'admin' permission");
-			return;
+			return 0;
 		}
 		send_ok(client_fd, "Rebooting...", NULL);
 		(void)audit_log(user, "system_reboot", "");
@@ -2412,472 +1878,16 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		sg_db_close();
 		usleep(100000);
 		(void)run_cmd("/sbin/reboot");
-		return;
+		return 0;
 	}
 
-	case SG_CMD_FW_STATUS: {
-		char result[2048];
-		int off = 0;
-
-		off += snprintf(result + off, sizeof(result) - off,
-				"  === Firmware Status ===\n");
-
-		/* Running version from build-time define or runtime file */
-#ifdef VERSION
-		off += snprintf(result + off, sizeof(result) - off,
-				"  Running version: %s\n", VERSION);
-#else
-		{
-			char verbuf[64] = {0};
-			FILE *vf = fopen("/tmp/stargazer-fw-version", "r");
-			if (vf) {
-				if (fgets(verbuf, sizeof(verbuf), vf)) {
-					char *nl = strchr(verbuf, '\n');
-					if (nl) *nl = '\0';
-				}
-				fclose(vf);
-			}
-			off += snprintf(result + off, sizeof(result) - off,
-					"  Running version: %s\n",
-					verbuf[0] ? verbuf : "unknown");
-		}
-#endif
-
-		/* Check for staged firmware */
-		FILE *mf = fopen("/tmp/sg-fw-staged/manifest.txt", "r");
-		if (mf) {
-			char line[256];
-			char staged_ver[256] = {0};
-			while (fgets(line, sizeof(line), mf)) {
-				if (strncmp(line, "version=", 8) == 0) {
-					char *nl = strchr(line + 8, '\n');
-					if (nl) *nl = '\0';
-					snprintf(staged_ver, sizeof(staged_ver),
-						 "%s", line + 8);
-				}
-			}
-			fclose(mf);
-			if (staged_ver[0])
-				off += snprintf(result + off,
-						sizeof(result) - off,
-						"  Staged version: %s\n",
-						staged_ver);
-		}
-
-		/* Boot partition device */
-		const char *bdev_argv[] = {"findfs", "LABEL=boot", NULL};
-		char *bdev = safe_exec(bdev_argv);
-		if (!bdev || !bdev[0]) {
-			free(bdev);
-			const char *blkid_argv[] = {"blkid", "-L", "boot", NULL};
-			bdev = safe_exec(blkid_argv);
-		}
-		if (bdev && bdev[0]) {
-			char *nl = strchr(bdev, '\n');
-			if (nl) *nl = '\0';
-			off += snprintf(result + off, sizeof(result) - off,
-					"  Boot partition: %s\n", bdev);
-		} else {
-			off += snprintf(result + off, sizeof(result) - off,
-					"  Boot partition: not found\n");
-		}
-		free(bdev);
-
-		(void)off;
-		send_ok(client_fd, NULL, result);
-		return;
-	}
-
-	case SG_CMD_FW_UPGRADE: {
-		const char *perms = get_user_permissions(user);
-		if (!has_permission(perms, "admin")) {
-			send_error(client_fd, SG_ERR_PERM_DENIED,
-				   "Requires 'admin' permission");
-			return;
-		}
-		if (!payload || hdr->payload_len == 0) {
-			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing URL");
-			return;
-		}
-
-		/* Extract URL from payload */
-		char url[1024];
-		extract_val(payload, "url", url, sizeof(url));
-		if (!url[0]) {
-			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing URL");
-			return;
-		}
-
-		/* Validate URL scheme */
-		if (strncmp(url, "http://", 7) != 0 &&
-		    strncmp(url, "https://", 8) != 0 &&
-		    strncmp(url, "tftp://", 7) != 0) {
-			send_error(client_fd, SG_ERR_INVALID_ARG,
-				   "URL must start with http://, https://, or tftp://");
-			return;
-		}
-
-		/* Check if upgrade already running */
-		{
-			char state_check[256] = {0};
-			FILE *sf = fopen(FW_STATE_FILE, "r");
-			if (sf) {
-				size_t rd = fread(state_check, 1, sizeof(state_check) - 1, sf);
-				state_check[rd] = '\0';
-				fclose(sf);
-				if (strstr(state_check, "status=running")) {
-					send_error(client_fd, SG_ERR_IN_USE,
-						   "Firmware upgrade already in progress");
-					return;
-				}
-			}
-		}
-
-		/* Write initial state and respond immediately */
-		fw_write_state(0, 6, "running", "Starting firmware upgrade...", "");
-		send_ok(client_fd, NULL, "Firmware upgrade started\n");
-
-		/* Save username for child audit log */
-		char fw_user[SG_USERNAME_MAX];
-		snprintf(fw_user, sizeof(fw_user), "%s", user);
-
-		/* Fork: parent returns to accept loop, child performs upgrade */
-		pid_t pid = fork();
-		if (pid < 0) {
-			mgmt_log("ERROR", "firmware upgrade fork failed: %s",
-				 strerror(errno));
-			fw_write_state(0, 6, "error", "Internal error: fork failed", "");
-			return;
-		}
-
-		if (pid > 0) {
-			/* Parent — return to main accept loop */
-			return;
-		}
-
-		/* ── Child process ─────────────────────────────────────── */
-
-		/* Close fds we don't need */
-		close(client_fd);
-		if (g_listen_fd >= 0)
-			close(g_listen_fd);
-
-		/* Re-open database (parent keeps its connection) */
-		sg_db_close();
-		if (sg_db_open(SG_DB_PATH) != 0)
-			mgmt_log("WARN", "firmware child: failed to reopen db");
-
-		/* Prepare working directories */
-		(void)run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged /tmp/sg-fw-boot");
-		(void)run_cmd("mkdir -p /tmp/sg-fw-download /tmp/sg-fw-staged /tmp/sg-fw-boot");
-
-		/* Step 1: Download firmware package */
-		fw_write_state(1, 6, "running", "Downloading firmware...", "");
-		mgmt_log("INFO", "firmware upgrade: downloading from %s", url);
-		char dlcmd[2048];
-		if (strncmp(url, "tftp://", 7) == 0) {
-			/* Parse tftp://host/path */
-			const char *hp = url + 7;
-			const char *slash = strchr(hp, '/');
-			if (!slash || !slash[1]) {
-				(void)run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
-				fw_write_state(1, 6, "error",
-					       "TFTP URL must be tftp://host/path", "");
-				sg_db_close();
-				_exit(1);
-			}
-			char thost[256];
-			size_t hlen = (size_t)(slash - hp);
-			if (hlen >= sizeof(thost)) hlen = sizeof(thost) - 1;
-			memcpy(thost, hp, hlen);
-			thost[hlen] = '\0';
-			const char *tremote = slash + 1;
-			snprintf(dlcmd, sizeof(dlcmd),
-				 "tftp -g -l /tmp/sg-fw-download/firmware.tar.gz "
-				 "-r '%s' '%s' 2>&1", tremote, thost);
-		} else {
-			snprintf(dlcmd, sizeof(dlcmd),
-				 "wget -q -O /tmp/sg-fw-download/firmware.tar.gz "
-				 "'%s' 2>&1", url);
-		}
-
-		char *dlout = run_cmd(dlcmd);
-		if (access("/tmp/sg-fw-download/firmware.tar.gz", F_OK) != 0) {
-			mgmt_log("ERROR", "firmware download failed: %s",
-				 dlout ? dlout : "(no output)");
-			free(dlout);
-			(void)run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
-			fw_write_state(1, 6, "error", "Download failed", "");
-			sg_db_close();
-			_exit(1);
-		}
-		free(dlout);
-
-		/* Step 2: Extract firmware package */
-		fw_write_state(2, 6, "running", "Extracting firmware package...", "");
-		char *exout = run_cmd("tar -xzf /tmp/sg-fw-download/firmware.tar.gz "
-				      "-C /tmp/sg-fw-staged/ 2>&1");
-		if (access("/tmp/sg-fw-staged/manifest.txt", F_OK) != 0) {
-			mgmt_log("ERROR", "firmware extract failed or missing manifest: %s",
-				 exout ? exout : "(no output)");
-			free(exout);
-			(void)run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
-			fw_write_state(2, 6, "error",
-				       "Invalid firmware package (missing manifest.txt)", "");
-			sg_db_close();
-			_exit(1);
-		}
-		free(exout);
-
-		/* Read manifest */
-		char manifest[2048] = {0};
-		FILE *mf = fopen("/tmp/sg-fw-staged/manifest.txt", "r");
-		if (mf) {
-			size_t rd = fread(manifest, 1, sizeof(manifest) - 1, mf);
-			manifest[rd] = '\0';
-			fclose(mf);
-		}
-
-		char fw_version[64], kernel_sha[128], initramfs_sha[128];
-		extract_val(manifest, "version", fw_version, sizeof(fw_version));
-		extract_val(manifest, "kernel_sha256", kernel_sha, sizeof(kernel_sha));
-		extract_val(manifest, "initramfs_sha256", initramfs_sha,
-			    sizeof(initramfs_sha));
-
-		if (!fw_version[0] || !kernel_sha[0] || !initramfs_sha[0]) {
-			(void)run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
-			fw_write_state(2, 6, "error",
-				       "Incomplete manifest (missing version or checksums)", "");
-			sg_db_close();
-			_exit(1);
-		}
-
-		/* Step 3: Verify checksums */
-		fw_write_state(3, 6, "running", "Verifying checksums...", "");
-		char *ksum = run_cmd("sha256sum /tmp/sg-fw-staged/kernel 2>/dev/null "
-				     "| cut -d' ' -f1");
-		char *isum = run_cmd("sha256sum /tmp/sg-fw-staged/initramfs.gz 2>/dev/null "
-				     "| cut -d' ' -f1");
-
-		/* Trim trailing newlines */
-		if (ksum) { char *nl = strchr(ksum, '\n'); if (nl) *nl = '\0'; }
-		if (isum) { char *nl = strchr(isum, '\n'); if (nl) *nl = '\0'; }
-
-		if (!ksum || !isum ||
-		    strcmp(ksum, kernel_sha) != 0 ||
-		    strcmp(isum, initramfs_sha) != 0) {
-			mgmt_log("ERROR", "firmware checksum mismatch: "
-				 "kernel=%s (expect %s) initramfs=%s (expect %s)",
-				 ksum ? ksum : "null", kernel_sha,
-				 isum ? isum : "null", initramfs_sha);
-			free(ksum);
-			free(isum);
-			(void)run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
-			fw_write_state(3, 6, "error",
-				       "Firmware checksum verification failed", "");
-			sg_db_close();
-			_exit(1);
-		}
-		free(ksum);
-		free(isum);
-
-		mgmt_log("INFO", "firmware v%s verified, installing...", fw_version);
-
-		/* Step 4: Find and mount boot partition */
-		fw_write_state(4, 6, "running", "Mounting boot partition...", "");
-		const char *bdev_argv[] = {"findfs", "LABEL=boot", NULL};
-		char *bdev = safe_exec(bdev_argv);
-		if (!bdev || !bdev[0]) {
-			free(bdev);
-			const char *blkid_argv[] = {"blkid", "-L", "boot", NULL};
-			bdev = safe_exec(blkid_argv);
-		}
-		if (!bdev || !bdev[0]) {
-			free(bdev);
-			/* Scan common device paths */
-			const char *candidates[] = {
-				"/dev/mmcblk0p1", "/dev/mmcblk1p1",
-				"/dev/vda1", "/dev/sda1", NULL
-			};
-			for (int i = 0; candidates[i]; i++) {
-				if (access(candidates[i], F_OK) != 0)
-					continue;
-				char bcmd[256];
-				snprintf(bcmd, sizeof(bcmd),
-					 "blkid -s LABEL -o value '%s' 2>/dev/null",
-					 candidates[i]);
-				char *lbl = run_cmd(bcmd);
-				if (lbl) {
-					char *nl = strchr(lbl, '\n');
-					if (nl) *nl = '\0';
-					if (strcmp(lbl, "boot") == 0) {
-						bdev = malloc(strlen(candidates[i]) + 1);
-						if (bdev)
-							strcpy(bdev, candidates[i]);
-						free(lbl);
-						break;
-					}
-					free(lbl);
-				}
-			}
-		}
-
-		if (!bdev || !bdev[0]) {
-			free(bdev);
-			(void)run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
-			fw_write_state(4, 6, "error",
-				       "Boot partition (LABEL=boot) not found", "");
-			sg_db_close();
-			_exit(1);
-		}
-
-		/* Trim trailing newline from device path */
-		{
-			char *nl = strchr(bdev, '\n');
-			if (nl) *nl = '\0';
-		}
-
-		/* Mount boot partition */
-		char mntcmd[512];
-		snprintf(mntcmd, sizeof(mntcmd),
-			 "mount '%s' /tmp/sg-fw-boot 2>&1", bdev);
-		char *mntout = run_cmd(mntcmd);
-		if (access("/tmp/sg-fw-boot/kernel", F_OK) != 0 &&
-		    access("/tmp/sg-fw-boot/initramfs.gz", F_OK) != 0) {
-			/* Boot partition mounted but seems empty — still ok
-			 * for first firmware install */
-			mgmt_log("WARN", "boot partition %s appears empty", bdev);
-		}
-		free(mntout);
-
-		/* Verify mount succeeded by checking mountpoint */
-		char *mpcheck = run_cmd("mountpoint -q /tmp/sg-fw-boot && echo ok 2>/dev/null");
-		if (!mpcheck || strncmp(mpcheck, "ok", 2) != 0) {
-			mgmt_log("ERROR", "failed to mount boot partition %s", bdev);
-			free(mpcheck);
-			free(bdev);
-			(void)run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
-			fw_write_state(4, 6, "error",
-				       "Failed to mount boot partition", "");
-			sg_db_close();
-			_exit(1);
-		}
-		free(mpcheck);
-
-		/* Log boot partition space before install */
-		char *df_before = run_cmd("df -h /tmp/sg-fw-boot 2>/dev/null | tail -1");
-		mgmt_log("INFO", "boot partition before install: %s",
-			 df_before ? df_before : "(unknown)");
-		free(df_before);
-
-		/* Remove existing files to free space (64MB partition can't
-		 * hold old + new simultaneously with a ~44MB kernel) */
-		(void)run_cmd("rm -f /tmp/sg-fw-boot/kernel "
-			      "/tmp/sg-fw-boot/initramfs.gz "
-			      "/tmp/sg-fw-boot/kernel.bak "
-			      "/tmp/sg-fw-boot/initramfs.gz.bak 2>/dev/null");
-
-		/* Step 5: Install firmware files */
-		fw_write_state(5, 6, "running",
-			       "Installing kernel and initramfs...", "");
-
-		int install_ok = 1;
-
-		char *cpk = run_cmd("cp /tmp/sg-fw-staged/kernel /tmp/sg-fw-boot/kernel 2>&1");
-		if (cpk && cpk[0])
-			mgmt_log("WARN", "kernel copy: %s", cpk);
-		free(cpk);
-
-		char *vk = run_cmd("cmp -s /tmp/sg-fw-staged/kernel /tmp/sg-fw-boot/kernel "
-				   "&& echo ok");
-		if (!vk || strncmp(vk, "ok", 2) != 0) {
-			mgmt_log("ERROR", "kernel verify failed");
-			install_ok = 0;
-		}
-		free(vk);
-
-		char *cpi = run_cmd("cp /tmp/sg-fw-staged/initramfs.gz /tmp/sg-fw-boot/initramfs.gz 2>&1");
-		if (cpi && cpi[0])
-			mgmt_log("WARN", "initramfs copy: %s", cpi);
-		free(cpi);
-
-		char *vi = run_cmd("cmp -s /tmp/sg-fw-staged/initramfs.gz /tmp/sg-fw-boot/initramfs.gz "
-				   "&& echo ok");
-		if (!vi || strncmp(vi, "ok", 2) != 0) {
-			mgmt_log("ERROR", "initramfs verify failed");
-			install_ok = 0;
-		}
-		free(vi);
-
-		if (!install_ok) {
-			char *df_fail = run_cmd("df -h /tmp/sg-fw-boot 2>/dev/null | tail -1");
-			mgmt_log("ERROR", "firmware install failed, boot partition: %s",
-				 df_fail ? df_fail : "(unknown)");
-			free(df_fail);
-			(void)run_cmd("sync");
-			(void)run_cmd("umount /tmp/sg-fw-boot 2>/dev/null");
-			free(bdev);
-			(void)run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
-			fw_write_state(5, 6, "error", "Firmware install failed", "");
-			sg_db_close();
-			_exit(1);
-		}
-
-		/* Copy manifest to boot partition for version tracking */
-		(void)run_cmd("cp /tmp/sg-fw-staged/manifest.txt /tmp/sg-fw-boot/manifest.txt 2>/dev/null");
-
-		/* Step 6: Sync, unmount, and finalize */
-		fw_write_state(6, 6, "running",
-			       "Syncing and unmounting boot partition...", "");
-		(void)run_cmd("sync");
-		(void)run_cmd("umount /tmp/sg-fw-boot 2>/dev/null");
-		free(bdev);
-
-		/* Cleanup download artifacts */
-		(void)run_cmd("rm -rf /tmp/sg-fw-download");
-
-		/* Audit log */
-		char audit_msg[1200];
-		snprintf(audit_msg, sizeof(audit_msg),
-			 "version=%s url=%s", fw_version, url);
-		(void)audit_log(fw_user, "firmware_upgrade", audit_msg);
-
-		mgmt_log("INFO", "firmware v%s installed successfully", fw_version);
-
-		char done_msg[256];
-		snprintf(done_msg, sizeof(done_msg),
-			 "Firmware v%s installed successfully. Rebooting...",
-			 fw_version);
-		fw_write_state(6, 6, "done", done_msg, fw_version);
-
-		/* Close DB and reboot */
-		sg_db_close();
-		usleep(100000);
-		(void)run_cmd("/sbin/reboot");
-		_exit(0);
-	}
-
-	case SG_CMD_FW_PROGRESS: {
-		/* Poll firmware upgrade progress from state file */
-		char state[512] = {0};
-		FILE *sf = fopen(FW_STATE_FILE, "r");
-		if (!sf) {
-			send_ok(client_fd, NULL,
-				"step=0\ntotal=0\nstatus=idle\n"
-				"message=No upgrade in progress\nversion=\n");
-			return;
-		}
-		size_t rd = fread(state, 1, sizeof(state) - 1, sf);
-		state[rd] = '\0';
-		fclose(sf);
-
-		/* If terminal state (done/error), clean up the file */
-		if (strstr(state, "status=done") || strstr(state, "status=error"))
-			unlink(FW_STATE_FILE);
-
-		send_ok(client_fd, NULL, state);
-		return;
-	}
+	/* ── Firmware (handlers in mgmtd_firmware.c) ──────────────────── */
+	case SG_CMD_FW_STATUS:
+		return handle_fw_status(client_fd, user, payload, hdr);
+	case SG_CMD_FW_UPGRADE:
+		return handle_fw_upgrade(client_fd, user, payload, hdr);
+	case SG_CMD_FW_PROGRESS:
+		return handle_fw_progress(client_fd, user, payload, hdr);
 
 	case SG_CMD_SHOW_STATUS: {
 		char *out = run_cmd(
@@ -2890,21 +1900,21 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 			"echo \"Uptime: $(cut -d' ' -f1 /proc/uptime 2>/dev/null)s\"");
 		send_ok(client_fd, NULL, out ? out : "");
 		free(out);
-		return;
+		return 0;
 	}
 
 	case SG_CMD_SHOW_IFACES: {
 		char *out = mgmtd_show_interfaces();
 		send_ok(client_fd, NULL, out ? out : "");
 		free(out);
-		return;
+		return 0;
 	}
 
 	case SG_CMD_SHOW_ROUTES: {
 		char *out = run_cmd("ip route 2>/dev/null || route -n 2>/dev/null");
 		send_ok(client_fd, NULL, out ? out : "");
 		free(out);
-		return;
+		return 0;
 	}
 
 	case SG_CMD_SHOW_STATS: {
@@ -2912,7 +1922,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 			"dmesg 2>/dev/null | grep -i 'pkt_forward\\|forwarded\\|dropped' | tail -20");
 		send_ok(client_fd, NULL, out ? out : "");
 		free(out);
-		return;
+		return 0;
 	}
 
 	case SG_CMD_WHOAMI: {
@@ -2920,7 +1930,7 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		char *udata = sg_db_get("system_admin", user);
 		if (!udata) {
 			send_ok(client_fd, NULL, "profile=read-only\npermissions=monitor\n");
-			return;
+			return 0;
 		}
 		char prof[128] = {0}, perm[256] = {0};
 		extract_val(udata, "profile", prof, sizeof(prof));
@@ -2940,146 +1950,22 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		snprintf(result, sizeof(result),
 			 "profile=%s\npermissions=%s\n", prof, perm);
 		send_ok(client_fd, NULL, result);
-		return;
+		return 0;
 	}
 
-	case SG_CMD_NET_PING: {
-		const char *perms = get_user_permissions(user);
-		if (!has_permission(perms, "monitor")) {
-			send_error(client_fd, SG_ERR_PERM_DENIED,
-				   "Requires 'monitor' permission");
-			return;
-		}
-		char target[256];
-		extract_val(payload, "target", target, sizeof(target));
-		if (!target[0]) {
-			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing target");
-			return;
-		}
-		if (!sg_is_safe_id(target)) {
-			send_error(client_fd, SG_ERR_INVALID_ARG,
-				   "Invalid target (use IPv4 address or hostname)");
-			return;
-		}
-		const char *argv[] = {"ping", "-c", "4", "-W", "2", target, NULL};
-		char *out = safe_exec(argv);
-		if (out) {
-			send_ok(client_fd, NULL, out);
-			free(out);
-		} else {
-			send_error(client_fd, SG_ERR_SYSTEM_FAIL,
-				   "Failed to execute ping");
-		}
-		return;
-	}
-
-	case SG_CMD_NET_TRACEROUTE: {
-		const char *perms = get_user_permissions(user);
-		if (!has_permission(perms, "monitor")) {
-			send_error(client_fd, SG_ERR_PERM_DENIED,
-				   "Requires 'monitor' permission");
-			return;
-		}
-		char target[256];
-		extract_val(payload, "target", target, sizeof(target));
-		if (!target[0]) {
-			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing target");
-			return;
-		}
-		if (!sg_is_safe_id(target)) {
-			send_error(client_fd, SG_ERR_INVALID_ARG,
-				   "Invalid target (use IPv4 address or hostname)");
-			return;
-		}
-		const char *argv[] = {"traceroute", "-m", "20", "-w", "2", target, NULL};
-		char *out = safe_exec(argv);
-		if (out) {
-			send_ok(client_fd, NULL, out);
-			free(out);
-		} else {
-			send_error(client_fd, SG_ERR_SYSTEM_FAIL,
-				   "Failed to execute traceroute");
-		}
-		return;
-	}
-
-	case SG_CMD_NET_NSLOOKUP: {
-		const char *perms = get_user_permissions(user);
-		if (!has_permission(perms, "monitor")) {
-			send_error(client_fd, SG_ERR_PERM_DENIED,
-				   "Requires 'monitor' permission");
-			return;
-		}
-		char target[256];
-		extract_val(payload, "target", target, sizeof(target));
-		if (!target[0]) {
-			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing target");
-			return;
-		}
-		if (!sg_is_safe_id(target)) {
-			send_error(client_fd, SG_ERR_INVALID_ARG,
-				   "Invalid target (use hostname or IP address)");
-			return;
-		}
-		const char *argv[] = {"nslookup", target, NULL};
-		char *out = safe_exec(argv);
-		if (out) {
-			send_ok(client_fd, NULL, out);
-			free(out);
-		} else {
-			send_error(client_fd, SG_ERR_SYSTEM_FAIL,
-				   "Failed to execute nslookup");
-		}
-		return;
-	}
-
-	case SG_CMD_NET_ARPING: {
-		const char *perms = get_user_permissions(user);
-		if (!has_permission(perms, "monitor")) {
-			send_error(client_fd, SG_ERR_PERM_DENIED,
-				   "Requires 'monitor' permission");
-			return;
-		}
-		char target[256], iface[64];
-		extract_val(payload, "target", target, sizeof(target));
-		extract_val(payload, "iface", iface, sizeof(iface));
-		if (!target[0]) {
-			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing target");
-			return;
-		}
-		if (!sg_is_safe_id(target)) {
-			send_error(client_fd, SG_ERR_INVALID_ARG,
-				   "Invalid target (use IPv4 address or hostname)");
-			return;
-		}
-		char *out;
-		if (iface[0]) {
-			if (!sg_is_safe_id(iface)) {
-				send_error(client_fd, SG_ERR_INVALID_ARG,
-					   "Invalid interface name");
-				return;
-			}
-			const char *argv[] = {"arping", "-c", "4", "-w", "2",
-					      "-I", iface, target, NULL};
-			out = safe_exec(argv);
-		} else {
-			const char *argv[] = {"arping", "-c", "4", "-w", "2",
-					      target, NULL};
-			out = safe_exec(argv);
-		}
-		if (out) {
-			send_ok(client_fd, NULL, out);
-			free(out);
-		} else {
-			send_error(client_fd, SG_ERR_SYSTEM_FAIL,
-				   "Failed to execute arping");
-		}
-		return;
-	}
+	/* ── Network diagnostics (handlers in mgmtd_network.c) ────────── */
+	case SG_CMD_NET_PING:
+		return handle_net_ping(client_fd, user, payload, hdr);
+	case SG_CMD_NET_TRACEROUTE:
+		return handle_net_traceroute(client_fd, user, payload, hdr);
+	case SG_CMD_NET_NSLOOKUP:
+		return handle_net_nslookup(client_fd, user, payload, hdr);
+	case SG_CMD_NET_ARPING:
+		return handle_net_arping(client_fd, user, payload, hdr);
 
 	case SG_CMD_PING:
 		send_ok(client_fd, "pong", NULL);
-		return;
+		return 0;
 
 	case SG_CMD_DEBUG_FETCH: {
 		if (debug_buf_used > 0) {
@@ -3089,12 +1975,12 @@ static void handle_request(int client_fd, sg_request_hdr_t *hdr,
 		} else {
 			send_ok(client_fd, NULL, NULL);
 		}
-		return;
+		return 0;
 	}
 
 	default:
 		send_error(client_fd, SG_ERR_INVALID_CMD, "Unknown command");
-		return;
+		return 0;
 	}
 }
 
@@ -3287,11 +2173,14 @@ int main(void)
 		}
 #endif
 
-		/* Handle request (with verified username) */
-		handle_request(cfd, &hdr, payload);
+		/* Handle request (with verified username)
+		 * Return 0 = main loop closes fd (default)
+		 * Return 1 = handler already closed fd (streaming) */
+		int owned = handle_request(cfd, &hdr, payload);
 
 		free(payload);
-		close(cfd);
+		if (!owned)
+			close(cfd);
 	}
 
 	close(sfd);

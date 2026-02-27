@@ -70,10 +70,11 @@ static const struct field_entry field_table[] = {
 	{ "network_nat", "status",      "enum:enable,disable",   0, "enable", "Enable or disable this rule"  },
 
 	/* system_interface */
-	{ "system_interface", "ip",          "cidr",          0, NULL,   "Interface IP address and mask" },
-	{ "system_interface", "status",      "enum:up,down",  0, "up",   "Administrative state"          },
-	{ "system_interface", "mtu",         "uint:576:65535", 0, "1500", "Maximum transmission unit" },
-	{ "system_interface", "description", "string",        1, NULL,   "Interface description"         },
+	{ "system_interface", "ip",          "cidr",             0, NULL,   "Interface IP address and mask"  },
+	{ "system_interface", "status",      "enum:up,down",     0, "up",   "Administrative state"           },
+	{ "system_interface", "mtu",         "uint:576:65535",   0, "1500", "Maximum transmission unit"      },
+	{ "system_interface", "allowaccess", "access-services",  1, NULL,   "Allowed management services"    },
+	{ "system_interface", "description", "string",           1, NULL,   "Interface description"          },
 
 	/* system_settings */
 	{ "system_settings", "hostname",   "safe-id",             0, "stargazer", "System hostname"      },
@@ -160,6 +161,23 @@ sg_is_safe_id(const char *s)
 		if (isalnum((unsigned char)*p))
 			continue;
 		if (*p == '_' || *p == '.' || *p == '-')
+			continue;
+		return 0;
+	}
+	return 1;
+}
+
+int
+sg_is_net_target(const char *s)
+{
+	if (!s || !*s)
+		return 0;
+	if (strlen(s) > SG_NET_TARGET_MAX)
+		return 0;
+	for (const char *p = s; *p; p++) {
+		if (isalnum((unsigned char)*p))
+			continue;
+		if (*p == '_' || *p == '.' || *p == '-' || *p == ':')
 			continue;
 		return 0;
 	}
@@ -305,6 +323,39 @@ sg_is_permissions_csv(const char *s)
 		    strcmp(tok, "admin") != 0)
 			return 0;
 		tok = strtok_r(NULL, ",", &saveptr);
+	}
+	return 1;
+}
+
+int
+sg_is_access_services(const char *s)
+{
+	/* Empty string = no services allowed → valid */
+	if (!s || !*s)
+		return 1;
+
+	size_t len = strlen(s);
+	if (len > 256)
+		return 0;
+
+	/* Space-separated tokens: "ping ssh https" */
+	char buf[257];
+	memcpy(buf, s, len + 1);
+
+	char *saveptr = NULL;
+	char *tok = strtok_r(buf, " ", &saveptr);
+	if (!tok)
+		return 0;
+
+	while (tok) {
+		if (strcmp(tok, "ping") != 0 &&
+		    strcmp(tok, "ssh") != 0 &&
+		    strcmp(tok, "https") != 0 &&
+		    strcmp(tok, "http") != 0 &&
+		    strcmp(tok, "snmp") != 0 &&
+		    strcmp(tok, "telnet") != 0)
+			return 0;
+		tok = strtok_r(NULL, " ", &saveptr);
 	}
 	return 1;
 }
@@ -569,6 +620,8 @@ sg_reg_value_rule(const char *type_name, const char *key)
 		return "timezone token (e.g. Asia/Ho_Chi_Minh)";
 	if (strcmp(kind, "permissions-csv") == 0)
 		return "CSV: monitor,configure,admin";
+	if (strcmp(kind, "access-services") == 0)
+		return "space-separated: ping ssh https http snmp telnet";
 	if (strcmp(kind, "port-or-range") == 0)
 		return "port or range (e.g. 80, 1024-65535)";
 	if (strcmp(kind, "password-interactive") == 0)
@@ -769,6 +822,10 @@ sg_reg_validate_value(const char *type_name, const char *key, const char *val)
 	/* permissions-csv */
 	if (strcmp(kind, "permissions-csv") == 0)
 		return sg_is_permissions_csv(val);
+
+	/* access-services */
+	if (strcmp(kind, "access-services") == 0)
+		return sg_is_access_services(val);
 
 	/* port-or-range */
 	if (strcmp(kind, "port-or-range") == 0)
