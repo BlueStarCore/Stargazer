@@ -164,6 +164,28 @@ $(BUSYBOX_BIN):
 	@sed -i 's/# CONFIG_TRACEROUTE is not set/CONFIG_TRACEROUTE=y/' $(BUSYBOX_DIR)/.config
 	@sed -i 's/# CONFIG_NSLOOKUP is not set/CONFIG_NSLOOKUP=y/' $(BUSYBOX_DIR)/.config
 	@sed -i 's/# CONFIG_ARPING is not set/CONFIG_ARPING=y/' $(BUSYBOX_DIR)/.config
+	# --- Hardening: disable shell applets (prevent shell escape) ---
+	@sed -i 's/CONFIG_ASH=y/CONFIG_ASH=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_HUSH=y/CONFIG_HUSH=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_SH_IS_ASH=y/CONFIG_SH_IS_NONE=y/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_BASH_IS_ASH=y/CONFIG_BASH_IS_NONE=y/' $(BUSYBOX_DIR)/.config
+	# --- Hardening: disable dangerous interactive/server applets ---
+	@sed -i 's/CONFIG_VI=y/CONFIG_VI=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_LESS=y/CONFIG_LESS=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_ED=y/CONFIG_ED=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_FTPD=y/CONFIG_FTPD=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_HTTPD=y/CONFIG_HTTPD=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_TELNETD=y/CONFIG_TELNETD=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_TFTPD=y/CONFIG_TFTPD=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_SU=y/CONFIG_SU=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_LOGIN=y/CONFIG_LOGIN=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_PASSWD=y/CONFIG_PASSWD=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_ADDUSER=y/CONFIG_ADDUSER=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_DELUSER=y/CONFIG_DELUSER=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_ADDGROUP=y/CONFIG_ADDGROUP=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_DELGROUP=y/CONFIG_DELGROUP=n/' $(BUSYBOX_DIR)/.config
+	# Resolve Kconfig dependencies after hardening changes
+	yes "" | $(MAKE) -C $(BUSYBOX_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) oldconfig
 	$(MAKE) -C $(BUSYBOX_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) -j$$(nproc)
 	$(MAKE) -C $(BUSYBOX_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) busybox.links
 	@mkdir -p $(BUILD_DIR)/busybox
@@ -183,6 +205,28 @@ $(BUSYBOX_LINKS):
 	@sed -i 's/# CONFIG_TRACEROUTE is not set/CONFIG_TRACEROUTE=y/' $(BUSYBOX_DIR)/.config
 	@sed -i 's/# CONFIG_NSLOOKUP is not set/CONFIG_NSLOOKUP=y/' $(BUSYBOX_DIR)/.config
 	@sed -i 's/# CONFIG_ARPING is not set/CONFIG_ARPING=y/' $(BUSYBOX_DIR)/.config
+	# --- Hardening: disable shell applets (prevent shell escape) ---
+	@sed -i 's/CONFIG_ASH=y/CONFIG_ASH=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_HUSH=y/CONFIG_HUSH=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_SH_IS_ASH=y/CONFIG_SH_IS_NONE=y/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_BASH_IS_ASH=y/CONFIG_BASH_IS_NONE=y/' $(BUSYBOX_DIR)/.config
+	# --- Hardening: disable dangerous interactive/server applets ---
+	@sed -i 's/CONFIG_VI=y/CONFIG_VI=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_LESS=y/CONFIG_LESS=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_ED=y/CONFIG_ED=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_FTPD=y/CONFIG_FTPD=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_HTTPD=y/CONFIG_HTTPD=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_TELNETD=y/CONFIG_TELNETD=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_TFTPD=y/CONFIG_TFTPD=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_SU=y/CONFIG_SU=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_LOGIN=y/CONFIG_LOGIN=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_PASSWD=y/CONFIG_PASSWD=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_ADDUSER=y/CONFIG_ADDUSER=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_DELUSER=y/CONFIG_DELUSER=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_ADDGROUP=y/CONFIG_ADDGROUP=n/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/CONFIG_DELGROUP=y/CONFIG_DELGROUP=n/' $(BUSYBOX_DIR)/.config
+	# Resolve Kconfig dependencies after hardening changes
+	yes "" | $(MAKE) -C $(BUSYBOX_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) oldconfig
 	$(MAKE) -C $(BUSYBOX_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) busybox.links
 
 # =============================================================================
@@ -337,8 +381,12 @@ $(ROOTFS_DIR)/.stamp: modules busybox dash logind mgmtd cli
 	cp $(BUILD_DIR)/cli/stargazer-cli $(ROOTFS_DIR)/sbin/stargazer-cli
 	@chmod +x $(ROOTFS_DIR)/sbin/stargazer-cli
 
+	# Create /sbin/nologin stub (blocks direct root login)
+	@printf '#!/bin/sh\necho "Direct login disabled."\nexit 1\n' > $(ROOTFS_DIR)/sbin/nologin
+	@chmod +x $(ROOTFS_DIR)/sbin/nologin
+
 	# Create minimal /etc files (no Alpine branding)
-	@echo 'root:x:0:0:root:/root:/bin/sh' > $(ROOTFS_DIR)/etc/passwd
+	@echo 'root:x:0:0:root:/root:/sbin/nologin' > $(ROOTFS_DIR)/etc/passwd
 	@echo 'nobody:x:65534:65534:nobody:/:/bin/false' >> $(ROOTFS_DIR)/etc/passwd
 	@echo 'root:x:0:root' > $(ROOTFS_DIR)/etc/group
 	@echo 'nobody:x:65534:' >> $(ROOTFS_DIR)/etc/group
@@ -347,7 +395,7 @@ $(ROOTFS_DIR)/.stamp: modules busybox dash logind mgmtd cli
 	@chmod 640 $(ROOTFS_DIR)/etc/shadow
 	@echo 'stargazer' > $(ROOTFS_DIR)/etc/hostname
 	@printf '127.0.0.1\tlocalhost\n::1\t\tlocalhost\n' > $(ROOTFS_DIR)/etc/hosts
-	@printf '/bin/sh\n/sbin/stargazer-cli\n' > $(ROOTFS_DIR)/etc/shells
+	@printf '/sbin/stargazer-cli\n' > $(ROOTFS_DIR)/etc/shells
 
 	# Install kernel modules
 	@mkdir -p $(ROOTFS_DIR)/lib/modules
@@ -558,8 +606,12 @@ test-build: modules busybox dash logind mgmtd cli uboot
 	cp $(BUILD_DIR)/cli/stargazer-cli $(BUILD_DIR)/test/initramfs/sbin/stargazer-cli
 	@chmod +x $(BUILD_DIR)/test/initramfs/sbin/stargazer-cli
 
+	# Create /sbin/nologin stub (blocks direct root login)
+	@printf '#!/bin/sh\necho "Direct login disabled."\nexit 1\n' > $(BUILD_DIR)/test/initramfs/sbin/nologin
+	@chmod +x $(BUILD_DIR)/test/initramfs/sbin/nologin
+
 	# Create minimal /etc files
-	@echo 'root:x:0:0:root:/root:/bin/sh' > $(BUILD_DIR)/test/initramfs/etc/passwd
+	@echo 'root:x:0:0:root:/root:/sbin/nologin' > $(BUILD_DIR)/test/initramfs/etc/passwd
 	@echo 'nobody:x:65534:65534:nobody:/:/bin/false' >> $(BUILD_DIR)/test/initramfs/etc/passwd
 	@echo 'root:x:0:root' > $(BUILD_DIR)/test/initramfs/etc/group
 	@echo 'nobody:x:65534:' >> $(BUILD_DIR)/test/initramfs/etc/group
@@ -568,7 +620,7 @@ test-build: modules busybox dash logind mgmtd cli uboot
 	@chmod 640 $(BUILD_DIR)/test/initramfs/etc/shadow
 	@echo 'stargazer' > $(BUILD_DIR)/test/initramfs/etc/hostname
 	@printf '127.0.0.1\tlocalhost\n::1\t\tlocalhost\n' > $(BUILD_DIR)/test/initramfs/etc/hosts
-	@printf '/bin/sh\n/sbin/stargazer-cli\n' > $(BUILD_DIR)/test/initramfs/etc/shells
+	@printf '/sbin/stargazer-cli\n' > $(BUILD_DIR)/test/initramfs/etc/shells
 
 	# Install kernel modules
 	@mkdir -p $(BUILD_DIR)/test/initramfs/lib/modules/stargazer
