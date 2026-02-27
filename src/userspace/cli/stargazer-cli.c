@@ -8,6 +8,7 @@
  */
 
 #define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE
 
 #include "cli_readline.h"
 #include "cli_ipc.h"
@@ -88,14 +89,30 @@ int main(void)
 	char profile[128]    = "read-only";
 	char permissions[256] = "monitor";
 
-	if (ipc_init(user) == 0 && ipc_available()) {
-		struct ipc_response resp;
-		if (ipc_send_str(SG_CMD_WHOAMI, "", &resp) == 0 &&
-		    resp.status == SG_OK && resp.payload) {
-			parse_whoami(resp.payload, profile, sizeof(profile),
-				     permissions, sizeof(permissions));
+	if (ipc_init(user) == 0) {
+		/*
+		 * Retry WHOAMI a few times — mgmtd may still be starting.
+		 * Without this, the CLI defaults to read-only for the
+		 * entire session if the socket isn't ready yet.
+		 */
+		for (int attempt = 0; attempt < 5; attempt++) {
+			if (!ipc_available()) {
+				usleep(200000); /* 200ms */
+				continue;
+			}
+			struct ipc_response resp;
+			if (ipc_send_str(SG_CMD_WHOAMI, "", &resp) == 0 &&
+			    resp.status == SG_OK && resp.payload) {
+				parse_whoami(resp.payload, profile,
+					     sizeof(profile),
+					     permissions,
+					     sizeof(permissions));
+				ipc_resp_free(&resp);
+				break;
+			}
+			ipc_resp_free(&resp);
+			usleep(200000);
 		}
-		ipc_resp_free(&resp);
 	}
 
 	/* Export for shell subcommands */
