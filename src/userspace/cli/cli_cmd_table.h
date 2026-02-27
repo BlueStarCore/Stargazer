@@ -16,6 +16,7 @@ typedef struct {
 	const char    *path;    /* "execute debug enable" */
 	const char    *desc;    /* "Enable debug output" */
 	const char    *perm;    /* "admin", "configure,admin" (OR), or NULL */
+	int            max_args;/* 0=none, N=at most N, -1=variadic */
 	cmd_handler_t  handler; /* leaf handler, or NULL = completion-only */
 } cmd_entry_t;
 

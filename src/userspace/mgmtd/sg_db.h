@@ -79,6 +79,12 @@ int sg_db_set_val(const char *type, const char *id, const char *key,
 int sg_db_count(const char *type);
 
 /*
+ * Return the current schema version of the open database.
+ * Returns -1 if the database is not open.
+ */
+int sg_db_schema_version(void);
+
+/*
  * Parse a section string "type:id" into type and id buffers.
  * If no colon, id is set to "0" (single config type).
  */

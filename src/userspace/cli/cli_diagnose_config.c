@@ -2498,6 +2498,182 @@ static void test_ipc_cfg_set_validation(void)
 	ipc_resp_free(&resp);
 }
 
+/* ── Section 33: cmd_table integrity (X-macro arg validation) ─────────── */
+
+static void test_cmd_table_integrity(void)
+{
+	const char *perms = "monitor,configure,admin";
+
+	printf(C_CYAN "\n  --- cmd_table integrity (arg validation) ---"
+	       C_NC "\n");
+
+	/* exit/logout return 1 on success — arg validation makes them
+	 * return 0 when extra args are supplied. */
+	tc_check("cmd-tbl", "exit returns 1 normally",
+		 cmd_dispatch("exit", perms), 1);
+	tc_check("cmd-tbl", "exit blocked with extra arg",
+		 cmd_dispatch("exit hello", perms), 0);
+	tc_check("cmd-tbl", "logout returns 1 normally",
+		 cmd_dispatch("logout", perms), 1);
+	tc_check("cmd-tbl", "logout blocked with extra arg",
+		 cmd_dispatch("logout world", perms), 0);
+
+	/* max_args=0 commands: extra args must be rejected */
+	tc_check("cmd-tbl", "help blocked with extra arg",
+		 cmd_dispatch("help extra", perms), 0);
+	tc_check("cmd-tbl", "show status blocked with extra",
+		 cmd_dispatch("show status hello", perms), 0);
+	tc_check("cmd-tbl", "show interfaces blocked with extra",
+		 cmd_dispatch("show interfaces hello", perms), 0);
+	tc_check("cmd-tbl", "show routes blocked with extra",
+		 cmd_dispatch("show routes extra", perms), 0);
+	tc_check("cmd-tbl", "show config blocked with extra",
+		 cmd_dispatch("show config extra", perms), 0);
+	tc_check("cmd-tbl", "show firmware blocked with extra",
+		 cmd_dispatch("show firmware extra", perms), 0);
+	tc_check("cmd-tbl", "execute debug enable blocked with extra",
+		 cmd_dispatch("execute debug enable extra", perms), 0);
+	tc_check("cmd-tbl", "execute debug disable blocked with extra",
+		 cmd_dispatch("execute debug disable extra", perms), 0);
+	tc_check("cmd-tbl", "execute debug reset blocked with extra",
+		 cmd_dispatch("execute debug reset extra", perms), 0);
+	tc_check("cmd-tbl", "execute diagnose top blocked with extra",
+		 cmd_dispatch("execute diagnose top extra", perms), 0);
+
+	/* Auto-usage prefix: 'show' alone prints subcommands, returns 0 */
+	tc_check("cmd-tbl", "show auto-usage (0 args, no handler)",
+		 cmd_dispatch("show", perms), 0);
+}
+
+/* ── Section 34: cmd_table arg limits ─────────────────────────────────── */
+
+static void test_cmd_arg_limits(void)
+{
+	const char *perms = "monitor,configure,admin";
+
+	printf(C_CYAN "\n  --- cmd_table arg limits ---" C_NC "\n");
+
+	/*
+	 * Only test the "blocked" path (too many args) — these are safe
+	 * because cmd_validate_args rejects before the handler runs.
+	 * The "within-limit" path can't be tested via cmd_dispatch
+	 * because it would actually execute the command (ping, arping,
+	 * etc.), blocking or causing side effects.
+	 *
+	 * The exit/logout tests in test_cmd_table_integrity prove the
+	 * validation gate works (return value changes from 1 to 0).
+	 */
+
+	/* execute ping: max_args=1, reject at 2 */
+	tc_check("arg-lim", "ping: 2 args blocked",
+		 cmd_dispatch("execute ping 8.8.8.8 extra", perms), 0);
+
+	/* execute traceroute: max_args=1, reject at 2 */
+	tc_check("arg-lim", "traceroute: 2 args blocked",
+		 cmd_dispatch("execute traceroute 8.8.8.8 extra", perms), 0);
+
+	/* execute nslookup: max_args=1, reject at 2 */
+	tc_check("arg-lim", "nslookup: 2 args blocked",
+		 cmd_dispatch("execute nslookup google.com extra", perms), 0);
+
+	/* execute arping: max_args=2, reject at 3 */
+	tc_check("arg-lim", "arping: 3 args blocked",
+		 cmd_dispatch("execute arping 10.0.0.1 eth0 extra", perms), 0);
+
+	/* execute debug option: max_args=2, reject at 3 */
+	tc_check("arg-lim", "debug option: 3 args blocked",
+		 cmd_dispatch("execute debug option timestamp on extra", perms), 0);
+
+	/* execute diagnose resources: max_args=1, reject at 2 */
+	tc_check("arg-lim", "diagnose resources: 2 args blocked",
+		 cmd_dispatch("execute diagnose resources cpu extra", perms), 0);
+
+	/* execute firmware upgrade: max_args=1, reject at 2 */
+	tc_check("arg-lim", "firmware upgrade: 2 args blocked",
+		 cmd_dispatch("execute firmware upgrade http://x extra", perms), 0);
+
+	/* execute debug cli: max_args=1, reject at 2 */
+	tc_check("arg-lim", "debug cli: 2 args blocked",
+		 cmd_dispatch("execute debug cli on extra", perms), 0);
+
+	/* execute debug flow trace: max_args=4, reject at 5 */
+	tc_check("arg-lim", "debug flow trace: 5 args blocked",
+		 cmd_dispatch("execute debug flow trace limit 100 extra extra extra", perms), 0);
+}
+
+/* ── Section 35: IPC schema version (DB migration) ────────────────────── */
+
+static void test_ipc_schema_version(void)
+{
+	struct ipc_response resp;
+	int conn;
+	const char *test_section = "firewall_address:__diag_schematest";
+
+	printf(C_CYAN "\n  --- IPC: DB schema migration verification ---"
+	       C_NC "\n");
+
+	/* 1. mgmtd is alive — proves schema was applied at startup */
+	ipc_check("PING mgmtd (schema applied at startup)",
+		  SG_CMD_PING, "", SG_OK);
+
+	/* 2. Create entry via CFG_SET — exercises INSERT on migrated schema */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_SET,
+			    "firewall_address:__diag_schematest\n"
+			    "name=__diag_schematest\n"
+			    "subnet=10.77.77.0/24\n"
+			    "type=ipmask\n",
+			    &resp);
+	if (conn == 0 && resp.status == SG_OK) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [schema] create __diag_schematest (INSERT OK)\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [schema] create __diag_schematest (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+		ipc_resp_free(&resp);
+		return;
+	}
+	ipc_resp_free(&resp);
+
+	/* 3. Read back — exercises SELECT on migrated schema */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_GET, test_section, &resp);
+	if (conn == 0 && resp.status == SG_OK && resp.payload &&
+	    strstr(resp.payload, "subnet=10.77.77.0/24")) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [schema] read __diag_schematest (SELECT OK)\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [schema] read __diag_schematest (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+	}
+	ipc_resp_free(&resp);
+
+	/* 4. Delete — exercises DELETE on migrated schema */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_DEL, test_section, &resp);
+	if (conn == 0 && resp.status == SG_OK) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [schema] delete __diag_schematest (DELETE OK)\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [schema] delete __diag_schematest (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+	}
+	ipc_resp_free(&resp);
+
+	/* 5. Confirm gone — verify schema supports NOT_FOUND properly */
+	ipc_check("confirm __diag_schematest deleted",
+		  SG_CMD_CFG_GET, test_section, SG_ERR_ENTRY_NOT_FOUND);
+}
+
 /* ── Cleanup helper ───────────────────────────────────────────────────── */
 
 static void cleanup_test_entries(void)
@@ -2534,6 +2710,12 @@ static void cleanup_test_entries(void)
 	    resp.status == SG_OK)
 		printf("  cleanup: deleted __diag_nattest\n");
 	ipc_resp_free(&resp);
+
+	if (ipc_send_str(SG_CMD_CFG_DEL,
+			 "firewall_address:__diag_schematest", &resp) == 0 &&
+	    resp.status == SG_OK)
+		printf("  cleanup: deleted __diag_schematest\n");
+	ipc_resp_free(&resp);
 }
 
 /* ── Public entry point ───────────────────────────────────────────────── */
@@ -2565,6 +2747,8 @@ int cli_diagnose_test_configure(int mode)
 	test_cmd_resolve();
 	test_ref_metadata();
 	test_dispatch_table();
+	test_cmd_table_integrity();
+	test_cmd_arg_limits();
 	test_registry_completeness();
 	test_default_roundtrip();
 	test_boundary_values();
@@ -2592,6 +2776,7 @@ int cli_diagnose_test_configure(int mode)
 			test_ipc_cfg_nat_roundtrip();
 			test_ipc_entry_id_enforcement();
 			test_ipc_cfg_set_validation();
+			test_ipc_schema_version();
 			cleanup_test_entries();
 		}
 	}

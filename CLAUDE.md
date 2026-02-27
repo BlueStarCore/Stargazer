@@ -58,10 +58,11 @@
   - No floats in kernel code (use fixed-point).
   - RCU for read-heavy session tables.
   - Cross-compile only; QEMU for tests.
-
+  - Need to create a plan first and plan why before make any changes
+  
   ## Commit style
   - Write commit messages in plain human language.
-  - Should explain which features is added, changed or deleted compare to the last commit. Start with a short summary, then explain the details — but not too much.
+  - Should explain which features is added, changed or deleted to compare the last commit. Start with a short summary, then explain the details.
   - Do not add `Co-Authored-By` lines.
 
   ## Next (if continuing)

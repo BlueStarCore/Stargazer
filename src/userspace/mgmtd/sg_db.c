@@ -12,6 +12,7 @@
 #include "sg_db.h"
 #include "sqlite3.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +20,11 @@
 /* ── Database handle ─────────────────────────────────────────────────────── */
 
 static sqlite3 *g_db;
+
+/* ── Schema version & hash ───────────────────────────────────────────────── */
+
+#define SG_SCHEMA_VERSION  1
+#define SG_SCHEMA_HASH     "d68116e6"
 
 /* ── Schema ──────────────────────────────────────────────────────────────── */
 
@@ -37,8 +43,69 @@ static const char *SCHEMA_SQL =
 	"  username     TEXT PRIMARY KEY,"
 	"  fail_count   INTEGER NOT NULL DEFAULT 0,"
 	"  locked_until INTEGER NOT NULL DEFAULT 0,"
-	"  updated_at   TEXT"
+	"  updated_at   TEXT NOT NULL DEFAULT (datetime('now'))"
 	");";
+
+/* ── Schema hash safety check ────────────────────────────────────────────── */
+
+static uint32_t schema_djb2(const char *s)
+{
+	uint32_t h = 5381;
+	while (*s)
+		h = h * 33 + (unsigned char)*s++;
+	return h;
+}
+
+/* ── Schema version tracking ─────────────────────────────────────────────── */
+
+static int sg_db_get_version(void)
+{
+	if (!g_db) return -1;
+
+	sqlite3_stmt *stmt;
+	if (sqlite3_prepare_v2(g_db, "PRAGMA user_version;",
+			       -1, &stmt, NULL) != SQLITE_OK)
+		return -1;
+
+	int ver = 0;
+	if (sqlite3_step(stmt) == SQLITE_ROW)
+		ver = sqlite3_column_int(stmt, 0);
+	sqlite3_finalize(stmt);
+	return ver;
+}
+
+static int sg_db_set_version(int ver)
+{
+	if (!g_db) return -1;
+
+	char sql[64];
+	snprintf(sql, sizeof(sql), "PRAGMA user_version = %d;", ver);
+	return sqlite3_exec(g_db, sql, NULL, NULL, NULL) == SQLITE_OK
+		? 0 : -1;
+}
+
+static int sg_db_migrate(void)
+{
+	int db_ver = sg_db_get_version();
+	if (db_ver == SG_SCHEMA_VERSION)
+		return 0;  /* no migration needed */
+
+	/* Forward migrations (upgrade) */
+	if (db_ver < 1) {
+		/* v0 -> v1: initial schema stamp (tables already created) */
+	}
+	/* Future: if (db_ver < 2) { ALTER TABLE ADD COLUMN ...; } */
+
+	/* Downgrade: log warning, stamp version.
+	 * SQLite ignores unknown columns in SELECT/INSERT,
+	 * so extra columns from a newer schema are harmless. */
+	if (db_ver > SG_SCHEMA_VERSION)
+		fprintf(stderr, "sg_db: DB schema v%d > code v%d"
+			" (downgrade)\n", db_ver, SG_SCHEMA_VERSION);
+
+	sg_db_set_version(SG_SCHEMA_VERSION);
+	return 0;
+}
 
 /* ── Open / Close ────────────────────────────────────────────────────────── */
 
@@ -60,6 +127,19 @@ int sg_db_open(const char *path)
 	/* Enforce foreign keys if we add them later */
 	sqlite3_exec(g_db, "PRAGMA foreign_keys=ON;", NULL, NULL, NULL);
 
+	/* Schema hash safety check — catch drift before anything runs */
+	{
+		char computed[16];
+		snprintf(computed, sizeof(computed), "%08x",
+			 schema_djb2(SCHEMA_SQL));
+		if (strcmp(computed, SG_SCHEMA_HASH) != 0)
+			fprintf(stderr, "sg_db: SCHEMA_SQL changed but"
+				" SG_SCHEMA_HASH not updated."
+				" Current hash: %s."
+				" Update SG_SCHEMA_HASH and bump"
+				" SG_SCHEMA_VERSION.\n", computed);
+	}
+
 	/* Create schema */
 	char *errmsg = NULL;
 	rc = sqlite3_exec(g_db, SCHEMA_SQL, NULL, NULL, &errmsg);
@@ -70,6 +150,9 @@ int sg_db_open(const char *path)
 		g_db = NULL;
 		return -1;
 	}
+
+	/* Run migrations */
+	sg_db_migrate();
 
 	return 0;
 }
@@ -436,4 +519,11 @@ int sg_db_count(const char *type)
 
 	sqlite3_finalize(stmt);
 	return count;
+}
+
+/* ── sg_db_schema_version ────────────────────────────────────────────────── */
+
+int sg_db_schema_version(void)
+{
+	return sg_db_get_version();
 }

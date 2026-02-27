@@ -550,75 +550,38 @@ static int cmd_arping(const char *args, const char *permissions)
 	return 0;
 }
 
-/* ── Command table ────────────────────────────────────────────────────── */
+/* ── Command table (generated from X-macro definitions) ───────────────── */
 
+#define X(p, d, perm, ma, h) {p, d, perm, ma, h},
 static const cmd_entry_t cmd_table[] = {
-	/* path                                    desc                                      perm              handler */
-	{"help",                                   "Show available commands",                 NULL,             cmd_help},
-	{"exit",                                   "Logout from CLI",                         NULL,             cmd_exit},
-	{"logout",                                 "Logout from CLI",                         NULL,             cmd_exit},
-
-	{"show",                                   "Show system information",                 "monitor",        NULL},
-	{"show status",                            "Module and system status",                "monitor",        cmd_show_status},
-	{"show sessions",                          "Active session table",                    "monitor",        cmd_show_sessions},
-	{"show stats",                             "Packet statistics",                       "monitor",        cmd_show_stats},
-	{"show interfaces",                        "Network interfaces",                      "monitor",        cmd_show_interfaces},
-	{"show routes",                            "Routing table",                           "monitor",        cmd_show_routes},
-	{"show configure",                         "Running configuration (FortiGate-style)", "monitor",        cmd_show_configure},
-	{"show config",                            "Current configuration",                   "monitor",        cmd_show_config},
-	{"show firmware",                          "Firmware version and status",             "monitor",        cmd_show_firmware},
-
-	{"configure",                              "Configure firewall",                      "configure,admin", cmd_configure},
-	{"configure commit",                       "Save a configuration revision",           "configure",      NULL},
-	{"configure revisions",                    "List configuration revisions",            "configure",      NULL},
-	{"configure rollback",                     "Rollback configuration to revision",      "configure",      NULL},
-
-	{"execute system",                         "System management commands",              "admin",          NULL},
-	{"execute system shutdown",                "Shut down the system",                    "admin",          cmd_sys_shutdown},
-	{"execute system reboot",                  "Reboot the system",                       "admin",          cmd_sys_reboot},
-
-	{"execute firmware",                       "Firmware management",                     "admin",          NULL},
-	{"execute firmware upgrade",               "Upgrade firmware from URL",               "admin",          cmd_fw_upgrade},
-
-	{"execute ping",                           "Ping a host (ICMP echo request)",         "monitor",        cmd_ping},
-	{"execute traceroute",                     "Trace route to a host",                   "monitor",        cmd_traceroute},
-	{"execute nslookup",                       "DNS lookup for a host or IP",             "monitor",        cmd_nslookup},
-	{"execute arping",                         "ARP ping a host on local network",        "monitor",        cmd_arping},
-
-	{"execute debug",                          "Runtime debug control",                   "admin",          cmd_debug_status},
-	{"execute debug enable",                   "Enable debug output",                     "admin",          cmd_debug_enable},
-	{"execute debug disable",                  "Disable debug output",                    "admin",          cmd_debug_disable},
-	{"execute debug reset",                    "Reset all debug options",                 "admin",          cmd_debug_reset},
-	{"execute debug status",                   "Show debug status",                       "admin",          cmd_debug_status},
-	{"execute debug option",                   "Set debug output options",                "admin",          cmd_debug_option},
-	{"execute debug option timestamp",         "Print timestamp in debug logs",           "admin",          NULL},
-	{"execute debug option actor",             "Print actor (user/system) in debug logs", "admin",          NULL},
-	{"execute debug option function",          "Print function name in debug logs",       "admin",          NULL},
-	{"execute debug option hierarchy",         "Print call hierarchy in debug logs",      "admin",          NULL},
-	{"execute debug flow trace",               "Enable packet flow tracing",              "admin",          cmd_debug_flow},
-	{"execute debug flow trace limit",         "Limit number of flow records",            "admin",          NULL},
-	{"execute debug flow trace unlimited",     "No flow record limit",                    "admin",          NULL},
-	{"execute debug cli",                      "Enable/disable CLI debug tracing",        "admin",          cmd_debug_cli},
-	{"execute debug mgmtd",                    "Enable/disable mgmtd daemon debug tracing", "admin",       cmd_debug_mgmtd},
-	{"execute debug auth",                     "Enable/disable auth debug tracing",       "admin",          cmd_debug_auth},
-	{"execute debug auth admin",               "Debug admin authentication",              "admin",          NULL},
-	{"execute debug auth user",                "Debug user authentication",               "admin",          NULL},
-
-	{"execute diagnose",                       "Run diagnostic tools",                    "admin",          NULL},
-	{"execute diagnose top",                   "Show process snapshot",                   "admin",          cmd_diag_top},
-	{"execute diagnose resources",             "Show system resource usage",              "admin",          cmd_diag_resources},
-	{"execute diagnose resources cpu",         "Show CPU usage and temperature",          "admin",          NULL},
-	{"execute diagnose resources ram",         "Show RAM usage",                          "admin",          NULL},
-	{"execute diagnose resources disk",        "Show disk usage",                         "admin",          NULL},
-	{"execute diagnose resources interface",   "Show interface throughput",               "admin",          NULL},
-	{"execute diagnose resources all",         "Show all resource metrics",               "admin",          NULL},
-	{"execute diagnose test-permissions",      "Test IPC permission model",               "admin",          cmd_diag_test_perms},
-	{"execute diagnose test-permissions full", "Full test with temp accounts",            "admin",          NULL},
-	{"execute diagnose test-configure",        "Test config validation",                  "admin",          cmd_diag_test_cfg},
-	{"execute diagnose test-configure full",   "Full test with IPC round-trip",           "admin",          NULL},
-
-	{NULL, NULL, NULL, NULL}
+#include "sg_cmd_defs.h"
+	{NULL, NULL, NULL, 0, NULL}  /* sentinel */
 };
+#undef X
+
+/* ── Argument validation ─────────────────────────────────────────────── */
+
+static int count_tokens(const char *s)
+{
+	int n = 0;
+	while (*s) {
+		while (*s == ' ') s++;
+		if (*s) { n++; while (*s && *s != ' ') s++; }
+	}
+	return n;
+}
+
+static int cmd_validate_args(const cmd_entry_t *e, const char *args)
+{
+	if (e->max_args < 0)  return 0;  /* variadic */
+	if (!args || !*args)  return 0;  /* no args given */
+	int n = count_tokens(args);
+	if (n > e->max_args) {
+		printf("  Error: too many arguments for '%s'\n", e->path);
+		return -1;
+	}
+	return 0;
+}
 
 /* ── Permission OR check ──────────────────────────────────────────────── */
 
@@ -734,6 +697,8 @@ int cmd_dispatch(const char *resolved, const char *permissions)
 			fprintf(stderr, "[CLI-DBG] handler: %s args=\"%s\"\n",
 				best->path, args);
 
+		if (cmd_validate_args(best, args) != 0)
+			return 0;
 		return best->handler(args, permissions);
 	}
 

@@ -678,8 +678,14 @@ int handle_fw_upgrade(int client_fd, const char *user,
 		 fw_version);
 	fw_write_state(6, 6, "done", done_msg, fw_version);
 
-	/* Close DB and reboot */
+	/* Close DB and back up before reboot */
 	sg_db_close();
+	{
+		const char *cp_argv[] = {"cp", "-f", SG_DB_PATH,
+					 SG_DB_PATH ".pre-upgrade",
+					 NULL};
+		free(safe_exec(cp_argv));
+	}
 	usleep(100000);
 	(void)fw_run_cmd("/sbin/reboot");
 	_exit(0);

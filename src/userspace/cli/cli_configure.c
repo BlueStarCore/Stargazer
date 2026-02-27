@@ -263,6 +263,17 @@ static int read_password(const char *prompt, char *buf, size_t buf_sz)
 	return pos;
 }
 
+/* Reject unexpected trailing arguments in configure contexts */
+static int cfg_reject_extra(const char *extra, const char *cmd_name)
+{
+	if (extra && extra[0]) {
+		printf("  Error: unexpected argument after '%s': %s\n",
+		       cmd_name, extra);
+		return 1;
+	}
+	return 0;
+}
+
 /* Check if required fields are present. Returns NULL if OK, or space-sep missing keys. */
 static const char *validate_required(const char *type_name,
 				     const struct kv_buf *b)
@@ -866,6 +877,8 @@ static int context_entry(const char *type_name, const char *label,
 				printf("  Usage: unset <key>\n");
 				continue;
 			}
+			if (cfg_reject_extra(val, "unset"))
+				continue;
 			if (!sg_reg_is_valid_key(type_name, key)) {
 				printf("  Error: invalid key '%s' for %s\n",
 				       key, type_name);
@@ -886,6 +899,8 @@ static int context_entry(const char *type_name, const char *label,
 				printf("  Usage: get <key>\n");
 				continue;
 			}
+			if (cfg_reject_extra(val, "get"))
+				continue;
 			if (!sg_reg_is_valid_key(type_name, key)) {
 				printf("  Error: invalid key '%s' for %s\n",
 				       key, type_name);
@@ -902,6 +917,8 @@ static int context_entry(const char *type_name, const char *label,
 				printf("  %s: (not set)\n", key);
 			}
 		} else if (strcmp(cmd, "show") == 0) {
+			if (cfg_reject_extra(key, "show"))
+				continue;
 			if (data.count > 0) {
 				printf("    edit \"%s\"\n", entry_id);
 				for (int i = 0; i < data.count; i++) {
@@ -934,6 +951,8 @@ static int context_entry(const char *type_name, const char *label,
 			}
 		} else if (strcmp(cmd, "next") == 0 ||
 			   strcmp(cmd, "end") == 0) {
+			if (cfg_reject_extra(key, cmd))
+				continue;
 			/* Warn if empty */
 			if (!data.modified && data.count == 0) {
 				printf("  Entry has no configuration."
@@ -1085,6 +1104,8 @@ static int context_entry(const char *type_name, const char *label,
 				*exit_all = 1;
 			break;
 		} else if (strcmp(cmd, "abort") == 0) {
+			if (cfg_reject_extra(key, "abort"))
+				continue;
 			if (cfg_dbg())
 				fprintf(stderr,
 					"[CFG-DBG] abort entry:"
@@ -1126,7 +1147,7 @@ static int context_table(const char *type_name, const char *label)
 
 	const char *line;
 	while ((line = cli_readline(prompt)) != NULL) {
-		char cmd[64], arg[256], dummy[4];
+		char cmd[64], arg[256], extra[256];
 		char linebuf[1024];
 		snprintf(linebuf, sizeof(linebuf), "%s", line);
 		char *trimmed = trim(linebuf);
@@ -1138,7 +1159,7 @@ static int context_table(const char *type_name, const char *label)
 			continue;
 
 		parse_line(resolved, cmd, sizeof(cmd),
-			   arg, sizeof(arg), dummy, sizeof(dummy));
+			   arg, sizeof(arg), extra, sizeof(extra));
 
 		if (cfg_dbg())
 			fprintf(stderr,
@@ -1146,6 +1167,8 @@ static int context_table(const char *type_name, const char *label)
 				cmd, arg[0] ? " " : "", arg);
 
 		if (strcmp(cmd, "show") == 0) {
+			if (cfg_reject_extra(arg, "show"))
+				continue;
 			/* List all entries via IPC */
 			struct ipc_response resp;
 			if (ipc_send_str(SG_CMD_CFG_LIST, type_name,
@@ -1247,6 +1270,8 @@ static int context_table(const char *type_name, const char *label)
 				       sg_reg_entry_id_kind(type_name));
 				continue;
 			}
+			if (cfg_reject_extra(extra, "edit"))
+				continue;
 			if (!sg_reg_validate_entry_id(type_name, arg)) {
 				printf("  Error: invalid ID '%s' for %s\n",
 				       arg, type_name);
@@ -1264,6 +1289,8 @@ static int context_table(const char *type_name, const char *label)
 				       sg_reg_entry_id_kind(type_name));
 				continue;
 			}
+			if (cfg_reject_extra(extra, "delete"))
+				continue;
 			if (!sg_reg_validate_entry_id(type_name, arg)) {
 				printf("  Error: invalid ID '%s' for %s\n",
 				       arg, type_name);
@@ -1356,6 +1383,8 @@ static int context_table(const char *type_name, const char *label)
 			}
 		} else if (strcmp(cmd, "end") == 0 ||
 			   strcmp(cmd, "abort") == 0) {
+			if (cfg_reject_extra(arg, cmd))
+				continue;
 			break;
 		} else {
 			printf("  Unknown command: %s (try '?')\n", cmd);
@@ -1493,6 +1522,8 @@ static int context_single(const char *type_name, const char *label)
 				printf("  Usage: unset <key>\n");
 				continue;
 			}
+			if (cfg_reject_extra(val, "unset"))
+				continue;
 			if (!sg_reg_is_valid_key(type_name, key)) {
 				printf("  Error: invalid key '%s'"
 				       " for %s\n", key, type_name);
@@ -1508,6 +1539,8 @@ static int context_single(const char *type_name, const char *label)
 				printf("  Usage: get <key>\n");
 				continue;
 			}
+			if (cfg_reject_extra(val, "get"))
+				continue;
 			if (!sg_reg_is_valid_key(type_name, key)) {
 				printf("  Error: invalid key '%s'"
 				       " for %s\n", key, type_name);
@@ -1519,6 +1552,8 @@ static int context_single(const char *type_name, const char *label)
 			else
 				printf("  %s: (not set)\n", key);
 		} else if (strcmp(cmd, "show") == 0) {
+			if (cfg_reject_extra(key, "show"))
+				continue;
 			if (data.count > 0) {
 				printf("config %s\n", label);
 				for (int i = 0; i < data.count; i++) {
@@ -1541,6 +1576,8 @@ static int context_single(const char *type_name, const char *label)
 				       " 'set <key> <value>')\n");
 			}
 		} else if (strcmp(cmd, "end") == 0) {
+			if (cfg_reject_extra(key, "end"))
+				continue;
 			if (data.modified) {
 				/* Validate required fields */
 				const char *miss = validate_required(
@@ -1609,6 +1646,8 @@ static int context_single(const char *type_name, const char *label)
 			}
 			break;
 		} else if (strcmp(cmd, "abort") == 0) {
+			if (cfg_reject_extra(key, "abort"))
+				continue;
 			if (cfg_dbg())
 				fprintf(stderr,
 					"[CFG-DBG] abort single:"
