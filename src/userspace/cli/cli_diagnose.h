@@ -29,4 +29,12 @@ int cli_diagnose_test_permissions(int mode, const char *permissions);
  */
 int cli_diagnose_test_configure(int mode);
 
+/*
+ * Run firewall & network validator diagnostics.
+ *   mode=0: local-only tests (validators, no IPC needed)
+ *   mode=1: full test (adds IPC round-trip tests requiring mgmtd)
+ * Returns 0 on all-pass, 1 on any failure.
+ */
+int cli_diagnose_test_firewall(int mode);
+
 #endif /* CLI_DIAGNOSE_H */

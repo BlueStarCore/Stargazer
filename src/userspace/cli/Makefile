@@ -16,6 +16,7 @@ SRCS := stargazer-cli.c \
         cli_dispatch.c \
         cli_diagnose.c \
         cli_diagnose_config.c \
+        cli_diagnose_fw.c \
         cli_diagnose_sys.c \
         cli_show.c \
         cli_debug.c \

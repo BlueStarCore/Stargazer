@@ -437,6 +437,25 @@ static int cmd_diag_test_cfg(const char *args, const char *permissions)
 	return 0;
 }
 
+static int cmd_diag_test_fw(const char *args, const char *permissions)
+{
+	(void)permissions;
+	int mode = 0;
+	if (args) {
+		while (*args == ' ')
+			args++;
+		if (strcmp(args, "full") == 0)
+			mode = 1;
+		else if (*args != '\0') {
+			printf("  Unknown argument: %s\n", args);
+			printf("  Usage: execute diagnose test-firewall [full]\n");
+			return 0;
+		}
+	}
+	cli_diagnose_test_firewall(mode);
+	return 0;
+}
+
 static int cmd_diag_fw_policy(const char *args, const char *permissions)
 {
 	(void)permissions;

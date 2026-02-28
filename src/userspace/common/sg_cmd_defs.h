@@ -77,6 +77,9 @@ X("execute diagnose test-permissions",      "Test IPC permission model",        
 X("execute diagnose test-permissions full", "Full test with temp accounts",            "admin",           0,  NULL)
 X("execute diagnose test-configure",        "Test config validation",                  "admin",           1,  cmd_diag_test_cfg)
 X("execute diagnose test-configure full",   "Full test with IPC round-trip",           "admin",           0,  NULL)
+X("execute diagnose test-firewall",        "Test firewall validators and diagnostics", "admin",           1,  cmd_diag_test_fw)
+X("execute diagnose test-firewall full",   "Full test with IPC round-trip",            "admin",           0,  NULL)
+
 X("execute diagnose firewall",              "Firewall diagnostics",                    "admin",           0,  NULL)
 X("execute diagnose firewall policy",       "Show firewall policy and rules",          "admin",           1,  cmd_diag_fw_policy)
 X("execute diagnose firewall policy nat",   "Show NAT rules",                          "admin",           0,  NULL)
