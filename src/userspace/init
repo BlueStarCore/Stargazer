@@ -31,29 +31,29 @@ if [ -z "$_sg_dev" ]; then
 fi
 
 if [ -n "$_sg_dev" ]; then
-	echo "[INIT] Found data partition: $_sg_dev"
+	echo "[stargazer] Found data partition: $_sg_dev"
 	if mount "$_sg_dev" /etc/stargazer 2>/tmp/sg_mount.log; then
-		echo "[INIT] Persistent storage: $_sg_dev -> /etc/stargazer"
+		echo "[stargazer] Persistent storage: $_sg_dev -> /etc/stargazer"
 		# Restore saved auth files (shadow/passwd) from persistent storage
 		if [ -f /etc/stargazer/shadow ]; then
 			cp /etc/stargazer/shadow /etc/shadow
 			chmod 640 /etc/shadow
-			echo "[INIT] Restored /etc/shadow from persistent storage"
+			echo "[stargazer] Restored /etc/shadow from persistent storage"
 		fi
 		if [ -f /etc/stargazer/passwd ]; then
 			cp /etc/stargazer/passwd /etc/passwd
-			echo "[INIT] Restored /etc/passwd from persistent storage"
+			echo "[stargazer] Restored /etc/passwd from persistent storage"
 		fi
 	else
-		echo "[INIT] ERROR: mount $_sg_dev failed:"
+		echo "[stargazer] ERROR: mount $_sg_dev failed:"
 		cat /tmp/sg_mount.log 2>/dev/null
-		echo "[INIT] Block devices: $(cat /proc/partitions 2>/dev/null | tail -n +3)"
-		echo "[INIT] blkid output: $(blkid 2>/dev/null)"
+		echo "[stargazer] Block devices: $(cat /proc/partitions 2>/dev/null | tail -n +3)"
+		echo "[stargazer] blkid output: $(blkid 2>/dev/null)"
 	fi
 else
-	echo "[INIT] WARNING: sgdata partition not found, config will not survive reboot"
-	echo "[INIT] Block devices: $(cat /proc/partitions 2>/dev/null | tail -n +3)"
-	echo "[INIT] blkid output: $(blkid 2>/dev/null)"
+	echo "[stargazer] WARNING: sgdata partition not found, config will not survive reboot"
+	echo "[stargazer] Block devices: $(cat /proc/partitions 2>/dev/null | tail -n +3)"
+	echo "[stargazer] blkid output: $(blkid 2>/dev/null)"
 fi
 
 # Ensure /dev/tty is accessible by non-root users (for readline terminal I/O)
@@ -89,6 +89,11 @@ if ! grep -q '^stargazer:' /etc/group 2>/dev/null; then
 	echo "stargazer:x:${_sg_gid}:" >> /etc/group
 fi
 
+# Lock down INPUT before any interface comes up — prevents a window
+# where traffic is accepted before mgmtd sets firewall rules.
+# mgmtd_init_firewall() will re-set this and add proper rules later.
+iptables -P INPUT DROP 2>/dev/null
+
 # Start services
 [ -x /etc/init.d/stargazer ] && /etc/init.d/stargazer start
 
@@ -105,13 +110,13 @@ if [ -n "$_nic" ]; then
 	ip link set "$_nic" up 2>/dev/null
 	if command -v udhcpc >/dev/null 2>&1; then
 		udhcpc -i "$_nic" -q -s /usr/share/udhcpc/default.script 2>/dev/null &
-		echo "[INIT] DHCP request sent on $_nic"
+		echo "[stargazer] DHCP request sent on $_nic"
 	fi
 fi
 
 # Start management daemon (privilege separation)
 if [ -x /sbin/stargazer-mgmtd ]; then
-	echo "[INIT] Starting management daemon..."
+	echo "[stargazer] Starting management daemon..."
 	/sbin/stargazer-mgmtd &
 	# Wait briefly for socket to be ready
 	_mgmt_wait=0
@@ -120,9 +125,9 @@ if [ -x /sbin/stargazer-mgmtd ]; then
 		_mgmt_wait=$((_mgmt_wait + 1))
 	done
 	if [ -S /run/stargazer-mgmtd.sock ]; then
-		echo "[INIT] Management daemon ready."
+		echo "[stargazer] Management daemon ready."
 	else
-		echo "[INIT] WARNING: Management daemon socket not found."
+		echo "[stargazer] WARNING: Management daemon socket not found."
 	fi
 fi
 
@@ -170,7 +175,7 @@ cp /sbin/poweroff /sbin/shutdown
 
 # Login loop
 # -c: set stdin as controlling terminal so Ctrl+C generates SIGINT
-echo "[INIT] Ready."
+echo "[stargazer] Ready."
 while true; do
 	setsid -c /sbin/stargazer-login </dev/console >/dev/console 2>&1 || sleep 2
 done

@@ -32,6 +32,8 @@ X("configure commit",                       "Save a configuration revision",    
 X("configure revisions",                    "List configuration revisions",            "configure",       0,  NULL)
 X("configure rollback",                     "Rollback configuration to revision",      "configure",       0,  NULL)
 
+X("execute",                                "Execute commands and operations",          NULL,              0,  NULL)
+
 X("execute system",                         "System management commands",              "admin",           0,  NULL)
 X("execute system shutdown",                "Shut down the system",                    "admin",           0,  cmd_sys_shutdown)
 X("execute system reboot",                  "Reboot the system",                       "admin",           0,  cmd_sys_reboot)
@@ -64,7 +66,7 @@ X("execute debug auth admin",               "Debug admin authentication",       
 X("execute debug auth user",                "Debug user authentication",               "admin",           0,  NULL)
 
 X("execute diagnose",                       "Run diagnostic tools",                    "admin",           0,  NULL)
-X("execute diagnose top",                   "Show process snapshot",                   "admin",           0,  cmd_diag_top)
+X("execute diagnose top",                   "Show live process monitor (q to quit)",   "admin",           2,  cmd_diag_top)
 X("execute diagnose resources",             "Show system resource usage",              "admin",           1,  cmd_diag_resources)
 X("execute diagnose resources cpu",         "Show CPU usage and temperature",          "admin",           0,  NULL)
 X("execute diagnose resources ram",         "Show RAM usage",                          "admin",           0,  NULL)
@@ -75,3 +77,8 @@ X("execute diagnose test-permissions",      "Test IPC permission model",        
 X("execute diagnose test-permissions full", "Full test with temp accounts",            "admin",           0,  NULL)
 X("execute diagnose test-configure",        "Test config validation",                  "admin",           1,  cmd_diag_test_cfg)
 X("execute diagnose test-configure full",   "Full test with IPC round-trip",           "admin",           0,  NULL)
+X("execute diagnose firewall",              "Firewall diagnostics",                    "admin",           0,  NULL)
+X("execute diagnose firewall policy",       "Show firewall policy and rules",          "admin",           1,  cmd_diag_fw_policy)
+X("execute diagnose firewall policy nat",   "Show NAT rules",                          "admin",           0,  NULL)
+X("execute diagnose firewall conntrack",    "Show connection tracking entries",         "admin",           0,  cmd_diag_fw_conntrack)
+X("execute diagnose routes",               "Show routing table",                       "admin",           0,  cmd_diag_routes)

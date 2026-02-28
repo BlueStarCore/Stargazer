@@ -28,6 +28,8 @@ void extract_val(const char *data, const char *key,
 
 char *safe_exec(const char *const argv[]);
 
+int ipt_exec(const char *const argv[]);
+
 int iface_exists(const char *name);
 
 void read_iface_mtu_limits(const char *name, int *out_min, int *out_max);

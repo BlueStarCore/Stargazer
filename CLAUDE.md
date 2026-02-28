@@ -55,11 +55,11 @@
   - `src/userspace/mgmtd/sg_db.c` — SQLite config backend.
 
   ## Constraints
+  - The mindset is, the firewall is always in dangerous position and can be hacked at anytime in any ways. Making the system honest, tests that verify real behavior, errors that say what's actually wrong, outputs that show actual data, and a build that doesn't silently break, A buffer is alway checked,
   - No floats in kernel code (use fixed-point).
   - RCU for read-heavy session tables.
   - Cross-compile only; QEMU for tests.
   - Need to create a plan first and plan why before make any changes
-  
   ## Commit style
   - Write commit messages in plain human language.
   - Should explain which features is added, changed or deleted to compare the last commit. Start with a short summary, then explain the details.

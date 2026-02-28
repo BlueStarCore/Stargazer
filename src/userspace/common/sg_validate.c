@@ -353,7 +353,8 @@ sg_is_access_services(const char *s)
 		    strcmp(tok, "https") != 0 &&
 		    strcmp(tok, "http") != 0 &&
 		    strcmp(tok, "snmp") != 0 &&
-		    strcmp(tok, "telnet") != 0)
+		    strcmp(tok, "telnet") != 0 &&
+		    strcmp(tok, "tftp") != 0)
 			return 0;
 		tok = strtok_r(NULL, " ", &saveptr);
 	}
@@ -621,7 +622,7 @@ sg_reg_value_rule(const char *type_name, const char *key)
 	if (strcmp(kind, "permissions-csv") == 0)
 		return "CSV: monitor,configure,admin";
 	if (strcmp(kind, "access-services") == 0)
-		return "space-separated: ping ssh https http snmp telnet";
+		return "space-separated: ping ssh https http snmp telnet tftp";
 	if (strcmp(kind, "port-or-range") == 0)
 		return "port or range (e.g. 80, 1024-65535)";
 	if (strcmp(kind, "password-interactive") == 0)

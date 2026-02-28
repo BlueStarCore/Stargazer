@@ -14,9 +14,11 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "cli_diagnose_sys.h"
+#include "cli_ipc.h"
 
 #include <ctype.h>
 #include <dirent.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -334,7 +336,7 @@ void diag_show_interface(void)
 	printf("\n");
 }
 
-/* ── Top (process snapshot) ──────────────────────────────────────────── */
+/* ── Top (live process monitor) ──────────────────────────────────────── */
 
 struct proc_info {
 	int    pid;
@@ -344,14 +346,20 @@ struct proc_info {
 	unsigned long stime;
 	unsigned long vsize;
 	long   rss;
+	/* Computed per refresh cycle */
+	unsigned long cpu_bp;  /* CPU usage in basis points (0–10000) */
+	unsigned long ram_bp;  /* RAM usage in basis points (0–10000) */
 };
 
 #define MAX_PROCS 1024
 
-static int cmp_proc_cpu(const void *a, const void *b)
+static int cmp_proc_cpu_bp(const void *a, const void *b)
 {
 	const struct proc_info *pa = a;
 	const struct proc_info *pb = b;
+	if (pb->cpu_bp > pa->cpu_bp) return 1;
+	if (pb->cpu_bp < pa->cpu_bp) return -1;
+	/* Tie-break by total ticks descending */
 	unsigned long ca = pa->utime + pa->stime;
 	unsigned long cb = pb->utime + pb->stime;
 	if (cb > ca) return 1;
@@ -359,70 +367,21 @@ static int cmp_proc_cpu(const void *a, const void *b)
 	return 0;
 }
 
-void diag_show_top(void)
+static int read_proc_list(struct proc_info *procs, int max)
 {
-	printf("\n  Process snapshot:\n");
-
-	/* Uptime */
-	FILE *fp = fopen("/proc/uptime", "r");
-	if (fp) {
-		char buf[64];
-		if (fgets(buf, sizeof(buf), fp)) {
-			/* Parse integer and fractional parts to avoid float */
-			unsigned long sec = strtoul(buf, NULL, 10);
-			unsigned long days = sec / 86400;
-			unsigned long hours = (sec % 86400) / 3600;
-			unsigned long mins = (sec % 3600) / 60;
-			printf("  Uptime: %lud %luh %lum\n", days, hours, mins);
-		}
-		fclose(fp);
-	}
-
-	/* Load average */
-	fp = fopen("/proc/loadavg", "r");
-	if (fp) {
-		char buf[64];
-		if (fgets(buf, sizeof(buf), fp))
-			printf("  Load avg: %.48s\n", buf);
-		fclose(fp);
-	}
-
-	/* Memory summary */
-	long mt = 0, ma = 0;
-	fp = fopen("/proc/meminfo", "r");
-	if (fp) {
-		char line[128];
-		while (fgets(line, sizeof(line), fp)) {
-			if (strncmp(line, "MemTotal:", 9) == 0)
-				mt = atol(line + 9);
-			else if (strncmp(line, "MemAvailable:", 13) == 0)
-				ma = atol(line + 13);
-		}
-		fclose(fp);
-	}
-	if (mt > 0)
-		printf("  Memory: %ld MiB used / %ld MiB total\n",
-		       (mt - ma) / 1024, mt / 1024);
-
-	/* Scan /proc/<pid>/stat for each process */
-	struct proc_info procs[MAX_PROCS];
-	int nprocs = 0;
-
 	DIR *dir = opendir("/proc");
-	if (!dir) {
-		printf("  Cannot open /proc\n\n");
-		return;
-	}
+	if (!dir)
+		return 0;
 
+	int nprocs = 0;
 	struct dirent *ent;
-	while ((ent = readdir(dir)) != NULL && nprocs < MAX_PROCS) {
-		/* Only numeric directories */
+	while ((ent = readdir(dir)) != NULL && nprocs < max) {
 		if (!isdigit((unsigned char)ent->d_name[0]))
 			continue;
 
 		char path[280];
 		snprintf(path, sizeof(path), "/proc/%s/stat", ent->d_name);
-		fp = fopen(path, "r");
+		FILE *fp = fopen(path, "r");
 		if (!fp)
 			continue;
 
@@ -436,11 +395,8 @@ void diag_show_top(void)
 		struct proc_info *pi = &procs[nprocs];
 		memset(pi, 0, sizeof(*pi));
 
-		/* Parse: pid (comm) state ... utime stime ... vsize rss
-		 * Fields:  1   2     3  ...  14    15   ...   23    24  */
 		pi->pid = atoi(buf);
 
-		/* Find comm between '(' and ')' */
 		const char *lp = strchr(buf, '(');
 		const char *rp = strrchr(buf, ')');
 		if (!lp || !rp || rp <= lp)
@@ -452,61 +408,211 @@ void diag_show_top(void)
 		memcpy(pi->comm, lp + 1, clen);
 		pi->comm[clen] = '\0';
 
-		/* Fields after ')': skip to field 3 (state) */
 		const char *p = rp + 1;
 		while (*p == ' ') p++;
 		pi->state = *p ? *p : '?';
 
-		/* Skip fields 4..13 to reach field 14 (utime) */
 		for (int f = 4; f <= 13 && *p; f++) {
 			while (*p && *p != ' ') p++;
 			while (*p == ' ') p++;
 		}
-		/* Now at field 14 (utime) */
 		pi->utime = strtoul(p, NULL, 10);
 		while (*p && *p != ' ') p++;
 		while (*p == ' ') p++;
-		/* Field 15 (stime) */
 		pi->stime = strtoul(p, NULL, 10);
 
-		/* Skip fields 16..22 to reach field 23 (vsize) */
 		for (int f = 16; f <= 22 && *p; f++) {
 			while (*p && *p != ' ') p++;
 			while (*p == ' ') p++;
 		}
-		/* Field 23 (vsize) */
 		pi->vsize = strtoul(p, NULL, 10);
 		while (*p && *p != ' ') p++;
 		while (*p == ' ') p++;
-		/* Field 24 (rss in pages) */
 		pi->rss = strtol(p, NULL, 10);
 
 		nprocs++;
 	}
 	closedir(dir);
+	return nprocs;
+}
 
-	/* Sort by CPU time descending */
-	qsort(procs, (size_t)nprocs, sizeof(procs[0]), cmp_proc_cpu);
-
-	/* Display top 20 */
-	long page_size = sysconf(_SC_PAGESIZE);
-	if (page_size <= 0) page_size = 4096;
-
-	printf("\n  %-7s %-20s %5s %10s %10s\n",
-	       "PID", "NAME", "STATE", "CPU-TICKS", "RSS-KiB");
-	printf("  %-7s %-20s %5s %10s %10s\n",
-	       "-------", "--------------------", "-----",
-	       "----------", "----------");
-
-	int show = nprocs < 20 ? nprocs : 20;
-	for (int i = 0; i < show; i++) {
-		struct proc_info *pi = &procs[i];
-		long rss_kib = pi->rss * page_size / 1024;
-		printf("  %-7d %-20.20s   %c   %10lu %10ld\n",
-		       pi->pid, pi->comm, pi->state,
-		       pi->utime + pi->stime, rss_kib);
+/*
+ * Poll-based sleep that checks for 'q' or Ctrl+C every 100ms.
+ * Returns 1 if user requested quit, 0 if sleep completed.
+ */
+static int interruptible_sleep_ms(int ms)
+{
+	int remaining = ms;
+	while (remaining > 0) {
+		if (ipc_check_quit_or_ctrl_c())
+			return 1;
+		int chunk = remaining < 100 ? remaining : 100;
+		usleep((unsigned)(chunk * 1000));
+		remaining -= chunk;
 	}
-	printf("\n");
+	return ipc_check_quit_or_ctrl_c();
+}
+
+void diag_show_top(int interval, int max_procs)
+{
+	if (interval < 1) interval = 1;
+	if (max_procs < 1) max_procs = 20;
+
+	long page_size_kb = sysconf(_SC_PAGESIZE);
+	if (page_size_kb <= 0) page_size_kb = 4096;
+	page_size_kb /= 1024;  /* convert to KiB */
+
+	/* Enter raw tty mode for q/Ctrl+C detection */
+	ipc_install_interrupt_handler();
+
+	/* First CPU sample (system-wide) */
+	struct cpu_sample cpu1[MAX_CPUS + 1];
+	int ncpu1 = read_cpu_samples(cpu1, MAX_CPUS + 1);
+
+	/* First process snapshot */
+	struct proc_info prev[MAX_PROCS];
+	int nprev = read_proc_list(prev, MAX_PROCS);
+
+	for (;;) {
+		/* Sleep with interrupt checking */
+		if (interruptible_sleep_ms(interval * 1000))
+			break;
+
+		/* Second CPU sample */
+		struct cpu_sample cpu2[MAX_CPUS + 1];
+		int ncpu2 = read_cpu_samples(cpu2, MAX_CPUS + 1);
+
+		/* Compute system-wide CPU% from aggregate "cpu" line */
+		unsigned long sys_cpu_bp = 0;
+		if (ncpu1 > 0 && ncpu2 > 0 &&
+		    strcmp(cpu1[0].name, "cpu") == 0 &&
+		    strcmp(cpu2[0].name, "cpu") == 0) {
+			unsigned long dt = cpu2[0].total - cpu1[0].total;
+			unsigned long di = cpu2[0].idle - cpu1[0].idle;
+			if (dt > 0)
+				sys_cpu_bp = (dt - di) * 10000 / dt;
+		}
+		unsigned long delta_total = 0;
+		if (ncpu1 > 0 && ncpu2 > 0)
+			delta_total = cpu2[0].total - cpu1[0].total;
+
+		/* Read memory info */
+		long mem_total_kb = 0, mem_avail_kb = 0;
+		FILE *fp = fopen("/proc/meminfo", "r");
+		if (fp) {
+			char line[128];
+			while (fgets(line, sizeof(line), fp)) {
+				if (strncmp(line, "MemTotal:", 9) == 0)
+					mem_total_kb = atol(line + 9);
+				else if (strncmp(line, "MemAvailable:", 13) == 0)
+					mem_avail_kb = atol(line + 13);
+			}
+			fclose(fp);
+		}
+		long mem_used_kb = mem_total_kb - mem_avail_kb;
+		unsigned long sys_mem_bp = 0;
+		if (mem_total_kb > 0)
+			sys_mem_bp = (unsigned long)(mem_used_kb * 10000 / mem_total_kb);
+
+		/* Current process snapshot */
+		struct proc_info cur[MAX_PROCS];
+		int ncur = read_proc_list(cur, MAX_PROCS);
+
+		/* Compute per-process CPU% by matching PIDs with previous sample */
+		for (int i = 0; i < ncur; i++) {
+			cur[i].cpu_bp = 0;
+			cur[i].ram_bp = 0;
+
+			/* CPU%: find matching PID in prev */
+			if (delta_total > 0) {
+				for (int j = 0; j < nprev; j++) {
+					if (prev[j].pid == cur[i].pid) {
+						unsigned long dt_proc =
+							(cur[i].utime + cur[i].stime) -
+							(prev[j].utime + prev[j].stime);
+						cur[i].cpu_bp = dt_proc * 10000 / delta_total;
+						break;
+					}
+				}
+			}
+
+			/* RAM% */
+			if (mem_total_kb > 0 && cur[i].rss > 0)
+				cur[i].ram_bp = (unsigned long)(cur[i].rss * page_size_kb * 10000 / mem_total_kb);
+		}
+
+		/* Sort by CPU% descending */
+		qsort(cur, (size_t)ncur, sizeof(cur[0]), cmp_proc_cpu_bp);
+
+		/* Clear screen and print header */
+		printf("\033[2J\033[H");
+
+		/* Uptime */
+		fp = fopen("/proc/uptime", "r");
+		if (fp) {
+			char buf[64];
+			if (fgets(buf, sizeof(buf), fp)) {
+				unsigned long sec = strtoul(buf, NULL, 10);
+				unsigned long days = sec / 86400;
+				unsigned long hours = (sec % 86400) / 3600;
+				unsigned long mins = (sec % 3600) / 60;
+				printf("  Uptime: %lud %luh %lum", days, hours, mins);
+			}
+			fclose(fp);
+		}
+
+		/* Load average */
+		fp = fopen("/proc/loadavg", "r");
+		if (fp) {
+			char buf[64];
+			if (fgets(buf, sizeof(buf), fp)) {
+				/* Trim trailing newline */
+				size_t len = strlen(buf);
+				if (len > 0 && buf[len - 1] == '\n')
+					buf[len - 1] = '\0';
+				printf("  Load: %s", buf);
+			}
+			fclose(fp);
+		}
+		printf("\n");
+
+		/* Tasks / CPU / Memory summary */
+		printf("  Tasks: %d", ncur);
+		printf("    CPU: %lu.%02lu%%",
+		       sys_cpu_bp / 100, sys_cpu_bp % 100);
+		printf("    Mem: %lu.%02lu%% (%ld/%ld MiB)\n",
+		       sys_mem_bp / 100, sys_mem_bp % 100,
+		       mem_used_kb / 1024, mem_total_kb / 1024);
+		printf("\n");
+
+		/* Column header */
+		printf("  %-7s %-20s %5s %7s %7s %10s\n",
+		       "PID", "NAME", "STATE", "CPU%", "MEM%", "RSS-KiB");
+		printf("  %-7s %-20s %5s %7s %7s %10s\n",
+		       "-------", "--------------------", "-----",
+		       "-------", "-------", "----------");
+
+		int show = ncur < max_procs ? ncur : max_procs;
+		for (int i = 0; i < show; i++) {
+			struct proc_info *pi = &cur[i];
+			long rss_kib = pi->rss * page_size_kb;
+			printf("  %-7d %-20.20s   %c   %3lu.%02lu  %3lu.%02lu  %10ld\n",
+			       pi->pid, pi->comm, pi->state,
+			       pi->cpu_bp / 100, pi->cpu_bp % 100,
+			       pi->ram_bp / 100, pi->ram_bp % 100,
+			       rss_kib);
+		}
+		printf("\n  Press 'q' to quit. Refreshing every %ds.\n", interval);
+
+		/* Rotate samples */
+		memcpy(cpu1, cpu2, sizeof(cpu1));
+		ncpu1 = ncpu2;
+		memcpy(prev, cur, sizeof(prev));
+		nprev = ncur;
+	}
+
+	/* Restore tty */
+	ipc_restore_interrupt_handler();
 }
 
 /* ── Dispatcher ──────────────────────────────────────────────────────── */

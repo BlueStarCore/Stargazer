@@ -15,8 +15,8 @@ void diag_show_ram(void);
 void diag_show_disk(void);
 void diag_show_interface(void);
 
-/* Process snapshot (like top) */
-void diag_show_top(void);
+/* Live process monitor (like top). interval=seconds, max_procs=display limit. */
+void diag_show_top(int interval, int max_procs);
 
 /* Dispatcher: cpu|ram|disk|interface|all */
 void diag_show_resources(const char *which);

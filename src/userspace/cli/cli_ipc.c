@@ -128,6 +128,10 @@ static const char *cmd_name(uint32_t cmd)
 	case SG_CMD_SHOW_CONFIG:    return "SHOW_CONFIG";
 	case SG_CMD_SHOW_STATS:     return "SHOW_STATS";
 	case SG_CMD_WHOAMI:         return "WHOAMI";
+	case SG_CMD_DIAG_FW_IPTABLES:  return "DIAG_FW_IPTABLES";
+	case SG_CMD_DIAG_FW_POLICY:    return "DIAG_FW_POLICY";
+	case SG_CMD_DIAG_FW_CONNTRACK: return "DIAG_FW_CONNTRACK";
+	case SG_CMD_DIAG_ROUTES:       return "DIAG_ROUTES";
 	case SG_CMD_PING:           return "PING";
 	case SG_CMD_DEBUG_FETCH:    return "DEBUG_FETCH";
 	default:                    return "?";
@@ -329,7 +333,7 @@ int ipc_send(uint32_t cmd, const char *payload, size_t payload_len,
 	resp->extra[sizeof(resp->extra) - 1] = '\0';
 
 	/* Read response payload */
-	if (rhdr.payload_len > 0 && rhdr.payload_len <= SG_PAYLOAD_MAX) {
+	if (rhdr.payload_len > 0 && rhdr.payload_len <= SG_RESPONSE_MAX) {
 		resp->payload = malloc(rhdr.payload_len + 1);
 		if (!resp->payload)
 			goto out;
@@ -518,6 +522,30 @@ int ipc_stream_interrupted(void)
 	if (!g_stream_interrupted)
 		check_ctrl_c();
 	return g_stream_interrupted != 0;
+}
+
+/* Like check_ctrl_c but also treats 'q'/'Q' as quit.
+ * Used by interactive monitors (e.g. diagnose top) where 'q' means exit.
+ * NOT suitable for IPC streaming where 'q' is valid payload data. */
+int ipc_check_quit_or_ctrl_c(void)
+{
+	if (g_stream_interrupted)
+		return 1;
+	if (g_interrupt_fd < 0)
+		return 0;
+	struct pollfd pfd;
+	pfd.fd = g_interrupt_fd;
+	pfd.events = POLLIN;
+	while (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+		char c;
+		if (read(g_interrupt_fd, &c, 1) != 1)
+			break;
+		if (c == 3 || c == 'q' || c == 'Q') {
+			g_stream_interrupted = 1;
+			return 1;
+		}
+	}
+	return 0;
 }
 
 int ipc_available(void)

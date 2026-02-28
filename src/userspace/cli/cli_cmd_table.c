@@ -191,6 +191,7 @@ static int cmd_fw_upgrade(const char *args, const char *permissions)
 
 	/* Confirm with admin */
 	printf("  WARNING: This will download firmware, install it, and reboot the device.\n");
+	printf("  Carefully read change logs before proceeding.\n");
 	printf("  Do you want to continue? [y/N] ");
 	fflush(stdout);
 
@@ -362,9 +363,26 @@ static int cmd_sys_reboot(const char *args, const char *permissions)
 
 static int cmd_diag_top(const char *args, const char *permissions)
 {
-	(void)args;
 	(void)permissions;
-	diag_show_top();
+	int interval = 1;
+	int max_procs = 20;
+
+	if (args && *args) {
+		const char *p = args;
+		while (*p == ' ') p++;
+		if (*p) {
+			interval = atoi(p);
+			if (interval < 1) interval = 1;
+			/* Skip to next arg */
+			while (*p && *p != ' ') p++;
+			while (*p == ' ') p++;
+			if (*p) {
+				max_procs = atoi(p);
+				if (max_procs < 1) max_procs = 1;
+			}
+		}
+	}
+	diag_show_top(interval, max_procs);
 	return 0;
 }
 
@@ -416,6 +434,98 @@ static int cmd_diag_test_cfg(const char *args, const char *permissions)
 		}
 	}
 	cli_diagnose_test_configure(mode);
+	return 0;
+}
+
+static int cmd_diag_fw_policy(const char *args, const char *permissions)
+{
+	(void)permissions;
+
+	/* Check if "nat" subcommand was passed (already resolved by dispatcher) */
+	const char *table = "filter";
+	if (args && *args) {
+		const char *p = args;
+		while (*p == ' ')
+			p++;
+		if (strncmp(p, "nat", 3) == 0)
+			table = "nat";
+	}
+
+	char payload[SG_PAYLOAD_MAX];
+	snprintf(payload, sizeof(payload), "table=%s\n", table);
+
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_DIAG_FW_IPTABLES, payload, &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+
+	if (resp.status != SG_OK) {
+		printf("  Failed: %s\n",
+		       resp.extra[0] ? resp.extra : sg_status_str(resp.status));
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	if (resp.payload && resp.payload_len > 0)
+		printf("%s", resp.payload);
+
+	ipc_resp_free(&resp);
+	return 0;
+}
+
+static int cmd_diag_fw_conntrack(const char *args, const char *permissions)
+{
+	(void)args;
+	(void)permissions;
+
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_DIAG_FW_CONNTRACK, "", &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+
+	if (resp.status != SG_OK) {
+		printf("  Failed: %s\n",
+		       resp.extra[0] ? resp.extra : sg_status_str(resp.status));
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	if (resp.payload && resp.payload_len > 0)
+		printf("%s", resp.payload);
+	else
+		printf("  No active connections.\n");
+
+	ipc_resp_free(&resp);
+	return 0;
+}
+
+static int cmd_diag_routes(const char *args, const char *permissions)
+{
+	(void)args;
+	(void)permissions;
+
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_DIAG_ROUTES, "", &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+
+	if (resp.status != SG_OK) {
+		printf("  Failed: %s\n",
+		       resp.extra[0] ? resp.extra : sg_status_str(resp.status));
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	if (resp.payload && resp.payload_len > 0)
+		printf("%s", resp.payload);
+
+	ipc_resp_free(&resp);
 	return 0;
 }
 

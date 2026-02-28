@@ -47,6 +47,11 @@ void ipc_install_interrupt_handler(void);
 void ipc_restore_interrupt_handler(void);
 int  ipc_stream_interrupted(void);
 
+/* Check for 'q'/'Q' or Ctrl+C on the tty (for interactive monitors).
+ * Unlike ipc_stream_interrupted() which only handles Ctrl+C, this also
+ * treats 'q' as a quit signal. Sets the interrupted flag on match. */
+int  ipc_check_quit_or_ctrl_c(void);
+
 /* Check if mgmtd socket exists. */
 int ipc_available(void);
 

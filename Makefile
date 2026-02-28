@@ -32,14 +32,14 @@ ROOTFS_DIR     := $(BUILD_DIR)/rootfs
 VERSION        := $(shell cat $(PROJECT_ROOT)/VERSION)
 
 # Kernel settings
-KERNEL_REPO    := https://github.com/frank-w/BPI-Router-Linux
-KERNEL_BRANCH  := 6.12-main
+KERNEL_REPO    := https://github.com/BlueStarCore/BPI-Router-Linux
+KERNEL_BRANCH  := stargazer/6.12-main
 KERNEL_IMAGE   := $(BUILD_DIR)/kernel.img
 KERNEL_DTB     := $(BUILD_DIR)/bpi-r4.dtb
 
 # Output
-ISO_FILE       := $(BUILD_DIR)/stargazer-bpi-r4.iso
-IMG_FILE       := $(BUILD_DIR)/stargazer-bpi-r4.img
+ISO_FILE       := $(BUILD_DIR)/stargazer-bpi-r4-$(VERSION).iso
+IMG_FILE       := $(BUILD_DIR)/stargazer-bpi-r4-$(VERSION).img
 MODULE_NAME    := pkt_forward
 
 # BusyBox settings
@@ -55,6 +55,15 @@ DASH_VERSION   := 0.5.12
 DASH_URL       := http://gondor.apana.org.au/~herbert/dash/files/dash-$(DASH_VERSION).tar.gz
 DASH_DIR       := $(BUSYBOX_CACHE_DIR)/dash-src
 DASH_BIN       := $(BUILD_DIR)/dash/dash
+
+# iptables settings (cross-compiled from netfilter.org; BusyBox has no iptables applet)
+LIBMNL_VERSION := 1.0.5
+LIBMNL_URL     := https://netfilter.org/projects/libmnl/files/libmnl-$(LIBMNL_VERSION).tar.bz2
+LIBMNL_DIR     := $(BUSYBOX_CACHE_DIR)/libmnl-$(LIBMNL_VERSION)
+IPTABLES_VERSION := 1.8.10
+IPTABLES_URL   := https://netfilter.org/projects/iptables/files/iptables-$(IPTABLES_VERSION).tar.xz
+IPTABLES_DIR   := $(BUSYBOX_CACHE_DIR)/iptables-$(IPTABLES_VERSION)
+IPTABLES_BIN   := $(BUILD_DIR)/iptables/iptables
 
 # Logind / C helpers
 LOGIND_DIR     := $(PROJECT_ROOT)/src/userspace/logind
@@ -84,7 +93,7 @@ SRC_WATCH := $(shell find $(PROJECT_ROOT)/src -name '*.c' -o -name '*.h' -o -nam
 # Main targets
 # =============================================================================
 
-.PHONY: all kernel modules busybox musl-toolchain dash logind mgmtd cli uboot rootfs iso image firmware test-build test test-run lanvm clean help
+.PHONY: all kernel modules busybox musl-toolchain dash iptables logind mgmtd cli uboot rootfs iso image firmware test-build test test-run lanvm clean help
 
 all: image
 
@@ -96,6 +105,7 @@ kernel: $(KERNEL_IMAGE)
 
 $(KERNEL_IMAGE): | kernel-source kernel-config
 	@echo "[1/5] Building kernel..."
+	$(MAKE) -C $(KERNEL_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) olddefconfig
 	$(MAKE) -C $(KERNEL_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) -j$$(nproc) Image dtbs modules
 	@mkdir -p $(BUILD_DIR)
 	cp $(KERNEL_DIR)/arch/$(ARCH)/boot/Image $(KERNEL_IMAGE)
@@ -275,63 +285,114 @@ $(DASH_BIN): $(MUSL_CC)
 	@echo "[3c/5] Dash ready: $(DASH_BIN)"
 
 # =============================================================================
-# 3d. Logind + C helpers (cross-compile with musl)
+# 3d. iptables (cross-compile from netfilter.org with musl)
+#     BusyBox has no iptables applet — we build the real one.
+#     Depends on libmnl (small netfilter netlink library).
+# =============================================================================
+
+iptables: $(IPTABLES_BIN)
+
+$(IPTABLES_BIN): $(MUSL_CC)
+	@echo "[3d/5] Building iptables (musl static)..."
+	@mkdir -p "$(BUSYBOX_CACHE_DIR)" $(BUILD_DIR)/iptables
+	# --- Build libmnl (iptables dependency) ---
+	@if [ ! -d "$(LIBMNL_DIR)" ]; then \
+		echo "Downloading libmnl $(LIBMNL_VERSION)..."; \
+		curl -fSL "$(LIBMNL_URL)" -o "$(BUSYBOX_CACHE_DIR)/libmnl-$(LIBMNL_VERSION).tar.bz2"; \
+		tar -xjf "$(BUSYBOX_CACHE_DIR)/libmnl-$(LIBMNL_VERSION).tar.bz2" -C "$(BUSYBOX_CACHE_DIR)"; \
+		rm -f "$(BUSYBOX_CACHE_DIR)/libmnl-$(LIBMNL_VERSION).tar.bz2"; \
+	fi
+	@if [ ! -f "$(LIBMNL_DIR)/src/.libs/libmnl.a" ]; then \
+		cd $(LIBMNL_DIR) && ./configure --host=aarch64-linux-musl \
+			CC=$(MUSL_CC) CFLAGS="-Os" LDFLAGS="-static" \
+			--enable-static --disable-shared --prefix=$(BUILD_DIR)/iptables/libmnl-prefix && \
+		$(MAKE) -C $(LIBMNL_DIR) -j$$(nproc) && \
+		$(MAKE) -C $(LIBMNL_DIR) install; \
+	fi
+	# --- Build iptables (legacy backend only, no nftables) ---
+	@if [ ! -d "$(IPTABLES_DIR)" ]; then \
+		echo "Downloading iptables $(IPTABLES_VERSION)..."; \
+		curl -fSL "$(IPTABLES_URL)" -o "$(BUSYBOX_CACHE_DIR)/iptables-$(IPTABLES_VERSION).tar.xz"; \
+		tar -xJf "$(BUSYBOX_CACHE_DIR)/iptables-$(IPTABLES_VERSION).tar.xz" -C "$(BUSYBOX_CACHE_DIR)"; \
+		rm -f "$(BUSYBOX_CACHE_DIR)/iptables-$(IPTABLES_VERSION).tar.xz"; \
+	fi
+	@if [ -f "$(IPTABLES_DIR)/Makefile" ]; then \
+		$(MAKE) -C $(IPTABLES_DIR) distclean 2>/dev/null || true; \
+	fi
+	cd $(IPTABLES_DIR) && ./configure --host=aarch64-linux-musl \
+		CC=$(MUSL_CC) \
+		CFLAGS="-Os -static" \
+		LDFLAGS="-static" \
+		libmnl_CFLAGS="-I$(BUILD_DIR)/iptables/libmnl-prefix/include" \
+		libmnl_LIBS="-L$(BUILD_DIR)/iptables/libmnl-prefix/lib -lmnl" \
+		--enable-static --disable-shared \
+		--disable-nftables \
+		--prefix=/usr
+	# Force fully-static binary: -all-static is a libtool flag (not gcc),
+	# so we inject it after configure into AM_LDFLAGS.
+	sed -i 's/^AM_LDFLAGS = .*/& -all-static/' $(IPTABLES_DIR)/iptables/Makefile
+	$(MAKE) -C $(IPTABLES_DIR) -j$$(nproc)
+	cp $(IPTABLES_DIR)/iptables/xtables-legacy-multi $(IPTABLES_BIN)
+	@echo "[3d/5] iptables ready: $(IPTABLES_BIN)"
+
+# =============================================================================
+# 3e. Logind + C helpers (cross-compile with musl)
 # =============================================================================
 
 logind: $(BUILD_DIR)/logind/stargazer-logind $(BUILD_DIR)/logind/stargazer-hashpw $(BUILD_DIR)/logind/stargazer-readline
 
 $(BUILD_DIR)/logind/stargazer-logind $(BUILD_DIR)/logind/stargazer-hashpw $(BUILD_DIR)/logind/stargazer-readline: $(MUSL_CC) $(SRC_WATCH)
-	@echo "[3d/5] Building logind + C helpers (musl static)..."
+	@echo "[3e/5] Building logind + C helpers (musl static)..."
 	@mkdir -p $(BUILD_DIR)/logind
 	$(MAKE) -C $(LOGIND_DIR) \
 		CROSS_COMPILE=$(MUSL_CROSS) \
 		BUILD_DIR=$(BUILD_DIR)/logind
-	@echo "[3d/5] Logind + helpers ready."
+	@echo "[3e/5] Logind + helpers ready."
 
 # =============================================================================
-# 3e. mgmtd — management daemon + IPC client (cross-compile with musl)
+# 3f. mgmtd — management daemon + IPC client (cross-compile with musl)
 # =============================================================================
 
 mgmtd: $(BUILD_DIR)/mgmtd/stargazer-mgmtd $(BUILD_DIR)/mgmtd/stargazer-ipc-cli
 
 $(BUILD_DIR)/mgmtd/stargazer-mgmtd $(BUILD_DIR)/mgmtd/stargazer-ipc-cli: $(MUSL_CC) $(SRC_WATCH)
-	@echo "[3e/5] Building mgmtd + IPC client (musl static)..."
+	@echo "[3f/5] Building mgmtd + IPC client (musl static)..."
 	@mkdir -p $(BUILD_DIR)/mgmtd
 	$(MAKE) -C $(MGMTD_DIR) \
 		CROSS_COMPILE=$(MUSL_CROSS) \
 		BUILD_DIR=$(BUILD_DIR)/mgmtd
-	@echo "[3e/5] mgmtd + IPC client ready."
+	@echo "[3f/5] mgmtd + IPC client ready."
 
 # =============================================================================
-# 3f. CLI — C binary (cross-compile with musl)
+# 3g. CLI — C binary (cross-compile with musl)
 # =============================================================================
 
 cli: $(BUILD_DIR)/cli/stargazer-cli
 
 $(BUILD_DIR)/cli/stargazer-cli: $(MUSL_CC) $(SRC_WATCH)
-	@echo "[3f/5] Building C CLI binary (musl static)..."
+	@echo "[3g/5] Building C CLI binary (musl static)..."
 	@mkdir -p $(BUILD_DIR)/cli
 	$(MAKE) -C $(CLI_DIR) \
 		CROSS_COMPILE=$(MUSL_CROSS) \
 		BUILD_DIR=$(BUILD_DIR)/cli \
 		VERSION=$(VERSION)
-	@echo "[3f/5] CLI binary ready."
+	@echo "[3g/5] CLI binary ready."
 
 # =============================================================================
-# 3g. U-Boot bootloader (for QEMU disk-based boot)
+# 3h. U-Boot bootloader (for QEMU disk-based boot)
 # =============================================================================
 
 uboot: $(UBOOT_BIN)
 
 $(UBOOT_BIN):
-	@echo "[3g/5] Fetching pre-built U-Boot for QEMU ARM64..."
+	@echo "[3h/5] Fetching pre-built U-Boot for QEMU ARM64..."
 	@mkdir -p $(BUILD_DIR)/u-boot
 	@TMPDIR=$$(mktemp -d); \
 	curl -fSL "$(UBOOT_DEB_URL)" -o "$$TMPDIR/u-boot-qemu.deb"; \
 	cd "$$TMPDIR" && ar x u-boot-qemu.deb && tar xf data.tar.* 2>/dev/null; \
 	cp "$$TMPDIR/usr/lib/u-boot/qemu_arm64/u-boot.bin" $(UBOOT_BIN); \
 	rm -rf "$$TMPDIR"
-	@echo "[3g/5] U-Boot ready: $(UBOOT_BIN)"
+	@echo "[3h/5] U-Boot ready: $(UBOOT_BIN)"
 
 # =============================================================================
 # 4. Rootfs (userspace)
@@ -339,7 +400,7 @@ $(UBOOT_BIN):
 
 rootfs: $(ROOTFS_DIR)/.stamp
 
-$(ROOTFS_DIR)/.stamp: modules busybox dash logind mgmtd cli
+$(ROOTFS_DIR)/.stamp: modules busybox dash iptables logind mgmtd cli
 	@echo "[4/5] Creating rootfs..."
 	@rm -rf $(ROOTFS_DIR)
 	@mkdir -p $(ROOTFS_DIR)
@@ -365,6 +426,13 @@ $(ROOTFS_DIR)/.stamp: modules busybox dash logind mgmtd cli
 	cp $(DASH_BIN) $(ROOTFS_DIR)/bin/dash
 	@chmod +x $(ROOTFS_DIR)/bin/dash
 	@ln -sf dash $(ROOTFS_DIR)/bin/sh
+
+	# Install iptables (xtables-legacy-multi with symlinks)
+	cp $(IPTABLES_BIN) $(ROOTFS_DIR)/sbin/xtables-legacy-multi
+	@chmod +x $(ROOTFS_DIR)/sbin/xtables-legacy-multi
+	@ln -sf xtables-legacy-multi $(ROOTFS_DIR)/sbin/iptables
+	@ln -sf xtables-legacy-multi $(ROOTFS_DIR)/sbin/iptables-save
+	@ln -sf xtables-legacy-multi $(ROOTFS_DIR)/sbin/iptables-restore
 
 	# Install logind + C helpers
 	cp $(BUILD_DIR)/logind/stargazer-logind $(ROOTFS_DIR)/sbin/
@@ -462,7 +530,7 @@ $(ISO_FILE): $(ROOTFS_DIR)/.stamp
 			$(BUILD_DIR)/iso; \
 	else \
 		echo "[WARN] xorriso not found, creating tar archive instead"; \
-		tar -czf $(BUILD_DIR)/stargazer-bpi-r4.tar.gz -C $(BUILD_DIR)/iso .; \
+		tar -czf $(BUILD_DIR)/stargazer-bpi-r4-$(VERSION).tar.gz -C $(BUILD_DIR)/iso .; \
 	fi
 
 	@echo ""
@@ -560,7 +628,7 @@ firmware: rootfs
 # Test in QEMU
 # =============================================================================
 
-test-build: modules busybox dash logind mgmtd cli uboot
+test-build: modules busybox dash iptables logind mgmtd cli uboot
 	@echo "Building test initramfs..."
 	@mkdir -p $(BUILD_DIR)/test
 
@@ -605,6 +673,13 @@ test-build: modules busybox dash logind mgmtd cli uboot
 	# Install C CLI binary as primary CLI
 	cp $(BUILD_DIR)/cli/stargazer-cli $(BUILD_DIR)/test/initramfs/sbin/stargazer-cli
 	@chmod +x $(BUILD_DIR)/test/initramfs/sbin/stargazer-cli
+
+	# Install iptables (xtables-legacy-multi with symlinks)
+	cp $(IPTABLES_BIN) $(BUILD_DIR)/test/initramfs/sbin/xtables-legacy-multi
+	@chmod +x $(BUILD_DIR)/test/initramfs/sbin/xtables-legacy-multi
+	@ln -sf xtables-legacy-multi $(BUILD_DIR)/test/initramfs/sbin/iptables
+	@ln -sf xtables-legacy-multi $(BUILD_DIR)/test/initramfs/sbin/iptables-save
+	@ln -sf xtables-legacy-multi $(BUILD_DIR)/test/initramfs/sbin/iptables-restore
 
 	# Create /sbin/nologin stub (blocks direct root login)
 	@printf '#!/bin/sh\necho "Direct login disabled."\nexit 1\n' > $(BUILD_DIR)/test/initramfs/sbin/nologin
@@ -755,13 +830,17 @@ lanvm: busybox dash
 # =============================================================================
 
 clean:
-	@echo "Cleaning..."
+	@echo "Cleaning (preserving kernel)..."
 	$(MAKE) -C $(MODULE_DIR) clean 2>/dev/null || true
 	$(MAKE) -C $(LOGIND_DIR) clean BUILD_DIR=$(BUILD_DIR)/logind 2>/dev/null || true
 	$(MAKE) -C $(MGMTD_DIR) clean BUILD_DIR=$(BUILD_DIR)/mgmtd 2>/dev/null || true
 	$(MAKE) -C $(CLI_DIR) clean BUILD_DIR=$(BUILD_DIR)/cli 2>/dev/null || true
-	rm -rf $(BUILD_DIR)
-	@echo "Clean complete (source caches preserved in .cache/)"
+	@# Remove build subdirectories but keep kernel.img
+	rm -rf $(BUILD_DIR)/busybox $(BUILD_DIR)/cli $(BUILD_DIR)/dash \
+	       $(BUILD_DIR)/image $(BUILD_DIR)/iptables $(BUILD_DIR)/logind \
+	       $(BUILD_DIR)/mgmtd $(BUILD_DIR)/modules $(BUILD_DIR)/rootfs \
+	       $(BUILD_DIR)/test $(BUILD_DIR)/u-boot $(BUILD_DIR)/firmware
+	@echo "Clean complete (kernel + source caches preserved)"
 
 help:
 	@echo "Stargazer NGFW Build System"
@@ -774,6 +853,7 @@ help:
 	@echo "  make modules  - Build kernel modules"
 	@echo "  make busybox  - Cross-compile BusyBox (system utilities)"
 	@echo "  make dash     - Cross-compile dash (POSIX shell, replaces ash)"
+	@echo "  make iptables - Cross-compile iptables (firewall management)"
 	@echo "  make logind   - Cross-compile logind + C helpers"
 	@echo "  make mgmtd    - Cross-compile mgmtd daemon + IPC client"
 	@echo "  make cli      - Cross-compile C CLI binary"

@@ -152,6 +152,68 @@ char *safe_exec(const char *const argv[])
 	return buf;
 }
 
+/*
+ * ipt_exec — Run an iptables command and check for errors.
+ *
+ * For iptables write operations (-P, -A, -D, -F, -N), success produces
+ * empty output.  Errors produce messages on stderr (captured by safe_exec).
+ * Binary-not-found also produces empty output (child exits 127), which is
+ * indistinguishable from success without an exit code — callers must use
+ * ipt_available() first to guard against that case.
+ *
+ * Returns 0 on success (empty output), -1 on error (non-empty output).
+ * On error, logs the command and iptables error message.
+ */
+int ipt_exec(const char *const argv[])
+{
+	char *out = safe_exec(argv);
+	if (!out) {
+		mgmt_log("ERROR", "ipt_exec: fork/malloc failed for '%s'",
+			 argv[0]);
+		return -1;
+	}
+	if (out[0] != '\0') {
+		/* Build command string for logging */
+		char cmd[256];
+		int pos = 0;
+		for (int i = 0; argv[i] && pos < (int)sizeof(cmd) - 1; i++) {
+			if (i > 0 && pos < (int)sizeof(cmd) - 1)
+				cmd[pos++] = ' ';
+			int n = snprintf(cmd + pos, sizeof(cmd) - (size_t)pos,
+					 "%s", argv[i]);
+			pos += n;
+		}
+		cmd[pos] = '\0';
+
+		/* Trim trailing newline from error output */
+		size_t len = strlen(out);
+		while (len > 0 && (out[len - 1] == '\n' || out[len - 1] == '\r'))
+			out[--len] = '\0';
+
+		mgmt_log("ERROR", "iptables failed: %s (cmd: %s)", out, cmd);
+		free(out);
+		return -1;
+	}
+	free(out);
+	return 0;
+}
+
+/*
+ * ipt_available — Check if the iptables binary is usable.
+ * Returns 1 if iptables responds to --version, 0 otherwise.
+ */
+static int ipt_available(void)
+{
+	const char *argv[] = {"iptables", "--version", NULL};
+	char *out = safe_exec(argv);
+	if (!out || out[0] == '\0') {
+		free(out);
+		return 0;
+	}
+	free(out);
+	return 1;
+}
+
 /* ── Debug state ───────────────────────────────────────────────────────── */
 
 static int debug_state_get_bool(const char *key, int defval)
@@ -841,6 +903,86 @@ static char *mgmtd_show_interfaces(void)
 	buf[used] = '\0';
 	return buf;
 #undef MAX_SHOW_NICS
+}
+
+/*
+ * Initialise base INPUT chain policy at boot.
+ * Must run BEFORE mgmtd_replay_config() so that per-interface SG_IN_*
+ * jump rules are appended after these foundational rules.
+ *
+ * Result:
+ *   INPUT policy DROP
+ *   1. -i lo -j ACCEPT                 (loopback / self-ping)
+ *   2. -m conntrack --ctstate EST,REL   (return traffic)
+ *   ... per-interface jumps added later by apply_allowaccess()
+ */
+static void mgmtd_init_firewall(void)
+{
+	/* Verify iptables is installed before touching any rules */
+	if (!ipt_available()) {
+		mgmt_log("ERROR",
+			 "iptables binary not found — firewall NOT configured! "
+			 "INPUT chain remains at default ACCEPT policy.");
+		return;
+	}
+
+	/* Policy DROP first — never leave INPUT in ACCEPT, even briefly */
+	const char *policy[] = {"iptables", "-P", "INPUT", "DROP", NULL};
+	if (ipt_exec(policy) != 0) {
+		mgmt_log("ERROR",
+			 "CRITICAL: failed to set INPUT policy DROP — "
+			 "firewall is NOT active!");
+		return;
+	}
+
+	/* Flush INPUT — clean slate (safe on restart) */
+	const char *flush[] = {"iptables", "-F", "INPUT", NULL};
+	ipt_exec(flush);
+
+	/* Ensure loopback is UP — nothing else in the boot sequence does this.
+	 * mgmtd_sync_interfaces() skips lo, so apply_interface() never runs
+	 * for it.  Without lo UP, self-ping and local daemon IPC break. */
+	if (iface_exists("lo")) {
+		const char *lo_up[] = {"ip", "link", "set", "lo", "up", NULL};
+		free(safe_exec(lo_up));
+		const char *lo_ip[] = {"ip", "addr", "add", "127.0.0.1/8",
+				       "dev", "lo", NULL};
+		free(safe_exec(lo_ip));  /* no-op if already assigned */
+
+		const char *lo[] = {"iptables", "-A", "INPUT",
+				    "-i", "lo", "-j", "ACCEPT", NULL};
+		if (ipt_exec(lo) != 0)
+			mgmt_log("ERROR", "failed to add loopback ACCEPT rule");
+	}
+
+	/* Allow return traffic for connections initiated by the firewall.
+	 * --ctdir REPLY ensures only reply-direction packets match, so
+	 * externally-initiated connections (tracked as ORIGINAL) still
+	 * fall through to per-interface SG_IN_* chains for policy check.
+	 *
+	 * BusyBox iptables may not support --ctdir; fall back to plain
+	 * conntrack match if the first attempt produces an error. */
+	const char *est[] = {"iptables", "-A", "INPUT",
+			     "-m", "conntrack",
+			     "--ctstate", "ESTABLISHED,RELATED",
+			     "--ctdir", "REPLY",
+			     "-j", "ACCEPT", NULL};
+	if (ipt_exec(est) != 0) {
+		/* --ctdir not supported; retry without it */
+		const char *est_compat[] = {"iptables", "-A", "INPUT",
+					    "-m", "conntrack",
+					    "--ctstate", "ESTABLISHED,RELATED",
+					    "-j", "ACCEPT", NULL};
+		if (ipt_exec(est_compat) != 0)
+			mgmt_log("ERROR",
+				 "failed to add ESTABLISHED/RELATED rule");
+		else
+			mgmt_log("INFO", "INPUT chain: policy DROP, lo ACCEPT, "
+				 "ESTABLISHED/RELATED ACCEPT (no ctdir)");
+	} else {
+		mgmt_log("INFO", "INPUT chain: policy DROP, lo ACCEPT, "
+			 "ESTABLISHED/RELATED ACCEPT (ctdir REPLY)");
+	}
 }
 
 /*
@@ -1953,6 +2095,128 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 		return 0;
 	}
 
+	/* ── Firewall/routing diagnostics ─────────────────────────────── */
+
+	case SG_CMD_DIAG_FW_IPTABLES: {
+		/* Extract table from payload (default "filter") */
+		char table[16] = "filter";
+		if (payload && payload[0])
+			extract_val(payload, "table", table, sizeof(table));
+
+		/* Whitelist: only "filter" or "nat" */
+		if (strcmp(table, "filter") != 0 && strcmp(table, "nat") != 0) {
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "Table must be 'filter' or 'nat'");
+			return 0;
+		}
+
+		const char *argv[] = {
+			"iptables", "-t", table, "-L", "-n", "-v", NULL
+		};
+		char *out = safe_exec(argv);
+		if (out && out[0])
+			send_ok(client_fd, NULL, out);
+		else
+			send_ok(client_fd, "empty",
+				"  No iptables rules found.\n"
+				"  (is iptables available?)\n");
+		free(out);
+		return 0;
+	}
+
+	case SG_CMD_DIAG_FW_POLICY: {
+		const char *argv[] = {
+			"iptables", "-L", "INPUT", "-n", "-v", NULL
+		};
+		char *out = safe_exec(argv);
+		if (out && out[0])
+			send_ok(client_fd, NULL, out);
+		else
+			send_ok(client_fd, "empty",
+				"  No INPUT chain rules found.\n"
+				"  (is iptables available?)\n");
+		free(out);
+		return 0;
+	}
+
+	case SG_CMD_DIAG_FW_CONNTRACK: {
+		/* Read /proc/net/nf_conntrack directly (zero fork) */
+		FILE *fp = fopen("/proc/net/nf_conntrack", "r");
+		if (!fp) {
+			send_ok(client_fd, NULL, "");
+			return 0;
+		}
+
+		size_t bufsz = 4096, used = 0;
+		char *buf = malloc(bufsz);
+		if (!buf) {
+			fclose(fp);
+			send_ok(client_fd, NULL, "");
+			return 0;
+		}
+
+		char line[512];
+		while (fgets(line, sizeof(line), fp)) {
+			size_t llen = strlen(line);
+			while (used + llen + 1 > bufsz) {
+				bufsz *= 2;
+				char *nb = realloc(buf, bufsz);
+				if (!nb) {
+					buf[used] = '\0';
+					fclose(fp);
+					send_ok(client_fd, NULL, buf);
+					free(buf);
+					return 0;
+				}
+				buf = nb;
+			}
+			memcpy(buf + used, line, llen);
+			used += llen;
+		}
+		buf[used] = '\0';
+		fclose(fp);
+		send_ok(client_fd, NULL, buf);
+		free(buf);
+		return 0;
+	}
+
+	case SG_CMD_DIAG_ROUTES: {
+		const char *argv4[] = {"ip", "-4", "route", NULL};
+		const char *argv6[] = {"ip", "-6", "route", NULL};
+		char *out4 = safe_exec(argv4);
+		char *out6 = safe_exec(argv6);
+
+		/* Detect when ip -6 silently returns IPv4 routes
+		 * (happens if IPv6 kernel module is not loaded).
+		 * Real IPv6 output always contains ':' in addresses. */
+		const char *v6_display;
+		if (out6 && out6[0] && !strchr(out6, ':'))
+			v6_display = "(IPv6 not available)\n";
+		else
+			v6_display = out6 ? out6 : "";
+
+		/* Concatenate with headers */
+		size_t len4 = out4 ? strlen(out4) : 0;
+		size_t len6 = strlen(v6_display);
+		size_t total = len4 + len6 + 64; /* room for headers */
+		char *buf = malloc(total);
+		if (buf) {
+			int n = snprintf(buf, total,
+					 "=== IPv4 Routes ===\n%s"
+					 "\n=== IPv6 Routes ===\n%s",
+					 out4 ? out4 : "",
+					 v6_display);
+			(void)n;
+			send_ok(client_fd, NULL, buf);
+			free(buf);
+		} else {
+			send_ok(client_fd, NULL, out4 ? out4 : "");
+		}
+		free(out4);
+		free(out6);
+		return 0;
+	}
+
 	/* ── Network diagnostics (handlers in mgmtd_network.c) ────────── */
 	case SG_CMD_NET_PING:
 		return handle_net_ping(client_fd, user, payload, hdr);
@@ -2056,6 +2320,9 @@ int main(void)
 
 	/* Discover NICs, create/protect interface entries */
 	mgmtd_sync_interfaces();
+
+	/* Set INPUT policy DROP, allow loopback + return traffic */
+	mgmtd_init_firewall();
 
 	/* Apply saved configuration to running system */
 	mgmtd_replay_config();
