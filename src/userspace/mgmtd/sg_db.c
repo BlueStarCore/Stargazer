@@ -118,6 +118,7 @@ int sg_db_open(const char *path)
 	if (rc != SQLITE_OK) {
 		fprintf(stderr, "sg_db: open %s: %s\n",
 			path, sqlite3_errmsg(g_db));
+		sqlite3_close(g_db);  /* sqlite3_open may alloc even on failure */
 		g_db = NULL;
 		return -1;
 	}

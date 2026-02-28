@@ -207,6 +207,7 @@ static int cmd_fw_upgrade(const char *args, const char *permissions)
 
 	struct ipc_response resp;
 	if (ipc_send_str(SG_CMD_FW_UPGRADE, payload, &resp) != 0) {
+		ipc_resp_free(&resp);
 		printf("  Error: could not contact management daemon.\n");
 		return 0;
 	}
@@ -478,6 +479,7 @@ static int cmd_nslookup(const char *args, const char *permissions)
 
 	struct ipc_response resp;
 	if (ipc_send_str(SG_CMD_NET_NSLOOKUP, payload, &resp) != 0) {
+		ipc_resp_free(&resp);
 		printf("  Error: could not contact management daemon.\n");
 		return 0;
 	}

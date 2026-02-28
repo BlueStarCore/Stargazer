@@ -1862,7 +1862,7 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 		sg_db_close();
 		/* Give time for response to be sent */
 		usleep(100000);
-		(void)run_cmd("/sbin/poweroff");
+		free(run_cmd("/sbin/poweroff"));
 		return 0;
 	}
 
@@ -1877,7 +1877,7 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 		/* Close DB so /etc/stargazer can be cleanly unmounted */
 		sg_db_close();
 		usleep(100000);
-		(void)run_cmd("/sbin/reboot");
+		free(run_cmd("/sbin/reboot"));
 		return 0;
 	}
 

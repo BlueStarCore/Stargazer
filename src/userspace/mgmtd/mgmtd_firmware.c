@@ -100,6 +100,11 @@ static char *fw_run_cmd(const char *cmd)
 	return buf;
 }
 
+static void fw_run_cmd_ignore(const char *cmd)
+{
+	free(fw_run_cmd(cmd));
+}
+
 /* ── Firmware handlers ───────────────────────────────────────────────────── */
 
 /* g_listen_fd is needed by the FW_UPGRADE child to close the listen socket */
@@ -277,8 +282,8 @@ int handle_fw_upgrade(int client_fd, const char *user,
 		mgmt_log("WARN", "firmware child: failed to reopen db");
 
 	/* Prepare working directories */
-	(void)fw_run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged /tmp/sg-fw-boot");
-	(void)fw_run_cmd("mkdir -p /tmp/sg-fw-download /tmp/sg-fw-staged /tmp/sg-fw-boot");
+	fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged /tmp/sg-fw-boot");
+	fw_run_cmd_ignore("mkdir -p /tmp/sg-fw-download /tmp/sg-fw-staged /tmp/sg-fw-boot");
 
 	/* Step 1: Download firmware package (non-blocking with progress) */
 	fw_write_state(1, 6, "running", "Downloading firmware... (0 KB)", "");
@@ -353,7 +358,7 @@ int handle_fw_upgrade(int client_fd, const char *user,
 		const char *hp = url + 7;
 		const char *slash = strchr(hp, '/');
 		if (!slash || !slash[1]) {
-			(void)fw_run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+			fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
 			fw_write_state(1, 6, "error",
 				       "TFTP URL must be tftp://host/path", "");
 			sg_db_close();
@@ -382,7 +387,7 @@ int handle_fw_upgrade(int client_fd, const char *user,
 	}
 
 	if (dl_pid < 0) {
-		(void)fw_run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
 		fw_write_state(1, 6, "error", "Download fork failed", "");
 		sg_db_close();
 		_exit(1);
@@ -418,7 +423,7 @@ int handle_fw_upgrade(int client_fd, const char *user,
 	    access(FW_DL_FILE, F_OK) != 0) {
 		mgmt_log("ERROR", "firmware download failed (exit=%d)",
 			 WIFEXITED(dl_status) ? WEXITSTATUS(dl_status) : -1);
-		(void)fw_run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
 		fw_write_state(1, 6, "error", "Download failed", "");
 		sg_db_close();
 		_exit(1);
@@ -449,7 +454,7 @@ int handle_fw_upgrade(int client_fd, const char *user,
 		mgmt_log("ERROR", "firmware extract failed or missing manifest: %s",
 			 exout ? exout : "(no output)");
 		free(exout);
-		(void)fw_run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
 		fw_write_state(2, 6, "error",
 			       "Invalid firmware package (missing manifest.txt)", "");
 		sg_db_close();
@@ -473,7 +478,7 @@ int handle_fw_upgrade(int client_fd, const char *user,
 		    sizeof(initramfs_sha));
 
 	if (!fw_version[0] || !kernel_sha[0] || !initramfs_sha[0]) {
-		(void)fw_run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
 		fw_write_state(2, 6, "error",
 			       "Incomplete manifest (missing version or checksums)", "");
 		sg_db_close();
@@ -500,7 +505,7 @@ int handle_fw_upgrade(int client_fd, const char *user,
 			 isum ? isum : "null", initramfs_sha);
 		free(ksum);
 		free(isum);
-		(void)fw_run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
 		fw_write_state(3, 6, "error",
 			       "Firmware checksum verification failed", "");
 		sg_db_close();
@@ -552,7 +557,7 @@ int handle_fw_upgrade(int client_fd, const char *user,
 
 	if (!bdev || !bdev[0]) {
 		free(bdev);
-		(void)fw_run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
 		fw_write_state(4, 6, "error",
 			       "Boot partition (LABEL=boot) not found", "");
 		sg_db_close();
@@ -584,7 +589,7 @@ int handle_fw_upgrade(int client_fd, const char *user,
 		mgmt_log("ERROR", "failed to mount boot partition %s", bdev);
 		free(mpcheck);
 		free(bdev);
-		(void)fw_run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
 		fw_write_state(4, 6, "error",
 			       "Failed to mount boot partition", "");
 		sg_db_close();
@@ -600,7 +605,7 @@ int handle_fw_upgrade(int client_fd, const char *user,
 
 	/* Remove existing files to free space (64MB partition can't
 	 * hold old + new simultaneously with a ~44MB kernel) */
-	(void)fw_run_cmd("rm -f /tmp/sg-fw-boot/kernel "
+	fw_run_cmd_ignore("rm -f /tmp/sg-fw-boot/kernel "
 		      "/tmp/sg-fw-boot/initramfs.gz "
 		      "/tmp/sg-fw-boot/kernel.bak "
 		      "/tmp/sg-fw-boot/initramfs.gz.bak 2>/dev/null");
@@ -642,27 +647,27 @@ int handle_fw_upgrade(int client_fd, const char *user,
 		mgmt_log("ERROR", "firmware install failed, boot partition: %s",
 			 df_fail ? df_fail : "(unknown)");
 		free(df_fail);
-		(void)fw_run_cmd("sync");
-		(void)fw_run_cmd("umount /tmp/sg-fw-boot 2>/dev/null");
+		fw_run_cmd_ignore("sync");
+		fw_run_cmd_ignore("umount /tmp/sg-fw-boot 2>/dev/null");
 		free(bdev);
-		(void)fw_run_cmd("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
 		fw_write_state(5, 6, "error", "Firmware install failed", "");
 		sg_db_close();
 		_exit(1);
 	}
 
 	/* Copy manifest to boot partition for version tracking */
-	(void)fw_run_cmd("cp /tmp/sg-fw-staged/manifest.txt /tmp/sg-fw-boot/manifest.txt 2>/dev/null");
+	fw_run_cmd_ignore("cp /tmp/sg-fw-staged/manifest.txt /tmp/sg-fw-boot/manifest.txt 2>/dev/null");
 
 	/* Step 6: Sync, unmount, and finalize */
 	fw_write_state(6, 6, "running",
 		       "Syncing and unmounting boot partition...", "");
-	(void)fw_run_cmd("sync");
-	(void)fw_run_cmd("umount /tmp/sg-fw-boot 2>/dev/null");
+	fw_run_cmd_ignore("sync");
+	fw_run_cmd_ignore("umount /tmp/sg-fw-boot 2>/dev/null");
 	free(bdev);
 
 	/* Cleanup download artifacts */
-	(void)fw_run_cmd("rm -rf /tmp/sg-fw-download");
+	fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download");
 
 	/* Audit log */
 	char audit_msg[1200];
@@ -687,7 +692,7 @@ int handle_fw_upgrade(int client_fd, const char *user,
 		free(safe_exec(cp_argv));
 	}
 	usleep(100000);
-	(void)fw_run_cmd("/sbin/reboot");
+	fw_run_cmd_ignore("/sbin/reboot");
 	_exit(0);
 }
 

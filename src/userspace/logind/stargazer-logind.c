@@ -522,24 +522,29 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
+	int ret = 0;
+
 	/* Authenticate */
 	char password[MAX_PASS_LEN];
 	int pw_rc = read_password("Password: ", password, sizeof(password));
 	if (pw_rc == -2) {
 		/* Ctrl+C during password — return to login prompt */
 		explicit_bzero(password, sizeof(password));
-		return EXIT_SIGINT;
+		ret = EXIT_SIGINT;
+		goto db_cleanup;
 	}
 	if (pw_rc != 0) {
 		audit_log(username, "login_fail", "reason=read-error");
-		return 1;
+		ret = 1;
+		goto db_cleanup;
 	}
 
 	if (authenticate(username, password) != 0) {
 		explicit_bzero(password, sizeof(password));
 		audit_log(username, "login_fail", "reason=bad-password");
 		fprintf(stderr, "Invalid credentials\n");
-		return 1;
+		ret = 1;
+		goto db_cleanup;
 	}
 
 	/*
@@ -585,11 +590,13 @@ int main(int argc, char *argv[])
 	int epc_rc = enforce_password_change(username);
 	if (epc_rc == -2) {
 		audit_log(username, "login_fail", "reason=password-change-interrupted");
-		return EXIT_SIGINT;
+		ret = EXIT_SIGINT;
+		goto db_cleanup;
 	}
 	if (epc_rc != 0) {
 		audit_log(username, "login_fail", "reason=enforce-change-failed");
-		return 1;
+		ret = 1;
+		goto db_cleanup;
 	}
 
 	/*
@@ -602,17 +609,22 @@ int main(int argc, char *argv[])
 		if (pm_rc == -2) {
 			audit_log(username, "login_fail",
 				  "reason=policy-change-interrupted");
-			return EXIT_SIGINT;
+			ret = EXIT_SIGINT;
+			goto db_cleanup;
 		}
 		if (pm_rc != 0) {
 			audit_log(username, "login_fail",
 				  "reason=policy-change-failed");
-			return 1;
+			ret = 1;
+			goto db_cleanup;
 		}
 	}
 
+db_cleanup:
 	/* Close config database before dropping privileges */
 	sg_db_close();
+	if (ret != 0)
+		return ret;
 
 	/* Restore signals */
 	signal(SIGINT, SIG_DFL);

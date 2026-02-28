@@ -2674,6 +2674,102 @@ static void test_ipc_schema_version(void)
 		  SG_CMD_CFG_GET, test_section, SG_ERR_ENTRY_NOT_FOUND);
 }
 
+/* ── IPC resource cleanup tests ───────────────────────────────────────── */
+
+static void test_ipc_resource_cleanup(void)
+{
+	struct ipc_response resp;
+	int conn;
+
+	printf(C_CYAN "\n  --- IPC: resource cleanup ---" C_NC "\n");
+
+	/* 1. Rapid IPC calls — catches fd/connection leaks (EMFILE) */
+	tc_total++;
+	{
+		int ok = 1;
+		for (int i = 0; i < 50; i++) {
+			conn = ipc_send_str(SG_CMD_PING, "", &resp);
+			ipc_resp_free(&resp);
+			if (conn != 0) {
+				ok = 0;
+				printf(C_RED "  FAIL" C_NC
+				       " [resource] rapid IPC #%d failed"
+				       " (fd leak?)\n", i + 1);
+				break;
+			}
+		}
+		if (ok) {
+			tc_pass++;
+			printf(C_GREEN "  PASS" C_NC
+			       " [resource] 50 rapid IPC calls"
+			       " (no fd leak)\n");
+		}
+	}
+
+	/* 2. Unknown opcode — exercises error-status cleanup path */
+	tc_total++;
+	conn = ipc_send(0xFFFF, NULL, 0, &resp);
+	if (conn == 0 && resp.status != SG_OK) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [resource] unknown opcode returns error"
+		       " (status=%u)\n", resp.status);
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [resource] unknown opcode: conn=%d status=%u\n",
+		       conn, conn == 0 ? resp.status : 0);
+	}
+	ipc_resp_free(&resp);
+
+	/* 3. Double ipc_resp_free — validates idempotent free safety */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_PING, "", &resp);
+	ipc_resp_free(&resp);
+	ipc_resp_free(&resp);  /* second free must not crash */
+	if (conn == 0) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [resource] double ipc_resp_free is safe\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [resource] double free test: conn=%d\n", conn);
+	}
+
+	/* 4. Mixed success/error cycles — real-world workload stability */
+	tc_total++;
+	{
+		int ok = 1;
+		for (int i = 0; i < 20; i++) {
+			if (i % 2 == 0) {
+				/* Success path: PING */
+				conn = ipc_send_str(SG_CMD_PING, "", &resp);
+			} else {
+				/* Error path: GET non-existent entry */
+				conn = ipc_send_str(SG_CMD_CFG_GET,
+						    "firewall_address:"
+						    "__diag_nonexist",
+						    &resp);
+			}
+			ipc_resp_free(&resp);
+			if (conn != 0) {
+				ok = 0;
+				printf(C_RED "  FAIL" C_NC
+				       " [resource] mixed cycle #%d failed\n",
+				       i + 1);
+				break;
+			}
+		}
+		if (ok) {
+			tc_pass++;
+			printf(C_GREEN "  PASS" C_NC
+			       " [resource] 20 mixed success/error cycles"
+			       " stable\n");
+		}
+	}
+}
+
 /* ── Cleanup helper ───────────────────────────────────────────────────── */
 
 static void cleanup_test_entries(void)
@@ -2777,6 +2873,7 @@ int cli_diagnose_test_configure(int mode)
 			test_ipc_entry_id_enforcement();
 			test_ipc_cfg_set_validation();
 			test_ipc_schema_version();
+			test_ipc_resource_cleanup();
 			cleanup_test_entries();
 		}
 	}

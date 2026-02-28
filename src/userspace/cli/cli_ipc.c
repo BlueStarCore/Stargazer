@@ -547,6 +547,6 @@ void ipc_fetch_debug(void)
 	if (ipc_send(SG_CMD_DEBUG_FETCH, NULL, 0, &resp) == 0) {
 		if (resp.payload && resp.payload_len > 0)
 			fprintf(stderr, "%s", resp.payload);
-		ipc_resp_free(&resp);
 	}
+	ipc_resp_free(&resp);
 }
