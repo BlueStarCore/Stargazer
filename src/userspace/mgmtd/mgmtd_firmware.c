@@ -353,6 +353,7 @@ int handle_fw_upgrade(int client_fd, const char *user,
 	}
 
 	pid_t dl_pid = -1;
+
 	if (strncmp(url, "tftp://", 7) == 0) {
 		/* Parse tftp://host/path */
 		const char *hp = url + 7;
@@ -370,8 +371,20 @@ int handle_fw_upgrade(int client_fd, const char *user,
 		memcpy(thost, hp, hlen);
 		thost[hlen] = '\0';
 		const char *tremote = slash + 1;
+
+		/* TFTP return traffic is handled by nf_conntrack_tftp +
+		 * ESTABLISHED,RELATED rule in SG_IN_<iface> chain.
+		 * See mgmtd_init_firewall() for CT helper setup. */
 		dl_pid = fork();
 		if (dl_pid == 0) {
+			/* Capture tftp output for diagnostics */
+			int efd = open("/tmp/sg-fw-tftp.log",
+				       O_WRONLY | O_CREAT | O_TRUNC, 0600);
+			if (efd >= 0) {
+				dup2(efd, STDOUT_FILENO);
+				dup2(efd, STDERR_FILENO);
+				close(efd);
+			}
 			execlp("tftp", "tftp", "-g",
 			       "-l", FW_DL_FILE,
 			       "-r", tremote, thost, NULL);
@@ -421,10 +434,33 @@ int handle_fw_upgrade(int client_fd, const char *user,
 
 	if (!WIFEXITED(dl_status) || WEXITSTATUS(dl_status) != 0 ||
 	    access(FW_DL_FILE, F_OK) != 0) {
-		mgmt_log("ERROR", "firmware download failed (exit=%d)",
-			 WIFEXITED(dl_status) ? WEXITSTATUS(dl_status) : -1);
+		int dl_exit = WIFEXITED(dl_status) ?
+			      WEXITSTATUS(dl_status) : -1;
+		/* Read tftp/wget error output for diagnostics */
+		char dl_err[256] = {0};
+		FILE *elf = fopen("/tmp/sg-fw-tftp.log", "r");
+		if (!elf)
+			elf = fopen("/tmp/sg-fw-upgrade.log", "r");
+		if (elf) {
+			size_t rd = fread(dl_err, 1, sizeof(dl_err) - 1, elf);
+			dl_err[rd] = '\0';
+			/* Trim trailing whitespace */
+			while (rd > 0 && (dl_err[rd-1] == '\n' ||
+					  dl_err[rd-1] == ' '))
+				dl_err[--rd] = '\0';
+			fclose(elf);
+		}
+		mgmt_log("ERROR", "firmware download failed (exit=%d): %s",
+			 dl_exit, dl_err[0] ? dl_err : "(no output)");
 		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
-		fw_write_state(1, 6, "error", "Download failed", "");
+		char errmsg[384];
+		if (dl_err[0])
+			snprintf(errmsg, sizeof(errmsg),
+				 "Download failed: %s", dl_err);
+		else
+			snprintf(errmsg, sizeof(errmsg),
+				 "Download failed (exit code %d)", dl_exit);
+		fw_write_state(1, 6, "error", errmsg, "");
 		sg_db_close();
 		_exit(1);
 	}

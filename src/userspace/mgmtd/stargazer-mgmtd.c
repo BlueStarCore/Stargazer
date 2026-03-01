@@ -955,34 +955,56 @@ static void mgmtd_init_firewall(void)
 			mgmt_log("ERROR", "failed to add loopback ACCEPT rule");
 	}
 
-	/* Allow return traffic for connections initiated by the firewall.
-	 * --ctdir REPLY ensures only reply-direction packets match, so
-	 * externally-initiated connections (tracked as ORIGINAL) still
-	 * fall through to per-interface SG_IN_* chains for policy check.
-	 *
-	 * BusyBox iptables may not support --ctdir; fall back to plain
-	 * conntrack match if the first attempt produces an error. */
+	/* Allow return traffic for connections initiated by the firewall
+	 * (e.g. ping reply, DNS response, HTTP response). */
 	const char *est[] = {"iptables", "-A", "INPUT",
 			     "-m", "conntrack",
 			     "--ctstate", "ESTABLISHED,RELATED",
-			     "--ctdir", "REPLY",
 			     "-j", "ACCEPT", NULL};
-	if (ipt_exec(est) != 0) {
-		/* --ctdir not supported; retry without it */
-		const char *est_compat[] = {"iptables", "-A", "INPUT",
-					    "-m", "conntrack",
-					    "--ctstate", "ESTABLISHED,RELATED",
-					    "-j", "ACCEPT", NULL};
-		if (ipt_exec(est_compat) != 0)
-			mgmt_log("ERROR",
-				 "failed to add ESTABLISHED/RELATED rule");
-		else
-			mgmt_log("INFO", "INPUT chain: policy DROP, lo ACCEPT, "
-				 "ESTABLISHED/RELATED ACCEPT (no ctdir)");
-	} else {
+	if (ipt_exec(est) != 0)
+		mgmt_log("ERROR",
+			 "failed to add ESTABLISHED/RELATED rule");
+	else
 		mgmt_log("INFO", "INPUT chain: policy DROP, lo ACCEPT, "
-			 "ESTABLISHED/RELATED ACCEPT (ctdir REPLY)");
-	}
+			 "ESTABLISHED/RELATED ACCEPT");
+
+	/* Load conntrack TFTP helper module and assign it explicitly
+	 * via xt_CT in the raw table.  This teaches conntrack about
+	 * TFTP's port-switching so return traffic is marked RELATED
+	 * and accepted by the ESTABLISHED,RELATED rules.
+	 *
+	 * Without this, TFTP firmware downloads will fail because the
+	 * server responds from a random port (not 69) and conntrack
+	 * can't mark those packets as RELATED without the helper. */
+	const char *mod1[] = {"insmod",
+		"/lib/modules/stargazer/nf_conntrack_tftp.ko", NULL};
+	const char *mod2[] = {"insmod",
+		"/lib/modules/stargazer/nf_nat_tftp.ko", NULL};
+	char *m1out = safe_exec(mod1);
+	char *m2out = safe_exec(mod2);
+
+	if (m1out && m1out[0] != '\0')
+		mgmt_log("ERROR", "insmod nf_conntrack_tftp: %s", m1out);
+	else
+		mgmt_log("INFO", "loaded nf_conntrack_tftp");
+	if (m2out && m2out[0] != '\0')
+		mgmt_log("ERROR", "insmod nf_nat_tftp: %s", m2out);
+	else
+		mgmt_log("INFO", "loaded nf_nat_tftp");
+	free(m1out);
+	free(m2out);
+
+	/* Assign TFTP helper for outbound TFTP requests (firmware dl) */
+	const char *ct_out[] = {"iptables", "-t", "raw",
+				"-I", "OUTPUT",
+				"-p", "udp", "-m", "udp",
+				"--dport", "69",
+				"-j", "CT", "--helper", "tftp", NULL};
+	if (ipt_exec(ct_out) == 0)
+		mgmt_log("INFO", "CT helper: tftp on OUTPUT udp/69");
+	else
+		mgmt_log("ERROR", "TFTP CT helper failed — "
+			 "firmware download via TFTP will not work");
 }
 
 /*
@@ -2103,10 +2125,11 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 		if (payload && payload[0])
 			extract_val(payload, "table", table, sizeof(table));
 
-		/* Whitelist: only "filter" or "nat" */
-		if (strcmp(table, "filter") != 0 && strcmp(table, "nat") != 0) {
+		/* Whitelist: only "filter", "nat", or "raw" */
+		if (strcmp(table, "filter") != 0 && strcmp(table, "nat") != 0 &&
+		    strcmp(table, "raw") != 0) {
 			send_error(client_fd, SG_ERR_INVALID_ARG,
-				   "Table must be 'filter' or 'nat'");
+				   "Table must be 'filter', 'nat', or 'raw'");
 			return 0;
 		}
 

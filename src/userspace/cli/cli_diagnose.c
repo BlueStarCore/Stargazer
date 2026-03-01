@@ -970,7 +970,8 @@ cleanup:
 
 /* ── Public entry point ────────────────────────────────────────────────── */
 
-int cli_diagnose_test_permissions(int mode, const char *permissions)
+int cli_diagnose_test_permissions(int mode, const char *permissions,
+				  diag_result_t *out)
 {
 	diag_pass  = 0;
 	diag_fail  = 0;
@@ -999,5 +1000,10 @@ int cli_diagnose_test_permissions(int mode, const char *permissions)
 		printf(C_GREEN " (all passed)" C_NC);
 	printf("\n\n");
 
+	if (out) {
+		out->passed = diag_pass;
+		out->failed = diag_fail;
+		out->total  = diag_total;
+	}
 	return diag_fail > 0 ? 1 : 0;
 }

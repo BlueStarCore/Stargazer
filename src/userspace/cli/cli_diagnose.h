@@ -14,12 +14,23 @@
 #define C_NC     "\033[0m"
 
 /*
+ * Test result counters — if non-NULL, each function writes its totals here
+ * so the unified selftest runner can aggregate across all suites.
+ */
+typedef struct {
+	int passed;
+	int failed;
+	int total;
+} diag_result_t;
+
+/*
  * Run IPC permission model diagnostics.
  *   mode=0: self-test (verify current user's access matches permissions)
  *   mode=1: full test (also creates temp accounts and verifies profile data)
  * Returns 0 on all-pass, 1 on any failure.
  */
-int cli_diagnose_test_permissions(int mode, const char *permissions);
+int cli_diagnose_test_permissions(int mode, const char *permissions,
+				  diag_result_t *out);
 
 /*
  * Run configuration validation diagnostics.
@@ -27,7 +38,7 @@ int cli_diagnose_test_permissions(int mode, const char *permissions);
  *   mode=1: full test (also runs IPC round-trip create/read/delete)
  * Returns 0 on all-pass, 1 on any failure.
  */
-int cli_diagnose_test_configure(int mode);
+int cli_diagnose_test_configure(int mode, diag_result_t *out);
 
 /*
  * Run firewall & network validator diagnostics.
@@ -35,6 +46,6 @@ int cli_diagnose_test_configure(int mode);
  *   mode=1: full test (adds IPC round-trip tests requiring mgmtd)
  * Returns 0 on all-pass, 1 on any failure.
  */
-int cli_diagnose_test_firewall(int mode);
+int cli_diagnose_test_firewall(int mode, diag_result_t *out);
 
 #endif /* CLI_DIAGNOSE_H */

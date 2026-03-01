@@ -400,7 +400,7 @@ static int cmd_diag_resources(const char *args, const char *permissions)
 	return 0;
 }
 
-static int cmd_diag_test_perms(const char *args, const char *permissions)
+static int cmd_diag_selftest(const char *args, const char *permissions)
 {
 	int mode = 0;
 	if (args) {
@@ -410,49 +410,38 @@ static int cmd_diag_test_perms(const char *args, const char *permissions)
 			mode = 1;
 		else if (*args != '\0') {
 			printf("  Unknown argument: %s\n", args);
-			printf("  Usage: execute diagnose test-permissions [full]\n");
+			printf("  Usage: execute diagnose selftest [full]\n");
 			return 0;
 		}
 	}
-	cli_diagnose_test_permissions(mode, permissions);
-	return 0;
-}
+	int fail = 0;
+	diag_result_t r, totals = {0, 0, 0};
 
-static int cmd_diag_test_cfg(const char *args, const char *permissions)
-{
-	(void)permissions;
-	int mode = 0;
-	if (args) {
-		while (*args == ' ')
-			args++;
-		if (strcmp(args, "full") == 0)
-			mode = 1;
-		else if (*args != '\0') {
-			printf("  Unknown argument: %s\n", args);
-			printf("  Usage: execute diagnose test-configure [full]\n");
-			return 0;
-		}
-	}
-	cli_diagnose_test_configure(mode);
-	return 0;
-}
+	fail += cli_diagnose_test_permissions(mode, permissions, &r);
+	totals.passed += r.passed;
+	totals.failed += r.failed;
+	totals.total  += r.total;
 
-static int cmd_diag_test_fw(const char *args, const char *permissions)
-{
-	(void)permissions;
-	int mode = 0;
-	if (args) {
-		while (*args == ' ')
-			args++;
-		if (strcmp(args, "full") == 0)
-			mode = 1;
-		else if (*args != '\0') {
-			printf("  Unknown argument: %s\n", args);
-			printf("  Usage: execute diagnose test-firewall [full]\n");
-			return 0;
-		}
-	}
-	cli_diagnose_test_firewall(mode);
+	fail += cli_diagnose_test_configure(mode, &r);
+	totals.passed += r.passed;
+	totals.failed += r.failed;
+	totals.total  += r.total;
+
+	fail += cli_diagnose_test_firewall(mode, &r);
+	totals.passed += r.passed;
+	totals.failed += r.failed;
+	totals.total  += r.total;
+
+	printf("\n  ══════════════════════════════════════\n");
+	printf("  Total: %d/%d passed", totals.passed, totals.total);
+	if (totals.failed > 0)
+		printf(C_RED ", %d FAILED" C_NC, totals.failed);
+	printf("\n");
+	if (fail == 0)
+		printf(C_GREEN "  All test suites passed." C_NC "\n");
+	else
+		printf(C_RED "  %d test suite(s) had failures." C_NC "\n", fail);
+	printf("  ══════════════════════════════════════\n\n");
 	return 0;
 }
 

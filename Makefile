@@ -124,6 +124,11 @@ kernel-config:
 		$(MAKE) -C $(KERNEL_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) defconfig; \
 		$(KERNEL_DIR)/scripts/config --file $(KERNEL_DIR)/.config \
 			--enable NETFILTER --enable NF_CONNTRACK \
+			--enable NF_CT_NETLINK \
+			--enable IP_NF_RAW \
+			--enable NETFILTER_XT_TARGET_CT \
+			--module NF_CONNTRACK_TFTP \
+			--module NF_NAT_TFTP \
 			--enable VIRTIO --enable VIRTIO_PCI --enable VIRTIO_NET \
 			--enable VIRTIO_BLK --enable VIRTIO_MMIO \
 			--enable MODULES --enable MODULE_UNLOAD \
@@ -142,6 +147,11 @@ $(BUILD_DIR)/modules/$(MODULE_NAME).ko: $(KERNEL_IMAGE) $(SRC_WATCH)
 	$(MAKE) -C $(KERNEL_DIR) M=$(MODULE_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) modules KBUILD_MODPOST_WARN=1
 	@mkdir -p $(BUILD_DIR)/modules
 	cp $(MODULE_DIR)/*.ko $(BUILD_DIR)/modules/
+	# Copy netfilter conntrack helper modules (TFTP etc.)
+	@for m in nf_conntrack_tftp.ko nf_nat_tftp.ko; do \
+		[ -f $(KERNEL_DIR)/net/netfilter/$$m ] && \
+		cp $(KERNEL_DIR)/net/netfilter/$$m $(BUILD_DIR)/modules/ || true; \
+	done
 	@echo "[2/5] Module ready: $@"
 
 # =============================================================================
@@ -171,6 +181,7 @@ $(BUSYBOX_BIN):
 	@sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' $(BUSYBOX_DIR)/.config
 	@sed -i 's/# CONFIG_TFTP is not set/CONFIG_TFTP=y/' $(BUSYBOX_DIR)/.config
 	@sed -i 's/# CONFIG_FEATURE_TFTP_GET is not set/CONFIG_FEATURE_TFTP_GET=y/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/# CONFIG_FEATURE_TFTP_BLOCKSIZE is not set/CONFIG_FEATURE_TFTP_BLOCKSIZE=y/' $(BUSYBOX_DIR)/.config
 	@sed -i 's/# CONFIG_TRACEROUTE is not set/CONFIG_TRACEROUTE=y/' $(BUSYBOX_DIR)/.config
 	@sed -i 's/# CONFIG_NSLOOKUP is not set/CONFIG_NSLOOKUP=y/' $(BUSYBOX_DIR)/.config
 	@sed -i 's/# CONFIG_ARPING is not set/CONFIG_ARPING=y/' $(BUSYBOX_DIR)/.config
@@ -212,6 +223,7 @@ $(BUSYBOX_LINKS):
 	@sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' $(BUSYBOX_DIR)/.config
 	@sed -i 's/# CONFIG_TFTP is not set/CONFIG_TFTP=y/' $(BUSYBOX_DIR)/.config
 	@sed -i 's/# CONFIG_FEATURE_TFTP_GET is not set/CONFIG_FEATURE_TFTP_GET=y/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/# CONFIG_FEATURE_TFTP_BLOCKSIZE is not set/CONFIG_FEATURE_TFTP_BLOCKSIZE=y/' $(BUSYBOX_DIR)/.config
 	@sed -i 's/# CONFIG_TRACEROUTE is not set/CONFIG_TRACEROUTE=y/' $(BUSYBOX_DIR)/.config
 	@sed -i 's/# CONFIG_NSLOOKUP is not set/CONFIG_NSLOOKUP=y/' $(BUSYBOX_DIR)/.config
 	@sed -i 's/# CONFIG_ARPING is not set/CONFIG_ARPING=y/' $(BUSYBOX_DIR)/.config
@@ -761,6 +773,9 @@ test-build: modules busybox dash iptables logind mgmtd cli uboot
 	@rm -rf $(BUILD_DIR)/test/boot-contents
 	@echo "Test boot disk created: $(BUILD_DIR)/test/boot.img"
 
+	# TFTP directory for QEMU built-in TFTP server (firmware testing)
+	@mkdir -p $(BUILD_DIR)/test/tftp
+
 test: test-build
 	@$(MAKE) --no-print-directory test-run
 
@@ -781,7 +796,7 @@ test-run:
 		-bios $(UBOOT_BIN) \
 		-drive file=$(BUILD_DIR)/test/boot.img,format=raw,if=virtio \
 		-drive file=$(BUILD_DIR)/test/data.img,format=raw,if=virtio \
-		-netdev user,id=net0,hostfwd=tcp::2222-:22 \
+		-netdev user,id=net0,hostfwd=tcp::2222-:22,net=10.0.1.0/24,host=10.0.1.1,tftp=$(BUILD_DIR)/test/tftp \
 		-device virtio-net-device,netdev=net0 \
 		-nographic
 

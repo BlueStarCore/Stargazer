@@ -2,11 +2,11 @@
 /*
  * cli_diagnose_fw.c — Firewall & network validator diagnostics for Stargazer CLI
  *
- * Implements "execute diagnose test-firewall [full]":
- *   - Basic: exercises access-services, interface-name, CIDR, IPv4 validators
- *   - Full:  IPC round-trip tests for diagnostic commands (requires mgmtd)
- *
- * Uses the same PASS/FAIL pattern as cli_diagnose_config.c (test-configure).
+ * Firewall test suite for "execute diagnose selftest [full]":
+ *   - Basic: exercises access-services, interface-name, CIDR, IPv4 validators,
+ *            and TFTP allowaccess rejection (SEC-FW-7)
+ *   - Full:  IPC round-trip tests for diagnostic commands (requires mgmtd),
+ *            INPUT chain structure (SEC-FW-8), CT helper rules (SEC-FW-9)
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -57,8 +57,8 @@ static void test_access_services(void)
 	/* Accept: multiple valid services */
 	fw_check("access-svc", "accept: 'ping ssh https'",
 		 sg_is_access_services("ping ssh https"), 1);
-	fw_check("access-svc", "accept: all seven services",
-		 sg_is_access_services("ping ssh https http snmp telnet tftp"), 1);
+	fw_check("access-svc", "accept: all six services",
+		 sg_is_access_services("ping ssh https http snmp telnet"), 1);
 
 	/* Accept: empty = no services */
 	fw_check("access-svc", "accept: '' (empty = no services)",
@@ -181,6 +181,12 @@ static void test_diag_input_validation(void)
 	fw_check("diag-val", "empty payload → SG_OK (default filter)",
 		 (conn == 0 && resp.status == SG_OK) ? 1 : 0, 1);
 	ipc_resp_free(&resp);
+
+	/* raw table (whitelisted for CT helper inspection) */
+	conn = ipc_send_str(SG_CMD_DIAG_FW_IPTABLES, "table=raw\n", &resp);
+	fw_check("diag-val", "table=raw → SG_OK",
+		 (conn == 0 && resp.status == SG_OK) ? 1 : 0, 1);
+	ipc_resp_free(&resp);
 }
 
 /* ── SEC-FW-5: Response payload presence (mode=1 only) ────────────────── */
@@ -250,43 +256,120 @@ static void test_network_validators(void)
 		 sg_is_ipv4("1.2.3.4.5"), 0);
 }
 
+/* ── SEC-FW-7: tftp not an allowaccess service ────────────────────────── */
+
+static void test_tftp_not_allowaccess(void)
+{
+	printf(C_CYAN "\n  --- SEC-FW-7: tftp not an allowaccess service ---" C_NC "\n");
+
+	fw_check("no-tftp", "reject: 'tftp' (not a management service)",
+		 sg_is_access_services("tftp"), 0);
+	fw_check("no-tftp", "reject: 'ping ssh tftp' (tftp taints list)",
+		 sg_is_access_services("ping ssh tftp"), 0);
+	fw_check("no-tftp", "accept: 'ping ssh' (valid without tftp)",
+		 sg_is_access_services("ping ssh"), 1);
+}
+
+/* ── SEC-FW-8: INPUT chain structure (IPC, mode=1) ───────────────────── */
+
+static void test_input_chain_structure(void)
+{
+	struct ipc_response resp;
+	int conn;
+
+	printf(C_CYAN "\n  --- SEC-FW-8: INPUT chain structure ---" C_NC "\n");
+
+	conn = ipc_send_str(SG_CMD_DIAG_FW_POLICY, "", &resp);
+
+	/* ESTABLISHED,RELATED rule must be in INPUT */
+	fw_check("input-chain", "ESTABLISHED,RELATED rule present",
+		 (conn == 0 && resp.payload &&
+		  strstr(resp.payload, "ESTABLISHED")) ? 1 : 0, 1);
+
+	/* Per-interface jump must exist */
+	fw_check("input-chain", "per-interface chain jump (SG_IN_) present",
+		 (conn == 0 && resp.payload &&
+		  strstr(resp.payload, "SG_IN_")) ? 1 : 0, 1);
+
+	/* Policy must be DROP */
+	fw_check("input-chain", "policy is DROP",
+		 (conn == 0 && resp.payload &&
+		  strstr(resp.payload, "policy DROP")) ? 1 : 0, 1);
+	ipc_resp_free(&resp);
+}
+
+/* ── SEC-FW-9: TFTP CT helper in raw table (IPC, mode=1) ─────────────── */
+
+static void test_ct_helper_tftp(void)
+{
+	struct ipc_response resp;
+	int conn;
+
+	printf(C_CYAN "\n  --- SEC-FW-9: TFTP CT helper in raw table ---" C_NC "\n");
+
+	conn = ipc_send_str(SG_CMD_DIAG_FW_IPTABLES, "table=raw\n", &resp);
+
+	/* Raw table must be queryable */
+	fw_check("ct-helper", "raw table query → SG_OK",
+		 (conn == 0 && resp.status == SG_OK) ? 1 : 0, 1);
+
+	/* CT helper rule must reference tftp */
+	fw_check("ct-helper", "CT helper 'tftp' rule present",
+		 (conn == 0 && resp.payload &&
+		  strstr(resp.payload, "helper") &&
+		  strstr(resp.payload, "tftp")) ? 1 : 0, 1);
+
+	/* Rule must target outbound UDP port 69 */
+	fw_check("ct-helper", "targets udp dpt:69",
+		 (conn == 0 && resp.payload &&
+		  strstr(resp.payload, "udp dpt:69")) ? 1 : 0, 1);
+	ipc_resp_free(&resp);
+}
+
 /* ── Entry point ──────────────────────────────────────────────────────── */
 
-int cli_diagnose_test_firewall(int mode)
+int cli_diagnose_test_firewall(int mode, diag_result_t *out)
 {
 	fw_pass = fw_fail = fw_total = 0;
 
-	printf("\n  Firewall & network validator diagnostics\n");
-
-	if (mode == 0)
-		printf("  (local-only mode — use 'full' for IPC round-trip tests)\n");
+	printf("\n  Stargazer Firewall & Network Validator Diagnostics\n");
+	printf("  ==================================================\n");
 
 	/* Local-only tests (no IPC needed) */
 	test_access_services();
 	test_iface_name();
 	test_network_validators();
+	test_tftp_not_allowaccess();
 
 	/* Full mode: IPC round-trip tests (require mgmtd) */
 	if (mode == 1) {
 		if (!ipc_available()) {
-			printf(C_RED "\n  mgmtd not available — "
-			       "skipping IPC tests" C_NC "\n");
+			printf(C_RED "\n  ERROR" C_NC
+			       ": mgmtd socket not found (%s)\n",
+			       SG_MGMTD_SOCK);
+			printf("  IPC tests skipped."
+			       " Start stargazer-mgmtd for full tests.\n");
 		} else {
 			test_diag_ipc_reachability();
 			test_diag_input_validation();
 			test_diag_payload_presence();
+			test_input_chain_structure();
+			test_ct_helper_tftp();
 		}
 	}
 
 	/* Summary */
-	printf("\n  ────────────────────────────────────\n");
-	printf("  Total: %d   ", fw_total);
-	if (fw_fail == 0)
-		printf(C_GREEN "PASS: %d" C_NC "   FAIL: 0\n", fw_pass);
+	printf("\n  Results: %d/%d passed", fw_pass, fw_total);
+	if (fw_fail > 0)
+		printf(C_RED ", %d FAILED" C_NC, fw_fail);
 	else
-		printf("PASS: %d   " C_RED "FAIL: %d" C_NC "\n",
-		       fw_pass, fw_fail);
-	printf("  ────────────────────────────────────\n\n");
+		printf(C_GREEN " (all passed)" C_NC);
+	printf("\n\n");
 
+	if (out) {
+		out->passed = fw_pass;
+		out->failed = fw_fail;
+		out->total  = fw_total;
+	}
 	return fw_fail > 0 ? 1 : 0;
 }

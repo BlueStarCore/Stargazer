@@ -2816,7 +2816,7 @@ static void cleanup_test_entries(void)
 
 /* ── Public entry point ───────────────────────────────────────────────── */
 
-int cli_diagnose_test_configure(int mode)
+int cli_diagnose_test_configure(int mode, diag_result_t *out)
 {
 	tc_pass  = 0;
 	tc_fail  = 0;
@@ -2886,5 +2886,10 @@ int cli_diagnose_test_configure(int mode)
 		printf(C_GREEN " (all passed)" C_NC);
 	printf("\n\n");
 
+	if (out) {
+		out->passed = tc_pass;
+		out->failed = tc_fail;
+		out->total  = tc_total;
+	}
 	return tc_fail > 0 ? 1 : 0;
 }

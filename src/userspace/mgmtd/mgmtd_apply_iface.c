@@ -128,11 +128,6 @@ static int apply_allowaccess(const char *iface, const char *services)
 					"-p", "tcp", "--dport", "23",
 					"-j", "ACCEPT", NULL};
 				if (ipt_exec(a) != 0) errors++;
-			} else if (strcmp(tok, "tftp") == 0) {
-				const char *a[] = {"iptables", "-A", chain,
-					"-p", "udp", "--dport", "69",
-					"-j", "ACCEPT", NULL};
-				if (ipt_exec(a) != 0) errors++;
 			}
 		}
 	}

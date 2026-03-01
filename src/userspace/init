@@ -66,14 +66,14 @@ echo 1 > /proc/sys/kernel/printk
 
 # Banner
 clear 2>/dev/null
-cat << 'EOF'
-
-  ╔═══════════════════════════════════════════════════════════╗
-  ║  STARGAZER NGFW v@VERSION@                                ║
-  ║  Multi-User Authenticated System                          ║
-  ╚═══════════════════════════════════════════════════════════╝
-
-EOF
+_l1="STARGAZER NGFW v@VERSION@"
+_l2="Multi-User Authenticated System"
+printf "\n"
+printf "  ╔═══════════════════════════════════════════════════════════╗\n"
+printf "  ║  %-55s  ║\n" "$_l1"
+printf "  ║  %-55s  ║\n" "$_l2"
+printf "  ╚═══════════════════════════════════════════════════════════╝\n"
+printf "\n"
 echo "Kernel: $(uname -r) | Arch: $(uname -m)"
 
 # Write firmware version for runtime queries (substituted at build time)
