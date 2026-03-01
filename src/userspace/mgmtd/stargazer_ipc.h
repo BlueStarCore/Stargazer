@@ -61,7 +61,7 @@ typedef enum {
 	/* Config read operations (1xx) */
 	SG_CMD_CFG_GET       = 100,   /* Get section data               */
 	SG_CMD_CFG_LIST      = 101,   /* List entries of a type          */
-	SG_CMD_CFG_LIST_TYPES = 102,  /* List all types in a domain      */
+	SG_CMD_CFG_LIST_TYPES = 102,  /* Reserved: list all config types (not yet implemented) */
 
 	/* Config write operations (2xx) */
 	SG_CMD_CFG_SET       = 200,   /* Set/update section data         */
@@ -80,25 +80,26 @@ typedef enum {
 	SG_CMD_SESSION_REV   = 400,   /* Get session revision for user   */
 	SG_CMD_SESSION_BUMP  = 401,   /* Bump session revision           */
 
-	/* Config revision management (5xx) */
-	SG_CMD_COMMIT        = 500,   /* Record config revision          */
-	SG_CMD_REVISIONS     = 501,   /* List revisions                  */
-	SG_CMD_ROLLBACK      = 502,   /* Rollback to revision            */
+	/* Config revision management (5xx) — CLI sends these, mgmtd not yet implemented */
+	SG_CMD_COMMIT        = 500,   /* Record config revision (stub)   */
+	SG_CMD_REVISIONS     = 501,   /* List revisions (stub)           */
+	SG_CMD_ROLLBACK      = 502,   /* Rollback to revision (stub)     */
 
 	/* System operations (6xx) */
 	SG_CMD_SYS_POWEROFF  = 600,
 	SG_CMD_SYS_REBOOT    = 601,
-	SG_CMD_FW_UPGRADE    = 602,   /* Download + install firmware    */
-	SG_CMD_FW_STATUS     = 603,   /* Show firmware version/status   */
-	SG_CMD_FW_PROGRESS   = 604,   /* Poll firmware upgrade progress */
+	SG_CMD_UPGRADE_START    = 602, /* Download + install firmware    */
+	SG_CMD_UPGRADE_STATUS   = 603, /* Show firmware version/status   */
+	SG_CMD_UPGRADE_PROGRESS = 604, /* Poll firmware upgrade progress */
 	SG_CMD_NET_PING      = 605,   /* Network ping (ICMP echo)       */
 	SG_CMD_NET_TRACEROUTE = 606,  /* Network traceroute             */
 	SG_CMD_NET_NSLOOKUP  = 607,   /* DNS lookup                     */
 	SG_CMD_NET_ARPING    = 608,   /* ARP ping (L2 reachability)     */
+	SG_CMD_UPGRADE_CANCEL  = 609, /* Cancel in-progress upgrade     */
 	SG_CMD_SHOW_STATUS   = 610,
 	SG_CMD_SHOW_IFACES   = 611,
 	SG_CMD_SHOW_ROUTES   = 612,
-	SG_CMD_SHOW_CONFIG   = 613,
+	SG_CMD_SHOW_CONFIG   = 613,   /* Reserved: not yet implemented   */
 	SG_CMD_SHOW_STATS    = 614,
 	SG_CMD_WHOAMI        = 620,   /* Get caller's profile+permissions */
 
@@ -108,12 +109,32 @@ typedef enum {
 	SG_CMD_DIAG_FW_CONNTRACK = 632,  /* Show conntrack entries            */
 	SG_CMD_DIAG_ROUTES       = 633,  /* Show IPv4+IPv6 routing tables     */
 
+	/* System diagnostics (64x) — served by mgmtd_diag.c */
+	SG_CMD_DIAG_CPU          = 640,  /* CPU jiffies + thermal readings     */
+	SG_CMD_DIAG_RAM          = 641,  /* MemTotal, MemAvailable             */
+	SG_CMD_DIAG_DISK         = 642,  /* statvfs("/") results               */
+	SG_CMD_DIAG_IFACE_STATS  = 643,  /* Per-iface rx/tx + link speed       */
+	SG_CMD_DIAG_PROCTOP      = 644,  /* CPU agg + mem + uptime + proc list */
+	SG_CMD_DIAG_THERMAL      = 645,  /* Thermal zone temperatures          */
+
+	/* Show data (65x) */
+	SG_CMD_SHOW_SESSIONS     = 650,  /* /proc/stargazer/sessions contents  */
+	SG_CMD_SHOW_BOOT_CONFIG  = 651,  /* modules + sysctl config files      */
+
+	/* Debug state (66x) */
+	SG_CMD_DEBUG_STATE_GET   = 660,  /* Read debug conf key=value pairs    */
+	SG_CMD_DEBUG_STATE_SET   = 661,  /* Atomic write debug conf            */
+	SG_CMD_DEBUG_STATE_RESET = 662,  /* Unlink debug conf                  */
+	SG_CMD_HISTORY_SAVE      = 663,  /* Save CLI history lines             */
+	SG_CMD_HISTORY_LOAD      = 664,  /* Load CLI history lines             */
+
 	/* DNS/DHCP — Member A (7xx): SG_CMD_DNS_* 700-749, SG_CMD_DHCP_* 750-799 */
 	/* NAT — Member B (8xx): SG_CMD_NAT_* 800-849 */
 
 	/* Keepalive / ping (9xx) */
 	SG_CMD_PING          = 900,
 	SG_CMD_DEBUG_FETCH   = 901,   /* Fetch buffered debug traces    */
+	SG_CMD_UPGRADE_TEST_SETUP = 902, /* Test: write/clean/query fw state */
 } sg_cmd_t;
 
 /* ── Message header ─────────────────────────────────────────────────────── */

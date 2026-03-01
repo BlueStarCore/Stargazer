@@ -13,7 +13,7 @@ CMD_DIR="/usr/libexec/stargazer"
 # ----------------------------------------------------------------------------
 ensure_admin_account() {
 	mkdir -p "$STARGAZER_CONF_DIR"
-	chmod 750 "$STARGAZER_CONF_DIR" 2>/dev/null
+	chmod 700 "$STARGAZER_CONF_DIR" 2>/dev/null
 
 	# ── Instance ID (unique per install) ──────────────────────────────────
 	if [ ! -f "$STARGAZER_CONF_DIR/.instance-id" ]; then
@@ -76,14 +76,11 @@ ensure_admin_account() {
 		fi
 	fi
 
-	# Set DB file permissions: root:stargazer 0660
-	_sg_grp="stargazer"
+	# Set DB file permissions: root-only (CLI reads via mgmtd IPC)
 	if [ -f "$STARGAZER_DB_PATH" ]; then
-		chmod 660 "$STARGAZER_DB_PATH" 2>/dev/null
-		chgrp "$_sg_grp" "$STARGAZER_DB_PATH" 2>/dev/null
+		chmod 600 "$STARGAZER_DB_PATH" 2>/dev/null
 	fi
-	chgrp "$_sg_grp" "$STARGAZER_CONF_DIR" 2>/dev/null
-	chmod 750 "$STARGAZER_CONF_DIR" 2>/dev/null
+	chmod 700 "$STARGAZER_CONF_DIR" 2>/dev/null
 }
 
 # ----------------------------------------------------------------------------

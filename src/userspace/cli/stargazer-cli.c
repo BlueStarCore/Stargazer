@@ -14,6 +14,7 @@
 #include "cli_ipc.h"
 #include "cli_cmd_table.h"
 #include "cli_debug.h"
+#include "cli_sandbox.h"
 
 #include <signal.h>
 #include <stdio.h>
@@ -85,78 +86,72 @@ int main(void)
 	if (!user)
 		user = "unknown";
 
-	/* 2. Get profile and permissions via IPC (opcode 620: WHOAMI) */
-	char profile[128]    = "read-only";
-	char permissions[256] = "monitor";
+	/* 2. Initialize IPC client */
+	ipc_init(user);
 
-	if (ipc_init(user) == 0) {
-		/*
-		 * Retry WHOAMI a few times — mgmtd may still be starting.
-		 * Without this, the CLI defaults to read-only for the
-		 * entire session if the socket isn't ready yet.
-		 */
-		for (int attempt = 0; attempt < 5; attempt++) {
-			if (!ipc_available()) {
-				usleep(200000); /* 200ms */
-				continue;
-			}
-			struct ipc_response resp;
-			if (ipc_send_str(SG_CMD_WHOAMI, "", &resp) == 0 &&
-			    resp.status == SG_OK && resp.payload) {
-				parse_whoami(resp.payload, profile,
-					     sizeof(profile),
-					     permissions,
-					     sizeof(permissions));
-				ipc_resp_free(&resp);
-				break;
-			}
-			ipc_resp_free(&resp);
-			usleep(200000);
-		}
-	}
-
-	/* Export for shell subcommands */
-	setenv("STARGAZER_PROFILE", profile, 1);
-	setenv("STARGAZER_PERMISSIONS", permissions, 1);
-	setenv("STARGAZER_USER", user, 1);
-
-	/* 3. Initialize terminal and readline */
+	/* 3. Initialize terminal (opens /dev/tty — last file open) */
 	if (cli_term_init() < 0) {
 		fprintf(stderr, "Error: cannot open terminal\n");
 		return 1;
 	}
 
-	/*
-	 * Ignore SIGINT globally.  In raw mode, Ctrl+C is handled as byte
-	 * 0x03 by readline.  During streaming/polling, cli_ipc polls the
-	 * tty directly for 0x03 — no signal needed.  SIG_IGN prevents an
-	 * accidental kill if a stray SIGINT is delivered.
-	 */
 	signal(SIGINT, SIG_IGN);
-
-	/* Tell the IPC layer which fd to poll for Ctrl+C during streaming */
 	ipc_set_interrupt_fd(cli_get_tty_fd());
 
-	/* 4. Register commands based on permissions */
+	/* 4. SANDBOX — all file opens done, lock down the process.
+	 * After this point: no open(), fork(), exec(), or network.
+	 * Only pre-opened fds and AF_UNIX IPC to mgmtd. */
+	if (cli_sandbox_install() != 0) {
+		fprintf(stderr, "Error: sandbox installation failed — refusing to run\n");
+		cli_term_cleanup();
+		return 1;
+	}
+
+	/* ── Everything below runs inside the sandbox ────────────── */
+
+	/* 5. Get profile and permissions via IPC (WHOAMI) */
+	char profile[128]    = "read-only";
+	char permissions[256] = "monitor";
+	for (int attempt = 0; attempt < 5; attempt++) {
+		if (!ipc_available()) {
+			usleep(200000);
+			continue;
+		}
+		struct ipc_response resp;
+		if (ipc_send_str(SG_CMD_WHOAMI, "", &resp) == 0 &&
+		    resp.status == SG_OK && resp.payload) {
+			parse_whoami(resp.payload, profile,
+				     sizeof(profile),
+				     permissions,
+				     sizeof(permissions));
+			ipc_resp_free(&resp);
+			break;
+		}
+		ipc_resp_free(&resp);
+		usleep(200000);
+	}
+
+	setenv("STARGAZER_PROFILE", profile, 1);
+	setenv("STARGAZER_PERMISSIONS", permissions, 1);
+	setenv("STARGAZER_USER", user, 1);
+
+	/* 6. Register commands based on permissions */
 	cmd_register_all(permissions);
 
-	/* 5. Load history */
-	char hist_path[256];
-	snprintf(hist_path, sizeof(hist_path),
-		 "/tmp/stargazer_cli_history_%ld", (long)getuid());
-	cli_hist_load(hist_path);
+	/* 7. Load history via IPC (inside sandbox) */
+	cli_hist_load_ipc();
 
-	/* 6. Print banner */
+	/* 8. Print banner */
 	printf("\n  Stargazer NGFW %s\n", VERSION);
 	printf("  User: %s | Profile: %s | Perms: %s\n",
 	       user, profile, permissions);
 	printf("  Type 'help' or '?' for available commands.\n\n");
 
-	/* 7. Session tracking */
+	/* 9. Session tracking */
 	int session_rev_start = get_session_rev(user);
 	int session_rev_cached = session_rev_start;
 
-	/* 8. Main loop */
+	/* 10. Main loop */
 	const char *line;
 	while ((line = cli_readline("stargazer> ")) != NULL) {
 		/* Trim leading whitespace */
@@ -226,8 +221,8 @@ int main(void)
 			break;
 	}
 
-	/* 9. Cleanup */
-	cli_hist_save(hist_path);
+	/* 11. Cleanup — save history via IPC (works inside sandbox) */
+	cli_hist_save_ipc(user);
 	cli_term_cleanup();
 	return 0;
 }

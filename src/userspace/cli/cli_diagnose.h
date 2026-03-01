@@ -48,4 +48,20 @@ int cli_diagnose_test_configure(int mode, diag_result_t *out);
  */
 int cli_diagnose_test_firewall(int mode, diag_result_t *out);
 
+/*
+ * Run firmware upgrade diagnostics.
+ *   mode=0: command ID verification only (no IPC needed)
+ *   mode=1: full test (IPC round-trip: status, progress, cancel, start validation)
+ * Returns 0 on all-pass, 1 on any failure.
+ */
+int cli_diagnose_test_upgrade(int mode, diag_result_t *out);
+
+/*
+ * Run sandbox integrity diagnostics.
+ *   mode=0: local checks only (seccomp + no_new_privs)
+ *   mode=1: full test (adds AF_UNIX socket + IPC round-trip)
+ * Returns 0 on all-pass, 1 on any failure.
+ */
+int cli_diagnose_test_sandbox(int mode, diag_result_t *out);
+
 #endif /* CLI_DIAGNOSE_H */

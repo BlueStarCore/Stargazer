@@ -2,10 +2,10 @@
 /*
  * cli_diagnose_sys.c — Pure C system diagnostics for Stargazer CLI
  *
- * Zero-fork resource monitoring. Reads /proc and /sys directly instead
- * of forking shell commands. Works on BusyBox/ash (no bash needed).
+ * IPC-only resource monitoring. All data comes from mgmtd via IPC —
+ * no direct /proc or /sys reads. Works in the seccomp sandbox.
  *
- * Replaces the shell-based resource functions from cli_debug.c:
+ * Replaces the shell-based resource functions:
  *   execute diagnose resources [cpu|ram|disk|interface|all]
  *   execute diagnose top
  */
@@ -17,12 +17,10 @@
 #include "cli_ipc.h"
 
 #include <ctype.h>
-#include <dirent.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/statvfs.h>
 #include <unistd.h>
 
 /* ── CPU ─────────────────────────────────────────────────────────────── */
@@ -39,26 +37,26 @@ struct cpu_sample {
 
 #define MAX_CPUS 64
 
-static int read_cpu_samples(struct cpu_sample *out, int max)
+/* Parse cpu samples from IPC response (text lines from mgmtd DIAG_CPU) */
+static int parse_cpu_samples(const char *data, struct cpu_sample *out, int max)
 {
-	FILE *fp = fopen("/proc/stat", "r");
-	if (!fp)
-		return 0;
-
 	int count = 0;
-	char line[256];
-	while (fgets(line, sizeof(line), fp) && count < max) {
-		if (strncmp(line, "cpu", 3) != 0)
+	const char *p = data;
+
+	while (*p && count < max) {
+		/* Only parse lines starting with "cpu" */
+		if (strncmp(p, "cpu", 3) != 0 ||
+		    (p[3] != ' ' && !isdigit((unsigned char)p[3]))) {
+			const char *nl = strchr(p, '\n');
+			if (!nl) break;
+			p = nl + 1;
 			continue;
-		/* Match "cpu" (aggregate) and "cpuN" lines */
-		if (line[3] != ' ' && !isdigit((unsigned char)line[3]))
-			continue;
+		}
 
 		struct cpu_sample *s = &out[count];
 		memset(s, 0, sizeof(*s));
 
 		/* Parse name */
-		const char *p = line;
 		int ni = 0;
 		while (*p && *p != ' ' && ni < (int)sizeof(s->name) - 1)
 			s->name[ni++] = *p++;
@@ -77,18 +75,60 @@ static int read_cpu_samples(struct cpu_sample *out, int max)
 		s->idle = s->vals[3] + s->vals[4]; /* idle + iowait */
 
 		count++;
+
+		const char *nl = strchr(p, '\n');
+		if (!nl) break;
+		p = nl + 1;
 	}
-	fclose(fp);
 	return count;
+}
+
+/* Parse thermal_zoneN=<millidegrees> lines from IPC response */
+static void print_thermal_from_response(const char *data)
+{
+	printf("  Temperatures:\n");
+	int found = 0;
+	const char *p = data;
+
+	while (*p) {
+		if (strncmp(p, "thermal_zone", 12) == 0) {
+			const char *eq = strchr(p, '=');
+			const char *nl = strchr(p, '\n');
+			if (eq) {
+				int zone = atoi(p + 12);
+				int tv = atoi(eq + 1);
+				printf("    thermal_zone%d : %d\u00b0C\n",
+				       zone, tv / 1000);
+				found = 1;
+			}
+			if (!nl) break;
+			p = nl + 1;
+			continue;
+		}
+		const char *nl = strchr(p, '\n');
+		if (!nl) break;
+		p = nl + 1;
+	}
+
+	if (!found)
+		printf("    N/A (VM or sensor not exposed)\n");
 }
 
 void diag_show_cpu(void)
 {
 	printf("\n---CPU resources:\n");
 
-	/* Count cores (cpuN lines, skip aggregate "cpu") */
+	/* First IPC call for CPU data */
+	struct ipc_response r1 = {0};
+	if (ipc_send_str(SG_CMD_DIAG_CPU, "", &r1) != 0 ||
+	    r1.status != SG_OK || !r1.payload) {
+		printf("  (mgmtd unavailable)\n\n");
+		ipc_resp_free(&r1);
+		return;
+	}
+
 	struct cpu_sample s1[MAX_CPUS + 1];
-	int n1 = read_cpu_samples(s1, MAX_CPUS + 1);
+	int n1 = parse_cpu_samples(r1.payload, s1, MAX_CPUS + 1);
 
 	int cores = 0;
 	for (int i = 0; i < n1; i++) {
@@ -100,8 +140,17 @@ void diag_show_cpu(void)
 	/* Wait 1s and sample again */
 	usleep(1000000);
 
+	struct ipc_response r2 = {0};
+	if (ipc_send_str(SG_CMD_DIAG_CPU, "", &r2) != 0 ||
+	    r2.status != SG_OK || !r2.payload) {
+		ipc_resp_free(&r1);
+		ipc_resp_free(&r2);
+		printf("  (second sample failed)\n\n");
+		return;
+	}
+
 	struct cpu_sample s2[MAX_CPUS + 1];
-	int n2 = read_cpu_samples(s2, MAX_CPUS + 1);
+	int n2 = parse_cpu_samples(r2.payload, s2, MAX_CPUS + 1);
 
 	/* Compute deltas */
 	printf("  Utilization (1s window):\n");
@@ -122,27 +171,12 @@ void diag_show_cpu(void)
 			       pct_x100 / 100, pct_x100 % 100);
 	}
 
-	/* Temperature */
-	printf("  Temperatures:\n");
-	int found_temp = 0;
-	char path[128];
-	for (int z = 0; z < 16; z++) {
-		snprintf(path, sizeof(path),
-			 "/sys/class/thermal/thermal_zone%d/temp", z);
-		FILE *fp = fopen(path, "r");
-		if (!fp)
-			continue;
-		char tbuf[32];
-		if (fgets(tbuf, sizeof(tbuf), fp)) {
-			int tv = atoi(tbuf);
-			printf("    thermal_zone%d : %d°C\n", z, tv / 1000);
-			found_temp = 1;
-		}
-		fclose(fp);
-	}
-	if (!found_temp)
-		printf("    N/A (VM or sensor not exposed)\n");
+	/* Thermal from second response (has latest data) */
+	print_thermal_from_response(r2.payload);
 	printf("\n");
+
+	ipc_resp_free(&r1);
+	ipc_resp_free(&r2);
 }
 
 /* ── RAM ─────────────────────────────────────────────────────────────── */
@@ -151,18 +185,26 @@ void diag_show_ram(void)
 {
 	printf("\n---RAM resources:\n");
 
-	long mt = 0, ma = 0;
-	FILE *fp = fopen("/proc/meminfo", "r");
-	if (fp) {
-		char line[128];
-		while (fgets(line, sizeof(line), fp)) {
-			if (strncmp(line, "MemTotal:", 9) == 0)
-				mt = atol(line + 9);
-			else if (strncmp(line, "MemAvailable:", 13) == 0)
-				ma = atol(line + 13);
-		}
-		fclose(fp);
+	struct ipc_response resp = {0};
+	if (ipc_send_str(SG_CMD_DIAG_RAM, "", &resp) != 0 ||
+	    resp.status != SG_OK || !resp.payload) {
+		printf("  (mgmtd unavailable)\n\n");
+		ipc_resp_free(&resp);
+		return;
 	}
+
+	long mt = 0, ma = 0;
+	const char *p = resp.payload;
+	while (*p) {
+		if (strncmp(p, "MemTotal=", 9) == 0)
+			mt = atol(p + 9);
+		else if (strncmp(p, "MemAvailable=", 13) == 0)
+			ma = atol(p + 13);
+		const char *nl = strchr(p, '\n');
+		if (!nl) break;
+		p = nl + 1;
+	}
+	ipc_resp_free(&resp);
 
 	if (mt <= 0) {
 		printf("  N/A\n\n");
@@ -170,7 +212,6 @@ void diag_show_ram(void)
 	}
 
 	long mu = mt - ma;
-	/* Fixed-point: pct_x100 = mu * 10000 / mt */
 	long pct_x100 = mt > 0 ? mu * 10000 / mt : 0;
 	printf("  Used: %ld.%02ld%% (%ld MiB / %ld MiB), Available: %ld MiB\n",
 	       pct_x100 / 100, pct_x100 % 100,
@@ -184,14 +225,35 @@ void diag_show_disk(void)
 {
 	printf("\n---Disk resources:\n");
 
-	struct statvfs sv;
-	if (statvfs("/", &sv) != 0) {
-		printf("  N/A (statvfs failed)\n\n");
+	struct ipc_response resp = {0};
+	if (ipc_send_str(SG_CMD_DIAG_DISK, "", &resp) != 0 ||
+	    resp.status != SG_OK || !resp.payload) {
+		printf("  N/A (mgmtd unavailable)\n\n");
+		ipc_resp_free(&resp);
 		return;
 	}
 
-	unsigned long long total = (unsigned long long)sv.f_blocks * sv.f_frsize;
-	unsigned long long avail = (unsigned long long)sv.f_bavail * sv.f_frsize;
+	unsigned long blocks = 0, bfree = 0, bavail = 0, frsize = 0;
+	const char *p = resp.payload;
+	while (*p) {
+		if (strncmp(p, "blocks=", 7) == 0)
+			blocks = strtoul(p + 7, NULL, 10);
+		else if (strncmp(p, "bfree=", 6) == 0)
+			bfree = strtoul(p + 6, NULL, 10);
+		else if (strncmp(p, "bavail=", 7) == 0)
+			bavail = strtoul(p + 7, NULL, 10);
+		else if (strncmp(p, "frsize=", 7) == 0)
+			frsize = strtoul(p + 7, NULL, 10);
+		const char *nl = strchr(p, '\n');
+		if (!nl) break;
+		p = nl + 1;
+	}
+	ipc_resp_free(&resp);
+
+	(void)bfree; /* bfree is for root; bavail is for unprivileged */
+
+	unsigned long long total = (unsigned long long)blocks * frsize;
+	unsigned long long avail = (unsigned long long)bavail * frsize;
 	unsigned long long used  = total - avail;
 
 	unsigned long long total_mb = total / (1024 * 1024);
@@ -217,54 +279,47 @@ struct iface_sample {
 
 #define MAX_IFACES 32
 
-static int read_iface_samples(struct iface_sample *out, int max)
+/* Parse iface samples from IPC response: "iface=<name> rx_bytes=N tx_bytes=N speed=M" */
+static int parse_iface_samples(const char *data, struct iface_sample *out, int max)
 {
-	FILE *fp = fopen("/proc/net/dev", "r");
-	if (!fp)
-		return 0;
-
-	char line[512];
 	int count = 0;
+	const char *p = data;
 
-	/* Skip header lines */
-	if (!fgets(line, sizeof(line), fp)) { fclose(fp); return 0; }
-	if (!fgets(line, sizeof(line), fp)) { fclose(fp); return 0; }
-
-	while (fgets(line, sizeof(line), fp) && count < max) {
-		/* Format: "  iface: rx_bytes rx_packets ... tx_bytes tx_packets ..." */
-		const char *p = line;
-		while (*p == ' ') p++;
-
-		const char *colon = strchr(p, ':');
-		if (!colon)
+	while (*p && count < max) {
+		if (strncmp(p, "iface=", 6) != 0) {
+			const char *nl = strchr(p, '\n');
+			if (!nl) break;
+			p = nl + 1;
 			continue;
+		}
 
 		struct iface_sample *s = &out[count];
-		size_t nlen = (size_t)(colon - p);
+		memset(s, 0, sizeof(*s));
+
+		/* Parse name */
+		const char *ns = p + 6;
+		const char *sp = ns;
+		while (*sp && *sp != ' ' && *sp != '\n') sp++;
+		size_t nlen = (size_t)(sp - ns);
 		if (nlen >= sizeof(s->name))
 			nlen = sizeof(s->name) - 1;
-		memcpy(s->name, p, nlen);
+		memcpy(s->name, ns, nlen);
 		s->name[nlen] = '\0';
 
-		/* Skip loopback */
-		if (strcmp(s->name, "lo") == 0)
-			continue;
+		/* Parse rx_bytes */
+		const char *rxp = strstr(p, "rx_bytes=");
+		if (rxp) s->rx_bytes = strtoull(rxp + 9, NULL, 10);
 
-		/* Parse rx_bytes (field 1 after colon) */
-		p = colon + 1;
-		while (*p == ' ') p++;
-		s->rx_bytes = strtoull(p, NULL, 10);
-
-		/* Skip 8 fields to reach tx_bytes (field 9) */
-		for (int f = 0; f < 8; f++) {
-			while (*p && *p != ' ') p++;
-			while (*p == ' ') p++;
-		}
-		s->tx_bytes = strtoull(p, NULL, 10);
+		/* Parse tx_bytes */
+		const char *txp = strstr(p, "tx_bytes=");
+		if (txp) s->tx_bytes = strtoull(txp + 9, NULL, 10);
 
 		count++;
+
+		const char *nl = strchr(p, '\n');
+		if (!nl) break;
+		p = nl + 1;
 	}
-	fclose(fp);
 	return count;
 }
 
@@ -273,15 +328,32 @@ void diag_show_interface(void)
 	printf("\n---Interface resources:\n");
 
 	/* First sample */
+	struct ipc_response r1 = {0};
+	if (ipc_send_str(SG_CMD_DIAG_IFACE_STATS, "", &r1) != 0 ||
+	    r1.status != SG_OK || !r1.payload) {
+		printf("  (mgmtd unavailable)\n\n");
+		ipc_resp_free(&r1);
+		return;
+	}
+
 	struct iface_sample s1[MAX_IFACES];
-	int n1 = read_iface_samples(s1, MAX_IFACES);
+	int n1 = parse_iface_samples(r1.payload, s1, MAX_IFACES);
 
 	/* Wait 1s */
 	usleep(1000000);
 
 	/* Second sample */
+	struct ipc_response r2 = {0};
+	if (ipc_send_str(SG_CMD_DIAG_IFACE_STATS, "", &r2) != 0 ||
+	    r2.status != SG_OK || !r2.payload) {
+		ipc_resp_free(&r1);
+		ipc_resp_free(&r2);
+		printf("  (second sample failed)\n\n");
+		return;
+	}
+
 	struct iface_sample s2[MAX_IFACES];
-	int n2 = read_iface_samples(s2, MAX_IFACES);
+	int n2 = parse_iface_samples(r2.payload, s2, MAX_IFACES);
 
 	printf("  Throughput (1s window):\n");
 	for (int i = 0; i < n1 && i < n2; i++) {
@@ -292,7 +364,6 @@ void diag_show_interface(void)
 		if (drx < 0) drx = 0;
 		if (dtx < 0) dtx = 0;
 
-		/* Fixed-point KB/s with 2 decimal places */
 		long long rx_kbs_x100 = drx * 100 / 1024;
 		long long tx_kbs_x100 = dtx * 100 / 1024;
 
@@ -302,38 +373,47 @@ void diag_show_interface(void)
 		       tx_kbs_x100 / 100, tx_kbs_x100 % 100);
 	}
 
-	/* Link speed via sysfs */
+	/* Link speed from latest response */
 	printf("  Link speed (best effort):\n");
-	DIR *dir = opendir("/sys/class/net");
-	if (dir) {
-		struct dirent *ent;
-		while ((ent = readdir(dir)) != NULL) {
-			if (ent->d_name[0] == '.')
-				continue;
-			if (strcmp(ent->d_name, "lo") == 0)
-				continue;
+	{
+		const char *p = r2.payload;
+		while (*p) {
+			if (strncmp(p, "iface=", 6) == 0) {
+				const char *ns = p + 6;
+				const char *sp = ns;
+				while (*sp && *sp != ' ' && *sp != '\n') sp++;
+				char iname[32];
+				size_t nlen = (size_t)(sp - ns);
+				if (nlen >= sizeof(iname))
+					nlen = sizeof(iname) - 1;
+				memcpy(iname, ns, nlen);
+				iname[nlen] = '\0';
 
-			char path[512], spd[32];
-			snprintf(path, sizeof(path),
-				 "/sys/class/net/%s/speed", ent->d_name);
-			FILE *fp = fopen(path, "r");
-			if (fp) {
-				if (fgets(spd, sizeof(spd), fp)) {
-					size_t slen = strlen(spd);
-					if (slen > 0 && spd[slen - 1] == '\n')
-						spd[--slen] = '\0';
+				const char *spdp = strstr(p, "speed=");
+				const char *nl = strchr(p, '\n');
+				/* Only use speed= if it's on same line */
+				if (spdp && (!nl || spdp < nl)) {
+					char spd[32];
+					const char *sv = spdp + 6;
+					int si = 0;
+					while (*sv && *sv != ' ' && *sv != '\n' &&
+					       si < (int)sizeof(spd) - 1)
+						spd[si++] = *sv++;
+					spd[si] = '\0';
+					printf("    %s: speed=%sMbps\n", iname, spd);
 				} else {
-					snprintf(spd, sizeof(spd), "unknown");
+					printf("    %s: speed=unknownMbps\n", iname);
 				}
-				fclose(fp);
-			} else {
-				snprintf(spd, sizeof(spd), "unknown");
 			}
-			printf("    %s: speed=%sMbps\n", ent->d_name, spd);
+			const char *nl = strchr(p, '\n');
+			if (!nl) break;
+			p = nl + 1;
 		}
-		closedir(dir);
 	}
 	printf("\n");
+
+	ipc_resp_free(&r1);
+	ipc_resp_free(&r2);
 }
 
 /* ── Top (live process monitor) ──────────────────────────────────────── */
@@ -346,9 +426,8 @@ struct proc_info {
 	unsigned long stime;
 	unsigned long vsize;
 	long   rss;
-	/* Computed per refresh cycle */
-	unsigned long cpu_bp;  /* CPU usage in basis points (0–10000) */
-	unsigned long ram_bp;  /* RAM usage in basis points (0–10000) */
+	unsigned long cpu_bp;
+	unsigned long ram_bp;
 };
 
 #define MAX_PROCS 1024
@@ -359,7 +438,6 @@ static int cmp_proc_cpu_bp(const void *a, const void *b)
 	const struct proc_info *pb = b;
 	if (pb->cpu_bp > pa->cpu_bp) return 1;
 	if (pb->cpu_bp < pa->cpu_bp) return -1;
-	/* Tie-break by total ticks descending */
 	unsigned long ca = pa->utime + pa->stime;
 	unsigned long cb = pb->utime + pb->stime;
 	if (cb > ca) return 1;
@@ -367,73 +445,109 @@ static int cmp_proc_cpu_bp(const void *a, const void *b)
 	return 0;
 }
 
-static int read_proc_list(struct proc_info *procs, int max)
+/*
+ * Parse proctop IPC response. Format:
+ *   cpu <user> <nice> ...          (aggregate cpu line)
+ *   mem_total_kb=N
+ *   mem_avail_kb=N
+ *   uptime=<seconds> <idle>
+ *   loadavg=<1> <5> <15> ...
+ *   proc=<pid> <comm> <state> <utime> <stime> <vsize> <rss>
+ */
+struct proctop_data {
+	struct cpu_sample cpu;
+	long mem_total_kb;
+	long mem_avail_kb;
+	char uptime[64];
+	char loadavg[64];
+	struct proc_info procs[MAX_PROCS];
+	int nprocs;
+};
+
+static void parse_proctop(const char *data, struct proctop_data *out)
 {
-	DIR *dir = opendir("/proc");
-	if (!dir)
-		return 0;
+	memset(out, 0, sizeof(*out));
+	const char *p = data;
 
-	int nprocs = 0;
-	struct dirent *ent;
-	while ((ent = readdir(dir)) != NULL && nprocs < max) {
-		if (!isdigit((unsigned char)ent->d_name[0]))
-			continue;
+	while (*p) {
+		const char *nl = strchr(p, '\n');
+		size_t llen = nl ? (size_t)(nl - p) : strlen(p);
 
-		char path[280];
-		snprintf(path, sizeof(path), "/proc/%s/stat", ent->d_name);
-		FILE *fp = fopen(path, "r");
-		if (!fp)
-			continue;
+		if (llen >= 4 && strncmp(p, "cpu ", 4) == 0) {
+			/* Parse CPU aggregate */
+			const char *cp = p + 4;
+			for (int i = 0; i < CPU_FIELDS && *cp; i++) {
+				while (*cp == ' ') cp++;
+				out->cpu.vals[i] = strtoul(cp, NULL, 10);
+				while (*cp && *cp != ' ' && *cp != '\n') cp++;
+			}
+			out->cpu.total = 0;
+			for (int i = 0; i < CPU_FIELDS; i++)
+				out->cpu.total += out->cpu.vals[i];
+			out->cpu.idle = out->cpu.vals[3] + out->cpu.vals[4];
+			snprintf(out->cpu.name, sizeof(out->cpu.name), "cpu");
+		} else if (strncmp(p, "mem_total_kb=", 13) == 0) {
+			out->mem_total_kb = atol(p + 13);
+		} else if (strncmp(p, "mem_avail_kb=", 13) == 0) {
+			out->mem_avail_kb = atol(p + 13);
+		} else if (strncmp(p, "uptime=", 7) == 0) {
+			size_t vlen = llen - 7;
+			if (vlen >= sizeof(out->uptime))
+				vlen = sizeof(out->uptime) - 1;
+			memcpy(out->uptime, p + 7, vlen);
+			out->uptime[vlen] = '\0';
+		} else if (strncmp(p, "loadavg=", 8) == 0) {
+			size_t vlen = llen - 8;
+			if (vlen >= sizeof(out->loadavg))
+				vlen = sizeof(out->loadavg) - 1;
+			memcpy(out->loadavg, p + 8, vlen);
+			out->loadavg[vlen] = '\0';
+		} else if (strncmp(p, "proc=", 5) == 0 &&
+			   out->nprocs < MAX_PROCS) {
+			struct proc_info *pi = &out->procs[out->nprocs];
+			memset(pi, 0, sizeof(*pi));
 
-		char buf[512];
-		if (!fgets(buf, sizeof(buf), fp)) {
-			fclose(fp);
-			continue;
+			const char *pp = p + 5;
+			pi->pid = atoi(pp);
+
+			/* Skip pid */
+			while (*pp && *pp != ' ' && *pp != '\n') pp++;
+			while (*pp == ' ') pp++;
+
+			/* Comm (until next space) */
+			int ci = 0;
+			while (*pp && *pp != ' ' && *pp != '\n' &&
+			       ci < (int)sizeof(pi->comm) - 1)
+				pi->comm[ci++] = *pp++;
+			pi->comm[ci] = '\0';
+			while (*pp == ' ') pp++;
+
+			/* State */
+			pi->state = *pp ? *pp : '?';
+			while (*pp && *pp != ' ' && *pp != '\n') pp++;
+			while (*pp == ' ') pp++;
+
+			/* utime, stime, vsize, rss */
+			pi->utime = strtoul(pp, NULL, 10);
+			while (*pp && *pp != ' ' && *pp != '\n') pp++;
+			while (*pp == ' ') pp++;
+
+			pi->stime = strtoul(pp, NULL, 10);
+			while (*pp && *pp != ' ' && *pp != '\n') pp++;
+			while (*pp == ' ') pp++;
+
+			pi->vsize = strtoul(pp, NULL, 10);
+			while (*pp && *pp != ' ' && *pp != '\n') pp++;
+			while (*pp == ' ') pp++;
+
+			pi->rss = strtol(pp, NULL, 10);
+
+			out->nprocs++;
 		}
-		fclose(fp);
 
-		struct proc_info *pi = &procs[nprocs];
-		memset(pi, 0, sizeof(*pi));
-
-		pi->pid = atoi(buf);
-
-		const char *lp = strchr(buf, '(');
-		const char *rp = strrchr(buf, ')');
-		if (!lp || !rp || rp <= lp)
-			continue;
-
-		size_t clen = (size_t)(rp - lp - 1);
-		if (clen >= sizeof(pi->comm))
-			clen = sizeof(pi->comm) - 1;
-		memcpy(pi->comm, lp + 1, clen);
-		pi->comm[clen] = '\0';
-
-		const char *p = rp + 1;
-		while (*p == ' ') p++;
-		pi->state = *p ? *p : '?';
-
-		for (int f = 4; f <= 13 && *p; f++) {
-			while (*p && *p != ' ') p++;
-			while (*p == ' ') p++;
-		}
-		pi->utime = strtoul(p, NULL, 10);
-		while (*p && *p != ' ') p++;
-		while (*p == ' ') p++;
-		pi->stime = strtoul(p, NULL, 10);
-
-		for (int f = 16; f <= 22 && *p; f++) {
-			while (*p && *p != ' ') p++;
-			while (*p == ' ') p++;
-		}
-		pi->vsize = strtoul(p, NULL, 10);
-		while (*p && *p != ' ') p++;
-		while (*p == ' ') p++;
-		pi->rss = strtol(p, NULL, 10);
-
-		nprocs++;
+		if (!nl) break;
+		p = nl + 1;
 	}
-	closedir(dir);
-	return nprocs;
 }
 
 /*
@@ -460,129 +574,106 @@ void diag_show_top(int interval, int max_procs)
 
 	long page_size_kb = sysconf(_SC_PAGESIZE);
 	if (page_size_kb <= 0) page_size_kb = 4096;
-	page_size_kb /= 1024;  /* convert to KiB */
+	page_size_kb /= 1024;
 
 	/* Enter raw tty mode for q/Ctrl+C detection */
 	ipc_install_interrupt_handler();
 
-	/* First CPU sample (system-wide) */
-	struct cpu_sample cpu1[MAX_CPUS + 1];
-	int ncpu1 = read_cpu_samples(cpu1, MAX_CPUS + 1);
+	/* First snapshot */
+	struct ipc_response r1 = {0};
+	if (ipc_send_str(SG_CMD_DIAG_PROCTOP, "", &r1) != 0 ||
+	    r1.status != SG_OK || !r1.payload) {
+		ipc_resp_free(&r1);
+		printf("  (mgmtd unavailable)\n");
+		ipc_restore_interrupt_handler();
+		return;
+	}
 
-	/* First process snapshot */
-	struct proc_info prev[MAX_PROCS];
-	int nprev = read_proc_list(prev, MAX_PROCS);
+	struct proctop_data prev;
+	parse_proctop(r1.payload, &prev);
+	ipc_resp_free(&r1);
 
 	for (;;) {
-		/* Sleep with interrupt checking */
 		if (interruptible_sleep_ms(interval * 1000))
 			break;
 
-		/* Second CPU sample */
-		struct cpu_sample cpu2[MAX_CPUS + 1];
-		int ncpu2 = read_cpu_samples(cpu2, MAX_CPUS + 1);
+		struct ipc_response r2 = {0};
+		if (ipc_send_str(SG_CMD_DIAG_PROCTOP, "", &r2) != 0 ||
+		    r2.status != SG_OK || !r2.payload) {
+			ipc_resp_free(&r2);
+			continue;
+		}
 
-		/* Compute system-wide CPU% from aggregate "cpu" line */
+		struct proctop_data cur;
+		parse_proctop(r2.payload, &cur);
+		ipc_resp_free(&r2);
+
+		/* System-wide CPU% */
 		unsigned long sys_cpu_bp = 0;
-		if (ncpu1 > 0 && ncpu2 > 0 &&
-		    strcmp(cpu1[0].name, "cpu") == 0 &&
-		    strcmp(cpu2[0].name, "cpu") == 0) {
-			unsigned long dt = cpu2[0].total - cpu1[0].total;
-			unsigned long di = cpu2[0].idle - cpu1[0].idle;
+		unsigned long delta_total = 0;
+		{
+			unsigned long dt = cur.cpu.total - prev.cpu.total;
+			unsigned long di = cur.cpu.idle - prev.cpu.idle;
 			if (dt > 0)
 				sys_cpu_bp = (dt - di) * 10000 / dt;
+			delta_total = dt;
 		}
-		unsigned long delta_total = 0;
-		if (ncpu1 > 0 && ncpu2 > 0)
-			delta_total = cpu2[0].total - cpu1[0].total;
 
-		/* Read memory info */
-		long mem_total_kb = 0, mem_avail_kb = 0;
-		FILE *fp = fopen("/proc/meminfo", "r");
-		if (fp) {
-			char line[128];
-			while (fgets(line, sizeof(line), fp)) {
-				if (strncmp(line, "MemTotal:", 9) == 0)
-					mem_total_kb = atol(line + 9);
-				else if (strncmp(line, "MemAvailable:", 13) == 0)
-					mem_avail_kb = atol(line + 13);
-			}
-			fclose(fp);
-		}
-		long mem_used_kb = mem_total_kb - mem_avail_kb;
+		/* Memory */
+		long mem_used_kb = cur.mem_total_kb - cur.mem_avail_kb;
 		unsigned long sys_mem_bp = 0;
-		if (mem_total_kb > 0)
-			sys_mem_bp = (unsigned long)(mem_used_kb * 10000 / mem_total_kb);
+		if (cur.mem_total_kb > 0)
+			sys_mem_bp = (unsigned long)(mem_used_kb * 10000 / cur.mem_total_kb);
 
-		/* Current process snapshot */
-		struct proc_info cur[MAX_PROCS];
-		int ncur = read_proc_list(cur, MAX_PROCS);
+		/* Per-process CPU% by matching PIDs */
+		for (int i = 0; i < cur.nprocs; i++) {
+			cur.procs[i].cpu_bp = 0;
+			cur.procs[i].ram_bp = 0;
 
-		/* Compute per-process CPU% by matching PIDs with previous sample */
-		for (int i = 0; i < ncur; i++) {
-			cur[i].cpu_bp = 0;
-			cur[i].ram_bp = 0;
-
-			/* CPU%: find matching PID in prev */
 			if (delta_total > 0) {
-				for (int j = 0; j < nprev; j++) {
-					if (prev[j].pid == cur[i].pid) {
+				for (int j = 0; j < prev.nprocs; j++) {
+					if (prev.procs[j].pid == cur.procs[i].pid) {
 						unsigned long dt_proc =
-							(cur[i].utime + cur[i].stime) -
-							(prev[j].utime + prev[j].stime);
-						cur[i].cpu_bp = dt_proc * 10000 / delta_total;
+							(cur.procs[i].utime + cur.procs[i].stime) -
+							(prev.procs[j].utime + prev.procs[j].stime);
+						cur.procs[i].cpu_bp = dt_proc * 10000 / delta_total;
 						break;
 					}
 				}
 			}
 
-			/* RAM% */
-			if (mem_total_kb > 0 && cur[i].rss > 0)
-				cur[i].ram_bp = (unsigned long)(cur[i].rss * page_size_kb * 10000 / mem_total_kb);
+			if (cur.mem_total_kb > 0 && cur.procs[i].rss > 0)
+				cur.procs[i].ram_bp = (unsigned long)(cur.procs[i].rss * page_size_kb * 10000 / cur.mem_total_kb);
 		}
 
 		/* Sort by CPU% descending */
-		qsort(cur, (size_t)ncur, sizeof(cur[0]), cmp_proc_cpu_bp);
+		qsort(cur.procs, (size_t)cur.nprocs, sizeof(cur.procs[0]),
+		      cmp_proc_cpu_bp);
 
 		/* Clear screen and print header */
 		printf("\033[2J\033[H");
 
 		/* Uptime */
-		fp = fopen("/proc/uptime", "r");
-		if (fp) {
-			char buf[64];
-			if (fgets(buf, sizeof(buf), fp)) {
-				unsigned long sec = strtoul(buf, NULL, 10);
-				unsigned long days = sec / 86400;
-				unsigned long hours = (sec % 86400) / 3600;
-				unsigned long mins = (sec % 3600) / 60;
-				printf("  Uptime: %lud %luh %lum", days, hours, mins);
-			}
-			fclose(fp);
+		if (cur.uptime[0]) {
+			unsigned long sec = strtoul(cur.uptime, NULL, 10);
+			unsigned long days = sec / 86400;
+			unsigned long hours = (sec % 86400) / 3600;
+			unsigned long mins = (sec % 3600) / 60;
+			printf("  Uptime: %lud %luh %lum", days, hours, mins);
 		}
 
 		/* Load average */
-		fp = fopen("/proc/loadavg", "r");
-		if (fp) {
-			char buf[64];
-			if (fgets(buf, sizeof(buf), fp)) {
-				/* Trim trailing newline */
-				size_t len = strlen(buf);
-				if (len > 0 && buf[len - 1] == '\n')
-					buf[len - 1] = '\0';
-				printf("  Load: %s", buf);
-			}
-			fclose(fp);
-		}
+		if (cur.loadavg[0])
+			printf("  Load: %s", cur.loadavg);
 		printf("\n");
 
 		/* Tasks / CPU / Memory summary */
-		printf("  Tasks: %d", ncur);
+		printf("  Tasks: %d", cur.nprocs);
 		printf("    CPU: %lu.%02lu%%",
 		       sys_cpu_bp / 100, sys_cpu_bp % 100);
 		printf("    Mem: %lu.%02lu%% (%ld/%ld MiB)\n",
 		       sys_mem_bp / 100, sys_mem_bp % 100,
-		       mem_used_kb / 1024, mem_total_kb / 1024);
+		       mem_used_kb / 1024, cur.mem_total_kb / 1024);
 		printf("\n");
 
 		/* Column header */
@@ -592,9 +683,9 @@ void diag_show_top(int interval, int max_procs)
 		       "-------", "--------------------", "-----",
 		       "-------", "-------", "----------");
 
-		int show = ncur < max_procs ? ncur : max_procs;
+		int show = cur.nprocs < max_procs ? cur.nprocs : max_procs;
 		for (int i = 0; i < show; i++) {
-			struct proc_info *pi = &cur[i];
+			struct proc_info *pi = &cur.procs[i];
 			long rss_kib = pi->rss * page_size_kb;
 			printf("  %-7d %-20.20s   %c   %3lu.%02lu  %3lu.%02lu  %10ld\n",
 			       pi->pid, pi->comm, pi->state,
@@ -602,16 +693,13 @@ void diag_show_top(int interval, int max_procs)
 			       pi->ram_bp / 100, pi->ram_bp % 100,
 			       rss_kib);
 		}
-		printf("\n  Press 'q' to quit. Refreshing every %ds.\n", interval);
+		printf("\n  Press 'q' to quit. Refreshing every %ds.\n",
+		       interval);
 
-		/* Rotate samples */
-		memcpy(cpu1, cpu2, sizeof(cpu1));
-		ncpu1 = ncpu2;
-		memcpy(prev, cur, sizeof(prev));
-		nprev = ncur;
+		/* Rotate */
+		prev = cur;
 	}
 
-	/* Restore tty */
 	ipc_restore_interrupt_handler();
 }
 

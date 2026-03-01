@@ -207,7 +207,7 @@ static int cmd_fw_upgrade(const char *args, const char *permissions)
 	snprintf(payload, sizeof(payload), "url=%s\n", args);
 
 	struct ipc_response resp;
-	if (ipc_send_str(SG_CMD_FW_UPGRADE, payload, &resp) != 0) {
+	if (ipc_send_str(SG_CMD_UPGRADE_START, payload, &resp) != 0) {
 		ipc_resp_free(&resp);
 		printf("  Error: could not contact management daemon.\n");
 		return 0;
@@ -237,12 +237,26 @@ static int cmd_fw_upgrade(const char *args, const char *permissions)
 		if (ipc_stream_interrupted()) {
 			if (have_inline)
 				printf("\n");
-			printf("  Interrupted.\n");
+			/* Send cancel to mgmtd so the child process stops */
+			struct ipc_response cr;
+			ipc_send_str(SG_CMD_UPGRADE_CANCEL, "", &cr);
+			if (cr.status != SG_OK) {
+				/* Cancel rejected (e.g. past point of no return) */
+				printf("  %s\n",
+				       cr.extra[0] ? cr.extra
+						   : sg_status_str(cr.status));
+				ipc_resp_free(&cr);
+				ipc_clear_interrupt();
+				have_inline = 0;
+				continue;
+			}
+			ipc_resp_free(&cr);
+			printf("  Firmware upgrade cancelled.\n");
 			break;
 		}
 
 		struct ipc_response pr;
-		if (ipc_send_str(SG_CMD_FW_PROGRESS, "", &pr) != 0) {
+		if (ipc_send_str(SG_CMD_UPGRADE_PROGRESS, "", &pr) != 0) {
 			if (have_inline)
 				printf("\n");
 			if (ipc_stream_interrupted())
@@ -318,6 +332,13 @@ static int cmd_fw_upgrade(const char *args, const char *permissions)
 			if (have_inline)
 				printf("\n");
 			printf("\n  Firmware upgrade failed.\n");
+			ipc_resp_free(&pr);
+			break;
+		}
+		if (strcmp(status, "cancelled") == 0) {
+			if (have_inline)
+				printf("\n");
+			printf("\n  Firmware upgrade cancelled.\n");
 			ipc_resp_free(&pr);
 			break;
 		}
@@ -428,6 +449,17 @@ static int cmd_diag_selftest(const char *args, const char *permissions)
 	totals.total  += r.total;
 
 	fail += cli_diagnose_test_firewall(mode, &r);
+	totals.passed += r.passed;
+	totals.failed += r.failed;
+	totals.total  += r.total;
+
+	fail += cli_diagnose_test_upgrade(mode, &r);
+	totals.passed += r.passed;
+	totals.failed += r.failed;
+	totals.total  += r.total;
+
+	r = (diag_result_t){0, 0, 0};
+	fail += cli_diagnose_test_sandbox(mode, &r);
 	totals.passed += r.passed;
 	totals.failed += r.failed;
 	totals.total  += r.total;

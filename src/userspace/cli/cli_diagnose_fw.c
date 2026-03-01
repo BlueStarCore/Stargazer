@@ -326,6 +326,60 @@ static void test_ct_helper_tftp(void)
 	ipc_resp_free(&resp);
 }
 
+/* ── SEC-FW-10: config scrub for upgrade/downgrade ────────────────────── */
+
+static void test_config_scrub(void)
+{
+	printf(C_CYAN "\n  --- SEC-FW-10: config scrub for upgrade/downgrade ---" C_NC "\n");
+
+	char out[128];
+	int changed;
+
+	/* access-services: strip unknown token, keep valid ones */
+	changed = sg_reg_scrub_value("system_interface", "allowaccess",
+				     "ping ssh tftp", out, sizeof(out));
+	fw_check("scrub", "strip 'tftp' from allowaccess",
+		 changed == 1 && strcmp(out, "ping ssh") == 0, 1);
+
+	/* access-services: all valid → no change */
+	changed = sg_reg_scrub_value("system_interface", "allowaccess",
+				     "ping ssh", out, sizeof(out));
+	fw_check("scrub", "valid allowaccess unchanged", changed, 0);
+
+	/* access-services: all invalid → empty (valid = no services) */
+	changed = sg_reg_scrub_value("system_interface", "allowaccess",
+				     "tftp ftp", out, sizeof(out));
+	fw_check("scrub", "all-invalid allowaccess -> empty",
+		 changed == 1 && strcmp(out, "") == 0, 1);
+
+	/* enum: invalid option → reset to default */
+	changed = sg_reg_scrub_value("system_interface", "status",
+				     "half-duplex", out, sizeof(out));
+	fw_check("scrub", "invalid enum -> default 'up'",
+		 changed == 1 && strcmp(out, "up") == 0, 1);
+
+	/* permissions-csv: strip unknown token, keep valid ones */
+	changed = sg_reg_scrub_value("system_admin-profile", "permissions",
+				     "monitor,configure,superuser", out,
+				     sizeof(out));
+	fw_check("scrub", "strip 'superuser' from permissions",
+		 changed == 1 && strcmp(out, "monitor,configure") == 0, 1);
+
+	/* permissions-csv: all valid → no change */
+	changed = sg_reg_scrub_value("system_admin-profile", "permissions",
+				     "monitor,configure", out, sizeof(out));
+	fw_check("scrub", "valid permissions unchanged", changed, 0);
+
+	/* field default lookup */
+	const char *def = sg_reg_field_default("system_interface", "status");
+	fw_check("scrub", "field default for status = 'up'",
+		 def != NULL && strcmp(def, "up") == 0, 1);
+
+	def = sg_reg_field_default("system_interface", "allowaccess");
+	fw_check("scrub", "field default for allowaccess = NULL",
+		 def == NULL, 1);
+}
+
 /* ── Entry point ──────────────────────────────────────────────────────── */
 
 int cli_diagnose_test_firewall(int mode, diag_result_t *out)
@@ -340,6 +394,7 @@ int cli_diagnose_test_firewall(int mode, diag_result_t *out)
 	test_iface_name();
 	test_network_validators();
 	test_tftp_not_allowaccess();
+	test_config_scrub();
 
 	/* Full mode: IPC round-trip tests (require mgmtd) */
 	if (mode == 1) {

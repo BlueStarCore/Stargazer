@@ -2,9 +2,8 @@
 /*
  * cli_show.c — Show command implementations for Stargazer CLI
  *
- * C replacement for cmd_show shell script.
- * All subcommands: status, sessions, stats, interfaces, routes,
- * configure (FortiGate-style dump), config.
+ * All data comes exclusively via IPC to mgmtd. No direct file reads,
+ * no fork/exec — the CLI is a pure terminal-to-IPC bridge after sandbox.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -16,98 +15,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
 /* ── Helpers ──────────────────────────────────────────────────────────── */
 
-/* Read entire contents of a file into a static buffer. Returns "" on failure. */
-static const char *read_proc_file(const char *path,
-				  char *buf, size_t bufsz)
-{
-	buf[0] = '\0';
-	FILE *fp = fopen(path, "r");
-	if (!fp)
-		return buf;
-
-	size_t used = 0;
-	char line[512];
-	while (fgets(line, sizeof(line), fp)) {
-		size_t llen = strlen(line);
-		if (used + llen + 1 >= bufsz)
-			break;
-		memcpy(buf + used, line, llen);
-		used += llen;
-	}
-	buf[used] = '\0';
-	fclose(fp);
-	return buf;
-}
-
-/* Run a command and capture stdout. Caller must free result. */
-static char *fork_capture(const char *const argv[])
-{
-	int pipefd[2];
-	if (pipe(pipefd) < 0)
-		return NULL;
-
-	pid_t pid = fork();
-	if (pid < 0) {
-		close(pipefd[0]);
-		close(pipefd[1]);
-		return NULL;
-	}
-
-	if (pid == 0) {
-		close(pipefd[0]);
-		dup2(pipefd[1], STDOUT_FILENO);
-		dup2(pipefd[1], STDERR_FILENO);
-		close(pipefd[1]);
-		execvp(argv[0], (char *const *)argv);
-		_exit(127);
-	}
-
-	close(pipefd[1]);
-
-	size_t bufsz = 4096, used = 0;
-	char *buf = malloc(bufsz);
-	if (!buf) {
-		close(pipefd[0]);
-		waitpid(pid, NULL, 0);
-		return NULL;
-	}
-
-	ssize_t n;
-	char tmp[1024];
-	while ((n = read(pipefd[0], tmp, sizeof(tmp))) > 0) {
-		while (used + (size_t)n + 1 > bufsz) {
-			bufsz *= 2;
-			char *nb = realloc(buf, bufsz);
-			if (!nb) {
-				free(buf);
-				close(pipefd[0]);
-				waitpid(pid, NULL, 0);
-				return NULL;
-			}
-			buf = nb;
-		}
-		memcpy(buf + used, tmp, (size_t)n);
-		used += (size_t)n;
-	}
-	buf[used] = '\0';
-	close(pipefd[0]);
-	waitpid(pid, NULL, 0);
-	return buf;
-}
-
-/* Print IPC payload or fallback message */
-static void show_ipc_or_fallback(uint32_t cmd, const char *payload_str,
-				 const char *header,
-				 const char *const fallback_argv[])
+/* Print IPC response or error */
+static void show_ipc(uint32_t cmd, const char *payload_str,
+		     const char *header)
 {
 	struct ipc_response resp = {0};
-	if (ipc_available() &&
-	    ipc_send_str(cmd, payload_str, &resp) == 0 &&
+	if (ipc_send_str(cmd, payload_str, &resp) == 0 &&
 	    resp.status == SG_OK && resp.payload && resp.payload[0]) {
 		if (header)
 			printf("  %s\n", header);
@@ -117,16 +33,9 @@ static void show_ipc_or_fallback(uint32_t cmd, const char *payload_str,
 	}
 	ipc_resp_free(&resp);
 
-	/* Fallback */
 	if (header)
 		printf("  %s\n", header);
-	if (fallback_argv) {
-		char *out = fork_capture(fallback_argv);
-		if (out) {
-			printf("%s", out);
-			free(out);
-		}
-	}
+	printf("  (mgmtd unavailable)\n");
 }
 
 /* ── show status ──────────────────────────────────────────────────────── */
@@ -134,53 +43,29 @@ static void show_ipc_or_fallback(uint32_t cmd, const char *payload_str,
 void show_status(void)
 {
 	struct ipc_response resp = {0};
-	if (ipc_available() &&
-	    ipc_send_str(SG_CMD_SHOW_STATUS, "", &resp) == 0 &&
+	if (ipc_send_str(SG_CMD_SHOW_STATUS, "", &resp) == 0 &&
 	    resp.status == SG_OK && resp.payload && resp.payload[0]) {
 		printf("%s", resp.payload);
 		ipc_resp_free(&resp);
 		return;
 	}
 	ipc_resp_free(&resp);
-
-	/* Fallback: read /proc directly */
-	printf("  === Stargazer Status ===\n");
-
-	char modules[4096];
-	read_proc_file("/proc/modules", modules, sizeof(modules));
-	if (strstr(modules, "pkt_forward"))
-		printf("  Module pkt_forward: loaded\n");
-	else
-		printf("  Module pkt_forward: not loaded\n");
-	if (strstr(modules, "session"))
-		printf("  Module session:     loaded\n");
-	else
-		printf("  Module session:     not loaded\n");
-
-	char uptime[128];
-	read_proc_file("/proc/uptime", uptime, sizeof(uptime));
-	char *sp = strchr(uptime, ' ');
-	if (sp) *sp = '\0';
-	char *nl = strchr(uptime, '\n');
-	if (nl) *nl = '\0';
-	if (uptime[0])
-		printf("  Uptime: %ss\n", uptime);
+	printf("  (mgmtd unavailable — cannot show status)\n");
 }
 
 /* ── show sessions ────────────────────────────────────────────────────── */
 
 void show_sessions(void)
 {
-	FILE *fp = fopen("/proc/stargazer/sessions", "r");
-	if (fp) {
+	struct ipc_response resp = {0};
+	if (ipc_send_str(SG_CMD_SHOW_SESSIONS, "", &resp) == 0 &&
+	    resp.status == SG_OK && resp.payload && resp.payload[0]) {
 		printf("  === Active Sessions ===\n");
-		char line[512];
-		while (fgets(line, sizeof(line), fp))
-			printf("%s", line);
-		fclose(fp);
+		printf("%s", resp.payload);
 	} else {
 		printf("  Session tracking not available (module not loaded)\n");
 	}
+	ipc_resp_free(&resp);
 }
 
 /* ── show stats ───────────────────────────────────────────────────────── */
@@ -188,44 +73,21 @@ void show_sessions(void)
 void show_stats(void)
 {
 	printf("  === Packet Statistics ===\n");
-
-	struct ipc_response resp = {0};
-	if (ipc_available() &&
-	    ipc_send_str(SG_CMD_SHOW_STATS, "", &resp) == 0 &&
-	    resp.status == SG_OK && resp.payload && resp.payload[0]) {
-		printf("%s", resp.payload);
-		ipc_resp_free(&resp);
-		return;
-	}
-	ipc_resp_free(&resp);
-
-	/* Fallback: fork dmesg */
-	const char *argv[] = {"sh", "-c",
-		"dmesg 2>/dev/null | grep -i 'pkt_forward\\|forwarded\\|dropped' | tail -10",
-		NULL};
-	char *out = fork_capture(argv);
-	if (out) {
-		printf("%s", out);
-		free(out);
-	}
+	show_ipc(SG_CMD_SHOW_STATS, "", NULL);
 }
 
 /* ── show interfaces ──────────────────────────────────────────────────── */
 
 void show_interfaces(void)
 {
-	const char *fallback[] = {"ip", "-brief", "link", NULL};
-	show_ipc_or_fallback(SG_CMD_SHOW_IFACES, "",
-			     "=== Network Interfaces ===", fallback);
+	show_ipc(SG_CMD_SHOW_IFACES, "", "=== Network Interfaces ===");
 }
 
 /* ── show routes ──────────────────────────────────────────────────────── */
 
 void show_routes(void)
 {
-	const char *fallback[] = {"ip", "route", NULL};
-	show_ipc_or_fallback(SG_CMD_SHOW_ROUTES, "",
-			     "=== Routing Table ===", fallback);
+	show_ipc(SG_CMD_SHOW_ROUTES, "", "=== Routing Table ===");
 }
 
 /* Check whether a value should be quoted in FortiGate-style output. */
@@ -258,8 +120,7 @@ void show_configure(void)
 		if (mode == CFG_TABLE) {
 			/* Get list of IDs */
 			struct ipc_response lresp = {0};
-			if (!ipc_available() ||
-			    ipc_send_str(SG_CMD_CFG_LIST, type, &lresp) != 0 ||
+			if (ipc_send_str(SG_CMD_CFG_LIST, type, &lresp) != 0 ||
 			    lresp.status != SG_OK || !lresp.payload ||
 			    !lresp.payload[0]) {
 				ipc_resp_free(&lresp);
@@ -339,8 +200,7 @@ void show_configure(void)
 			struct ipc_response gresp = {0};
 			char section[256];
 			snprintf(section, sizeof(section), "%s", type);
-			if (!ipc_available() ||
-			    ipc_send_str(SG_CMD_CFG_GET, section, &gresp) != 0 ||
+			if (ipc_send_str(SG_CMD_CFG_GET, section, &gresp) != 0 ||
 			    gresp.status != SG_OK || !gresp.payload ||
 			    !gresp.payload[0]) {
 				ipc_resp_free(&gresp);
@@ -392,8 +252,7 @@ void show_configure(void)
 void show_firmware(void)
 {
 	struct ipc_response resp = {0};
-	if (ipc_available() &&
-	    ipc_send_str(SG_CMD_FW_STATUS, "", &resp) == 0 &&
+	if (ipc_send_str(SG_CMD_UPGRADE_STATUS, "", &resp) == 0 &&
 	    resp.status == SG_OK && resp.payload && resp.payload[0]) {
 		printf("%s", resp.payload);
 		ipc_resp_free(&resp);
@@ -415,27 +274,28 @@ void show_firmware(void)
 void show_config(void)
 {
 	printf("  === Stargazer Configuration ===\n");
-	printf("  Modules:\n");
 
-	FILE *fp = fopen("/etc/modules-load.d/stargazer.conf", "r");
-	if (fp) {
-		char line[256];
-		while (fgets(line, sizeof(line), fp))
-			printf("    %s", line);
-		fclose(fp);
-	}
+	struct ipc_response resp = {0};
+	if (ipc_send_str(SG_CMD_SHOW_BOOT_CONFIG, "", &resp) == 0 &&
+	    resp.status == SG_OK && resp.payload && resp.payload[0]) {
+		/* Parse [modules] and [sysctl] sections */
+		const char *p = resp.payload;
+		while (*p) {
+			const char *eol = strchr(p, '\n');
+			size_t llen = eol ? (size_t)(eol - p) : strlen(p);
 
-	printf("  Sysctl:\n");
-	fp = fopen("/etc/sysctl.d/10-stargazer.conf", "r");
-	if (fp) {
-		char line[256];
-		while (fgets(line, sizeof(line), fp)) {
-			/* Skip comments and empty lines */
-			if (line[0] == '#' || line[0] == '\n')
-				continue;
-			printf("    %s", line);
+			if (llen == 9 && strncmp(p, "[modules]", 9) == 0)
+				printf("  Modules:\n");
+			else if (llen == 8 && strncmp(p, "[sysctl]", 8) == 0)
+				printf("  Sysctl:\n");
+			else if (llen > 0)
+				printf("    %.*s\n", (int)llen, p);
+
+			if (!eol) break;
+			p = eol + 1;
 		}
-		fclose(fp);
+	} else {
+		printf("  (mgmtd unavailable — cannot show config)\n");
 	}
+	ipc_resp_free(&resp);
 }
-

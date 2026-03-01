@@ -27,7 +27,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -647,52 +646,62 @@ static void hist_add(const char *line)
 	}
 }
 
-void cli_hist_load(const char *file)
+/* ── IPC-based history (works inside sandbox) ─────────────────────────── */
+
+#include "cli_ipc.h"
+
+void cli_hist_load_ipc(void)
 {
-	FILE *fp;
-	char line[CLI_MAX_LINE];
-
-	if (!file || !file[0])
+	struct ipc_response resp = {0};
+	if (ipc_send_str(SG_CMD_HISTORY_LOAD, "", &resp) != 0 ||
+	    resp.status != SG_OK || !resp.payload) {
+		ipc_resp_free(&resp);
 		return;
-
-	fp = fopen(file, "r");
-	if (!fp)
-		return;
-
-	while (fgets(line, sizeof(line), fp)) {
-		size_t len = strlen(line);
-		while (len > 0 &&
-		       (line[len - 1] == '\n' || line[len - 1] == '\r')) {
-			line[len - 1] = '\0';
-			len--;
-		}
-		hist_add(line);
 	}
 
-	fclose(fp);
+	/* Parse lines from response */
+	char *p = resp.payload;
+	while (*p) {
+		char *nl = strchr(p, '\n');
+		if (nl) *nl = '\0';
+
+		size_t len = strlen(p);
+		while (len > 0 && (p[len - 1] == '\r'))
+			p[--len] = '\0';
+
+		if (len > 0)
+			hist_add(p);
+
+		if (!nl) break;
+		p = nl + 1;
+	}
+
+	ipc_resp_free(&resp);
 }
 
-void cli_hist_save(const char *file)
+void cli_hist_save_ipc(const char *username)
 {
-	char tmppath[CLI_MAX_LINE + 32];
-	FILE *fp;
-
-	if (!file || !file[0])
+	if (nhist == 0 || !username || !username[0])
 		return;
 
-	snprintf(tmppath, sizeof(tmppath), "%s.tmp.%d",
-		 file, (int)getpid());
-	fp = fopen(tmppath, "w");
-	if (!fp)
-		return;
+	/* Build payload: "user=<username>\n<line1>\n<line2>\n..." */
+	char payload[CLI_MAX_LINE * CLI_MAX_HIST + 256];
+	size_t pos = 0;
 
-	for (int i = 0; i < nhist; i++)
-		fprintf(fp, "%s\n", hist[i]);
+	int n = snprintf(payload, sizeof(payload), "user=%s\n", username);
+	if (n > 0)
+		pos = (size_t)n;
 
-	fclose(fp);
-	chmod(tmppath, 0600);
-	if (rename(tmppath, file) != 0)
-		unlink(tmppath);
+	for (int i = 0; i < nhist; i++) {
+		n = snprintf(payload + pos, sizeof(payload) - pos,
+			     "%s\n", hist[i]);
+		if (n > 0 && (size_t)n < sizeof(payload) - pos)
+			pos += (size_t)n;
+	}
+
+	struct ipc_response resp = {0};
+	ipc_send(SG_CMD_HISTORY_SAVE, payload, pos, &resp);
+	ipc_resp_free(&resp);
 }
 
 /* ── Abbreviation resolution ──────────────────────────────────────────── */

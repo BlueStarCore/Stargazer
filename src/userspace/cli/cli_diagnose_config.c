@@ -2537,8 +2537,6 @@ static void test_cmd_table_integrity(void)
 		 cmd_dispatch("execute debug disable extra", perms), 0);
 	tc_check("cmd-tbl", "execute debug reset blocked with extra",
 		 cmd_dispatch("execute debug reset extra", perms), 0);
-	tc_check("cmd-tbl", "execute diagnose top blocked with extra",
-		 cmd_dispatch("execute diagnose top extra", perms), 0);
 
 	/* Auto-usage prefix: 'show' alone prints subcommands, returns 0 */
 	tc_check("cmd-tbl", "show auto-usage (0 args, no handler)",
@@ -2583,6 +2581,12 @@ static void test_cmd_arg_limits(void)
 	/* execute debug option: max_args=2, reject at 3 */
 	tc_check("arg-lim", "debug option: 3 args blocked",
 		 cmd_dispatch("execute debug option timestamp on extra", perms), 0);
+
+	/* execute diagnose top: max_args=2, reject at 3
+	 * (within-limit dispatches to the interactive handler, so only
+	 * test the rejection path here) */
+	tc_check("arg-lim", "diagnose top: 3 args blocked",
+		 cmd_dispatch("execute diagnose top 1 20 extra", perms), 0);
 
 	/* execute diagnose resources: max_args=1, reject at 2 */
 	tc_check("arg-lim", "diagnose resources: 2 args blocked",

@@ -1008,9 +1008,98 @@ static void mgmtd_init_firewall(void)
 }
 
 /*
+ * scrub_config_entry — Validate every key=value line in a config entry.
+ *
+ * Strips unknown keys and cleans invalid values using sg_reg_scrub_value().
+ * Builds the scrubbed output in 'out'. Returns 1 if anything changed, 0 if clean.
+ */
+static int scrub_config_entry(const char *type, const char *id,
+                              const char *data, char *out, size_t outsz)
+{
+	int changed = 0;
+	size_t pos = 0;
+	const char *p = data;
+
+	while (*p) {
+		const char *eol = strchr(p, '\n');
+		size_t llen = eol ? (size_t)(eol - p) : strlen(p);
+
+		/* Skip empty lines */
+		if (llen == 0) {
+			p++;
+			continue;
+		}
+
+		/* Extract key=value */
+		char line[MAX_LINE];
+		if (llen >= sizeof(line)) llen = sizeof(line) - 1;
+		memcpy(line, p, llen);
+		line[llen] = '\0';
+
+		char *eq = strchr(line, '=');
+		if (!eq) {
+			/* Malformed line — skip */
+			p += llen;
+			if (eol) p++;
+			changed = 1;
+			continue;
+		}
+
+		*eq = '\0';
+		const char *key = line;
+		const char *val = eq + 1;
+
+		/* Internal metadata keys — preserve as-is, never scrub */
+		if (strcmp(key, "builtin") == 0) {
+			int n = snprintf(out + pos, outsz - pos,
+					 "%s=%s\n", key, val);
+			if (n > 0 && pos + (size_t)n < outsz)
+				pos += (size_t)n;
+			p += llen;
+			if (eol) p++;
+			continue;
+		}
+
+		/* Unknown key → strip */
+		if (!sg_reg_is_valid_key(type, key)) {
+			mgmt_log("INFO", "scrub %s:%s: stripped unknown key '%s'",
+				 type, id, key);
+			changed = 1;
+			p += llen;
+			if (eol) p++;
+			continue;
+		}
+
+		/* Validate and scrub value */
+		char clean_val[MAX_LINE];
+		int scrubbed = sg_reg_scrub_value(type, key, val,
+		                                  clean_val, sizeof(clean_val));
+		if (scrubbed) {
+			mgmt_log("INFO", "scrub %s:%s: '%s' cleaned '%s' -> '%s'",
+				 type, id, key, val, clean_val);
+			changed = 1;
+		}
+
+		const char *use_val = scrubbed ? clean_val : val;
+
+		/* Append key=value\n to output */
+		int n = snprintf(out + pos, outsz - pos, "%s=%s\n", key, use_val);
+		if (n > 0 && pos + (size_t)n < outsz)
+			pos += (size_t)n;
+
+		p += llen;
+		if (eol) p++;
+	}
+
+	out[pos] = '\0';
+	return changed;
+}
+
+/*
  * Replay saved configuration at boot.
  * Iterates through config types that have runtime apply handlers
  * and calls apply_config() for each entry.
+ * Scrubs invalid values before applying — survives version upgrades/downgrades.
  */
 static void mgmtd_replay_config(void)
 {
@@ -1025,8 +1114,17 @@ static void mgmtd_replay_config(void)
 	for (int i = 0; single_types[i]; i++) {
 		char *data = sg_db_get(single_types[i], "0");
 		if (data) {
+			char clean[SG_PAYLOAD_MAX];
+			int scrubbed = scrub_config_entry(single_types[i], "0",
+			                                  data, clean,
+			                                  sizeof(clean));
+			const char *use = scrubbed ? clean : data;
+
+			if (scrubbed)
+				sg_db_set(single_types[i], "0", clean);
+
 			sg_status_t rc = apply_config(single_types[i], "0",
-						      data, result,
+						      use, result,
 						      sizeof(result));
 			mgmt_log(rc == SG_OK ? "INFO" : "WARN",
 				 "replay %s: %s", single_types[i], result);
@@ -1071,8 +1169,17 @@ static void mgmtd_replay_config(void)
 
 			char *data = sg_db_get(table_types[i], id);
 			if (data) {
-				sg_status_t rc = apply_config(
+				char clean[SG_PAYLOAD_MAX];
+				int scrubbed = scrub_config_entry(
 					table_types[i], id, data,
+					clean, sizeof(clean));
+				const char *use = scrubbed ? clean : data;
+
+				if (scrubbed)
+					sg_db_set(table_types[i], id, clean);
+
+				sg_status_t rc = apply_config(
+					table_types[i], id, use,
 					result, sizeof(result));
 				mgmt_log(rc == SG_OK ? "INFO" : "WARN",
 					 "replay %s:%s: %s",
@@ -1140,38 +1247,6 @@ int session_rev_bump(const char *user)
 	int rev = session_rev_get(user);
 	session_rev_set(user, rev + 1);
 	return rev + 1;
-}
-
-/* ── System command helpers ─────────────────────────────────────────────── */
-
-/*
- * run_cmd: DEPRECATED — kept only for hardcoded status commands.
- * New code MUST use safe_exec() with argument arrays.
- */
-static char *run_cmd(const char *cmd)
-{
-	FILE *fp = popen(cmd, "r");
-	if (!fp) return NULL;
-
-	size_t bufsize = 4096, used = 0;
-	char *buf = malloc(bufsize);
-	if (!buf) { pclose(fp); return NULL; }
-
-	char line[1024];
-	while (fgets(line, sizeof(line), fp)) {
-		size_t llen = strlen(line);
-		while (used + llen + 1 > bufsize) {
-			bufsize *= 2;
-			char *nb = realloc(buf, bufsize);
-			if (!nb) { free(buf); pclose(fp); return NULL; }
-			buf = nb;
-		}
-		memcpy(buf + used, line, llen);
-		used += llen;
-	}
-	buf[used] = '\0';
-	pclose(fp);
-	return buf;
 }
 
 /* ── Apply config to running system ─────────────────────────────────────── */
@@ -2026,7 +2101,10 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 		sg_db_close();
 		/* Give time for response to be sent */
 		usleep(100000);
-		free(run_cmd("/sbin/poweroff"));
+		{
+			const char *argv[] = {"/sbin/poweroff", NULL};
+			free(safe_exec(argv));
+		}
 		return 0;
 	}
 
@@ -2041,29 +2119,62 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 		/* Close DB so /etc/stargazer can be cleanly unmounted */
 		sg_db_close();
 		usleep(100000);
-		free(run_cmd("/sbin/reboot"));
+		{
+			const char *argv[] = {"/sbin/reboot", NULL};
+			free(safe_exec(argv));
+		}
 		return 0;
 	}
 
-	/* ── Firmware (handlers in mgmtd_firmware.c) ──────────────────── */
-	case SG_CMD_FW_STATUS:
-		return handle_fw_status(client_fd, user, payload, hdr);
-	case SG_CMD_FW_UPGRADE:
-		return handle_fw_upgrade(client_fd, user, payload, hdr);
-	case SG_CMD_FW_PROGRESS:
-		return handle_fw_progress(client_fd, user, payload, hdr);
+	/* ── Firmware upgrade (handlers in mgmtd_firmware.c) ──────────── */
+	case SG_CMD_UPGRADE_STATUS:
+		return handle_upgrade_status(client_fd, user, payload, hdr);
+	case SG_CMD_UPGRADE_START:
+		return handle_upgrade_start(client_fd, user, payload, hdr);
+	case SG_CMD_UPGRADE_PROGRESS:
+		return handle_upgrade_progress(client_fd, user, payload, hdr);
+	case SG_CMD_UPGRADE_CANCEL:
+		return handle_upgrade_cancel(client_fd, user, payload, hdr);
 
 	case SG_CMD_SHOW_STATUS: {
-		char *out = run_cmd(
-			"echo '=== Stargazer Status ===';"
-			"if lsmod 2>/dev/null | grep -q pkt_forward; then"
-			"  echo 'Module pkt_forward: loaded';"
-			"else"
-			"  echo 'Module pkt_forward: not loaded';"
-			"fi;"
-			"echo \"Uptime: $(cut -d' ' -f1 /proc/uptime 2>/dev/null)s\"");
-		send_ok(client_fd, NULL, out ? out : "");
-		free(out);
+		char status_buf[512];
+		size_t spos = 0;
+		int n;
+
+		n = snprintf(status_buf, sizeof(status_buf),
+			     "=== Stargazer Status ===\n");
+		if (n > 0) spos += (size_t)n;
+
+		/* Check if pkt_forward module is loaded */
+		const char *lsmod_argv[] = {"lsmod", NULL};
+		char *lsmod_out = safe_exec(lsmod_argv);
+		const char *mod_status = "not loaded";
+		if (lsmod_out && strstr(lsmod_out, "pkt_forward"))
+			mod_status = "loaded";
+		n = snprintf(status_buf + spos, sizeof(status_buf) - spos,
+			     "Module pkt_forward: %s\n", mod_status);
+		if (n > 0 && (size_t)n < sizeof(status_buf) - spos)
+			spos += (size_t)n;
+		free(lsmod_out);
+
+		/* Read uptime from /proc */
+		FILE *fp = fopen("/proc/uptime", "r");
+		if (fp) {
+			char uptbuf[64] = {0};
+			if (fgets(uptbuf, sizeof(uptbuf), fp)) {
+				/* First field is seconds */
+				char *sp = strchr(uptbuf, ' ');
+				if (sp) *sp = '\0';
+				n = snprintf(status_buf + spos,
+					     sizeof(status_buf) - spos,
+					     "Uptime: %ss\n", uptbuf);
+				if (n > 0 && (size_t)n < sizeof(status_buf) - spos)
+					spos += (size_t)n;
+			}
+			fclose(fp);
+		}
+
+		send_ok(client_fd, NULL, status_buf);
 		return 0;
 	}
 
@@ -2075,17 +2186,62 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 	}
 
 	case SG_CMD_SHOW_ROUTES: {
-		char *out = run_cmd("ip route 2>/dev/null || route -n 2>/dev/null");
+		const char *argv[] = {"ip", "route", NULL};
+		char *out = safe_exec(argv);
 		send_ok(client_fd, NULL, out ? out : "");
 		free(out);
 		return 0;
 	}
 
 	case SG_CMD_SHOW_STATS: {
-		char *out = run_cmd(
-			"dmesg 2>/dev/null | grep -i 'pkt_forward\\|forwarded\\|dropped' | tail -20");
-		send_ok(client_fd, NULL, out ? out : "");
-		free(out);
+		const char *argv[] = {"dmesg", NULL};
+		char *raw = safe_exec(argv);
+		if (!raw || !raw[0]) {
+			send_ok(client_fd, NULL, raw ? raw : "");
+			free(raw);
+			return 0;
+		}
+
+		/* Filter lines matching pkt_forward/forwarded/dropped,
+		 * keep last 20 matching lines (replaces grep|tail pipeline).
+		 * Circular buffer of (start, len) pairs. */
+		struct { const char *s; size_t len; } ring[20];
+		int nmatches = 0;
+		const char *p = raw;
+		while (*p) {
+			const char *eol = strchr(p, '\n');
+			size_t llen = eol ? (size_t)(eol - p) : strlen(p);
+			/* Case-insensitive match within the line */
+			if (memmem(p, llen, "pkt_forward", 11) ||
+			    memmem(p, llen, "forwarded", 9) ||
+			    memmem(p, llen, "dropped", 7) ||
+			    memmem(p, llen, "Forwarded", 9) ||
+			    memmem(p, llen, "Dropped", 7)) {
+				ring[nmatches % 20].s = p;
+				ring[nmatches % 20].len = llen;
+				nmatches++;
+			}
+			if (!eol) break;
+			p = eol + 1;
+		}
+
+		/* Build output from ring buffer */
+		char buf[4096];
+		size_t used = 0;
+		int count = nmatches < 20 ? nmatches : 20;
+		int start = nmatches <= 20 ? 0 : nmatches % 20;
+		for (int i = 0; i < count && used < sizeof(buf) - 2; i++) {
+			int idx = (start + i) % 20;
+			size_t llen = ring[idx].len;
+			if (used + llen + 2 > sizeof(buf))
+				llen = sizeof(buf) - used - 2;
+			memcpy(buf + used, ring[idx].s, llen);
+			used += llen;
+			buf[used++] = '\n';
+		}
+		buf[used] = '\0';
+		send_ok(client_fd, NULL, buf);
+		free(raw);
 		return 0;
 	}
 
@@ -2120,6 +2276,13 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 	/* ── Firewall/routing diagnostics ─────────────────────────────── */
 
 	case SG_CMD_DIAG_FW_IPTABLES: {
+		const char *perms = get_user_permissions(user);
+		if (!has_permission(perms, "monitor")) {
+			mgmt_log("WARN", "user '%s' denied FW_IPTABLES (no monitor perm)", user);
+			send_error(client_fd, SG_ERR_PERM_DENIED,
+				   "Requires 'monitor' permission");
+			return 0;
+		}
 		/* Extract table from payload (default "filter") */
 		char table[16] = "filter";
 		if (payload && payload[0])
@@ -2148,6 +2311,13 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 	}
 
 	case SG_CMD_DIAG_FW_POLICY: {
+		const char *perms = get_user_permissions(user);
+		if (!has_permission(perms, "monitor")) {
+			mgmt_log("WARN", "user '%s' denied FW_POLICY (no monitor perm)", user);
+			send_error(client_fd, SG_ERR_PERM_DENIED,
+				   "Requires 'monitor' permission");
+			return 0;
+		}
 		const char *argv[] = {
 			"iptables", "-L", "INPUT", "-n", "-v", NULL
 		};
@@ -2163,6 +2333,13 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 	}
 
 	case SG_CMD_DIAG_FW_CONNTRACK: {
+		const char *perms = get_user_permissions(user);
+		if (!has_permission(perms, "monitor")) {
+			mgmt_log("WARN", "user '%s' denied FW_CONNTRACK (no monitor perm)", user);
+			send_error(client_fd, SG_ERR_PERM_DENIED,
+				   "Requires 'monitor' permission");
+			return 0;
+		}
 		/* Read /proc/net/nf_conntrack directly (zero fork) */
 		FILE *fp = fopen("/proc/net/nf_conntrack", "r");
 		if (!fp) {
@@ -2204,6 +2381,13 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 	}
 
 	case SG_CMD_DIAG_ROUTES: {
+		const char *perms = get_user_permissions(user);
+		if (!has_permission(perms, "monitor")) {
+			mgmt_log("WARN", "user '%s' denied DIAG_ROUTES (no monitor perm)", user);
+			send_error(client_fd, SG_ERR_PERM_DENIED,
+				   "Requires 'monitor' permission");
+			return 0;
+		}
 		const char *argv4[] = {"ip", "-4", "route", NULL};
 		const char *argv6[] = {"ip", "-6", "route", NULL};
 		char *out4 = safe_exec(argv4);
@@ -2250,9 +2434,42 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 	case SG_CMD_NET_ARPING:
 		return handle_net_arping(client_fd, user, payload, hdr);
 
+	/* ── System diagnostics (handlers in mgmtd_diag.c) ───────────── */
+	case SG_CMD_DIAG_CPU:
+		return handle_diag_cpu(client_fd, user, payload, hdr);
+	case SG_CMD_DIAG_RAM:
+		return handle_diag_ram(client_fd, user, payload, hdr);
+	case SG_CMD_DIAG_DISK:
+		return handle_diag_disk(client_fd, user, payload, hdr);
+	case SG_CMD_DIAG_IFACE_STATS:
+		return handle_diag_iface_stats(client_fd, user, payload, hdr);
+	case SG_CMD_DIAG_PROCTOP:
+		return handle_diag_proctop(client_fd, user, payload, hdr);
+	case SG_CMD_DIAG_THERMAL:
+		return handle_diag_thermal(client_fd, user, payload, hdr);
+
+	case SG_CMD_SHOW_SESSIONS:
+		return handle_show_sessions(client_fd, user, payload, hdr);
+	case SG_CMD_SHOW_BOOT_CONFIG:
+		return handle_show_boot_config(client_fd, user, payload, hdr);
+
+	case SG_CMD_DEBUG_STATE_GET:
+		return handle_debug_state_get(client_fd, user, payload, hdr);
+	case SG_CMD_DEBUG_STATE_SET:
+		return handle_debug_state_set(client_fd, user, payload, hdr);
+	case SG_CMD_DEBUG_STATE_RESET:
+		return handle_debug_state_reset(client_fd, user, payload, hdr);
+	case SG_CMD_HISTORY_SAVE:
+		return handle_history_save(client_fd, user, payload, hdr);
+	case SG_CMD_HISTORY_LOAD:
+		return handle_history_load(client_fd, user, payload, hdr);
+
 	case SG_CMD_PING:
 		send_ok(client_fd, "pong", NULL);
 		return 0;
+
+	case SG_CMD_UPGRADE_TEST_SETUP:
+		return handle_upgrade_test_setup(client_fd, user, payload, hdr);
 
 	case SG_CMD_DEBUG_FETCH: {
 		if (debug_buf_used > 0) {
@@ -2328,8 +2545,10 @@ int main(void)
 
 	mgmt_log("INFO", "stargazer-mgmtd started, listening on %s", SG_MGMTD_SOCK);
 
-	/* Ensure config directory exists */
-	mkdir(CONF_DIR, 0755);
+	/* Ensure config directory exists with restricted permissions.
+	 * mgmtd is now the sole accessor — CLI reads via IPC only. */
+	mkdir(CONF_DIR, 0700);
+	chmod(CONF_DIR, 0700);
 
 	/* Open SQLite database */
 	if (sg_db_open(SG_DB_PATH) != 0) {
@@ -2337,6 +2556,11 @@ int main(void)
 		close(sfd);
 		return 1;
 	}
+
+	/* Harden file permissions — mgmtd is the sole file accessor */
+	chmod(SG_DB_PATH, 0600);
+	chmod(AUDIT_LOG, 0600);
+	chmod(SESSION_REV_FILE, 0600);
 
 	/* Seed defaults on first boot (no-op if already seeded) */
 	mgmtd_seed_defaults();

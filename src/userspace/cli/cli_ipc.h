@@ -46,6 +46,7 @@ void ipc_set_interrupt_fd(int fd);
 void ipc_install_interrupt_handler(void);
 void ipc_restore_interrupt_handler(void);
 int  ipc_stream_interrupted(void);
+void ipc_clear_interrupt(void);
 
 /* Check for 'q'/'Q' or Ctrl+C on the tty (for interactive monitors).
  * Unlike ipc_stream_interrupted() which only handles Ctrl+C, this also

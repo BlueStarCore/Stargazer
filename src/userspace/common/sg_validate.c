@@ -947,3 +947,105 @@ sg_reg_validate_entry_id(const char *type_name, const char *id)
 	/* safe-id */
 	return sg_is_safe_id(id);
 }
+
+/* ── Config scrub helpers ────────────────────────────────────────────────── */
+
+const char *
+sg_reg_field_default(const char *type_name, const char *key)
+{
+	if (!type_name || !key)
+		return NULL;
+	for (const struct field_entry *f = field_table; f->type; f++) {
+		if (strcmp(f->type, type_name) == 0 &&
+		    strcmp(f->key, key) == 0)
+			return f->defval;
+	}
+	return NULL;
+}
+
+int
+sg_reg_scrub_value(const char *type, const char *key, const char *val,
+                   char *out, size_t outsz)
+{
+	if (!type || !key || !val || !out || outsz == 0)
+		return 0;
+
+	out[0] = '\0';
+
+	/* If the whole value already validates, keep it unchanged */
+	if (sg_reg_validate_value(type, key, val)) {
+		size_t vlen = strlen(val);
+		if (vlen >= outsz)
+			vlen = outsz - 1;
+		memcpy(out, val, vlen);
+		out[vlen] = '\0';
+		return 0;
+	}
+
+	const char *kind = sg_reg_value_kind(type, key);
+
+	/* access-services: space-separated, keep individually valid tokens */
+	if (strcmp(kind, "access-services") == 0) {
+		size_t vlen = strlen(val);
+		if (vlen > 256) vlen = 256;
+		char buf[257];
+		memcpy(buf, val, vlen);
+		buf[vlen] = '\0';
+
+		size_t pos = 0;
+		char *saveptr = NULL;
+		char *tok = strtok_r(buf, " ", &saveptr);
+		while (tok) {
+			if (sg_is_access_services(tok)) {
+				if (pos > 0 && pos < outsz - 1)
+					out[pos++] = ' ';
+				size_t tlen = strlen(tok);
+				if (pos + tlen < outsz) {
+					memcpy(out + pos, tok, tlen);
+					pos += tlen;
+				}
+			}
+			tok = strtok_r(NULL, " ", &saveptr);
+		}
+		out[pos] = '\0';
+		return 1;
+	}
+
+	/* permissions-csv: comma-separated, keep individually valid tokens */
+	if (strcmp(kind, "permissions-csv") == 0) {
+		size_t vlen = strlen(val);
+		if (vlen > 256) vlen = 256;
+		char buf[257];
+		memcpy(buf, val, vlen);
+		buf[vlen] = '\0';
+
+		size_t pos = 0;
+		char *saveptr = NULL;
+		char *tok = strtok_r(buf, ",", &saveptr);
+		while (tok) {
+			if (sg_is_permissions_csv(tok)) {
+				if (pos > 0 && pos < outsz - 1)
+					out[pos++] = ',';
+				size_t tlen = strlen(tok);
+				if (pos + tlen < outsz) {
+					memcpy(out + pos, tok, tlen);
+					pos += tlen;
+				}
+			}
+			tok = strtok_r(NULL, ",", &saveptr);
+		}
+		out[pos] = '\0';
+		return 1;
+	}
+
+	/* All other kinds: reset to field default (or empty) */
+	const char *def = sg_reg_field_default(type, key);
+	if (def) {
+		size_t dlen = strlen(def);
+		if (dlen >= outsz)
+			dlen = outsz - 1;
+		memcpy(out, def, dlen);
+		out[dlen] = '\0';
+	}
+	return 1;
+}

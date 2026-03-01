@@ -96,14 +96,18 @@ int handle_admin_check_pw(int client_fd, const char *user,
 int handle_admin_lock_pw(int client_fd, const char *user,
 			 const char *payload, const sg_request_hdr_t *hdr);
 
-/* ── Firmware handlers (defined in mgmtd_firmware.c) ─────────────────────── */
+/* ── Firmware upgrade handlers (defined in mgmtd_firmware.c) ──────────────── */
 
-int handle_fw_status(int client_fd, const char *user,
-		     const char *payload, const sg_request_hdr_t *hdr);
-int handle_fw_upgrade(int client_fd, const char *user,
-		      const char *payload, const sg_request_hdr_t *hdr);
-int handle_fw_progress(int client_fd, const char *user,
-		       const char *payload, const sg_request_hdr_t *hdr);
+int handle_upgrade_status(int client_fd, const char *user,
+			  const char *payload, const sg_request_hdr_t *hdr);
+int handle_upgrade_start(int client_fd, const char *user,
+			 const char *payload, const sg_request_hdr_t *hdr);
+int handle_upgrade_progress(int client_fd, const char *user,
+			    const char *payload, const sg_request_hdr_t *hdr);
+int handle_upgrade_cancel(int client_fd, const char *user,
+			  const char *payload, const sg_request_hdr_t *hdr);
+int handle_upgrade_test_setup(int client_fd, const char *user,
+			      const char *payload, const sg_request_hdr_t *hdr);
 
 /* ── Network diagnostic handlers (defined in mgmtd_network.c) ────────────── */
 
@@ -115,5 +119,34 @@ int handle_net_nslookup(int client_fd, const char *user,
 			const char *payload, const sg_request_hdr_t *hdr);
 int handle_net_arping(int client_fd, const char *user,
 		      const char *payload, const sg_request_hdr_t *hdr);
+
+/* ── System diagnostics handlers (defined in mgmtd_diag.c) ───────────────── */
+
+int handle_diag_cpu(int client_fd, const char *user,
+		    const char *payload, const sg_request_hdr_t *hdr);
+int handle_diag_ram(int client_fd, const char *user,
+		    const char *payload, const sg_request_hdr_t *hdr);
+int handle_diag_disk(int client_fd, const char *user,
+		     const char *payload, const sg_request_hdr_t *hdr);
+int handle_diag_iface_stats(int client_fd, const char *user,
+			    const char *payload, const sg_request_hdr_t *hdr);
+int handle_diag_proctop(int client_fd, const char *user,
+			const char *payload, const sg_request_hdr_t *hdr);
+int handle_diag_thermal(int client_fd, const char *user,
+			const char *payload, const sg_request_hdr_t *hdr);
+int handle_show_sessions(int client_fd, const char *user,
+			 const char *payload, const sg_request_hdr_t *hdr);
+int handle_show_boot_config(int client_fd, const char *user,
+			    const char *payload, const sg_request_hdr_t *hdr);
+int handle_debug_state_get(int client_fd, const char *user,
+			   const char *payload, const sg_request_hdr_t *hdr);
+int handle_debug_state_set(int client_fd, const char *user,
+			   const char *payload, const sg_request_hdr_t *hdr);
+int handle_debug_state_reset(int client_fd, const char *user,
+			     const char *payload, const sg_request_hdr_t *hdr);
+int handle_history_save(int client_fd, const char *user,
+			const char *payload, const sg_request_hdr_t *hdr);
+int handle_history_load(int client_fd, const char *user,
+			const char *payload, const sg_request_hdr_t *hdr);
 
 #endif /* MGMTD_INTERNAL_H */

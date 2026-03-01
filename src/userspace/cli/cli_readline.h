@@ -56,8 +56,8 @@ int cli_resolve_cmd(const char *input, char *output, size_t out_sz);
 /* Return the terminal fd used by readline (-1 if not initialized). */
 int cli_get_tty_fd(void);
 
-/* History management. */
-void cli_hist_load(const char *file);
-void cli_hist_save(const char *file);
+/* History via IPC (works inside sandbox). */
+void cli_hist_load_ipc(void);
+void cli_hist_save_ipc(const char *username);
 
 #endif /* CLI_READLINE_H */

@@ -5,22 +5,20 @@
  * C replacement for the debug subtree of cmd_execute.
  *
  * Primary state is in-memory (fast, no I/O per check).
- * Secondary persistence to /tmp/stargazer-debug.conf so state
- * survives across CLI sessions (best-effort — works when /tmp
- * is writable, silently degrades otherwise).
+ * Secondary persistence through mgmtd IPC (SG_CMD_DEBUG_STATE_*).
+ * No direct file I/O — works in the seccomp sandbox.
  */
 
 #define _POSIX_C_SOURCE 200809L
 
 #include "cli_debug.h"
+#include "cli_ipc.h"
 #include "sg_validate.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
-#define DEBUG_STATE_FILE "/tmp/stargazer-debug.conf"
 #define MAX_STATE_KEYS   32
 #define MAX_KEY_LEN      64
 #define MAX_VAL_LEN      64
@@ -34,39 +32,64 @@ struct dbg_entry {
 
 static struct dbg_entry mem_state[MAX_STATE_KEYS];
 static int mem_count;
-static int mem_loaded; /* 1 after first file load attempt */
+static int mem_loaded; /* 1 after first load attempt */
 
-/* Try to load state from file (once, on first access) */
+/*
+ * Load state via IPC (once, on first access).
+ *
+ * Safe from deadlock because ipc_send() computes debug flags
+ * BEFORE connect() — so this inner IPC completes fully before
+ * the outer connection is established.
+ *
+ * Call chain: ipc_send(X) → dbg_enabled() → mem_load_once()
+ *   → ipc_send(DEBUG_STATE_GET) → dbg_enabled() → mem_loaded=1 → return
+ *   → inner IPC completes → outer ipc_send(X) continues
+ */
 static void mem_load_once(void)
 {
 	if (mem_loaded)
 		return;
 	mem_loaded = 1;
 
-	FILE *fp = fopen(DEBUG_STATE_FILE, "r");
-	if (!fp)
+	struct ipc_response resp = {0};
+	if (ipc_send_str(SG_CMD_DEBUG_STATE_GET, "", &resp) != 0 ||
+	    resp.status != SG_OK || !resp.payload) {
+		ipc_resp_free(&resp);
 		return;
+	}
 
-	char line[128];
-	while (fgets(line, sizeof(line), fp) && mem_count < MAX_STATE_KEYS) {
-		char *eq = strchr(line, '=');
-		if (!eq) continue;
-		size_t klen = (size_t)(eq - line);
-		if (klen == 0 || klen >= MAX_KEY_LEN) continue;
+	/* Parse key=value lines from mgmtd response */
+	const char *p = resp.payload;
+	while (*p && mem_count < MAX_STATE_KEYS) {
+		const char *eq = strchr(p, '=');
+		const char *nl = strchr(p, '\n');
+		if (!eq || (nl && eq > nl)) {
+			if (!nl) break;
+			p = nl + 1;
+			continue;
+		}
 
-		memcpy(mem_state[mem_count].key, line, klen);
+		size_t klen = (size_t)(eq - p);
+		if (klen == 0 || klen >= MAX_KEY_LEN) {
+			if (!nl) break;
+			p = nl + 1;
+			continue;
+		}
+
+		memcpy(mem_state[mem_count].key, p, klen);
 		mem_state[mem_count].key[klen] = '\0';
 
 		const char *v = eq + 1;
-		size_t vlen = strlen(v);
-		if (vlen > 0 && v[vlen - 1] == '\n') vlen--;
+		size_t vlen = nl ? (size_t)(nl - v) : strlen(v);
 		if (vlen >= MAX_VAL_LEN) vlen = MAX_VAL_LEN - 1;
 		memcpy(mem_state[mem_count].val, v, vlen);
 		mem_state[mem_count].val[vlen] = '\0';
 
 		mem_count++;
+		if (!nl) break;
+		p = nl + 1;
 	}
-	fclose(fp);
+	ipc_resp_free(&resp);
 }
 
 /* Lookup key in memory */
@@ -95,21 +118,23 @@ static void mem_set(const char *key, const char *val)
 	}
 }
 
-/* Persist in-memory state to file (best-effort) */
+/* Persist in-memory state via mgmtd IPC */
 static void mem_persist(void)
 {
-	char tmppath[128];
-	snprintf(tmppath, sizeof(tmppath), "%s.tmp.%d",
-		 DEBUG_STATE_FILE, (int)getpid());
+	/* Build key=value payload */
+	char payload[4096];
+	size_t pos = 0;
+	for (int i = 0; i < mem_count; i++) {
+		int n = snprintf(payload + pos, sizeof(payload) - pos,
+				 "%s=%s\n", mem_state[i].key,
+				 mem_state[i].val);
+		if (n > 0 && (size_t)n < sizeof(payload) - pos)
+			pos += (size_t)n;
+	}
 
-	FILE *fp = fopen(tmppath, "w");
-	if (!fp)
-		return;
-	for (int i = 0; i < mem_count; i++)
-		fprintf(fp, "%s=%s\n", mem_state[i].key, mem_state[i].val);
-	fclose(fp);
-	if (rename(tmppath, DEBUG_STATE_FILE) != 0)
-		unlink(tmppath);
+	struct ipc_response resp = {0};
+	ipc_send_str(SG_CMD_DEBUG_STATE_SET, payload, &resp);
+	ipc_resp_free(&resp);
 }
 
 /* ── Public API ───────────────────────────────────────────────────────── */
@@ -131,8 +156,11 @@ void dbg_set(const char *key, const char *val)
 void dbg_reset(void)
 {
 	mem_count = 0;
-	mem_loaded = 1; /* don't reload stale file */
-	unlink(DEBUG_STATE_FILE);
+	mem_loaded = 1; /* don't reload stale data */
+
+	struct ipc_response resp = {0};
+	ipc_send_str(SG_CMD_DEBUG_STATE_RESET, "", &resp);
+	ipc_resp_free(&resp);
 }
 
 int dbg_enabled(void)

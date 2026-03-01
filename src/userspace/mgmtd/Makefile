@@ -29,7 +29,7 @@ $(BUILD_DIR)/sqlite3.o: sqlite3.c sqlite3.h
 MGMTD_APPLY_SRCS := mgmtd_apply_route.c mgmtd_apply_iface.c \
                      mgmtd_apply_nat.c mgmtd_apply_dns.c mgmtd_apply_dhcp.c
 
-MGMTD_SRCS := mgmtd_user.c mgmtd_firmware.c mgmtd_network.c
+MGMTD_SRCS := mgmtd_user.c mgmtd_firmware.c mgmtd_network.c mgmtd_diag.c
 
 $(BUILD_DIR)/stargazer-mgmtd: stargazer-mgmtd.c stargazer_ipc.h mgmtd_apply.h \
                                mgmtd_internal.h \

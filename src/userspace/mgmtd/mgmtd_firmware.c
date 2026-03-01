@@ -5,7 +5,13 @@
  * Extracted from stargazer-mgmtd.c to keep the monolith manageable.
  * Contains:
  *   - Firmware state file management
- *   - FW_STATUS, FW_UPGRADE, FW_PROGRESS handlers
+ *   - UPGRADE_STATUS, UPGRADE_START, UPGRADE_PROGRESS, UPGRADE_CANCEL handlers
+ *
+ * Cancel mechanism:
+ *   The parent process creates /tmp/sg-fw-cancel when it receives
+ *   SG_CMD_UPGRADE_CANCEL.  The child process checks for this file
+ *   at natural checkpoints (between steps 1-4, and inside the download
+ *   poll loop).  Steps 5+ are past the point of no return.
  */
 
 #define _GNU_SOURCE
@@ -28,11 +34,12 @@
 
 #define FW_STATE_FILE     "/tmp/sg-fw-upgrade.state"
 #define FW_STATE_FILE_TMP "/tmp/sg-fw-upgrade.state.tmp"
+#define FW_CANCEL_FILE    "/tmp/sg-fw-cancel"
 
 /*
  * Write firmware upgrade progress to state file atomically.
  * The child process calls this at each step so the parent (serving
- * FW_PROGRESS polls) always reads a complete, consistent file.
+ * UPGRADE_PROGRESS polls) always reads a complete, consistent file.
  *
  * A step history log is appended after a "---" separator so the CLI
  * can print all steps even if polling missed some (fast steps).
@@ -63,6 +70,7 @@ static void fw_write_state(int step, int total, const char *status,
 	FILE *fp = fopen(FW_STATE_FILE_TMP, "w");
 	if (!fp)
 		return;
+	fchmod(fileno(fp), 0600);
 	fprintf(fp, "step=%d\ntotal=%d\nstatus=%s\nmessage=%s\nversion=%s\n",
 		step, total, status, message, version ? version : "");
 	/* Append step history log after separator */
@@ -105,13 +113,52 @@ static void fw_run_cmd_ignore(const char *cmd)
 	free(fw_run_cmd(cmd));
 }
 
+/* ── Cancel check (child process only) ───────────────────────────────────── */
+
+/*
+ * fw_cancel_cleanup — clean up temp files and optionally unmount boot.
+ * Called by fw_check_cancel() when cancel is detected.
+ */
+static void fw_cancel_cleanup(int boot_mounted)
+{
+	if (boot_mounted)
+		fw_run_cmd_ignore("umount /tmp/sg-fw-boot 2>/dev/null");
+	fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged /tmp/sg-fw-boot");
+	unlink(FW_CANCEL_FILE);
+}
+
+/*
+ * fw_check_cancel — check if the cancel flag file exists.
+ *
+ * If cancelled: writes "cancelled" state, cleans up, closes DB, and
+ * calls _exit(1).  Does NOT return in that case.
+ *
+ * If not cancelled: returns 0.
+ *
+ * boot_mounted: set to 1 if boot partition is currently mounted.
+ */
+static int fw_check_cancel(int boot_mounted)
+{
+	if (access(FW_CANCEL_FILE, F_OK) != 0)
+		return 0;
+
+	mgmt_log("INFO", "firmware upgrade cancelled by user");
+	fw_write_state(0, 6, "cancelled",
+		       "Firmware upgrade cancelled by user.", "");
+	fw_cancel_cleanup(boot_mounted);
+	sg_db_close();
+	_exit(1);
+	/* NOTREACHED */
+	return 1;
+}
+
 /* ── Firmware handlers ───────────────────────────────────────────────────── */
 
-/* g_listen_fd is needed by the FW_UPGRADE child to close the listen socket */
+/* g_listen_fd is needed by the UPGRADE_START child to close the listen socket */
 extern int g_listen_fd;
 
-int handle_fw_status(int client_fd, const char *user,
-		     const char *payload, const sg_request_hdr_t *hdr)
+int handle_upgrade_status(int client_fd, const char *user,
+			  const char *payload, const sg_request_hdr_t *hdr)
 {
 	(void)user; (void)payload; (void)hdr;
 	char result[2048];
@@ -186,8 +233,8 @@ int handle_fw_status(int client_fd, const char *user,
 	return 0;
 }
 
-int handle_fw_upgrade(int client_fd, const char *user,
-		      const char *payload, const sg_request_hdr_t *hdr)
+int handle_upgrade_start(int client_fd, const char *user,
+			 const char *payload, const sg_request_hdr_t *hdr)
 {
 	const char *perms = get_user_permissions(user);
 	if (!has_permission(perms, "admin")) {
@@ -232,6 +279,9 @@ int handle_fw_upgrade(int client_fd, const char *user,
 			}
 		}
 	}
+
+	/* Clear any stale cancel flag from a previous run */
+	unlink(FW_CANCEL_FILE);
 
 	/* Reset step log state for fresh upgrade */
 	fw_steps_log[0] = '\0';
@@ -413,6 +463,19 @@ int handle_fw_upgrade(int client_fd, const char *user,
 		int wret = waitpid(dl_pid, &dl_status, WNOHANG);
 		if (wret != 0)
 			break;
+
+		/* Cancel check during download — kill the download child */
+		if (access(FW_CANCEL_FILE, F_OK) == 0) {
+			kill(dl_pid, SIGTERM);
+			waitpid(dl_pid, NULL, 0);
+			mgmt_log("INFO", "firmware upgrade cancelled during download");
+			fw_write_state(0, 6, "cancelled",
+				       "Firmware upgrade cancelled by user.", "");
+			fw_cancel_cleanup(0);
+			sg_db_close();
+			_exit(1);
+		}
+
 		struct stat st;
 		long kb = 0;
 		if (stat(FW_DL_FILE, &st) == 0)
@@ -482,6 +545,9 @@ int handle_fw_upgrade(int client_fd, const char *user,
 		fw_write_state(1, 6, "running", msg, "");
 	}
 
+	/* Cancel check: before step 2 */
+	fw_check_cancel(0);
+
 	/* Step 2: Extract firmware package */
 	fw_write_state(2, 6, "running", "Extracting firmware package...", "");
 	char *exout = fw_run_cmd("tar -xzf /tmp/sg-fw-download/firmware.tar.gz "
@@ -521,6 +587,9 @@ int handle_fw_upgrade(int client_fd, const char *user,
 		_exit(1);
 	}
 
+	/* Cancel check: before step 3 */
+	fw_check_cancel(0);
+
 	/* Step 3: Verify checksums */
 	fw_write_state(3, 6, "running", "Verifying checksums...", "");
 	char *ksum = fw_run_cmd("sha256sum /tmp/sg-fw-staged/kernel 2>/dev/null "
@@ -551,6 +620,9 @@ int handle_fw_upgrade(int client_fd, const char *user,
 	free(isum);
 
 	mgmt_log("INFO", "firmware v%s verified, installing...", fw_version);
+
+	/* Cancel check: before step 4 */
+	fw_check_cancel(0);
 
 	/* Step 4: Find and mount boot partition */
 	fw_write_state(4, 6, "running", "Mounting boot partition...", "");
@@ -633,11 +705,17 @@ int handle_fw_upgrade(int client_fd, const char *user,
 	}
 	free(mpcheck);
 
+	/* Last cancel checkpoint — boot partition is mounted but files
+	 * are not yet touched.  After this point we are committed. */
+	fw_check_cancel(1);
+
 	/* Log boot partition space before install */
 	char *df_before = fw_run_cmd("df -h /tmp/sg-fw-boot 2>/dev/null | tail -1");
 	mgmt_log("INFO", "boot partition before install: %s",
 		 df_before ? df_before : "(unknown)");
 	free(df_before);
+
+	/* ── Point of no return ── Steps 5 and 6 run to completion ── */
 
 	/* Remove existing files to free space (64MB partition can't
 	 * hold old + new simultaneously with a ~44MB kernel) */
@@ -732,8 +810,8 @@ int handle_fw_upgrade(int client_fd, const char *user,
 	_exit(0);
 }
 
-int handle_fw_progress(int client_fd, const char *user,
-		       const char *payload, const sg_request_hdr_t *hdr)
+int handle_upgrade_progress(int client_fd, const char *user,
+			    const char *payload, const sg_request_hdr_t *hdr)
 {
 	(void)user; (void)payload; (void)hdr;
 	/* Poll firmware upgrade progress from state file */
@@ -749,10 +827,154 @@ int handle_fw_progress(int client_fd, const char *user,
 	state[rd] = '\0';
 	fclose(sf);
 
-	/* If terminal state (done/error), clean up the file */
-	if (strstr(state, "status=done") || strstr(state, "status=error"))
+	/* If terminal state (done/error/cancelled), clean up the file */
+	if (strstr(state, "status=done") || strstr(state, "status=error") ||
+	    strstr(state, "status=cancelled"))
 		unlink(FW_STATE_FILE);
 
 	send_ok(client_fd, NULL, state);
+	return 0;
+}
+
+int handle_upgrade_cancel(int client_fd, const char *user,
+			  const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)payload; (void)hdr;
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "admin")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "Requires 'admin' permission");
+		return 0;
+	}
+
+	/* Check current upgrade state to decide action:
+	 *   - Running at step >= 5: reject (past point of no return)
+	 *   - Running at step <  5: create cancel flag for child
+	 *   - Not running / no state: clean up any stale cancel flag
+	 */
+	int active = 0;
+	{
+		char state_buf[512] = {0};
+		FILE *sf = fopen(FW_STATE_FILE, "r");
+		if (sf) {
+			size_t rd = fread(state_buf, 1,
+					  sizeof(state_buf) - 1, sf);
+			state_buf[rd] = '\0';
+			fclose(sf);
+
+			char cur_status[32], cur_step[16];
+			extract_val(state_buf, "status",
+				    cur_status, sizeof(cur_status));
+			extract_val(state_buf, "step",
+				    cur_step, sizeof(cur_step));
+			int step = atoi(cur_step);
+
+			if (strcmp(cur_status, "running") == 0) {
+				if (step >= 5) {
+					char msg[SG_EXTRA_MAX];
+					snprintf(msg, sizeof(msg),
+						 "Cannot cancel: firmware "
+						 "install is past the point "
+						 "of no return (step %d/6)",
+						 step);
+					mgmt_log("WARN",
+						 "cancel rejected by %s "
+						 "at step %d", user, step);
+					send_error(client_fd,
+						   SG_ERR_IN_USE, msg);
+					return 0;
+				}
+				active = 1;
+			}
+		}
+	}
+
+	if (!active) {
+		/* No active upgrade — clean up any stale cancel flag */
+		unlink(FW_CANCEL_FILE);
+		mgmt_log("INFO", "firmware cancel by %s (no active upgrade)",
+			 user);
+		send_ok(client_fd, NULL, "Cancel requested\n");
+		return 0;
+	}
+
+	/* Create the cancel flag file — the child picks it up on next check */
+	int fd = open(FW_CANCEL_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0) {
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL,
+			   "Failed to create cancel flag");
+		return 0;
+	}
+	close(fd);
+
+	mgmt_log("INFO", "firmware upgrade cancel requested by %s", user);
+	send_ok(client_fd, NULL, "Cancel requested\n");
+	return 0;
+}
+
+/* ── Test setup handler (for selftest suite) ─────────────────────────── */
+
+int handle_upgrade_test_setup(int client_fd, const char *user,
+			      const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)hdr;
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "admin")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "Requires 'admin' permission");
+		return 0;
+	}
+
+	if (!payload || !payload[0]) {
+		send_error(client_fd, SG_ERR_MISSING_ARG, "Missing action");
+		return 0;
+	}
+
+	char action[32];
+	extract_val(payload, "action", action, sizeof(action));
+
+	if (strcmp(action, "write_state") == 0) {
+		/* Write a firmware state file with given parameters */
+		char step[16], total[16], status[32], message[256], version[64];
+		extract_val(payload, "step", step, sizeof(step));
+		extract_val(payload, "total", total, sizeof(total));
+		extract_val(payload, "status", status, sizeof(status));
+		extract_val(payload, "message", message, sizeof(message));
+		extract_val(payload, "version", version, sizeof(version));
+
+		FILE *fp = fopen(FW_STATE_FILE_TMP, "w");
+		if (!fp) {
+			send_error(client_fd, SG_ERR_IO_FAIL,
+				   "Cannot write state file");
+			return 0;
+		}
+		fchmod(fileno(fp), 0600);
+		fprintf(fp, "step=%s\ntotal=%s\nstatus=%s\n"
+			"message=%s\nversion=%s\n",
+			step, total, status, message, version);
+		fclose(fp);
+		rename(FW_STATE_FILE_TMP, FW_STATE_FILE);
+		send_ok(client_fd, NULL, NULL);
+
+	} else if (strcmp(action, "clean") == 0) {
+		/* Remove both state file and cancel flag */
+		unlink(FW_STATE_FILE);
+		unlink(FW_CANCEL_FILE);
+		send_ok(client_fd, NULL, NULL);
+
+	} else if (strcmp(action, "query") == 0) {
+		/* Report whether state file and cancel flag exist */
+		int sf = (access(FW_STATE_FILE, F_OK) == 0) ? 1 : 0;
+		int cf = (access(FW_CANCEL_FILE, F_OK) == 0) ? 1 : 0;
+		char result[64];
+		snprintf(result, sizeof(result),
+			 "state_file=%d\ncancel_flag=%d\n", sf, cf);
+		send_ok(client_fd, NULL, result);
+
+	} else {
+		send_error(client_fd, SG_ERR_INVALID_ARG,
+			   "Unknown action (use write_state/clean/query)");
+	}
+
 	return 0;
 }

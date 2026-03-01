@@ -72,6 +72,20 @@ const char *sg_reg_value_rule(const char *type_name, const char *key);
 /* Get custom human-readable description for a type:key pair. */
 const char *sg_reg_field_desc(const char *type_name, const char *key);
 
+/* Get the default value for a specific field (type+key). Returns NULL if none. */
+const char *sg_reg_field_default(const char *type_name, const char *key);
+
+/*
+ * Scrub a single field value against the registry.
+ * If val passes validation → copies val to out, returns 0 (no change).
+ * If val fails validation → produces a cleaned value in out, returns 1.
+ *   - access-services: keeps individually valid tokens, drops invalid ones.
+ *   - permissions-csv: keeps individually valid tokens, drops invalid ones.
+ *   - other kinds: resets to field default (or empty string if no default).
+ */
+int sg_reg_scrub_value(const char *type, const char *key, const char *val,
+                       char *out, size_t outsz);
+
 /* Get entry ID rule for a type ("uint" or "safe-id"). */
 const char *sg_reg_entry_id_kind(const char *type_name);
 

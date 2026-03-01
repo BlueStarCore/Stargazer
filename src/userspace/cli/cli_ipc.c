@@ -115,9 +115,10 @@ static const char *cmd_name(uint32_t cmd)
 	case SG_CMD_ROLLBACK:       return "ROLLBACK";
 	case SG_CMD_SYS_POWEROFF:   return "SYS_POWEROFF";
 	case SG_CMD_SYS_REBOOT:     return "SYS_REBOOT";
-	case SG_CMD_FW_UPGRADE:     return "FW_UPGRADE";
-	case SG_CMD_FW_STATUS:      return "FW_STATUS";
-	case SG_CMD_FW_PROGRESS:    return "FW_PROGRESS";
+	case SG_CMD_UPGRADE_START:      return "UPGRADE_START";
+	case SG_CMD_UPGRADE_STATUS:    return "UPGRADE_STATUS";
+	case SG_CMD_UPGRADE_PROGRESS:  return "UPGRADE_PROGRESS";
+	case SG_CMD_UPGRADE_CANCEL:    return "UPGRADE_CANCEL";
 	case SG_CMD_NET_PING:       return "NET_PING";
 	case SG_CMD_NET_TRACEROUTE: return "NET_TRACEROUTE";
 	case SG_CMD_NET_NSLOOKUP:  return "NET_NSLOOKUP";
@@ -132,8 +133,22 @@ static const char *cmd_name(uint32_t cmd)
 	case SG_CMD_DIAG_FW_POLICY:    return "DIAG_FW_POLICY";
 	case SG_CMD_DIAG_FW_CONNTRACK: return "DIAG_FW_CONNTRACK";
 	case SG_CMD_DIAG_ROUTES:       return "DIAG_ROUTES";
+	case SG_CMD_DIAG_CPU:          return "DIAG_CPU";
+	case SG_CMD_DIAG_RAM:          return "DIAG_RAM";
+	case SG_CMD_DIAG_DISK:         return "DIAG_DISK";
+	case SG_CMD_DIAG_IFACE_STATS:  return "DIAG_IFACE_STATS";
+	case SG_CMD_DIAG_PROCTOP:      return "DIAG_PROCTOP";
+	case SG_CMD_DIAG_THERMAL:      return "DIAG_THERMAL";
+	case SG_CMD_SHOW_SESSIONS:     return "SHOW_SESSIONS";
+	case SG_CMD_SHOW_BOOT_CONFIG:  return "SHOW_BOOT_CONFIG";
+	case SG_CMD_DEBUG_STATE_GET:   return "DEBUG_STATE_GET";
+	case SG_CMD_DEBUG_STATE_SET:   return "DEBUG_STATE_SET";
+	case SG_CMD_DEBUG_STATE_RESET: return "DEBUG_STATE_RESET";
+	case SG_CMD_HISTORY_SAVE:      return "HISTORY_SAVE";
+	case SG_CMD_HISTORY_LOAD:      return "HISTORY_LOAD";
 	case SG_CMD_PING:           return "PING";
 	case SG_CMD_DEBUG_FETCH:    return "DEBUG_FETCH";
+	case SG_CMD_UPGRADE_TEST_SETUP: return "UPGRADE_TEST_SETUP";
 	default:                    return "?";
 	}
 }
@@ -275,6 +290,24 @@ int ipc_send(uint32_t cmd, const char *payload, size_t payload_len,
 	if (payload_len > SG_PAYLOAD_MAX)
 		return -1;
 
+	/*
+	 * Compute debug flags BEFORE opening the connection.
+	 *
+	 * dbg_enabled() → mem_load_once() may trigger an IPC call on
+	 * first access (to load debug state).  If we called it after
+	 * connect(), mgmtd would already be blocked reading our socket
+	 * while the inner IPC opens a second connection → deadlock
+	 * (mgmtd is single-threaded).  By doing it here, any inner
+	 * IPC completes before we touch the network.
+	 */
+	uint32_t debug_flags = 0;
+	if (dbg_enabled()) {
+		if (strcmp(dbg_get("mgmtd_debug", "0"), "1") == 0)
+			debug_flags |= SG_DBG_FLAG_MGMTD;
+		if (strcmp(dbg_get("auth_admin", "0"), "1") == 0)
+			debug_flags |= SG_DBG_FLAG_AUTH;
+	}
+
 	/* Open a new connection for each request */
 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0)
@@ -296,14 +329,7 @@ int ipc_send(uint32_t cmd, const char *payload, size_t payload_len,
 	hdr.cmd         = cmd;
 	snprintf(hdr.username, sizeof(hdr.username), "%s", ipc_username);
 	hdr.payload_len = (uint32_t)payload_len;
-
-	/* Pass debug flags to mgmtd so it knows to buffer traces */
-	if (dbg_enabled()) {
-		if (strcmp(dbg_get("mgmtd_debug", "0"), "1") == 0)
-			hdr.debug_flags |= SG_DBG_FLAG_MGMTD;
-		if (strcmp(dbg_get("auth_admin", "0"), "1") == 0)
-			hdr.debug_flags |= SG_DBG_FLAG_AUTH;
-	}
+	hdr.debug_flags = debug_flags;
 
 	if (safe_write(fd, &hdr, sizeof(hdr)) < 0)
 		goto out;
@@ -377,6 +403,15 @@ int ipc_send_stream(uint32_t cmd, const char *payload_str,
 	if (payload_len > SG_PAYLOAD_MAX)
 		return -1;
 
+	/* Compute debug flags before connecting (same reason as ipc_send) */
+	uint32_t debug_flags = 0;
+	if (dbg_enabled()) {
+		if (strcmp(dbg_get("mgmtd_debug", "0"), "1") == 0)
+			debug_flags |= SG_DBG_FLAG_MGMTD;
+		if (strcmp(dbg_get("auth_admin", "0"), "1") == 0)
+			debug_flags |= SG_DBG_FLAG_AUTH;
+	}
+
 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0)
 		return -1;
@@ -397,13 +432,7 @@ int ipc_send_stream(uint32_t cmd, const char *payload_str,
 	hdr.cmd         = cmd;
 	snprintf(hdr.username, sizeof(hdr.username), "%s", ipc_username);
 	hdr.payload_len = (uint32_t)payload_len;
-
-	if (dbg_enabled()) {
-		if (strcmp(dbg_get("mgmtd_debug", "0"), "1") == 0)
-			hdr.debug_flags |= SG_DBG_FLAG_MGMTD;
-		if (strcmp(dbg_get("auth_admin", "0"), "1") == 0)
-			hdr.debug_flags |= SG_DBG_FLAG_AUTH;
-	}
+	hdr.debug_flags = debug_flags;
 
 	if (safe_write(fd, &hdr, sizeof(hdr)) < 0)
 		goto out;
@@ -524,6 +553,11 @@ int ipc_stream_interrupted(void)
 	return g_stream_interrupted != 0;
 }
 
+void ipc_clear_interrupt(void)
+{
+	g_stream_interrupted = 0;
+}
+
 /* Like check_ctrl_c but also treats 'q'/'Q' as quit.
  * Used by interactive monitors (e.g. diagnose top) where 'q' means exit.
  * NOT suitable for IPC streaming where 'q' is valid payload data. */
@@ -550,7 +584,16 @@ int ipc_check_quit_or_ctrl_c(void)
 
 int ipc_available(void)
 {
-	return access(SG_MGMTD_SOCK, F_OK) == 0;
+	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0)
+		return 0;
+	struct sockaddr_un addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", SG_MGMTD_SOCK);
+	int rc = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+	close(fd);
+	return rc == 0;
 }
 
 void ipc_resp_free(struct ipc_response *resp)

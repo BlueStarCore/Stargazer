@@ -19,7 +19,6 @@
 #include "cli_debug.h"
 #include "sg_validate.h"
 
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -218,11 +217,13 @@ static char *trim(char *s)
 	return s;
 }
 
-/* Read password from terminal with echo disabled */
+/* Read password from terminal with echo disabled.
+ * Uses the pre-opened tty fd from cli_get_tty_fd() — safe inside sandbox
+ * (open("/dev/tty") would be killed by seccomp/Landlock). */
 static int read_password(const char *prompt, char *buf, size_t buf_sz)
 {
 	struct termios old, noecho;
-	int tty = open("/dev/tty", 0); /* O_RDONLY */
+	int tty = cli_get_tty_fd();
 	if (tty < 0) tty = STDIN_FILENO;
 
 	printf("%s", prompt);
@@ -234,10 +235,8 @@ static int read_password(const char *prompt, char *buf, size_t buf_sz)
 			size_t len = strlen(buf);
 			if (len > 0 && buf[len - 1] == '\n')
 				buf[--len] = '\0';
-			if (tty != STDIN_FILENO) close(tty);
 			return (int)len;
 		}
-		if (tty != STDIN_FILENO) close(tty);
 		return 0;
 	}
 	noecho = old;
@@ -258,8 +257,6 @@ static int read_password(const char *prompt, char *buf, size_t buf_sz)
 	tcsetattr(tty, TCSANOW, &old);
 	printf("\n");
 
-	if (tty != STDIN_FILENO)
-		close(tty);
 	return pos;
 }
 
