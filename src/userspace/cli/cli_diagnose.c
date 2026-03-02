@@ -243,6 +243,8 @@ static void diag_self_test(const char *permissions)
 			 "__diag_nobody", is_adm);
 	diag_test("SESSION_BUMP bump session",
 		  SG_CMD_SESSION_BUMP, "__diag_nobody", is_adm);
+	diag_test("DEBUG_FETCH debug traces",
+		  SG_CMD_DEBUG_FETCH, "", is_adm);
 }
 
 /* ── Cleanup temp accounts ─────────────────────────────────────────────── */
@@ -286,6 +288,10 @@ static void diag_cleanup_all(void)
 
 	/* SEC-14 password test user */
 	ipc_send_str(SG_CMD_ADMIN_DELETE, "__diag_pw", &resp);
+	ipc_resp_free(&resp);
+
+	/* Profile upgrade test user */
+	ipc_send_str(SG_CMD_ADMIN_DELETE, "__diag_upg", &resp);
 	ipc_resp_free(&resp);
 }
 
@@ -959,7 +965,48 @@ static void diag_full_test(void)
 	diag_test("ADMIN_DELETE __diag_ro",
 		  SG_CMD_ADMIN_DELETE, "__diag_ro", 1);
 
-	/* 8. Security/adversarial tests */
+	/* 8. Profile upgrade verification: read-only → read-write */
+	printf("\n" C_CYAN
+	       "  --- Profile upgrade (read-only -> read-write) ---"
+	       C_NC "\n");
+
+	diag_test_status("Create __diag_upg (profile=read-only)",
+			 SG_CMD_ADMIN_CREATE,
+			 "__diag_upg\nread-only\n",
+			 SG_OK);
+
+	diag_test_status("Upgrade __diag_upg to read-write",
+			 SG_CMD_CFG_SET,
+			 "system_admin:__diag_upg\n"
+			 "profile=read-write\n"
+			 "enforce-change-password=enable\n"
+			 "enforce-password-policy=enable\n",
+			 SG_OK);
+
+	diag_total++;
+	if (ipc_send_str(SG_CMD_CFG_GET,
+			 "system_admin:__diag_upg",
+			 &resp) == 0 &&
+	    resp.status == SG_OK && resp.payload &&
+	    strstr(resp.payload, "profile=read-write")) {
+		printf(C_GREEN "  PASS" C_NC " [%3u] Verify __diag_upg"
+		       " upgraded to read-write\n",
+		       SG_CMD_CFG_GET);
+		diag_pass++;
+	} else {
+		printf(C_RED "  FAIL" C_NC " [%3u] Verify __diag_upg"
+		       " profile upgrade (status=%u)\n",
+		       SG_CMD_CFG_GET, resp.status);
+		diag_fail++;
+	}
+	ipc_resp_free(&resp);
+
+	diag_test_status("Delete __diag_upg",
+			 SG_CMD_ADMIN_DELETE,
+			 "__diag_upg",
+			 SG_OK);
+
+	/* 9. Security/adversarial tests */
 	diag_security_tests();
 
 	return;

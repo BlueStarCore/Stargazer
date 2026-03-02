@@ -2472,6 +2472,12 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 		return handle_upgrade_test_setup(client_fd, user, payload, hdr);
 
 	case SG_CMD_DEBUG_FETCH: {
+		const char *perms = get_user_permissions(user);
+		if (!has_permission(perms, "admin")) {
+			send_error(client_fd, SG_ERR_PERM_DENIED,
+				   "Requires 'admin' permission");
+			return 0;
+		}
 		if (debug_buf_used > 0) {
 			send_ok(client_fd, NULL, debug_buf);
 			debug_buf_used = 0;

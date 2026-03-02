@@ -56,6 +56,13 @@ int cli_resolve_cmd(const char *input, char *output, size_t out_sz);
 /* Return the terminal fd used by readline (-1 if not initialized). */
 int cli_get_tty_fd(void);
 
+/*
+ * Idle callback — called every ~5 seconds while waiting for input.
+ * Return 0 to keep waiting, non-zero to abort readline (returns NULL).
+ */
+typedef int (*cli_idle_cb_t)(void);
+void cli_set_idle_cb(cli_idle_cb_t cb);
+
 /* History via IPC (works inside sandbox). */
 void cli_hist_load_ipc(void);
 void cli_hist_save_ipc(const char *username);

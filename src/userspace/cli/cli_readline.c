@@ -19,15 +19,18 @@
  */
 
 #define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 
 #include "cli_readline.h"
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Terminal writes: non-actionable on failure, suppress warn_unused_result */
@@ -67,6 +70,16 @@ static char line_buf[CLI_MAX_LINE];
 static char paste_buf[PASTE_BUF_SIZE];
 static int  paste_len = 0;
 static int  paste_pos = 0;
+
+/* Idle callback — fired every ~5 seconds while blocked on input */
+static cli_idle_cb_t rl_idle_cb = NULL;
+static struct timespec last_idle_check;
+
+void cli_set_idle_cb(cli_idle_cb_t cb)
+{
+	rl_idle_cb = cb;
+	clock_gettime(CLOCK_MONOTONIC, &last_idle_check);
+}
 
 /* ── Terminal ─────────────────────────────────────────────────────────── */
 
@@ -937,6 +950,37 @@ const char *cli_readline(const char *prompt)
 		tty_write(tty_fd, buf, (size_t)pos);
 
 	while (1) {
+		/* ── Idle callback with 5-second poll ────────────── */
+		if (rl_idle_cb) {
+			struct timespec now;
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			long elapsed = now.tv_sec - last_idle_check.tv_sec;
+			if (elapsed >= 5) {
+				if (rl_idle_cb() != 0) {
+					disable_raw();
+					return NULL;
+				}
+				clock_gettime(CLOCK_MONOTONIC,
+					      &last_idle_check);
+				elapsed = 0;
+			}
+			struct timespec timeout;
+			timeout.tv_sec  = 5 - elapsed;
+			timeout.tv_nsec = 0;
+			struct pollfd pfd = { .fd = tty_fd,
+					      .events = POLLIN };
+			int pr = ppoll(&pfd, 1, &timeout, NULL);
+			if (pr == 0)
+				continue;	/* timeout — check fires */
+			if (pr < 0) {
+				if (errno == EINTR)
+					continue;
+				paste_pos = paste_len = 0;
+				disable_raw();
+				return NULL;
+			}
+		}
+
 		char c;
 		ssize_t n = read(tty_fd, &c, 1);
 		if (n <= 0) {

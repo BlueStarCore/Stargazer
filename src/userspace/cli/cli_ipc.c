@@ -615,7 +615,8 @@ void ipc_fetch_debug(void)
 		return;
 
 	struct ipc_response resp;
-	if (ipc_send(SG_CMD_DEBUG_FETCH, NULL, 0, &resp) == 0) {
+	if (ipc_send(SG_CMD_DEBUG_FETCH, NULL, 0, &resp) == 0 &&
+	    resp.status == SG_OK) {
 		if (resp.payload && resp.payload_len > 0)
 			fprintf(stderr, "%s", resp.payload);
 	}

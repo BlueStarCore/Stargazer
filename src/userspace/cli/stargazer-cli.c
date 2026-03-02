@@ -73,6 +73,41 @@ static int get_session_rev(const char *user)
 	return rev;
 }
 
+/* ── Idle permission check ─────────────────────────────────────────────── */
+
+static char *g_permissions = NULL;
+
+static int check_permissions_cb(void)
+{
+	if (!g_permissions)
+		return 0;
+
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_WHOAMI, "", &resp) != 0) {
+		ipc_resp_free(&resp);
+		return 0;  /* mgmtd unreachable — don't kick */
+	}
+	if (resp.status != SG_OK) {
+		ipc_resp_free(&resp);
+		return -1;  /* user no longer valid */
+	}
+
+	char new_perms[256]   = "monitor";
+	char new_profile[128] = "read-only";
+	if (resp.payload)
+		parse_whoami(resp.payload, new_profile, sizeof(new_profile),
+			     new_perms, sizeof(new_perms));
+	ipc_resp_free(&resp);
+
+	if (strcmp(g_permissions, new_perms) != 0) {
+		printf("\r\n  Permissions changed (was: %s, now: %s).\r\n"
+		       "  Please login again.\r\n",
+		       g_permissions, new_perms);
+		return -1;
+	}
+	return 0;
+}
+
 /* ── Main ──────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -151,7 +186,11 @@ int main(void)
 	int session_rev_start = get_session_rev(user);
 	int session_rev_cached = session_rev_start;
 
-	/* 10. Main loop */
+	/* 10. Idle permission polling — detects profile changes while idle */
+	g_permissions = permissions;
+	cli_set_idle_cb(check_permissions_cb);
+
+	/* 11. Main loop */
 	const char *line;
 	while ((line = cli_readline("stargazer> ")) != NULL) {
 		/* Trim leading whitespace */
@@ -206,22 +245,27 @@ int main(void)
 		/* Fetch mgmtd/auth debug traces after each command */
 		ipc_fetch_debug();
 
-		if (dbg_enabled() &&
-		    strcmp(dbg_get("cli_debug", "0"), "1") == 0)
-			fprintf(stderr,
-				"[CLI-DBG] dispatch rc=%d\n", rc);
-
-		/* Refresh session baseline after commands that modify config */
+		/* Refresh session baseline after commands that modify config.
+		 * Without this, selftest (which bumps session rev via
+		 * SEC-8 self-bump and profile updates) would cause the
+		 * acting admin to kick themselves on the next command.
+		 * Real permission changes are still detected by the idle
+		 * poll callback (check_permissions_cb) every 5 seconds. */
 		if (strncmp(resolved, "configure", 9) == 0 ||
 		    strncmp(resolved, "execute", 7) == 0) {
 			session_rev_start = get_session_rev(user);
 		}
 
+		if (dbg_enabled() &&
+		    strcmp(dbg_get("cli_debug", "0"), "1") == 0)
+			fprintf(stderr,
+				"[CLI-DBG] dispatch rc=%d\n", rc);
+
 		if (rc != 0)
 			break;
 	}
 
-	/* 11. Cleanup — save history via IPC (works inside sandbox) */
+	/* 12. Cleanup — save history via IPC (works inside sandbox) */
 	cli_hist_save_ipc(user);
 	cli_term_cleanup();
 	return 0;
