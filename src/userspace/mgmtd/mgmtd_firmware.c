@@ -460,6 +460,23 @@ int handle_upgrade_start(int client_fd, const char *user,
 	long total_kb = total_bytes > 0 ? (total_bytes + 1023) / 1024 : -1;
 	int dl_status = 0;
 	for (;;) {
+		/* Update progress first so the final iteration shows 100% */
+		struct stat st;
+		long kb = 0;
+		if (stat(FW_DL_FILE, &st) == 0)
+			kb = (long)(st.st_size / 1024);
+		char msg[128];
+		if (total_kb > 0) {
+			int pct = (int)(kb * 100 / total_kb);
+			snprintf(msg, sizeof(msg),
+				 "Downloading firmware... %d%% (%ld/%ld KB)",
+				 pct, kb, total_kb);
+		} else {
+			snprintf(msg, sizeof(msg),
+				 "Downloading firmware... (%ld KB)", kb);
+		}
+		fw_write_state(1, 6, "running", msg, "");
+
 		int wret = waitpid(dl_pid, &dl_status, WNOHANG);
 		if (wret != 0)
 			break;
@@ -476,22 +493,6 @@ int handle_upgrade_start(int client_fd, const char *user,
 			_exit(1);
 		}
 
-		struct stat st;
-		long kb = 0;
-		if (stat(FW_DL_FILE, &st) == 0)
-			kb = (long)(st.st_size / 1024);
-		char msg[128];
-		if (total_kb > 0) {
-			int pct = (int)(kb * 100 / total_kb);
-			if (pct > 99) pct = 99;
-			snprintf(msg, sizeof(msg),
-				 "Downloading firmware... %d%% (%ld/%ld KB)",
-				 pct, kb, total_kb);
-		} else {
-			snprintf(msg, sizeof(msg),
-				 "Downloading firmware... (%ld KB)", kb);
-		}
-		fw_write_state(1, 6, "running", msg, "");
 		usleep(500000);
 	}
 
@@ -526,23 +527,6 @@ int handle_upgrade_start(int client_fd, const char *user,
 		fw_write_state(1, 6, "error", errmsg, "");
 		sg_db_close();
 		_exit(1);
-	}
-
-	/* Show final download size */
-	{
-		struct stat st;
-		long kb = 0;
-		if (stat(FW_DL_FILE, &st) == 0)
-			kb = (long)(st.st_size / 1024);
-		char msg[128];
-		if (total_kb > 0)
-			snprintf(msg, sizeof(msg),
-				 "Downloading firmware... 100%% (%ld/%ld KB) done",
-				 kb, total_kb);
-		else
-			snprintf(msg, sizeof(msg),
-				 "Downloading firmware... (%ld KB) done", kb);
-		fw_write_state(1, 6, "running", msg, "");
 	}
 
 	/* Cancel check: before step 2 */
@@ -796,6 +780,9 @@ int handle_upgrade_start(int client_fd, const char *user,
 		 "Firmware v%s installed successfully. Rebooting...",
 		 fw_version);
 	fw_write_state(6, 6, "done", done_msg, fw_version);
+
+	/* Stamp integrity flag so new firmware recognizes this as a seeded DB */
+	sg_db_set_val("system_meta", "0", "seeded", "1");
 
 	/* Close DB and back up before reboot */
 	sg_db_close();

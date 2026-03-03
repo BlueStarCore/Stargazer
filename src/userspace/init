@@ -34,7 +34,7 @@ if [ -n "$_sg_dev" ]; then
 	echo "[stargazer] Found data partition: $_sg_dev"
 	if mount "$_sg_dev" /etc/stargazer 2>/tmp/sg_mount.log; then
 		echo "[stargazer] Persistent storage: $_sg_dev -> /etc/stargazer"
-		# Restore saved auth files (shadow/passwd) from persistent storage
+		# Restore saved auth files from persistent storage
 		if [ -f /etc/stargazer/shadow ]; then
 			cp /etc/stargazer/shadow /etc/shadow
 			chmod 640 /etc/shadow
@@ -43,6 +43,10 @@ if [ -n "$_sg_dev" ]; then
 		if [ -f /etc/stargazer/passwd ]; then
 			cp /etc/stargazer/passwd /etc/passwd
 			echo "[stargazer] Restored /etc/passwd from persistent storage"
+		fi
+		if [ -f /etc/stargazer/group ]; then
+			cp /etc/stargazer/group /etc/group
+			echo "[stargazer] Restored /etc/group from persistent storage"
 		fi
 	else
 		echo "[stargazer] ERROR: mount $_sg_dev failed:"
@@ -117,18 +121,27 @@ fi
 # Start management daemon (privilege separation)
 if [ -x /sbin/stargazer-mgmtd ]; then
 	echo "[stargazer] Starting management daemon..."
+	_ready=/run/mgmtd-ready
+	mkfifo "$_ready" 2>/dev/null
 	/sbin/stargazer-mgmtd &
-	# Wait briefly for socket to be ready
-	_mgmt_wait=0
-	while [ ! -S /run/stargazer-mgmtd.sock ] && [ "$_mgmt_wait" -lt 20 ]; do
-		usleep 50000 2>/dev/null || sleep 1
-		_mgmt_wait=$((_mgmt_wait + 1))
-	done
-	if [ -S /run/stargazer-mgmtd.sock ]; then
-		echo "[stargazer] Management daemon ready."
-	else
-		echo "[stargazer] WARNING: Management daemon socket not found."
-	fi
+	# Block until mgmtd signals readiness via FIFO (zero-CPU wait).
+	# Timeout guard: if mgmtd crashes before writing, unblock after 10s.
+	(sleep 10; echo timeout > "$_ready" 2>/dev/null) &
+	_to=$!
+	read _sig < "$_ready"
+	kill "$_to" 2>/dev/null; wait "$_to" 2>/dev/null
+	rm -f "$_ready"
+	case "$_sig" in
+		ready) echo "[stargazer] Management daemon ready." ;;
+		error)
+			echo ""
+			echo "  CRITICAL: Boot integrity check FAILED"
+			echo "  Database may be corrupted or tampered with."
+			echo "  Management daemon refused to start."
+			echo ""
+			;;
+		*) echo "[stargazer] WARNING: Management daemon did not start (timeout)." ;;
+	esac
 fi
 
 # Create commands (remove busybox symlinks first to avoid "Text file busy")
@@ -148,6 +161,7 @@ killall stargazer-mgmtd 2>/dev/null; sleep 1
 if mountpoint -q /etc/stargazer 2>/dev/null; then
 	cp /etc/shadow /etc/stargazer/shadow 2>/dev/null
 	cp /etc/passwd /etc/stargazer/passwd 2>/dev/null
+	cp /etc/group /etc/stargazer/group 2>/dev/null
 	sync
 	umount /etc/stargazer 2>/dev/null
 fi
@@ -163,6 +177,7 @@ killall stargazer-mgmtd 2>/dev/null; sleep 1
 if mountpoint -q /etc/stargazer 2>/dev/null; then
 	cp /etc/shadow /etc/stargazer/shadow 2>/dev/null
 	cp /etc/passwd /etc/stargazer/passwd 2>/dev/null
+	cp /etc/group /etc/stargazer/group 2>/dev/null
 	sync
 	umount /etc/stargazer 2>/dev/null
 fi

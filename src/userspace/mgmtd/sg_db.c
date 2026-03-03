@@ -90,6 +90,10 @@ static int sg_db_migrate(void)
 	if (db_ver == SG_SCHEMA_VERSION)
 		return 0;  /* no migration needed */
 
+	/* Wrap all migrations in a transaction */
+	if (sqlite3_exec(g_db, "BEGIN;", NULL, NULL, NULL) != SQLITE_OK)
+		return -1;
+
 	/* Forward migrations (upgrade) */
 	if (db_ver < 1) {
 		/* v0 -> v1: initial schema stamp (tables already created) */
@@ -103,7 +107,15 @@ static int sg_db_migrate(void)
 		fprintf(stderr, "sg_db: DB schema v%d > code v%d"
 			" (downgrade)\n", db_ver, SG_SCHEMA_VERSION);
 
-	sg_db_set_version(SG_SCHEMA_VERSION);
+	if (sg_db_set_version(SG_SCHEMA_VERSION) != 0) {
+		sqlite3_exec(g_db, "ROLLBACK;", NULL, NULL, NULL);
+		return -1;
+	}
+
+	if (sqlite3_exec(g_db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+		sqlite3_exec(g_db, "ROLLBACK;", NULL, NULL, NULL);
+		return -1;
+	}
 	return 0;
 }
 
@@ -153,7 +165,12 @@ int sg_db_open(const char *path)
 	}
 
 	/* Run migrations */
-	sg_db_migrate();
+	if (sg_db_migrate() != 0) {
+		fprintf(stderr, "sg_db: migration failed\n");
+		sqlite3_close(g_db);
+		g_db = NULL;
+		return -1;
+	}
 
 	return 0;
 }
@@ -520,6 +537,62 @@ int sg_db_count(const char *type)
 
 	sqlite3_finalize(stmt);
 	return count;
+}
+
+/* ── sg_db_list_types ────────────────────────────────────────────────────── */
+
+char *sg_db_list_types(void)
+{
+	if (!g_db) return NULL;
+
+	sqlite3_stmt *stmt;
+	const char *sql = "SELECT DISTINCT type FROM config ORDER BY type;";
+	if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK)
+		return NULL;
+
+	size_t bufsz = 1024, used = 0;
+	char *buf = malloc(bufsz);
+	if (!buf) { sqlite3_finalize(stmt); return NULL; }
+	buf[0] = '\0';
+
+	while (sqlite3_step(stmt) == SQLITE_ROW) {
+		const char *t = (const char *)sqlite3_column_text(stmt, 0);
+		if (!t) continue;
+
+		size_t tlen = strlen(t);
+		if (buf_append(&buf, &used, &bufsz, t, tlen) < 0 ||
+		    buf_append(&buf, &used, &bufsz, "\n", 1) < 0) {
+			free(buf);
+			sqlite3_finalize(stmt);
+			return NULL;
+		}
+	}
+
+	sqlite3_finalize(stmt);
+
+	if (used == 0) {
+		free(buf);
+		return NULL;
+	}
+	return buf;
+}
+
+/* ── sg_db_purge_type ───────────────────────────────────────────────────── */
+
+int sg_db_purge_type(const char *type)
+{
+	if (!g_db || !type) return -1;
+
+	sqlite3_stmt *stmt;
+	const char *sql = "DELETE FROM config WHERE type=?1;";
+	if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK)
+		return -1;
+
+	sqlite3_bind_text(stmt, 1, type, -1, SQLITE_STATIC);
+	int rc = sqlite3_step(stmt);
+	sqlite3_finalize(stmt);
+
+	return (rc == SQLITE_DONE) ? 0 : -1;
 }
 
 /* ── sg_db_schema_version ────────────────────────────────────────────────── */

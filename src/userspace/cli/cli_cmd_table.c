@@ -232,8 +232,6 @@ static int cmd_fw_upgrade(const char *args, const char *permissions)
 	int have_inline = 0;   /* true if an in-place progress line is active */
 	char last_msg[256] = {0};
 	for (int i = 0; i < 240; i++) {  /* 240 * 500ms = 120s timeout */
-		usleep(500000);
-
 		if (ipc_stream_interrupted()) {
 			if (have_inline)
 				printf("\n");
@@ -248,6 +246,7 @@ static int cmd_fw_upgrade(const char *args, const char *permissions)
 				ipc_resp_free(&cr);
 				ipc_clear_interrupt();
 				have_inline = 0;
+				usleep(500000);
 				continue;
 			}
 			ipc_resp_free(&cr);
@@ -268,6 +267,7 @@ static int cmd_fw_upgrade(const char *args, const char *permissions)
 
 		if (pr.status != SG_OK || !pr.payload) {
 			ipc_resp_free(&pr);
+			usleep(500000);
 			continue;
 		}
 
@@ -279,6 +279,28 @@ static int cmd_fw_upgrade(const char *args, const char *permissions)
 
 		int step = atoi(step_s);
 		int total = atoi(total_s);
+
+		/* When the step advances and we have an in-place progress
+		 * line (e.g. "84%"), overwrite it with 100% before moving
+		 * on.  This handles the race where mgmtd advances to the
+		 * next step before the CLI polls the final progress. */
+		if (step > last_step && last_step > 0 && have_inline) {
+			char *pct = strstr(last_msg, "% ");
+			if (!pct)
+				pct = strstr(last_msg, "%(");
+			if (pct) {
+				/* Find start of the number before '%' */
+				char *np = pct;
+				while (np > last_msg && np[-1] >= '0' &&
+				       np[-1] <= '9')
+					np--;
+				/* Rewrite: keep prefix, replace "NN% ..." with "100%" */
+				printf("\r\033[K  [%d/%d] %.*s100%%",
+				       last_step, total,
+				       (int)(np - last_msg), last_msg);
+				fflush(stdout);
+			}
+		}
 
 		/* Print step log lines (step transitions) as in-place
 		 * lines so that subsequent progress updates within the
@@ -350,6 +372,7 @@ static int cmd_fw_upgrade(const char *args, const char *permissions)
 		}
 
 		ipc_resp_free(&pr);
+		usleep(500000);
 	}
 
 	ipc_restore_interrupt_handler();
@@ -460,6 +483,12 @@ static int cmd_diag_selftest(const char *args, const char *permissions)
 
 	r = (diag_result_t){0, 0, 0};
 	fail += cli_diagnose_test_sandbox(mode, &r);
+	totals.passed += r.passed;
+	totals.failed += r.failed;
+	totals.total  += r.total;
+
+	r = (diag_result_t){0, 0, 0};
+	fail += cli_diagnose_test_database(mode, &r);
 	totals.passed += r.passed;
 	totals.failed += r.failed;
 	totals.total  += r.total;

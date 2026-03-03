@@ -16,6 +16,8 @@
 #include "cli_debug.h"
 #include "cli_sandbox.h"
 
+#include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -67,10 +69,24 @@ static int get_session_rev(const char *user)
 
 	if (ipc_send_str(SG_CMD_SESSION_REV, user, &resp) == 0 &&
 	    resp.status == SG_OK && resp.payload) {
-		rev = atoi(resp.payload);
+		errno = 0;
+		long val = strtol(resp.payload, NULL, 10);
+		if (errno == 0 && val > 0 && val <= INT_MAX)
+			rev = (int)val;
 	}
 	ipc_resp_free(&resp);
 	return rev;
+}
+
+/* ── Session rev refresh (called by selftest to absorb self-bumps) ────── */
+
+static int        *g_session_rev_start;
+static const char *g_session_user;
+
+void cli_refresh_session(void)
+{
+	if (g_session_rev_start && g_session_user)
+		*g_session_rev_start = get_session_rev(g_session_user);
 }
 
 /* ── Idle permission check ─────────────────────────────────────────────── */
@@ -82,6 +98,17 @@ static int check_permissions_cb(void)
 	if (!g_permissions)
 		return 0;
 
+	/* Check session revision — catches admin bumps / account changes */
+	if (g_session_rev_start && g_session_user) {
+		int rev = get_session_rev(g_session_user);
+		if (rev != *g_session_rev_start) {
+			printf("\r\n  Session expired due to account/profile change.\r\n"
+			       "  Please login again.\r\n");
+			return -1;
+		}
+	}
+
+	/* Check permissions — catches profile permission edits */
 	struct ipc_response resp;
 	if (ipc_send_str(SG_CMD_WHOAMI, "", &resp) != 0) {
 		ipc_resp_free(&resp);
@@ -185,6 +212,8 @@ int main(void)
 	/* 9. Session tracking */
 	int session_rev_start = get_session_rev(user);
 	int session_rev_cached = session_rev_start;
+	g_session_rev_start = &session_rev_start;
+	g_session_user = user;
 
 	/* 10. Idle permission polling — detects profile changes while idle */
 	g_permissions = permissions;
@@ -244,17 +273,6 @@ int main(void)
 
 		/* Fetch mgmtd/auth debug traces after each command */
 		ipc_fetch_debug();
-
-		/* Refresh session baseline after commands that modify config.
-		 * Without this, selftest (which bumps session rev via
-		 * SEC-8 self-bump and profile updates) would cause the
-		 * acting admin to kick themselves on the next command.
-		 * Real permission changes are still detected by the idle
-		 * poll callback (check_permissions_cb) every 5 seconds. */
-		if (strncmp(resolved, "configure", 9) == 0 ||
-		    strncmp(resolved, "execute", 7) == 0) {
-			session_rev_start = get_session_rev(user);
-		}
 
 		if (dbg_enabled() &&
 		    strcmp(dbg_get("cli_debug", "0"), "1") == 0)

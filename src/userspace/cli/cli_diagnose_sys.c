@@ -594,13 +594,12 @@ void diag_show_top(int interval, int max_procs)
 	ipc_resp_free(&r1);
 
 	for (;;) {
-		if (interruptible_sleep_ms(interval * 1000))
-			break;
-
 		struct ipc_response r2 = {0};
 		if (ipc_send_str(SG_CMD_DIAG_PROCTOP, "", &r2) != 0 ||
 		    r2.status != SG_OK || !r2.payload) {
 			ipc_resp_free(&r2);
+			if (interruptible_sleep_ms(interval * 1000))
+				break;
 			continue;
 		}
 
@@ -698,6 +697,9 @@ void diag_show_top(int interval, int max_procs)
 
 		/* Rotate */
 		prev = cur;
+
+		if (interruptible_sleep_ms(interval * 1000))
+			break;
 	}
 
 	ipc_restore_interrupt_handler();

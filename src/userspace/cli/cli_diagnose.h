@@ -64,4 +64,19 @@ int cli_diagnose_test_upgrade(int mode, diag_result_t *out);
  */
 int cli_diagnose_test_sandbox(int mode, diag_result_t *out);
 
+/*
+ * Run database health diagnostics.
+ *   mode=0: registry consistency (local, no IPC)
+ *   mode=1: full test (IPC round-trips for DB state verification)
+ * Returns 0 on all-pass, 1 on any failure.
+ */
+int cli_diagnose_test_database(int mode, diag_result_t *out);
+
+/*
+ * Refresh the main loop's session rev baseline.
+ * Called by selftest after SEC-8 self-bump to prevent the acting admin
+ * from being kicked by their own diagnostic operations.
+ */
+void cli_refresh_session(void);
+
 #endif /* CLI_DIAGNOSE_H */

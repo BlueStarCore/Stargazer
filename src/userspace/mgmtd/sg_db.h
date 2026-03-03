@@ -99,4 +99,17 @@ void sg_db_parse_section(const char *section, char *type, size_t tsz,
 char *sg_db_find_referencing(const char *ref_type, const char *ref_key,
 			     const char *target_value);
 
+/*
+ * List all distinct config types present in the database.
+ * Returns heap string "type1\ntype2\n" or NULL if none.
+ * Caller must free().
+ */
+char *sg_db_list_types(void);
+
+/*
+ * Delete all rows for a given config type.
+ * Returns 0 on success, -1 on error.
+ */
+int sg_db_purge_type(const char *type);
+
 #endif /* SG_DB_H */

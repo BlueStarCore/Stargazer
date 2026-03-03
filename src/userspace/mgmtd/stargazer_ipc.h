@@ -61,7 +61,7 @@ typedef enum {
 	/* Config read operations (1xx) */
 	SG_CMD_CFG_GET       = 100,   /* Get section data               */
 	SG_CMD_CFG_LIST      = 101,   /* List entries of a type          */
-	SG_CMD_CFG_LIST_TYPES = 102,  /* Reserved: list all config types (not yet implemented) */
+	SG_CMD_CFG_LIST_TYPES = 102,  /* List all config types in DB     */
 
 	/* Config write operations (2xx) */
 	SG_CMD_CFG_SET       = 200,   /* Set/update section data         */

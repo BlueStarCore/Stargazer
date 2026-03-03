@@ -25,6 +25,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
+#include <limits.h>
 #include <pwd.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -63,6 +64,14 @@
 #define BUF_SIZE         (sizeof(sg_request_hdr_t) + SG_PAYLOAD_MAX)
 #define DEBUG_STATE_FILE  "/tmp/stargazer-debug.conf"
 #define MGMT_DEFAULT_IP   "192.168.99.99/24" /* first NIC on first boot */
+
+/* Boot integrity states — returned by mgmtd_check_boot_integrity() */
+typedef enum {
+	BOOT_FIRST,       /* No flag, all tables empty → seed defaults */
+	BOOT_NORMAL,      /* Flag present, all tables populated → skip seed */
+	BOOT_CORRUPTED,   /* Flag present but critical tables missing rows */
+	BOOT_COMPROMISED  /* No flag but critical tables have data (tampering) */
+} boot_state_t;
 
 #define DEBUG_BUF_SIZE 4096
 static char debug_buf[DEBUG_BUF_SIZE];
@@ -504,67 +513,310 @@ void send_ok_audited(int fd, const char *extra, const char *payload,
 static sg_status_t apply_config(const char *type, const char *id,
 				const char *data, char *result, size_t rsize);
 
+/* ── FIFO signaling to init ─────────────────────────────────────────────── */
+
+/*
+ * Signal init via the readiness FIFO. Used for both "ready" and "error".
+ */
+static void mgmtd_signal_fifo(const char *msg)
+{
+	int rfd = open("/run/mgmtd-ready", O_WRONLY);
+	if (rfd >= 0) {
+		write(rfd, msg, strlen(msg));
+		close(rfd);
+	}
+}
+
+/* ── Boot integrity check ──────────────────────────────────────────────── */
+
+/*
+ * Critical tables that MUST all be populated after first-boot seeding.
+ * If the seeded flag is set but any of these are empty, the database
+ * is corrupted.  If the flag is absent but any have data, the flag
+ * was removed (potential tampering).
+ */
+static const char *critical_tables[] = {
+	"system_admin-profile",
+	"system_admin",
+	"system_password-policy",
+};
+#define N_CRITICAL (sizeof(critical_tables) / sizeof(critical_tables[0]))
+
+static boot_state_t mgmtd_check_boot_integrity(void)
+{
+	/* Read the seeded flag from system_meta */
+	int flag_set = 0;
+	char *val = sg_db_get_val("system_meta", "0", "seeded");
+	if (val) {
+		flag_set = (strcmp(val, "1") == 0);
+		free(val);
+	}
+
+	/* Count rows in each critical table */
+	int counts[N_CRITICAL];
+	int all_empty = 1;
+	int all_populated = 1;
+
+	for (size_t i = 0; i < N_CRITICAL; i++) {
+		counts[i] = sg_db_count(critical_tables[i]);
+		if (counts[i] > 0)
+			all_empty = 0;
+		else
+			all_populated = 0;
+	}
+
+	if (!flag_set && all_empty) {
+		mgmt_log("INFO", "first boot detected — no seeded flag, all tables empty");
+		return BOOT_FIRST;
+	}
+
+	if (flag_set && all_populated) {
+		return BOOT_NORMAL;
+	}
+
+	if (flag_set && !all_populated) {
+		/* CORRUPTED: flag says seeded but some tables are empty */
+		mgmt_log("ERROR", "boot integrity: CORRUPTED — "
+			 "seeded flag present but critical tables missing data");
+		for (size_t i = 0; i < N_CRITICAL; i++) {
+			mgmt_log("ERROR", "  %-30s %s",
+				 critical_tables[i],
+				 counts[i] > 0 ? "OK" : "MISSING");
+		}
+		return BOOT_CORRUPTED;
+	}
+
+	/* !flag_set && !all_empty → COMPROMISED */
+	mgmt_log("ERROR", "boot integrity: COMPROMISED — "
+		 "seeded flag absent but critical tables contain data");
+	for (size_t i = 0; i < N_CRITICAL; i++) {
+		mgmt_log("ERROR", "  %-30s %s",
+			 critical_tables[i],
+			 counts[i] > 0 ? "PRESENT" : "empty");
+	}
+	return BOOT_COMPROMISED;
+}
+
 /* ── First-boot database seeding ────────────────────────────────────────── */
 
 /*
  * Seed database with default configuration on first boot.
- * Only runs if no admin profiles exist (empty database).
- * Idempotent: safe to call on every startup.
+ * Called only when mgmtd_check_boot_integrity() returns BOOT_FIRST.
+ * Sets the seeded flag LAST — if seeding partially fails, next boot
+ * re-tries as FIRST BOOT.
  */
-static void mgmtd_seed_defaults(void)
+static int mgmtd_seed_defaults(void)
 {
-	/* If profiles already exist, database was previously seeded */
-	if (sg_db_count("system_admin-profile") > 0)
-		return;
-
-	mgmt_log("INFO", "first boot detected — seeding default configuration");
+	mgmt_log("INFO", "first boot — seeding default configuration");
 
 	/* ── Admin profiles ─────────────────────────────────────────── */
-	sg_db_set("system_admin-profile", "read-write",
-		  "permissions=monitor,configure,admin\n"
-		  "description=Full administrative access\n"
-		  "builtin=yes\n");
+	if (sg_db_set("system_admin-profile", "read-write",
+		      "permissions=monitor,configure,admin\n"
+		      "description=Full administrative access\n"
+		      "builtin=yes\n") != 0) goto fail;
 
-	sg_db_set("system_admin-profile", "read-only",
-		  "permissions=monitor\n"
-		  "description=Read-only monitoring access\n"
-		  "builtin=yes\n");
+	if (sg_db_set("system_admin-profile", "read-only",
+		      "permissions=monitor\n"
+		      "description=Read-only monitoring access\n"
+		      "builtin=yes\n") != 0) goto fail;
 
 	/* ── Default admin account ──────────────────────────────────── */
-	sg_db_set("system_admin", "admin",
-		  "profile=read-write\n"
-		  "enforce-change-password=enable\n"
-		  "enforce-password-policy=enable\n"
-		  "builtin=yes\n");
+	if (sg_db_set("system_admin", "admin",
+		      "profile=read-write\n"
+		      "enforce-change-password=enable\n"
+		      "enforce-password-policy=enable\n"
+		      "builtin=yes\n") != 0) goto fail;
 
 	/* ── Password policy ────────────────────────────────────────── */
-	sg_db_set("system_password-policy", "0",
-		  "min-length=8\n"
-		  "min-uppercase=1\n"
-		  "min-lowercase=1\n"
-		  "min-digit=1\n"
-		  "min-special=0\n"
-		  "builtin=yes\n");
+	if (sg_db_set("system_password-policy", "0",
+		      "min-length=8\n"
+		      "min-uppercase=1\n"
+		      "min-lowercase=1\n"
+		      "min-digit=1\n"
+		      "min-special=0\n"
+		      "builtin=yes\n") != 0) goto fail;
 
 	/* ── System settings ────────────────────────────────────────── */
-	sg_db_set("system_settings", "0",
-		  "hostname=stargazer\n"
-		  "ip-forward=enable\n");
+	if (sg_db_set("system_settings", "0",
+		      "hostname=stargazer\n"
+		      "ip-forward=enable\n") != 0) goto fail;
 
 	/* ── Default firewall policy (deny all) ─────────────────────── */
-	sg_db_set("firewall_policy", "1",
-		  "name=default-deny\n"
-		  "srcintf=any\n"
-		  "dstintf=any\n"
-		  "srcaddr=all\n"
-		  "dstaddr=all\n"
-		  "action=deny\n"
-		  "status=enable\n"
-		  "comment=Default deny all traffic\n");
+	if (sg_db_set("firewall_policy", "1",
+		      "name=default-deny\n"
+		      "srcintf=any\n"
+		      "dstintf=any\n"
+		      "srcaddr=all\n"
+		      "dstaddr=all\n"
+		      "action=deny\n"
+		      "status=enable\n"
+		      "comment=Default deny all traffic\n") != 0) goto fail;
 
 	/* Interfaces and routes are handled by mgmtd_sync_interfaces() */
 
+	/* Verify critical tables populated before stamping flag */
+	for (size_t i = 0; i < N_CRITICAL; i++) {
+		if (sg_db_count(critical_tables[i]) == 0) {
+			mgmt_log("ERROR", "seed verify: %s has 0 entries",
+				 critical_tables[i]);
+			return -1;
+		}
+	}
+
+	/* Stamp the seeded flag LAST — if seeding partially fails,
+	 * next boot retries as BOOT_FIRST (no flag, all tables empty). */
+	sg_db_set_val("system_meta", "0", "seeded", "1");
+
 	mgmt_log("INFO", "default configuration seeded successfully");
+	return 0;
+
+fail:
+	mgmt_log("ERROR", "seed failed — database write error");
+	return -1;
+}
+
+/* ── Config reconciliation ──────────────────────────────────────────────── */
+
+/*
+ * Reconcile database state with the current firmware's config registry.
+ * Runs on every boot (both FIRST and NORMAL). Direction-agnostic:
+ * handles upgrade, downgrade, and same-version equally.
+ *
+ * Phase 1: Seed missing CFG_SINGLE types (new types added by firmware)
+ * Phase 2: Backfill missing keys on existing entries (new fields added)
+ * Phase 3: Purge stale types (types removed from registry)
+ */
+static void mgmtd_reconcile_config(void)
+{
+	const sg_type_info_t *types = sg_reg_types();
+	int changes = 0;
+
+	/* ── Phase 1: seed missing CFG_SINGLE types ───────────────── */
+
+	for (const sg_type_info_t *t = types; t->name; t++) {
+		if (t->mode != CFG_SINGLE)
+			continue;
+		if (sg_db_count(t->name) > 0)
+			continue;
+
+		const char *defs = sg_reg_default_values(t->name);
+		if (!defs || !defs[0])
+			continue;
+
+		/* Copy static buffer — sg_db_set may clobber it */
+		char defcopy[1024];
+		snprintf(defcopy, sizeof(defcopy), "%s", defs);
+
+		if (sg_db_set(t->name, "0", defcopy) == 0) {
+			mgmt_log("INFO", "reconcile: seeded missing %s",
+				 t->name);
+			changes++;
+		} else {
+			mgmt_log("ERROR", "reconcile: failed to seed %s",
+				 t->name);
+		}
+	}
+
+	/* ── Phase 2: backfill missing keys on existing entries ───── */
+
+	for (const sg_type_info_t *t = types; t->name; t++) {
+		const char *defs = sg_reg_default_values(t->name);
+		if (!defs || !defs[0])
+			continue;
+
+		/* Copy static buffer before iterating */
+		char defcopy[1024];
+		snprintf(defcopy, sizeof(defcopy), "%s", defs);
+
+		/* Parse "key=val\n" pairs from defaults */
+		char *p = defcopy;
+		while (*p) {
+			if (*p == '\n') { p++; continue; }
+
+			char *eol = strchr(p, '\n');
+			if (eol) *eol = '\0';
+
+			char *eq = strchr(p, '=');
+			if (!eq) {
+				p = eol ? eol + 1 : p + strlen(p);
+				continue;
+			}
+			*eq = '\0';
+			const char *key = p;
+			const char *val = eq + 1;
+
+			if (t->mode == CFG_SINGLE) {
+				if (sg_db_count(t->name) > 0) {
+					char *cur = sg_db_get_val(t->name, "0", key);
+					if (!cur) {
+						sg_db_set_val(t->name, "0", key, val);
+						mgmt_log("INFO", "reconcile: backfilled %s.%s = %s",
+							 t->name, key, val);
+						changes++;
+					} else {
+						free(cur);
+					}
+				}
+			} else {
+				/* CFG_TABLE: iterate all existing entries */
+				char *ids = sg_db_list(t->name);
+				if (ids) {
+					char *id = ids;
+					while (*id) {
+						char *nl = strchr(id, '\n');
+						if (nl) *nl = '\0';
+						if (*id) {
+							char *cur = sg_db_get_val(t->name, id, key);
+							if (!cur) {
+								sg_db_set_val(t->name, id, key, val);
+								mgmt_log("INFO", "reconcile: backfilled %s:%s.%s = %s",
+									 t->name, id, key, val);
+								changes++;
+							} else {
+								free(cur);
+							}
+						}
+						if (!nl) break;
+						id = nl + 1;
+					}
+					free(ids);
+				}
+			}
+
+			p = eol ? eol + 1 : p + strlen(p) + strlen(val) + 1;
+		}
+	}
+
+	/* ── Phase 3: purge stale types ───────────────────────────── */
+
+	char *db_types = sg_db_list_types();
+	if (db_types) {
+		/* Copy because we modify during iteration */
+		char *copy = strdup(db_types);
+		free(db_types);
+		if (copy) {
+			char *tp = copy;
+			while (*tp) {
+				char *nl = strchr(tp, '\n');
+				if (nl) *nl = '\0';
+				if (*tp) {
+					/* Skip internal meta type */
+					if (strcmp(tp, "system_meta") != 0 &&
+					    sg_reg_type_mode(tp) == -1) {
+						mgmt_log("INFO", "reconcile: purging stale type '%s'", tp);
+						sg_db_purge_type(tp);
+						changes++;
+					}
+				}
+				if (!nl) break;
+				tp = nl + 1;
+			}
+			free(copy);
+		}
+	}
+
+	if (changes > 0)
+		mgmt_log("INFO", "reconcile: %d change(s) applied", changes);
 }
 
 /* ── Interface discovery and protection ─────────────────────────────────── */
@@ -1134,6 +1386,7 @@ static void mgmtd_replay_config(void)
 
 	/* Table config types (multiple entries) */
 	static const char *table_types[] = {
+		"system_admin",
 		"system_interface",
 		"network_route_static",
 		"network_nat",
@@ -1207,7 +1460,10 @@ int session_rev_get(const char *user)
 
 	while (fgets(line, sizeof(line), fp)) {
 		if (strncmp(line, user, ulen) == 0 && line[ulen] == ':') {
-			rev = atoi(line + ulen + 1);
+			errno = 0;
+			long val = strtol(line + ulen + 1, NULL, 10);
+			if (errno == 0 && val > 0 && val <= INT_MAX)
+				rev = (int)val;
 			break;
 		}
 	}
@@ -1225,28 +1481,111 @@ static void session_rev_set(const char *user, int rev)
 
 	size_t ulen = strlen(user);
 
+	int write_ok = 1;
+
 	FILE *in = fopen(SESSION_REV_FILE, "r");
 	if (in) {
 		char line[MAX_LINE];
 		while (fgets(line, sizeof(line), in)) {
-			if (strncmp(line, user, ulen) != 0 || line[ulen] != ':')
-				fputs(line, out);
+			if (strncmp(line, user, ulen) != 0 || line[ulen] != ':') {
+				if (fputs(line, out) == EOF)
+					write_ok = 0;
+			}
 		}
 		fclose(in);
 	}
-	fprintf(out, "%s:%d\n", user, rev);
+
+	if (fprintf(out, "%s:%d\n", user, rev) < 0)
+		write_ok = 0;
+	if (fflush(out) != 0)
+		write_ok = 0;
+	if (fsync(fileno(out)) != 0)
+		write_ok = 0;
 	fchmod(fileno(out), 0644);
 	fclose(out);
 
-	if (rename(tmppath, SESSION_REV_FILE) != 0)
+	if (write_ok) {
+		if (rename(tmppath, SESSION_REV_FILE) != 0) {
+			mgmt_log("ERROR", "session_rev_set: rename failed: %s",
+				 strerror(errno));
+			unlink(tmppath);
+		}
+	} else {
+		mgmt_log("ERROR", "session_rev_set: write failed for user '%s'",
+			 user);
 		unlink(tmppath);
+	}
 }
 
 int session_rev_bump(const char *user)
 {
 	int rev = session_rev_get(user);
-	session_rev_set(user, rev + 1);
-	return rev + 1;
+	rev = (rev >= INT_MAX - 1) ? 1 : rev + 1;
+	session_rev_set(user, rev);
+	return rev;
+}
+
+/*
+ * Must be called after ANY successful admin account mutation.
+ * Invalidates the target user's active CLI sessions so they
+ * must re-authenticate with updated credentials / permissions.
+ */
+void admin_notify_change(const char *user)
+{
+	session_rev_bump(user);
+}
+
+void session_rev_del(const char *user)
+{
+	char tmppath[128];
+	snprintf(tmppath, sizeof(tmppath), "%s.tmp.%d",
+		 SESSION_REV_FILE, (int)getpid());
+
+	FILE *out = fopen(tmppath, "w");
+	if (!out) return;
+
+	size_t ulen = strlen(user);
+	int write_ok = 1;
+	int found = 0;
+
+	FILE *in = fopen(SESSION_REV_FILE, "r");
+	if (in) {
+		char line[MAX_LINE];
+		while (fgets(line, sizeof(line), in)) {
+			if (strncmp(line, user, ulen) == 0 &&
+			    line[ulen] == ':') {
+				found = 1;
+			} else {
+				if (fputs(line, out) == EOF)
+					write_ok = 0;
+			}
+		}
+		fclose(in);
+	}
+
+	if (fflush(out) != 0)
+		write_ok = 0;
+	if (fsync(fileno(out)) != 0)
+		write_ok = 0;
+	fchmod(fileno(out), 0644);
+	fclose(out);
+
+	if (!found) {
+		unlink(tmppath);
+		return;
+	}
+
+	if (write_ok) {
+		if (rename(tmppath, SESSION_REV_FILE) != 0) {
+			mgmt_log("ERROR", "session_rev_del: rename failed: %s",
+				 strerror(errno));
+			unlink(tmppath);
+		}
+	} else {
+		mgmt_log("ERROR", "session_rev_del: write failed for user '%s'",
+			 user);
+		unlink(tmppath);
+	}
 }
 
 /* ── Apply config to running system ─────────────────────────────────────── */
@@ -1399,7 +1738,7 @@ static sg_status_t apply_config(const char *type, const char *id,
 			snprintf(result, rsize, "Admin '%s' applied (profile: %s)." AUDIT_WARN, id, profile);
 		else
 			snprintf(result, rsize, "Admin '%s' applied (profile: %s).", id, profile);
-		session_rev_bump(id);
+		admin_notify_change(id);
 		return SG_OK;
 	}
 
@@ -1738,6 +2077,25 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 		return 0;
 	}
 
+	case SG_CMD_CFG_LIST_TYPES: {
+		/* List all distinct config types stored in the database.
+		 * Requires admin permission (exposes full schema). */
+		const char *perms = get_user_permissions(user);
+		if (!has_permission(perms, "admin")) {
+			send_error(client_fd, SG_ERR_PERM_DENIED,
+				   "Requires 'admin' permission");
+			return 0;
+		}
+		char *types = sg_db_list_types();
+		if (types) {
+			send_ok(client_fd, NULL, types);
+			free(types);
+		} else {
+			send_ok(client_fd, "No types", "");
+		}
+		return 0;
+	}
+
 	/* ── Config write ───────────────────────────────────────────────── */
 	case SG_CMD_CFG_SET: {
 		/* Payload format: "section\nkey=value\nkey=value\n..." */
@@ -1854,7 +2212,7 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 
 		/* Bump session for admin/profile/policy config changes */
 		if (strcmp(db_type, "system_admin") == 0) {
-			session_rev_bump(db_id);
+			admin_notify_change(db_id);
 		} else if (strcmp(db_type, "system_password-policy") == 0) {
 			/* Policy change affects all admins — bump everyone */
 			char *admins = sg_db_list("system_admin");
@@ -1968,8 +2326,9 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 
 		/* If deleting admin, bump session and delete system user */
 		if (strcmp(db_type, "system_admin") == 0) {
-			session_rev_bump(db_id);
+			admin_notify_change(db_id);
 			delete_system_user(db_id);
+			session_rev_del(db_id);
 		}
 
 		if (sg_db_del(db_type, db_id) != 0) {
@@ -2515,7 +2874,54 @@ int main(void)
 	/* Remove stale socket */
 	unlink(SG_MGMTD_SOCK);
 
-	/* Create socket */
+	/* Ensure config directory exists with restricted permissions.
+	 * mgmtd is now the sole accessor — CLI reads via IPC only. */
+	mkdir(CONF_DIR, 0700);
+	chmod(CONF_DIR, 0700);
+
+	/* Open SQLite database */
+	if (sg_db_open(SG_DB_PATH) != 0) {
+		fprintf(stderr, "stargazer-mgmtd: failed to open database\n");
+		mgmtd_signal_fifo("error");
+		return 1;
+	}
+
+	/* Harden file permissions — mgmtd is the sole file accessor */
+	chmod(SG_DB_PATH, 0600);
+	chmod(AUDIT_LOG, 0600);
+	chmod(SESSION_REV_FILE, 0600);
+
+	/* Boot integrity check — single source of truth for first-boot detection */
+	boot_state_t boot = mgmtd_check_boot_integrity();
+	if (boot == BOOT_CORRUPTED || boot == BOOT_COMPROMISED) {
+		mgmt_log("ERROR", "refusing to start — database integrity check failed");
+		mgmtd_signal_fifo("error");
+		sg_db_close();
+		return 1;
+	}
+	if (boot == BOOT_FIRST) {
+		if (mgmtd_seed_defaults() != 0) {
+			mgmt_log("ERROR", "refusing to start — seed failed");
+			mgmtd_signal_fifo("error");
+			sg_db_close();
+			return 1;
+		}
+	}
+
+	/* Reconcile config: seed missing types, backfill keys, purge stale */
+	mgmtd_reconcile_config();
+
+	/* Discover NICs, create/protect interface entries */
+	mgmtd_sync_interfaces();
+
+	/* Set INPUT policy DROP, allow loopback + return traffic */
+	mgmtd_init_firewall();
+
+	/* Apply saved configuration to running system */
+	mgmtd_replay_config();
+
+	/* Create socket AFTER init is complete — socket file appearance means
+	 * mgmtd is truly ready to accept connections (no backlog delay). */
 	int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (sfd < 0) {
 		perror("socket");
@@ -2549,36 +2955,10 @@ int main(void)
 		return 1;
 	}
 
+	/* Signal readiness to init via FIFO */
+	mgmtd_signal_fifo("ready");
+
 	mgmt_log("INFO", "stargazer-mgmtd started, listening on %s", SG_MGMTD_SOCK);
-
-	/* Ensure config directory exists with restricted permissions.
-	 * mgmtd is now the sole accessor — CLI reads via IPC only. */
-	mkdir(CONF_DIR, 0700);
-	chmod(CONF_DIR, 0700);
-
-	/* Open SQLite database */
-	if (sg_db_open(SG_DB_PATH) != 0) {
-		fprintf(stderr, "stargazer-mgmtd: failed to open database\n");
-		close(sfd);
-		return 1;
-	}
-
-	/* Harden file permissions — mgmtd is the sole file accessor */
-	chmod(SG_DB_PATH, 0600);
-	chmod(AUDIT_LOG, 0600);
-	chmod(SESSION_REV_FILE, 0600);
-
-	/* Seed defaults on first boot (no-op if already seeded) */
-	mgmtd_seed_defaults();
-
-	/* Discover NICs, create/protect interface entries */
-	mgmtd_sync_interfaces();
-
-	/* Set INPUT policy DROP, allow loopback + return traffic */
-	mgmtd_init_firewall();
-
-	/* Apply saved configuration to running system */
-	mgmtd_replay_config();
 
 	/* Store listen fd for forked children to close */
 	g_listen_fd = sfd;
