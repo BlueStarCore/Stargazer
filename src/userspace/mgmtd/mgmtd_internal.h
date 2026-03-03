@@ -57,6 +57,8 @@ void debug_buf_push(const char *fmt, ...)
 
 int  session_rev_get(const char *user);
 int  session_rev_bump(const char *user);
+void session_rev_del(const char *user);
+void admin_notify_change(const char *user);
 
 /* ── Auth / permissions (defined in stargazer-mgmtd.c) ───────────────────── */
 

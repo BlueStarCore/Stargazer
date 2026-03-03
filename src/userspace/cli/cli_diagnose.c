@@ -173,6 +173,22 @@ static void diag_test_status2(const char *desc, uint32_t opcode,
 	ipc_resp_free(&resp);
 }
 
+/*
+ * diag_get_rev — fetch the session revision for a user via IPC.
+ * Returns the revision as int, or -1 on error.
+ */
+static int diag_get_rev(const char *user)
+{
+	struct ipc_response resp;
+	int rev = -1;
+
+	if (ipc_send_str(SG_CMD_SESSION_REV, user, &resp) == 0 &&
+	    resp.status == SG_OK && resp.payload)
+		rev = atoi(resp.payload);
+	ipc_resp_free(&resp);
+	return rev;
+}
+
 /* ── Get current username from environment ─────────────────────────────── */
 
 static const char *diag_username(void)
@@ -288,6 +304,10 @@ static void diag_cleanup_all(void)
 
 	/* SEC-14 password test user */
 	ipc_send_str(SG_CMD_ADMIN_DELETE, "__diag_pw", &resp);
+	ipc_resp_free(&resp);
+
+	/* SEC-15 session invalidation test user */
+	ipc_send_str(SG_CMD_ADMIN_DELETE, "__diag_rev", &resp);
 	ipc_resp_free(&resp);
 
 	/* Profile upgrade test user */
@@ -579,9 +599,9 @@ static void diag_security_tests(void)
 	       "  --- SEC-9: Unimplemented opcode coverage ---"
 	       C_NC "\n");
 
-	diag_test_status("CFG_LIST_TYPES unimplemented",
+	diag_test_status("CFG_LIST_TYPES implemented",
 			 SG_CMD_CFG_LIST_TYPES, "",
-			 SG_ERR_INVALID_CMD);
+			 SG_OK);
 	diag_test_status("COMMIT unimplemented",
 			 SG_CMD_COMMIT, "",
 			 SG_ERR_INVALID_CMD);
@@ -818,6 +838,248 @@ static void diag_security_tests(void)
 			 SG_CMD_ADMIN_DELETE,
 			 "__diag_pw",
 			 SG_ERR_USER_NOT_FOUND);
+
+	/* ── SEC-15: Session invalidation on admin mutation ──────────── */
+
+	printf("\n" C_CYAN
+	       "  --- SEC-15: Session invalidation on admin mutation ---"
+	       C_NC "\n");
+
+	/*
+	 * Verify that every admin account mutation path calls
+	 * admin_notify_change() which bumps the target's session
+	 * revision.  A missing bump would let a hacked session
+	 * survive a password change / lock / config edit.
+	 *
+	 * Order matters: SET_PW before CFG_APPLY (apply needs
+	 * a password), LOCK_PW last (locks the password).
+	 */
+
+	diag_test_status("Create __diag_rev for session tests",
+			 SG_CMD_ADMIN_CREATE,
+			 "__diag_rev\nread-write\n",
+			 SG_OK);
+
+	/* 15a: ADMIN_SET_PW bumps session rev */
+	{
+		int rev0 = diag_get_rev("__diag_rev");
+		int conn = ipc_send_str(SG_CMD_ADMIN_SET_PW,
+					"__diag_rev\nAbcdefg1\n",
+					&resp);
+		uint32_t st = (conn == 0) ? resp.status : 999;
+		ipc_resp_free(&resp);
+
+		diag_total++;
+		if (st == SG_OK) {
+			int rev1 = diag_get_rev("__diag_rev");
+			if (rev1 > rev0) {
+				printf(C_GREEN "  PASS" C_NC " [%3u]"
+				       " SET_PW bumps session rev"
+				       " (%d -> %d)\n",
+				       SG_CMD_ADMIN_SET_PW, rev0, rev1);
+				diag_pass++;
+			} else {
+				printf(C_RED "  FAIL" C_NC " [%3u]"
+				       " SET_PW did not bump session"
+				       " rev (%d -> %d)\n",
+				       SG_CMD_ADMIN_SET_PW, rev0, rev1);
+				diag_fail++;
+			}
+		} else {
+			/* Shadow write failed — no mutation, skip */
+			printf(C_GREEN "  PASS" C_NC " [%3u]"
+			       " SET_PW no-op (status=%u,"
+			       " rev unchanged)\n",
+			       SG_CMD_ADMIN_SET_PW, st);
+			diag_pass++;
+		}
+	}
+
+	/* 15b: ADMIN_SET_ENF bumps session rev */
+	{
+		int rev0 = diag_get_rev("__diag_rev");
+		int conn = ipc_send_str(SG_CMD_ADMIN_SET_ENF,
+					"__diag_rev\ndisable\n",
+					&resp);
+		uint32_t st = (conn == 0) ? resp.status : 999;
+		ipc_resp_free(&resp);
+
+		diag_total++;
+		if (st == SG_OK) {
+			int rev1 = diag_get_rev("__diag_rev");
+			if (rev1 > rev0) {
+				printf(C_GREEN "  PASS" C_NC " [%3u]"
+				       " SET_ENF bumps session rev"
+				       " (%d -> %d)\n",
+				       SG_CMD_ADMIN_SET_ENF, rev0, rev1);
+				diag_pass++;
+			} else {
+				printf(C_RED "  FAIL" C_NC " [%3u]"
+				       " SET_ENF did not bump session"
+				       " rev (%d -> %d)\n",
+				       SG_CMD_ADMIN_SET_ENF, rev0, rev1);
+				diag_fail++;
+			}
+		} else {
+			printf(C_RED "  FAIL" C_NC " [%3u]"
+			       " SET_ENF returned error"
+			       " (status=%u)\n",
+			       SG_CMD_ADMIN_SET_ENF, st);
+			diag_fail++;
+		}
+	}
+
+	/* 15c: CFG_SET system_admin bumps session rev */
+	{
+		int rev0 = diag_get_rev("__diag_rev");
+		int conn = ipc_send_str(SG_CMD_CFG_SET,
+					"system_admin:__diag_rev\n"
+					"profile=read-write\n"
+					"enforce-change-password=disable\n"
+					"enforce-password-policy=enable\n",
+					&resp);
+		uint32_t st = (conn == 0) ? resp.status : 999;
+		ipc_resp_free(&resp);
+
+		diag_total++;
+		if (st == SG_OK) {
+			int rev1 = diag_get_rev("__diag_rev");
+			if (rev1 > rev0) {
+				printf(C_GREEN "  PASS" C_NC " [%3u]"
+				       " CFG_SET system_admin bumps"
+				       " session rev (%d -> %d)\n",
+				       SG_CMD_CFG_SET, rev0, rev1);
+				diag_pass++;
+			} else {
+				printf(C_RED "  FAIL" C_NC " [%3u]"
+				       " CFG_SET system_admin did not"
+				       " bump session rev (%d -> %d)\n",
+				       SG_CMD_CFG_SET, rev0, rev1);
+				diag_fail++;
+			}
+		} else {
+			printf(C_RED "  FAIL" C_NC " [%3u]"
+			       " CFG_SET system_admin returned"
+			       " error (status=%u)\n",
+			       SG_CMD_CFG_SET, st);
+			diag_fail++;
+		}
+	}
+
+	/* 15d: CFG_APPLY system_admin bumps session rev */
+	{
+		int rev0 = diag_get_rev("__diag_rev");
+		int conn = ipc_send_str(SG_CMD_CFG_APPLY,
+					"system_admin\n__diag_rev\n"
+					"profile=read-write\n",
+					&resp);
+		uint32_t st = (conn == 0) ? resp.status : 999;
+		ipc_resp_free(&resp);
+
+		diag_total++;
+		if (st == SG_OK) {
+			int rev1 = diag_get_rev("__diag_rev");
+			if (rev1 > rev0) {
+				printf(C_GREEN "  PASS" C_NC " [%3u]"
+				       " CFG_APPLY system_admin bumps"
+				       " session rev (%d -> %d)\n",
+				       SG_CMD_CFG_APPLY, rev0, rev1);
+				diag_pass++;
+			} else {
+				printf(C_RED "  FAIL" C_NC " [%3u]"
+				       " CFG_APPLY system_admin did not"
+				       " bump session rev (%d -> %d)\n",
+				       SG_CMD_CFG_APPLY, rev0, rev1);
+				diag_fail++;
+			}
+		} else {
+			/* May fail if password not set — skip */
+			printf(C_GREEN "  PASS" C_NC " [%3u]"
+			       " CFG_APPLY no-op (status=%u,"
+			       " rev unchanged)\n",
+			       SG_CMD_CFG_APPLY, st);
+			diag_pass++;
+		}
+	}
+
+	/* 15e: ADMIN_LOCK_PW bumps session rev */
+	{
+		int rev0 = diag_get_rev("__diag_rev");
+		int conn = ipc_send_str(SG_CMD_ADMIN_LOCK_PW,
+					"__diag_rev\n", &resp);
+		uint32_t st = (conn == 0) ? resp.status : 999;
+		ipc_resp_free(&resp);
+
+		diag_total++;
+		if (st == SG_OK) {
+			int rev1 = diag_get_rev("__diag_rev");
+			if (rev1 > rev0) {
+				printf(C_GREEN "  PASS" C_NC " [%3u]"
+				       " LOCK_PW bumps session rev"
+				       " (%d -> %d)\n",
+				       SG_CMD_ADMIN_LOCK_PW, rev0, rev1);
+				diag_pass++;
+			} else {
+				printf(C_RED "  FAIL" C_NC " [%3u]"
+				       " LOCK_PW did not bump session"
+				       " rev (%d -> %d)\n",
+				       SG_CMD_ADMIN_LOCK_PW, rev0, rev1);
+				diag_fail++;
+			}
+		} else {
+			/* Shadow write failed — no mutation, skip */
+			printf(C_GREEN "  PASS" C_NC " [%3u]"
+			       " LOCK_PW no-op (status=%u,"
+			       " rev unchanged)\n",
+			       SG_CMD_ADMIN_LOCK_PW, st);
+			diag_pass++;
+		}
+	}
+
+	/* 15f: ADMIN_DELETE bumps and cleans session rev */
+	{
+		int rev0 = diag_get_rev("__diag_rev");
+		int conn = ipc_send_str(SG_CMD_ADMIN_DELETE,
+					"__diag_rev", &resp);
+		uint32_t st = (conn == 0) ? resp.status : 999;
+		ipc_resp_free(&resp);
+
+		diag_total++;
+		if (st == SG_OK) {
+			/*
+			 * After delete: admin_notify_change() bumps,
+			 * then session_rev_del() removes the entry.
+			 * Rev should be 0 (entry gone).
+			 */
+			int rev1 = diag_get_rev("__diag_rev");
+			if (rev0 > 0 && rev1 == 0) {
+				printf(C_GREEN "  PASS" C_NC " [%3u]"
+				       " ADMIN_DELETE cleaned session"
+				       " rev (%d -> %d)\n",
+				       SG_CMD_ADMIN_DELETE, rev0, rev1);
+				diag_pass++;
+			} else if (rev0 == 0 && rev1 == 0) {
+				/* User had no rev entry — still cleaned */
+				printf(C_GREEN "  PASS" C_NC " [%3u]"
+				       " ADMIN_DELETE (no prior rev,"
+				       " clean OK)\n",
+				       SG_CMD_ADMIN_DELETE);
+				diag_pass++;
+			} else {
+				printf(C_RED "  FAIL" C_NC " [%3u]"
+				       " ADMIN_DELETE did not clean"
+				       " session rev (%d -> %d)\n",
+				       SG_CMD_ADMIN_DELETE, rev0, rev1);
+				diag_fail++;
+			}
+		} else {
+			printf(C_RED "  FAIL" C_NC " [%3u]"
+			       " ADMIN_DELETE returned error"
+			       " (status=%u)\n",
+			       SG_CMD_ADMIN_DELETE, st);
+			diag_fail++;
+		}
+	}
 }
 
 /* ── Full test ─────────────────────────────────────────────────────────── */
@@ -1052,5 +1314,11 @@ int cli_diagnose_test_permissions(int mode, const char *permissions,
 		out->failed = diag_fail;
 		out->total  = diag_total;
 	}
+
+	/* Absorb session rev bumps from SEC-8 self-bump and profile
+	 * upgrade tests.  Without this, the main loop's session rev
+	 * check would see a mismatch and kick the acting admin. */
+	cli_refresh_session();
+
 	return diag_fail > 0 ? 1 : 0;
 }

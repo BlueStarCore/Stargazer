@@ -312,7 +312,10 @@ int create_system_user(const char *username, const char *shell)
 		while (fgets(line, sizeof(line), fp)) {
 			if (strncmp(line, check, strlen(check)) == 0) {
 				fclose(fp);
-				return 0; /* already exists */
+				/* User exists — still ensure group membership
+				 * so they can connect to the mgmtd socket. */
+				add_user_to_group(username, "stargazer");
+				return 0;
 			}
 		}
 		fclose(fp);
@@ -632,7 +635,8 @@ int handle_admin_delete(int client_fd, const char *user,
 
 	sg_db_del("system_admin", target);
 	delete_system_user(target);
-	session_rev_bump(target);
+	admin_notify_change(target);
+	session_rev_del(target);
 
 	if (g_debug_flags & SG_DBG_FLAG_AUTH)
 		debug_buf_push("[AUTH-DBG] delete user=%s result=ok\n",
@@ -703,6 +707,7 @@ int handle_admin_set_pw(int client_fd, const char *user,
 		return 0;
 	}
 	explicit_bzero(pw, sizeof(pw));
+	admin_notify_change(target);
 	if (g_debug_flags & SG_DBG_FLAG_AUTH)
 		debug_buf_push("[AUTH-DBG] set_password user=%s result=ok\n",
 			       target);
@@ -775,6 +780,7 @@ int handle_admin_set_enf(int client_fd, const char *user,
 	sg_db_set("system_admin", target, newdata);
 	free(existing);
 	free(newdata);
+	admin_notify_change(target);
 	send_ok_audited(client_fd, "Enforce policy updated", NULL,
 			user, "admin_set_enforce", target);
 	return 0;
@@ -879,6 +885,7 @@ int handle_admin_lock_pw(int client_fd, const char *user,
 			   "Failed to lock password");
 		return 0;
 	}
+	admin_notify_change(lock_target);
 	if (g_debug_flags & SG_DBG_FLAG_AUTH)
 		debug_buf_push("[AUTH-DBG] lock_password user=%s result=ok\n",
 			       lock_target);
