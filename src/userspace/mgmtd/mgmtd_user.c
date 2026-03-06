@@ -636,7 +636,6 @@ int handle_admin_delete(int client_fd, const char *user,
 	sg_db_del("system_admin", target);
 	delete_system_user(target);
 	admin_notify_change(target);
-	session_rev_del(target);
 
 	if (g_debug_flags & SG_DBG_FLAG_AUTH)
 		debug_buf_push("[AUTH-DBG] delete user=%s result=ok\n",

@@ -1147,18 +1147,6 @@ static void test_ipc_admin_reject(void)
 		  "a;b",
 		  SG_ERR_INVALID_ARG);
 
-	/* SESSION_REV with bad username */
-	ipc_check("SESSION_REV username '$var'",
-		  SG_CMD_SESSION_REV,
-		  "$var",
-		  SG_ERR_INVALID_ARG);
-
-	/* SESSION_BUMP with bad username */
-	ipc_check("SESSION_BUMP username '`id`'",
-		  SG_CMD_SESSION_BUMP,
-		  "`id`",
-		  SG_ERR_INVALID_ARG);
-
 	/* ADMIN_CREATE with bad username (no validation, but verify it
 	 * does not crash — this tests existing behavior) */
 	ipc_check("ADMIN_CREATE username 'a:b' (should reject)",
@@ -2438,6 +2426,10 @@ static void test_ipc_cfg_set_validation(void)
 	}
 	ipc_resp_free(&resp);
 
+	/* Profile update triggers session tag purge for all admins
+	 * using this profile.  Re-acquire tag to continue testing. */
+	ipc_reacquire_tag();
+
 	/* Verify builtin=yes was preserved */
 	tc_total++;
 	conn = ipc_send_str(SG_CMD_CFG_GET,
@@ -2779,6 +2771,9 @@ static void test_ipc_resource_cleanup(void)
 static void cleanup_test_entries(void)
 {
 	struct ipc_response resp;
+
+	/* Re-acquire tag in case a prior test triggered a session purge */
+	ipc_reacquire_tag();
 
 	/* Best-effort cleanup of test entries */
 	if (ipc_send_str(SG_CMD_CFG_DEL,

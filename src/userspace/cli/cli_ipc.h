@@ -22,6 +22,17 @@ struct ipc_response {
 /* Initialize IPC client with the authenticated username. */
 int ipc_init(const char *username);
 
+/* Session tag management.
+ * Tag is sent in every IPC request header for server-side validation. */
+void     ipc_set_session_tag(uint64_t tag);
+uint64_t ipc_get_session_tag(void);
+int      ipc_session_expired(void);
+void     ipc_clear_session_expired(void);
+
+/* Re-acquire a session tag after expiration. Returns 0 on success, -1 on error.
+ * Clears the session-expired flag and replaces the stored tag. */
+int      ipc_reacquire_tag(void);
+
 /* Send request and receive response. Returns 0 on SG_OK, -1 on conn error.
  * On success/error, resp is populated. Caller must free resp->payload. */
 int ipc_send(uint32_t cmd, const char *payload, size_t payload_len,

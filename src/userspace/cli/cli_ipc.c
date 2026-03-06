@@ -27,7 +27,9 @@
 
 /* ── Static state ──────────────────────────────────────────────────────── */
 
-static char ipc_username[SG_USERNAME_MAX];
+static char     ipc_username[SG_USERNAME_MAX];
+static uint64_t ipc_session_tag;
+static int      g_session_expired;
 
 /* ── Poll-based Ctrl+C interrupt detection ────────────────────────────── */
 
@@ -108,8 +110,8 @@ static const char *cmd_name(uint32_t cmd)
 	case SG_CMD_ADMIN_SET_ENF:  return "ADMIN_SET_ENF";
 	case SG_CMD_ADMIN_CHECK_PW: return "ADMIN_CHECK_PW";
 	case SG_CMD_ADMIN_LOCK_PW:  return "ADMIN_LOCK_PW";
-	case SG_CMD_SESSION_REV:    return "SESSION_REV";
-	case SG_CMD_SESSION_BUMP:   return "SESSION_BUMP";
+	case SG_CMD_SESSION_TAG_NEW: return "SESSION_TAG_NEW";
+	case SG_CMD_SESSION_TAG_DEL: return "SESSION_TAG_DEL";
 	case SG_CMD_COMMIT:         return "COMMIT";
 	case SG_CMD_REVISIONS:      return "REVISIONS";
 	case SG_CMD_ROLLBACK:       return "ROLLBACK";
@@ -166,6 +168,7 @@ static const char *status_name(uint32_t s)
 	case SG_ERR_AUTH_FAIL:         return "AUTH_FAIL";
 	case SG_ERR_LOCKED:            return "LOCKED";
 	case SG_ERR_PROFILE_DENY:      return "PROFILE_DENY";
+	case SG_ERR_SESSION_EXPIRED:   return "SESSION_EXPIRED";
 	case SG_ERR_NOT_FOUND:         return "NOT_FOUND";
 	case SG_ERR_USER_NOT_FOUND:    return "USER_NOT_FOUND";
 	case SG_ERR_PROFILE_NOT_FOUND: return "PROFILE_NOT_FOUND";
@@ -277,6 +280,51 @@ int ipc_init(const char *username)
 	return 0;
 }
 
+void ipc_set_session_tag(uint64_t tag)
+{
+	ipc_session_tag = tag;
+}
+
+uint64_t ipc_get_session_tag(void)
+{
+	return ipc_session_tag;
+}
+
+int ipc_session_expired(void)
+{
+	return g_session_expired;
+}
+
+void ipc_clear_session_expired(void)
+{
+	g_session_expired = 0;
+}
+
+int ipc_reacquire_tag(void)
+{
+	struct ipc_response resp;
+	uint64_t old_tag = ipc_session_tag;
+
+	/* Clear expired flag so the SESSION_TAG_NEW request goes through */
+	g_session_expired = 0;
+	ipc_session_tag = 0;
+
+	if (ipc_send_str(SG_CMD_SESSION_TAG_NEW, "", &resp) != 0 ||
+	    resp.status != SG_OK || !resp.payload) {
+		ipc_resp_free(&resp);
+		ipc_session_tag = old_tag;
+		return -1;
+	}
+	uint64_t new_tag = strtoull(resp.payload, NULL, 10);
+	ipc_resp_free(&resp);
+	if (new_tag == 0) {
+		ipc_session_tag = old_tag;
+		return -1;
+	}
+	ipc_session_tag = new_tag;
+	return 0;
+}
+
 int ipc_send(uint32_t cmd, const char *payload, size_t payload_len,
 	     struct ipc_response *resp)
 {
@@ -330,6 +378,7 @@ int ipc_send(uint32_t cmd, const char *payload, size_t payload_len,
 	snprintf(hdr.username, sizeof(hdr.username), "%s", ipc_username);
 	hdr.payload_len = (uint32_t)payload_len;
 	hdr.debug_flags = debug_flags;
+	hdr.session_tag = ipc_session_tag;
 
 	if (safe_write(fd, &hdr, sizeof(hdr)) < 0)
 		goto out;
@@ -357,6 +406,10 @@ int ipc_send(uint32_t cmd, const char *payload, size_t payload_len,
 	resp->status = rhdr.status;
 	memcpy(resp->extra, rhdr.extra, sizeof(resp->extra));
 	resp->extra[sizeof(resp->extra) - 1] = '\0';
+
+	/* Detect session expiration */
+	if (resp->status == SG_ERR_SESSION_EXPIRED)
+		g_session_expired = 1;
 
 	/* Read response payload */
 	if (rhdr.payload_len > 0 && rhdr.payload_len <= SG_RESPONSE_MAX) {
@@ -433,6 +486,7 @@ int ipc_send_stream(uint32_t cmd, const char *payload_str,
 	snprintf(hdr.username, sizeof(hdr.username), "%s", ipc_username);
 	hdr.payload_len = (uint32_t)payload_len;
 	hdr.debug_flags = debug_flags;
+	hdr.session_tag = ipc_session_tag;
 
 	if (safe_write(fd, &hdr, sizeof(hdr)) < 0)
 		goto out;
@@ -520,6 +574,8 @@ int ipc_send_stream(uint32_t cmd, const char *payload_str,
 		if (!is_stream) {
 			/* Final response */
 			ret = (int)rhdr.status;
+			if (rhdr.status == SG_ERR_SESSION_EXPIRED)
+				g_session_expired = 1;
 			break;
 		}
 	}

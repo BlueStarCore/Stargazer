@@ -53,11 +53,9 @@ int  audit_log(const char *user, const char *event, const char *msg);
 void debug_buf_push(const char *fmt, ...)
 	__attribute__((format(printf, 1, 2)));
 
-/* ── Session (defined in stargazer-mgmtd.c) ──────────────────────────────── */
+/* ── Session tags (defined in stargazer-mgmtd.c) ─────────────────────────── */
 
-int  session_rev_get(const char *user);
-int  session_rev_bump(const char *user);
-void session_rev_del(const char *user);
+void session_tag_purge_user(const char *user);
 void admin_notify_change(const char *user);
 
 /* ── Auth / permissions (defined in stargazer-mgmtd.c) ───────────────────── */
