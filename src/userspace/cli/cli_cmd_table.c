@@ -522,6 +522,36 @@ static int cmd_diag_selftest(const char *args, const char *permissions)
 	return 0;
 }
 
+static int cmd_diag_pentest(const char *args, const char *permissions)
+{
+	int mode = 0;
+	if (args) {
+		while (*args == ' ')
+			args++;
+		if (strcmp(args, "full") == 0)
+			mode = 1;
+		else if (*args != '\0') {
+			printf("  Unknown argument: %s\n", args);
+			printf("  Usage: execute diagnose pentest [full]\n");
+			return 0;
+		}
+	}
+	diag_result_t r = {0, 0, 0};
+	int fail = cli_diagnose_test_pentest(mode, permissions, &r);
+
+	printf("  ══════════════════════════════════════\n");
+	printf("  Pentest: %d/%d passed", r.passed, r.total);
+	if (r.failed > 0)
+		printf(C_RED ", %d FAILED" C_NC, r.failed);
+	printf("\n");
+	if (fail == 0)
+		printf(C_GREEN "  All pentest checks passed." C_NC "\n");
+	else
+		printf(C_RED "  %d pentest check(s) failed." C_NC "\n", r.failed);
+	printf("  ══════════════════════════════════════\n\n");
+	return 0;
+}
+
 static int cmd_diag_fw_policy(const char *args, const char *permissions)
 {
 	(void)permissions;

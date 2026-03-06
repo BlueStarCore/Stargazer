@@ -65,6 +65,15 @@ int cli_diagnose_test_upgrade(int mode, diag_result_t *out);
 int cli_diagnose_test_sandbox(int mode, diag_result_t *out);
 
 /*
+ * Run penetration tests (adversarial input, auth IPC security, config perms).
+ *   mode=0: SEC-16..18 (auth gate, config visibility, password handler fuzzing)
+ *   mode=1: full test (also runs SEC-1..15 injection/overflow/escalation tests)
+ * Returns 0 on all-pass, 1 on any failure.
+ */
+int cli_diagnose_test_pentest(int mode, const char *permissions,
+			      diag_result_t *out);
+
+/*
  * Run database health diagnostics.
  *   mode=0: registry consistency (local, no IPC)
  *   mode=1: full test (IPC round-trips for DB state verification)
