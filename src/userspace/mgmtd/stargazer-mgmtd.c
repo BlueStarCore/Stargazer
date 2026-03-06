@@ -1760,6 +1760,12 @@ int has_permission(const char *perms_csv, const char *perm)
 }
 
 /*
+ * Check if user has the per-type permission for a config type.
+ * Returns 1 if allowed, 0 if denied.
+ * "admin" perm types require "admin".
+ * "configure" perm types require "configure" OR "admin".
+ */
+/*
  * Return the permission required to access a config type.
  * Returns "admin", "configure", etc., or NULL if the type is unknown.
  * Callers decide what user permissions satisfy the requirement
@@ -1968,7 +1974,10 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 	    cmd != SG_CMD_WHOAMI &&
 	    cmd != SG_CMD_DEBUG_FETCH &&
 	    cmd != SG_CMD_HISTORY_LOAD &&
-	    cmd != SG_CMD_HISTORY_SAVE) {
+	    cmd != SG_CMD_HISTORY_SAVE &&
+	    cmd != SG_CMD_AUTH_LOGIN &&
+	    cmd != SG_CMD_AUTH_CHANGE_PW &&
+	    cmd != SG_CMD_AUTH_LOGIN_OK) {
 		if (!session_tag_validate(user, hdr->session_tag)) {
 			send_error(client_fd, SG_ERR_SESSION_EXPIRED,
 				   "Session tag invalid or expired");
@@ -2450,6 +2459,14 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 		return handle_admin_check_pw(client_fd, user, payload, hdr);
 	case SG_CMD_ADMIN_LOCK_PW:
 		return handle_admin_lock_pw(client_fd, user, payload, hdr);
+
+	/* ── Auth login flow (logind privilege separation) ─────────────── */
+	case SG_CMD_AUTH_LOGIN:
+		return handle_auth_login(client_fd, user, payload, hdr);
+	case SG_CMD_AUTH_CHANGE_PW:
+		return handle_auth_change_pw(client_fd, user, payload, hdr);
+	case SG_CMD_AUTH_LOGIN_OK:
+		return handle_auth_login_ok(client_fd, user, payload, hdr);
 
 	/* ── Session tag ───────────────────────────────────────────────── */
 	case SG_CMD_SESSION_TAG_NEW: {

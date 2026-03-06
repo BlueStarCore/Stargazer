@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <grp.h>
 #include <pwd.h>
+#include <shadow.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -893,5 +894,289 @@ int handle_admin_lock_pw(int client_fd, const char *user,
 			       lock_target);
 	send_ok_audited(client_fd, "Password locked", NULL,
 			user, "admin_password_locked", lock_target);
+	return 0;
+}
+
+/* ── Auth login handlers (privilege separation for logind) ─────────────── */
+
+/*
+ * SG_CMD_AUTH_LOGIN — Authenticate user via shadow + crypt.
+ * Replaces logind's direct getspnam/crypt calls.
+ *
+ * Payload: "username\npassword\n"
+ * Returns: SG_OK + "enforce_change=0|1\npolicy_mismatch=0|1\n"
+ *          SG_ERR_AUTH_FAIL on bad password or missing user
+ *          SG_ERR_LOCKED on locked account
+ *
+ * Permission: caller must be root (logind runs as UID 0).
+ */
+int handle_auth_login(int client_fd, const char *user,
+		      const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)hdr;
+
+	/* Only root (logind) can call auth commands */
+	if (strcmp(user, "root") != 0) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "Auth commands require root caller");
+		return 0;
+	}
+
+	if (!payload) {
+		send_error(client_fd, SG_ERR_MISSING_ARG, "Missing credentials");
+		return 0;
+	}
+
+	/* Parse "username\npassword\n" */
+	char target[SG_USERNAME_MAX] = {0};
+	char password[MAX_LINE] = {0};
+
+	const char *nl = strchr(payload, '\n');
+	if (!nl) {
+		send_error(client_fd, SG_ERR_INVALID_ARG, "Bad payload format");
+		return 0;
+	}
+	size_t ulen = (size_t)(nl - payload);
+	if (ulen == 0 || ulen >= sizeof(target)) {
+		send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid username");
+		return 0;
+	}
+	memcpy(target, payload, ulen);
+	target[ulen] = '\0';
+
+	const char *pw_start = nl + 1;
+	size_t pw_len = strlen(pw_start);
+	if (pw_len > 0 && pw_start[pw_len - 1] == '\n')
+		pw_len--;
+	if (pw_len >= sizeof(password)) {
+		send_error(client_fd, SG_ERR_INVALID_ARG, "Password too long");
+		return 0;
+	}
+	memcpy(password, pw_start, pw_len);
+	password[pw_len] = '\0';
+
+	if (!sg_is_safe_id(target)) {
+		explicit_bzero(password, sizeof(password));
+		send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid username");
+		return 0;
+	}
+
+	/*
+	 * Constant-time defense (BUG-AUTH-01): always call crypt() even if
+	 * user not found, so response latency doesn't leak username validity.
+	 */
+	static const char dummy_hash[] =
+		"$6$dummy.salt.value$"
+		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+	struct spwd *sp = getspnam(target);
+	const char *hash = sp ? sp->sp_pwdp : dummy_hash;
+
+	char *result = crypt(password, hash);
+
+	int auth_ok = 0;
+
+	if (!sp) {
+		/* User not found — fail after crypt (timing constant) */
+	} else if (sp->sp_pwdp[0] == '!' || sp->sp_pwdp[0] == '*') {
+		/* Locked account */
+		explicit_bzero(password, sizeof(password));
+		audit_log(target, "login_fail", "reason=account-locked");
+		send_error(client_fd, SG_ERR_LOCKED, "Account is locked");
+		return 0;
+	} else if (sp->sp_pwdp[0] == '\0' && password[0] == '\0') {
+		/* Empty password (first-login) */
+		auth_ok = 1;
+	} else if (result && strcmp(result, sp->sp_pwdp) == 0) {
+		auth_ok = 1;
+	}
+
+	if (!auth_ok) {
+		explicit_bzero(password, sizeof(password));
+		audit_log(target, "login_fail", "reason=bad-password");
+		send_error(client_fd, SG_ERR_AUTH_FAIL, "Invalid credentials");
+		return 0;
+	}
+
+	/*
+	 * Authentication succeeded. Check enforce flags and policy.
+	 */
+	int enforce_change = 0;
+	char *epc_val = sg_db_get_val("system_admin", target,
+				       "enforce-change-password");
+	if (epc_val) {
+		if (strcmp(epc_val, "enable") == 0)
+			enforce_change = 1;
+		free(epc_val);
+	}
+
+	int policy_mismatch = 0;
+	if (mgmtd_is_policy_enforced(target)) {
+		const char *reason = NULL;
+		int rc = mgmtd_validate_password(target, password, NULL,
+						  &reason);
+		if (rc != 0)
+			policy_mismatch = 1;
+	}
+
+	explicit_bzero(password, sizeof(password));
+
+	char resp[128];
+	snprintf(resp, sizeof(resp), "enforce_change=%d\npolicy_mismatch=%d\n",
+		 enforce_change, policy_mismatch);
+
+	if (g_debug_flags & SG_DBG_FLAG_AUTH)
+		debug_buf_push("[AUTH-DBG] auth_login user=%s result=ok "
+			       "enforce=%d policy_mismatch=%d\n",
+			       target, enforce_change, policy_mismatch);
+
+	send_ok(client_fd, NULL, resp);
+	return 0;
+}
+
+/*
+ * SG_CMD_AUTH_CHANGE_PW — Change password during forced login flow.
+ *
+ * Payload: "username\nnew_password\nsource\n"
+ *   source = "admin-flag" or "policy-mismatch"
+ *
+ * On success: updates shadow, clears enforce flag if admin-flag,
+ *             audits event, returns SG_OK.
+ * On fail: returns SG_ERR_POLICY_FAIL with reason in extra.
+ */
+int handle_auth_change_pw(int client_fd, const char *user,
+			  const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)hdr;
+
+	if (strcmp(user, "root") != 0) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "Auth commands require root caller");
+		return 0;
+	}
+
+	if (!payload) {
+		send_error(client_fd, SG_ERR_MISSING_ARG, "Missing payload");
+		return 0;
+	}
+
+	/* Parse "username\nnew_password\nsource\n" */
+	char target[SG_USERNAME_MAX] = {0};
+	char new_pw[MAX_LINE] = {0};
+	char source[32] = {0};
+
+	const char *nl1 = strchr(payload, '\n');
+	if (!nl1) {
+		send_error(client_fd, SG_ERR_INVALID_ARG, "Bad payload format");
+		return 0;
+	}
+	size_t ulen = (size_t)(nl1 - payload);
+	if (ulen == 0 || ulen >= sizeof(target)) {
+		send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid username");
+		return 0;
+	}
+	memcpy(target, payload, ulen);
+
+	const char *nl2 = strchr(nl1 + 1, '\n');
+	if (!nl2) {
+		send_error(client_fd, SG_ERR_INVALID_ARG, "Bad payload format");
+		return 0;
+	}
+	size_t plen = (size_t)(nl2 - (nl1 + 1));
+	if (plen >= sizeof(new_pw)) {
+		send_error(client_fd, SG_ERR_INVALID_ARG, "Password too long");
+		return 0;
+	}
+	memcpy(new_pw, nl1 + 1, plen);
+
+	/* Source field (optional trailing newline) */
+	const char *src_start = nl2 + 1;
+	size_t slen = strlen(src_start);
+	if (slen > 0 && src_start[slen - 1] == '\n')
+		slen--;
+	if (slen >= sizeof(source))
+		slen = sizeof(source) - 1;
+	memcpy(source, src_start, slen);
+
+	if (!sg_is_safe_id(target)) {
+		explicit_bzero(new_pw, sizeof(new_pw));
+		send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid username");
+		return 0;
+	}
+
+	/* Validate against password policy */
+	const char *reason = NULL;
+	int rc = mgmtd_validate_password(target, new_pw, NULL, &reason);
+	if (rc != 0) {
+		explicit_bzero(new_pw, sizeof(new_pw));
+		send_error(client_fd, SG_ERR_POLICY_FAIL,
+			   reason ? reason : "Password policy violation");
+		return 0;
+	}
+
+	/* Update shadow file */
+	if (set_password(target, new_pw) != 0) {
+		explicit_bzero(new_pw, sizeof(new_pw));
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL,
+			   "Failed to update password");
+		return 0;
+	}
+	explicit_bzero(new_pw, sizeof(new_pw));
+
+	/* If source=admin-flag, clear the enforce-change-password flag */
+	if (strcmp(source, "admin-flag") == 0) {
+		sg_db_set_val("system_admin", target,
+			      "enforce-change-password", "disable");
+	}
+
+	const char *event = (strcmp(source, "admin-flag") == 0)
+				? "password_force_change"
+				: "password_policy_change";
+	char amsg[128];
+	snprintf(amsg, sizeof(amsg), "source=%s", source);
+
+	if (g_debug_flags & SG_DBG_FLAG_AUTH)
+		debug_buf_push("[AUTH-DBG] auth_change_pw user=%s source=%s "
+			       "result=ok\n", target, source);
+
+	send_ok_audited(client_fd, "Password changed", NULL,
+			target, event, amsg);
+	return 0;
+}
+
+/*
+ * SG_CMD_AUTH_LOGIN_OK — Confirm login success (audit event).
+ *
+ * Payload: "target_username\n" (the user who logged in)
+ * Permission: caller must be root.
+ */
+int handle_auth_login_ok(int client_fd, const char *user,
+			 const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)hdr;
+
+	if (strcmp(user, "root") != 0) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "Auth commands require root caller");
+		return 0;
+	}
+
+	/* Extract target username from payload */
+	char target[SG_USERNAME_MAX] = {0};
+	if (payload && payload[0]) {
+		snprintf(target, sizeof(target), "%s", payload);
+		size_t tlen = strlen(target);
+		if (tlen > 0 && target[tlen - 1] == '\n')
+			target[tlen - 1] = '\0';
+	} else {
+		snprintf(target, sizeof(target), "%s", user);
+	}
+
+	if (g_debug_flags & SG_DBG_FLAG_AUTH)
+		debug_buf_push("[AUTH-DBG] auth_login_ok user=%s\n", target);
+
+	send_ok_audited(client_fd, NULL, NULL,
+			target, "login_success", "source=logind");
 	return 0;
 }

@@ -96,6 +96,15 @@ int handle_admin_check_pw(int client_fd, const char *user,
 int handle_admin_lock_pw(int client_fd, const char *user,
 			 const char *payload, const sg_request_hdr_t *hdr);
 
+/* ── Auth login handlers (defined in mgmtd_user.c) ────────────────────────── */
+
+int handle_auth_login(int client_fd, const char *user,
+		      const char *payload, const sg_request_hdr_t *hdr);
+int handle_auth_change_pw(int client_fd, const char *user,
+			  const char *payload, const sg_request_hdr_t *hdr);
+int handle_auth_login_ok(int client_fd, const char *user,
+			 const char *payload, const sg_request_hdr_t *hdr);
+
 /* ── Firmware upgrade handlers (defined in mgmtd_firmware.c) ──────────────── */
 
 int handle_upgrade_status(int client_fd, const char *user,

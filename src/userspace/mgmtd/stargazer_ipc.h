@@ -77,6 +77,11 @@ typedef enum {
 	SG_CMD_ADMIN_CHECK_PW = 304,  /* Validate password against policy */
 	SG_CMD_ADMIN_LOCK_PW  = 305,  /* Lock (invalidate) admin password */
 
+	/* Auth login flow (31x) — used by stargazer-logind */
+	SG_CMD_AUTH_LOGIN      = 310,  /* Authenticate user via shadow     */
+	SG_CMD_AUTH_CHANGE_PW  = 311,  /* Change password (logind forced)  */
+	SG_CMD_AUTH_LOGIN_OK   = 312,  /* Confirm login success (audit)    */
+
 	/* Session/auth (4xx) */
 	SG_CMD_SESSION_TAG_NEW = 400, /* Acquire a new session tag       */
 	SG_CMD_SESSION_TAG_DEL = 401, /* Release session tag (logout)    */
