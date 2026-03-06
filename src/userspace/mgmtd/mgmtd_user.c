@@ -833,9 +833,12 @@ int handle_admin_check_pw(int client_fd, const char *user,
 		return 0;
 	}
 
+	/* CHECK_PW is an explicit policy check — always enforce.
+	 * Default to "enable" when no override is provided, so policy
+	 * is checked even for non-existent users. */
 	const char *reason = NULL;
 	int rc = mgmtd_validate_password(chk_user, chk_pw,
-					  chk_enforce[0] ? chk_enforce : NULL,
+					  chk_enforce[0] ? chk_enforce : "enable",
 					  &reason);
 	explicit_bzero(chk_pw, sizeof(chk_pw));
 

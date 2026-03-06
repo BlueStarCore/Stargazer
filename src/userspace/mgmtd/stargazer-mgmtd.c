@@ -1760,21 +1760,14 @@ int has_permission(const char *perms_csv, const char *perm)
 }
 
 /*
- * Check if user has the per-type permission for a config type.
- * Returns 1 if allowed, 0 if denied.
- * "admin" perm types require "admin".
- * "configure" perm types require "configure" OR "admin".
+ * Return the permission required to access a config type.
+ * Returns "admin", "configure", etc., or NULL if the type is unknown.
+ * Callers decide what user permissions satisfy the requirement
+ * based on the operation (read vs write).
  */
-int check_type_permission(const char *user, const char *type_name)
+const char *get_type_permission(const char *type_name)
 {
-	const char *required = sg_reg_type_perm(type_name);
-	if (!required)
-		return 0; /* unknown type → deny */
-	const char *perms = get_user_permissions(user);
-	if (strcmp(required, "admin") == 0)
-		return has_permission(perms, "admin");
-	/* "configure" types: configure OR admin */
-	return has_permission(perms, "configure") || has_permission(perms, "admin");
+	return sg_reg_type_perm(type_name);
 }
 
 /* ── Referential integrity check ────────────────────────────────────────── */
@@ -2011,8 +2004,16 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid type name");
 			return 0;
 		}
-		if (!check_type_permission(user, db_type)) {
-			send_error(client_fd, SG_ERR_ENTRY_NOT_FOUND, section);
+		if (!get_type_permission(db_type)) {
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "Unknown config type");
+			return 0;
+		}
+		/* Read operations: any authenticated user can view config */
+
+		if (db_id[0] && !sg_reg_validate_entry_id(db_type, db_id)) {
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "Invalid entry ID");
 			return 0;
 		}
 
@@ -2041,10 +2042,12 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid type prefix");
 			return 0;
 		}
-		if (!check_type_permission(user, prefix)) {
-			send_ok(client_fd, "No entries", "");
+		if (!get_type_permission(prefix)) {
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "Unknown config type");
 			return 0;
 		}
+		/* Read operations: any authenticated user can list */
 
 		char *list = sg_db_list(prefix);
 		if (list) {
@@ -2108,9 +2111,28 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Unknown config type");
 			return 0;
 		}
-		if (!check_type_permission(user, db_type)) {
-			send_error(client_fd, SG_ERR_INVALID_ARG, "Unknown config type");
-			return 0;
+		{
+			const char *req = get_type_permission(db_type);
+			if (!req) {
+				send_error(client_fd, SG_ERR_INVALID_ARG,
+					   "Unknown config type");
+				return 0;
+			}
+			const char *perms = get_user_permissions(user);
+			if (strcmp(req, "admin") == 0) {
+				if (!has_permission(perms, "admin")) {
+					send_error(client_fd, SG_ERR_PERM_DENIED,
+						   "Requires 'admin' permission");
+					return 0;
+				}
+			} else {
+				if (!has_permission(perms, "configure") &&
+				    !has_permission(perms, "admin")) {
+					send_error(client_fd, SG_ERR_PERM_DENIED,
+						   "Requires 'configure' permission");
+					return 0;
+				}
+			}
 		}
 		if (!sg_reg_validate_entry_id(db_type, db_id)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid entry ID");
@@ -2275,12 +2297,34 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Unknown config type");
 			return 0;
 		}
-		if (!check_type_permission(user, db_type)) {
-			send_error(client_fd, SG_ERR_INVALID_ARG, "Unknown config type");
-			return 0;
+		{
+			const char *req = get_type_permission(db_type);
+			if (!req) {
+				send_error(client_fd, SG_ERR_INVALID_ARG, "Unknown config type");
+				return 0;
+			}
+			const char *perms = get_user_permissions(user);
+			if (strcmp(req, "admin") == 0) {
+				if (!has_permission(perms, "admin")) {
+					send_error(client_fd, SG_ERR_PERM_DENIED,
+						   "Requires 'admin' permission");
+					return 0;
+				}
+			} else {
+				if (!has_permission(perms, "configure") &&
+				    !has_permission(perms, "admin")) {
+					send_error(client_fd, SG_ERR_PERM_DENIED,
+						   "Requires 'configure' permission");
+					return 0;
+				}
+			}
 		}
 		if (db_id[0] == '\0') {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Missing entry ID");
+			return 0;
+		}
+		if (!sg_reg_validate_entry_id(db_type, db_id)) {
+			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid entry ID");
 			return 0;
 		}
 
@@ -2348,8 +2392,32 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 		memcpy(id_str, p, ilen);
 		id_str[ilen] = '\0';
 
-		if (!check_type_permission(user, type_str)) {
-			send_error(client_fd, SG_ERR_INVALID_ARG, "Unknown config type");
+		{
+			const char *req = get_type_permission(type_str);
+			if (!req) {
+				send_error(client_fd, SG_ERR_INVALID_ARG, "Unknown config type");
+				return 0;
+			}
+			const char *perms = get_user_permissions(user);
+			if (strcmp(req, "admin") == 0) {
+				if (!has_permission(perms, "admin")) {
+					send_error(client_fd, SG_ERR_PERM_DENIED,
+						   "Requires 'admin' permission");
+					return 0;
+				}
+			} else {
+				if (!has_permission(perms, "configure") &&
+				    !has_permission(perms, "admin")) {
+					send_error(client_fd, SG_ERR_PERM_DENIED,
+						   "Requires 'configure' permission");
+					return 0;
+				}
+			}
+		}
+
+		if (!sg_reg_validate_entry_id(type_str, id_str)) {
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "Invalid entry ID");
 			return 0;
 		}
 

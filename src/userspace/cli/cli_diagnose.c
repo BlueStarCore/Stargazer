@@ -611,10 +611,10 @@ static void diag_security_tests(void)
 			 SG_CMD_ADMIN_CHECK_PW,
 			 "admin\nAbcdefg1\nenable\n",
 			 SG_OK);
-	diag_test_status("CHECK_PW nonexistent user (policy not enforced)",
+	diag_test_status("CHECK_PW nonexistent user (policy always enforced)",
 			 SG_CMD_ADMIN_CHECK_PW,
 			 "__diag_ghost\nabc\n",
-			 SG_OK);
+			 SG_ERR_POLICY_FAIL);
 
 	/* ── SEC-11: CFG_APPLY validation ────────────────────────────── */
 
@@ -694,36 +694,47 @@ static void diag_security_tests(void)
 				 SG_OK);
 	}
 
-	/* ── SEC-13: CFG_GET/CFG_DEL ID validation gaps ──────────────── */
+	/* ── SEC-13: CFG_GET/CFG_DEL/CFG_SET entry ID validation ────── */
 
 	printf("\n" C_CYAN
-	       "  --- SEC-13: CFG_GET/CFG_DEL ID validation gaps ---"
+	       "  --- SEC-13: Config entry ID validation ---"
 	       C_NC "\n");
 
+	/* All invalid IDs must be rejected early with INVALID_ARG.
+	 * sg_reg_validate_entry_id() enforces safe-id or uint
+	 * depending on the type's ID kind. */
 	diag_test_status("CFG_GET semicolon in ID",
 			 SG_CMD_CFG_GET,
 			 "firewall_address:test;evil",
-			 SG_ERR_ENTRY_NOT_FOUND);
+			 SG_ERR_INVALID_ARG);
 	diag_test_status("CFG_GET single-quote in ID",
 			 SG_CMD_CFG_GET,
 			 "firewall_address:test'evil",
-			 SG_ERR_ENTRY_NOT_FOUND);
-	diag_test_status("CFG_DEL semicolon in ID (no-op OK)",
-			 SG_CMD_CFG_DEL,
-			 "firewall_address:test;evil",
-			 SG_OK);
-	diag_test_status("CFG_DEL backtick in ID (no-op OK)",
-			 SG_CMD_CFG_DEL,
-			 "firewall_address:test`evil",
-			 SG_OK);
-	diag_test_status("CFG_SET firewall_policy non-numeric ID",
-			 SG_CMD_CFG_SET,
-			 "firewall_policy:abc\nname=test\n",
 			 SG_ERR_INVALID_ARG);
 	diag_test_status("CFG_GET path traversal in ID",
 			 SG_CMD_CFG_GET,
 			 "firewall_address:../../../etc/shadow",
-			 SG_ERR_ENTRY_NOT_FOUND);
+			 SG_ERR_INVALID_ARG);
+	diag_test_status("CFG_DEL semicolon in ID",
+			 SG_CMD_CFG_DEL,
+			 "firewall_address:test;evil",
+			 SG_ERR_INVALID_ARG);
+	diag_test_status("CFG_DEL backtick in ID",
+			 SG_CMD_CFG_DEL,
+			 "firewall_address:test`evil",
+			 SG_ERR_INVALID_ARG);
+	diag_test_status("CFG_DEL path traversal in ID",
+			 SG_CMD_CFG_DEL,
+			 "firewall_address:../../etc/shadow",
+			 SG_ERR_INVALID_ARG);
+	diag_test_status("CFG_SET firewall_policy non-numeric ID",
+			 SG_CMD_CFG_SET,
+			 "firewall_policy:abc\nname=test\n",
+			 SG_ERR_INVALID_ARG);
+	diag_test_status("CFG_SET SQL injection in ID",
+			 SG_CMD_CFG_SET,
+			 "firewall_address:x' OR '1'='1\nname=test\n",
+			 SG_ERR_INVALID_ARG);
 
 	/* ── SEC-14: Password policy enforcement ─────────────────────── */
 

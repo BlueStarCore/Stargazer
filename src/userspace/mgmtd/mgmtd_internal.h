@@ -62,7 +62,7 @@ void admin_notify_change(const char *user);
 
 const char *get_user_permissions(const char *username);
 int  has_permission(const char *perms_csv, const char *perm);
-int  check_type_permission(const char *user, const char *type_name);
+const char *get_type_permission(const char *type_name);
 
 /* ── Config validation (defined in stargazer-mgmtd.c) ────────────────────── */
 
