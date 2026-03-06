@@ -281,24 +281,40 @@ static int cmd_fw_upgrade(const char *args, const char *permissions)
 		int total = atoi(total_s);
 
 		/* When the step advances and we have an in-place progress
-		 * line (e.g. "84%"), overwrite it with 100% before moving
-		 * on.  This handles the race where mgmtd advances to the
+		 * line, overwrite it with 100% before moving on.
+		 * This handles the race where mgmtd advances to the
 		 * next step before the CLI polls the final progress. */
 		if (step > last_step && last_step > 0 && have_inline) {
-			char *pct = strstr(last_msg, "% ");
-			if (!pct)
-				pct = strstr(last_msg, "%(");
-			if (pct) {
-				/* Find start of the number before '%' */
-				char *np = pct;
-				while (np > last_msg && np[-1] >= '0' &&
-				       np[-1] <= '9')
-					np--;
-				/* Rewrite: keep prefix, replace "NN% ..." with "100%" */
-				printf("\r\033[K  [%d/%d] %.*s100%%",
-				       last_step, total,
-				       (int)(np - last_msg), last_msg);
+			if (last_step == 1) {
+				/* Download step: show 100% with protocol */
+				const char *via = strstr(last_msg, " via ");
+				if (via)
+					printf("\r\033[K  [1/%d] "
+					       "Downloading firmware..."
+					       " 100%%%s",
+					       total, via);
+				else
+					printf("\r\033[K  [1/%d] "
+					       "Downloading firmware..."
+					       " 100%%", total);
 				fflush(stdout);
+			} else {
+				char *pct = strstr(last_msg, "% ");
+				if (!pct)
+					pct = strstr(last_msg, "%(");
+				if (pct) {
+					char *np = pct;
+					while (np > last_msg &&
+					       np[-1] >= '0' &&
+					       np[-1] <= '9')
+						np--;
+					printf("\r\033[K  [%d/%d] "
+					       "%.*s100%%",
+					       last_step, total,
+					       (int)(np - last_msg),
+					       last_msg);
+					fflush(stdout);
+				}
 			}
 		}
 
