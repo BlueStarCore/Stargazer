@@ -188,7 +188,7 @@ int main(void)
 		}
 		ipc_resp_free(&tresp);
 		if (tag == 0) {
-			fprintf(stderr, "Error: failed to acquire session tag\n");
+			fprintf(stderr, "Error: failed to acquire session\n");
 			cli_term_cleanup();
 			return 1;
 		}

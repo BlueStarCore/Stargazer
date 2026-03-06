@@ -281,7 +281,7 @@ int main(int argc, char *argv[])
 		session_tag = strtoull(tag_payload, NULL, 10);
 		free(tag_payload);
 		if (session_tag == 0) {
-			fprintf(stderr, "Error: failed to acquire session tag\n");
+			fprintf(stderr, "Error: failed to acquire session\n");
 			free(payload);
 			return 1;
 		}

@@ -1980,7 +1980,7 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 	    cmd != SG_CMD_AUTH_LOGIN_OK) {
 		if (!session_tag_validate(user, hdr->session_tag)) {
 			send_error(client_fd, SG_ERR_SESSION_EXPIRED,
-				   "Session tag invalid or expired");
+				   "Session invalid or expired");
 			return 0;
 		}
 	}

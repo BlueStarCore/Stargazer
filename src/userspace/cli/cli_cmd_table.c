@@ -404,8 +404,14 @@ static int cmd_sys_shutdown(const char *args, const char *permissions)
 	(void)args;
 	(void)permissions;
 	struct ipc_response resp;
-	printf("  System shutting down...\n");
-	ipc_send_str(SG_CMD_SYS_POWEROFF, "", &resp);
+	if (ipc_send_str(SG_CMD_SYS_POWEROFF, "", &resp) != 0) {
+		printf("  Error: could not contact management daemon.\n");
+	} else if (resp.status == SG_OK) {
+		printf("  System shutting down...\n");
+	} else {
+		printf("  Error: %s\n", resp.extra[0] ? resp.extra
+						      : sg_status_str(resp.status));
+	}
 	ipc_resp_free(&resp);
 	return 0;
 }
@@ -415,8 +421,14 @@ static int cmd_sys_reboot(const char *args, const char *permissions)
 	(void)args;
 	(void)permissions;
 	struct ipc_response resp;
-	printf("  System rebooting...\n");
-	ipc_send_str(SG_CMD_SYS_REBOOT, "", &resp);
+	if (ipc_send_str(SG_CMD_SYS_REBOOT, "", &resp) != 0) {
+		printf("  Error: could not contact management daemon.\n");
+	} else if (resp.status == SG_OK) {
+		printf("  System rebooting...\n");
+	} else {
+		printf("  Error: %s\n", resp.extra[0] ? resp.extra
+						      : sg_status_str(resp.status));
+	}
 	ipc_resp_free(&resp);
 	return 0;
 }
