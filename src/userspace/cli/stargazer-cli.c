@@ -16,8 +16,6 @@
 #include "cli_debug.h"
 #include "cli_sandbox.h"
 
-#include <errno.h>
-#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,35 +58,6 @@ static void parse_whoami(const char *payload,
 	}
 }
 
-/* ── Get session revision via IPC ──────────────────────────────────────── */
-
-static int get_session_rev(const char *user)
-{
-	struct ipc_response resp;
-	int rev = 0;
-
-	if (ipc_send_str(SG_CMD_SESSION_REV, user, &resp) == 0 &&
-	    resp.status == SG_OK && resp.payload) {
-		errno = 0;
-		long val = strtol(resp.payload, NULL, 10);
-		if (errno == 0 && val > 0 && val <= INT_MAX)
-			rev = (int)val;
-	}
-	ipc_resp_free(&resp);
-	return rev;
-}
-
-/* ── Session rev refresh (called by selftest to absorb self-bumps) ────── */
-
-static int        *g_session_rev_start;
-static const char *g_session_user;
-
-void cli_refresh_session(void)
-{
-	if (g_session_rev_start && g_session_user)
-		*g_session_rev_start = get_session_rev(g_session_user);
-}
-
 /* ── Idle permission check ─────────────────────────────────────────────── */
 
 static char *g_permissions = NULL;
@@ -98,17 +67,20 @@ static int check_permissions_cb(void)
 	if (!g_permissions)
 		return 0;
 
-	/* Check session revision — catches admin bumps / account changes */
-	if (g_session_rev_start && g_session_user) {
-		int rev = get_session_rev(g_session_user);
-		if (rev != *g_session_rev_start) {
-			printf("\r\n  Session expired due to account/profile change.\r\n"
-			       "  Please login again.\r\n");
-			return -1;
-		}
+	/* PING is tag-validated: if the tag was purged (admin mutation),
+	 * mgmtd returns SG_ERR_SESSION_EXPIRED and we kick the user. */
+	struct ipc_response ping_resp;
+	if (ipc_send_str(SG_CMD_PING, "", &ping_resp) == 0 &&
+	    ping_resp.status == SG_ERR_SESSION_EXPIRED) {
+		ipc_resp_free(&ping_resp);
+		printf("\r\n  Session expired due to account/profile change.\r\n"
+		       "  Please login again.\r\n");
+		return -1;
 	}
+	ipc_resp_free(&ping_resp);
 
-	/* Check permissions — catches profile permission edits */
+	/* Check permissions — catches profile permission edits.
+	 * WHOAMI is tag-exempt so it always works. */
 	struct ipc_response resp;
 	if (ipc_send_str(SG_CMD_WHOAMI, "", &resp) != 0) {
 		ipc_resp_free(&resp);
@@ -158,6 +130,7 @@ int main(void)
 	}
 
 	signal(SIGINT, SIG_IGN);
+	signal(SIGHUP, SIG_IGN);  /* let readline see EOF instead of dying */
 	ipc_set_interrupt_fd(cli_get_tty_fd());
 
 	/* 4. SANDBOX — all file opens done, lock down the process.
@@ -175,10 +148,6 @@ int main(void)
 	char profile[128]    = "read-only";
 	char permissions[256] = "monitor";
 	for (int attempt = 0; attempt < 5; attempt++) {
-		if (!ipc_available()) {
-			usleep(200000);
-			continue;
-		}
 		struct ipc_response resp;
 		if (ipc_send_str(SG_CMD_WHOAMI, "", &resp) == 0 &&
 		    resp.status == SG_OK && resp.payload) {
@@ -209,11 +178,25 @@ int main(void)
 	       user, profile, permissions);
 	printf("  Type 'help' or '?' for available commands.\n\n");
 
-	/* 9. Session tracking */
-	int session_rev_start = get_session_rev(user);
-	int session_rev_cached = session_rev_start;
-	g_session_rev_start = &session_rev_start;
-	g_session_user = user;
+	/* 9. Acquire session tag from mgmtd */
+	{
+		struct ipc_response tresp;
+		uint64_t tag = 0;
+		if (ipc_send_str(SG_CMD_SESSION_TAG_NEW, "", &tresp) == 0 &&
+		    tresp.status == SG_OK && tresp.payload) {
+			tag = strtoull(tresp.payload, NULL, 10);
+		}
+		ipc_resp_free(&tresp);
+		if (tag == 0) {
+			fprintf(stderr, "Error: failed to acquire session tag\n");
+			cli_term_cleanup();
+			return 1;
+		}
+		ipc_set_session_tag(tag);
+		/* Clear any stale expired flag from pre-tag IPC calls
+		 * (e.g. HISTORY_LOAD runs before tag acquisition). */
+		ipc_clear_session_expired();
+	}
 
 	/* 10. Idle permission polling — detects profile changes while idle */
 	g_permissions = permissions;
@@ -253,23 +236,15 @@ int main(void)
 				"[CLI-DBG] resolve: \"%s\""
 				" -> \"%s\"\n", trimmed, resolved);
 
-		/* Session check — detect external account/profile changes */
-		session_rev_cached = get_session_rev(user);
-		if (session_rev_cached != session_rev_start) {
-			if (dbg_enabled() &&
-			    strcmp(dbg_get("cli_debug", "0"), "1") == 0)
-				fprintf(stderr,
-					"[CLI-DBG] session expired:"
-					" rev %d -> %d\n",
-					session_rev_start,
-					session_rev_cached);
+		/* Dispatch */
+		int rc = cmd_dispatch(resolved, permissions);
+
+		/* Check if session was expired by mgmtd during dispatch */
+		if (ipc_session_expired()) {
 			printf("  Session expired due to account/profile change.\n");
 			printf("  Please login again.\n");
 			break;
 		}
-
-		/* Dispatch */
-		int rc = cmd_dispatch(resolved, permissions);
 
 		/* Fetch mgmtd/auth debug traces after each command */
 		ipc_fetch_debug();
@@ -283,7 +258,15 @@ int main(void)
 			break;
 	}
 
-	/* 12. Cleanup — save history via IPC (works inside sandbox) */
+	/* 12. Release session tag (graceful logout) */
+	{
+		struct ipc_response lr;
+		memset(&lr, 0, sizeof(lr));
+		ipc_send_str(SG_CMD_SESSION_TAG_DEL, "", &lr);
+		ipc_resp_free(&lr);
+	}
+
+	/* 13. Cleanup — save history via IPC (works inside sandbox) */
 	cli_hist_save_ipc(user);
 	cli_term_cleanup();
 	return 0;

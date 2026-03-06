@@ -75,6 +75,8 @@ X("execute diagnose resources interface",   "Show interface throughput",        
 X("execute diagnose resources all",         "Show all resource metrics",               "admin",           0,  NULL)
 X("execute diagnose selftest",              "Run all built-in self-tests",             "admin",           1,  cmd_diag_selftest)
 X("execute diagnose selftest full",        "Full self-test with IPC round-trip",       "admin",           0,  NULL)
+X("execute diagnose pentest",              "Run security penetration tests",          "admin",           1,  cmd_diag_pentest)
+X("execute diagnose pentest full",         "Full pentest with SEC-1..18",             "admin",           0,  NULL)
 
 X("execute diagnose firewall",              "Firewall diagnostics",                    "admin",           0,  NULL)
 X("execute diagnose firewall policy",       "Show firewall policy and rules",          "admin",           1,  cmd_diag_fw_policy)

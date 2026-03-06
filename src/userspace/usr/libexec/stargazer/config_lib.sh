@@ -421,7 +421,7 @@ auth_debug() {
 # ── SQLite sync helpers (Phase C bootstrap) ─────────────────────────────────
 
 STARGAZER_DB_PATH="${STARGAZER_CONF_DIR}/stargazer.db"
-STARGAZER_SESSION_REV_FILE="/run/stargazer-session.rev"
+# Session rev file removed — session tags are in-memory inside mgmtd
 
 _db_ready() {
 	command -v sqlite3 >/dev/null 2>&1 || return 1
@@ -456,86 +456,13 @@ admin_exists_in_config() {
 	cfg_get "$STARGAZER_CONF_DIR/system.conf" "system_admin:${_ae_user}" >/dev/null 2>&1
 }
 
-session_user_rev_get() {
-	_sr_user="$1"
-	if _ipc_available; then
-		ipc_send 400 "$_sr_user"
-		[ "$IPC_RC" -eq 0 ] && echo "$IPC_PAYLOAD" && return 0
-		echo 0
-		return 0
-	fi
-	# Direct fallback
-	_sr_rev=0
-	[ -r "$STARGAZER_SESSION_REV_FILE" ] || {
-		echo 0
-		return
-	}
-	while IFS=: read -r _u _r || [ -n "$_u" ]; do
-		[ "$_u" = "$_sr_user" ] || continue
-		_sr_rev="${_r:-0}"
-		break
-	done < "$STARGAZER_SESSION_REV_FILE"
-	case "$_sr_rev" in
-		""|*[!0-9]*) _sr_rev=0 ;;
-	esac
-	echo "$_sr_rev"
-}
-
-session_user_rev_set() {
-	_ss_user="$1"
-	_ss_rev="$2"
-	if _ipc_available; then
-		# rev_set is handled by mgmtd internally
-		return 0
-	fi
-	# Direct fallback
-	_ss_tmp="${STARGAZER_SESSION_REV_FILE}.tmp.$$"
-	> "$_ss_tmp"
-	if [ -f "$STARGAZER_SESSION_REV_FILE" ]; then
-		while IFS=: read -r _u _r || [ -n "$_u" ]; do
-			[ -z "$_u" ] && continue
-			[ "$_u" = "$_ss_user" ] && continue
-			echo "${_u}:${_r}" >> "$_ss_tmp"
-		done < "$STARGAZER_SESSION_REV_FILE"
-	fi
-	echo "${_ss_user}:${_ss_rev}" >> "$_ss_tmp"
-	mv -f "$_ss_tmp" "$STARGAZER_SESSION_REV_FILE"
-	chmod 644 "$STARGAZER_SESSION_REV_FILE" 2>/dev/null
-}
-
-session_user_rev_bump() {
-	_sb_user="$1"
-	if _ipc_available; then
-		ipc_send 401 "$_sb_user"
-		return $IPC_RC
-	fi
-	# Direct fallback
-	_sb_old=$(session_user_rev_get "$_sb_user")
-	case "$_sb_old" in
-		""|*[!0-9]*) _sb_old=0 ;;
-	esac
-	_sb_new=$((_sb_old + 1))
-	session_user_rev_set "$_sb_user" "$_sb_new"
-	return 0
-}
-
-session_profile_rev_bump() {
-	_sp_profile="$1"
-	[ -z "$_sp_profile" ] && return 0
-	if _db_ready; then
-		_sp_q=$(_db_escape "$_sp_profile")
-		sqlite3 "$STARGAZER_DB_PATH" "SELECT DISTINCT id FROM config WHERE type='system_admin' AND key='profile' AND value='${_sp_q}';" 2>/dev/null \
-		| while IFS= read -r _u; do
-			[ -n "$_u" ] && session_user_rev_bump "$_u"
-		done
-		return 0
-	fi
-	_sp_sys="$STARGAZER_CONF_DIR/system.conf"
-	for _u in $(cfg_list "$_sp_sys" "system_admin"); do
-		_up=$(cfg_get "$_sp_sys" "system_admin:${_u}" 2>/dev/null | grep '^profile=' | cut -d= -f2-)
-		[ "$_up" = "$_sp_profile" ] && session_user_rev_bump "$_u"
-	done
-}
+# session_user_rev_get / session_user_rev_set / session_user_rev_bump /
+# session_profile_rev_bump — replaced by in-memory session tags inside mgmtd.
+# These are kept as no-ops so callers don't break.
+session_user_rev_get()     { echo 0; }
+session_user_rev_set()     { return 0; }
+session_user_rev_bump()    { return 0; }
+session_profile_rev_bump() { return 0; }
 
 admin_get_enforce_policy() {
 	_ag_user="$1"

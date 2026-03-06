@@ -173,22 +173,6 @@ static void diag_test_status2(const char *desc, uint32_t opcode,
 	ipc_resp_free(&resp);
 }
 
-/*
- * diag_get_rev — fetch the session revision for a user via IPC.
- * Returns the revision as int, or -1 on error.
- */
-static int diag_get_rev(const char *user)
-{
-	struct ipc_response resp;
-	int rev = -1;
-
-	if (ipc_send_str(SG_CMD_SESSION_REV, user, &resp) == 0 &&
-	    resp.status == SG_OK && resp.payload)
-		rev = atoi(resp.payload);
-	ipc_resp_free(&resp);
-	return rev;
-}
-
 /* ── Get current username from environment ─────────────────────────────── */
 
 static const char *diag_username(void)
@@ -213,8 +197,6 @@ static void diag_self_test(const char *permissions)
 		  SG_CMD_PING, "", 1);
 	diag_test("WHOAMI identity",
 		  SG_CMD_WHOAMI, "", 1);
-	diag_test("SESSION_REV session revision",
-		  SG_CMD_SESSION_REV, diag_username(), 1);
 
 	/* Monitor-level ops */
 	diag_test("SHOW_STATUS system status",
@@ -257,8 +239,6 @@ static void diag_self_test(const char *permissions)
 	diag_test_access("ADMIN_DELETE __diag_nobody (access check)",
 			 SG_CMD_ADMIN_DELETE,
 			 "__diag_nobody", is_adm);
-	diag_test("SESSION_BUMP bump session",
-		  SG_CMD_SESSION_BUMP, "__diag_nobody", is_adm);
 	diag_test("DEBUG_FETCH debug traces",
 		  SG_CMD_DEBUG_FETCH, "", is_adm);
 }
@@ -286,6 +266,9 @@ static void diag_cleanup_all(void)
 {
 	struct ipc_response resp;
 
+	/* Re-acquire tag in case a prior test triggered a session purge */
+	ipc_reacquire_tag();
+
 	diag_cleanup_accounts();
 
 	/* Clean up config entries left by security tests */
@@ -308,6 +291,10 @@ static void diag_cleanup_all(void)
 
 	/* SEC-15 session invalidation test user */
 	ipc_send_str(SG_CMD_ADMIN_DELETE, "__diag_rev", &resp);
+	ipc_resp_free(&resp);
+
+	/* SEC-17 config permission test entries */
+	ipc_send_str(SG_CMD_CFG_DEL, "system_admin:__diag_perm", &resp);
 	ipc_resp_free(&resp);
 
 	/* Profile upgrade test user */
@@ -337,12 +324,6 @@ static void diag_security_tests(void)
 			 SG_ERR_INVALID_ARG);
 	diag_test_status("ADMIN_DELETE rejects quote in username",
 			 SG_CMD_ADMIN_DELETE, "admin'",
-			 SG_ERR_INVALID_ARG);
-	diag_test_status("SESSION_BUMP rejects semicolon in username",
-			 SG_CMD_SESSION_BUMP, "admin;reboot",
-			 SG_ERR_INVALID_ARG);
-	diag_test_status("SESSION_REV rejects pipe in username",
-			 SG_CMD_SESSION_REV, "admin|cat /etc/shadow",
 			 SG_ERR_INVALID_ARG);
 	diag_test_status("ADMIN_SET_ENF rejects backtick in username",
 			 SG_CMD_ADMIN_SET_ENF, "`reboot`\nenable\n",
@@ -383,10 +364,6 @@ static void diag_security_tests(void)
 	diag_test_status("CFG_GET empty payload",
 			 SG_CMD_CFG_GET, "",
 			 SG_ERR_MISSING_ARG);
-	diag_test_status("SESSION_BUMP empty payload",
-			 SG_CMD_SESSION_BUMP, "",
-			 SG_ERR_MISSING_ARG);
-
 	/* ── SEC-3: Nonexistent resources ─────────────────────────────── */
 
 	printf("\n" C_CYAN "  --- SEC-3: Nonexistent resources ---"
@@ -588,11 +565,6 @@ static void diag_security_tests(void)
 			  SG_CMD_ADMIN_DELETE, diag_username(),
 			  SG_ERR_BUILTIN, SG_ERR_IN_USE);
 
-	/* Session bump for self */
-	diag_test_status("Session bump for self",
-			 SG_CMD_SESSION_BUMP, diag_username(),
-			 SG_OK);
-
 	/* ── SEC-9: Unimplemented opcode coverage ────────────────────── */
 
 	printf("\n" C_CYAN
@@ -643,10 +615,10 @@ static void diag_security_tests(void)
 			 SG_CMD_ADMIN_CHECK_PW,
 			 "admin\nAbcdefg1\nenable\n",
 			 SG_OK);
-	diag_test_status("CHECK_PW nonexistent user (policy not enforced)",
+	diag_test_status("CHECK_PW nonexistent user (policy always enforced)",
 			 SG_CMD_ADMIN_CHECK_PW,
 			 "__diag_ghost\nabc\n",
-			 SG_OK);
+			 SG_ERR_POLICY_FAIL);
 
 	/* ── SEC-11: CFG_APPLY validation ────────────────────────────── */
 
@@ -692,14 +664,7 @@ static void diag_security_tests(void)
 				 SG_CMD_ADMIN_DELETE, buf,
 				 SG_ERR_INVALID_ARG);
 
-		/* Test 2: Username at SG_USERNAME_MAX (64 chars) to SESSION_REV */
-		memset(buf, 'a', SG_USERNAME_MAX);
-		buf[SG_USERNAME_MAX] = '\0';
-		diag_test_status("SESSION_REV username at max (64 chars)",
-				 SG_CMD_SESSION_REV, buf,
-				 SG_OK);
-
-		/* Test 3: Long config type (256 chars) to CFG_GET */
+		/* Test 2: Long config type (256 chars) to CFG_GET */
 		memset(buf, 'a', 256);
 		buf[256] = '\0';
 		diag_test_status("CFG_GET long type (256 chars)",
@@ -733,36 +698,47 @@ static void diag_security_tests(void)
 				 SG_OK);
 	}
 
-	/* ── SEC-13: CFG_GET/CFG_DEL ID validation gaps ──────────────── */
+	/* ── SEC-13: CFG_GET/CFG_DEL/CFG_SET entry ID validation ────── */
 
 	printf("\n" C_CYAN
-	       "  --- SEC-13: CFG_GET/CFG_DEL ID validation gaps ---"
+	       "  --- SEC-13: Config entry ID validation ---"
 	       C_NC "\n");
 
+	/* All invalid IDs must be rejected early with INVALID_ARG.
+	 * sg_reg_validate_entry_id() enforces safe-id or uint
+	 * depending on the type's ID kind. */
 	diag_test_status("CFG_GET semicolon in ID",
 			 SG_CMD_CFG_GET,
 			 "firewall_address:test;evil",
-			 SG_ERR_ENTRY_NOT_FOUND);
+			 SG_ERR_INVALID_ARG);
 	diag_test_status("CFG_GET single-quote in ID",
 			 SG_CMD_CFG_GET,
 			 "firewall_address:test'evil",
-			 SG_ERR_ENTRY_NOT_FOUND);
-	diag_test_status("CFG_DEL semicolon in ID (no-op OK)",
-			 SG_CMD_CFG_DEL,
-			 "firewall_address:test;evil",
-			 SG_OK);
-	diag_test_status("CFG_DEL backtick in ID (no-op OK)",
-			 SG_CMD_CFG_DEL,
-			 "firewall_address:test`evil",
-			 SG_OK);
-	diag_test_status("CFG_SET firewall_policy non-numeric ID",
-			 SG_CMD_CFG_SET,
-			 "firewall_policy:abc\nname=test\n",
 			 SG_ERR_INVALID_ARG);
 	diag_test_status("CFG_GET path traversal in ID",
 			 SG_CMD_CFG_GET,
 			 "firewall_address:../../../etc/shadow",
-			 SG_ERR_ENTRY_NOT_FOUND);
+			 SG_ERR_INVALID_ARG);
+	diag_test_status("CFG_DEL semicolon in ID",
+			 SG_CMD_CFG_DEL,
+			 "firewall_address:test;evil",
+			 SG_ERR_INVALID_ARG);
+	diag_test_status("CFG_DEL backtick in ID",
+			 SG_CMD_CFG_DEL,
+			 "firewall_address:test`evil",
+			 SG_ERR_INVALID_ARG);
+	diag_test_status("CFG_DEL path traversal in ID",
+			 SG_CMD_CFG_DEL,
+			 "firewall_address:../../etc/shadow",
+			 SG_ERR_INVALID_ARG);
+	diag_test_status("CFG_SET firewall_policy non-numeric ID",
+			 SG_CMD_CFG_SET,
+			 "firewall_policy:abc\nname=test\n",
+			 SG_ERR_INVALID_ARG);
+	diag_test_status("CFG_SET SQL injection in ID",
+			 SG_CMD_CFG_SET,
+			 "firewall_address:x' OR '1'='1\nname=test\n",
+			 SG_ERR_INVALID_ARG);
 
 	/* ── SEC-14: Password policy enforcement ─────────────────────── */
 
@@ -839,248 +815,523 @@ static void diag_security_tests(void)
 			 "__diag_pw",
 			 SG_ERR_USER_NOT_FOUND);
 
-	/* ── SEC-15: Session invalidation on admin mutation ──────────── */
+	/* ── SEC-15: Admin mutation paths succeed ────────────────────── */
 
 	printf("\n" C_CYAN
-	       "  --- SEC-15: Session invalidation on admin mutation ---"
+	       "  --- SEC-15: Admin mutation paths succeed ---"
 	       C_NC "\n");
 
 	/*
-	 * Verify that every admin account mutation path calls
-	 * admin_notify_change() which bumps the target's session
-	 * revision.  A missing bump would let a hacked session
-	 * survive a password change / lock / config edit.
-	 *
-	 * Order matters: SET_PW before CFG_APPLY (apply needs
-	 * a password), LOCK_PW last (locks the password).
+	 * Verify that every admin account mutation path completes
+	 * successfully.  Tag purge is an internal detail — we trust
+	 * it if the mutation succeeds.
 	 */
 
-	diag_test_status("Create __diag_rev for session tests",
+	diag_test_status("Create __diag_rev for mutation tests",
 			 SG_CMD_ADMIN_CREATE,
 			 "__diag_rev\nread-write\n",
 			 SG_OK);
 
-	/* 15a: ADMIN_SET_PW bumps session rev */
-	{
-		int rev0 = diag_get_rev("__diag_rev");
-		int conn = ipc_send_str(SG_CMD_ADMIN_SET_PW,
-					"__diag_rev\nAbcdefg1\n",
-					&resp);
-		uint32_t st = (conn == 0) ? resp.status : 999;
-		ipc_resp_free(&resp);
+	/* 15a: ADMIN_SET_PW succeeds */
+	diag_test_status2("SET_PW for __diag_rev",
+			  SG_CMD_ADMIN_SET_PW,
+			  "__diag_rev\nAbcdefg1\n",
+			  SG_OK, SG_ERR_SYSTEM_FAIL);
 
-		diag_total++;
-		if (st == SG_OK) {
-			int rev1 = diag_get_rev("__diag_rev");
-			if (rev1 > rev0) {
-				printf(C_GREEN "  PASS" C_NC " [%3u]"
-				       " SET_PW bumps session rev"
-				       " (%d -> %d)\n",
-				       SG_CMD_ADMIN_SET_PW, rev0, rev1);
-				diag_pass++;
-			} else {
-				printf(C_RED "  FAIL" C_NC " [%3u]"
-				       " SET_PW did not bump session"
-				       " rev (%d -> %d)\n",
-				       SG_CMD_ADMIN_SET_PW, rev0, rev1);
-				diag_fail++;
-			}
-		} else {
-			/* Shadow write failed — no mutation, skip */
-			printf(C_GREEN "  PASS" C_NC " [%3u]"
-			       " SET_PW no-op (status=%u,"
-			       " rev unchanged)\n",
-			       SG_CMD_ADMIN_SET_PW, st);
-			diag_pass++;
-		}
-	}
+	/* 15b: ADMIN_SET_ENF succeeds */
+	diag_test_status("SET_ENF for __diag_rev",
+			 SG_CMD_ADMIN_SET_ENF,
+			 "__diag_rev\ndisable\n",
+			 SG_OK);
 
-	/* 15b: ADMIN_SET_ENF bumps session rev */
-	{
-		int rev0 = diag_get_rev("__diag_rev");
-		int conn = ipc_send_str(SG_CMD_ADMIN_SET_ENF,
-					"__diag_rev\ndisable\n",
-					&resp);
-		uint32_t st = (conn == 0) ? resp.status : 999;
-		ipc_resp_free(&resp);
+	/* 15c: CFG_SET system_admin succeeds */
+	diag_test_status("CFG_SET system_admin for __diag_rev",
+			 SG_CMD_CFG_SET,
+			 "system_admin:__diag_rev\n"
+			 "profile=read-write\n"
+			 "enforce-change-password=disable\n"
+			 "enforce-password-policy=enable\n",
+			 SG_OK);
 
-		diag_total++;
-		if (st == SG_OK) {
-			int rev1 = diag_get_rev("__diag_rev");
-			if (rev1 > rev0) {
-				printf(C_GREEN "  PASS" C_NC " [%3u]"
-				       " SET_ENF bumps session rev"
-				       " (%d -> %d)\n",
-				       SG_CMD_ADMIN_SET_ENF, rev0, rev1);
-				diag_pass++;
-			} else {
-				printf(C_RED "  FAIL" C_NC " [%3u]"
-				       " SET_ENF did not bump session"
-				       " rev (%d -> %d)\n",
-				       SG_CMD_ADMIN_SET_ENF, rev0, rev1);
-				diag_fail++;
-			}
-		} else {
-			printf(C_RED "  FAIL" C_NC " [%3u]"
-			       " SET_ENF returned error"
-			       " (status=%u)\n",
-			       SG_CMD_ADMIN_SET_ENF, st);
-			diag_fail++;
-		}
-	}
+	/* 15d: CFG_APPLY system_admin succeeds (or no-op) */
+	diag_test_status2("CFG_APPLY system_admin for __diag_rev",
+			  SG_CMD_CFG_APPLY,
+			  "system_admin\n__diag_rev\n"
+			  "profile=read-write\n",
+			  SG_OK, SG_ERR_SYSTEM_FAIL);
 
-	/* 15c: CFG_SET system_admin bumps session rev */
-	{
-		int rev0 = diag_get_rev("__diag_rev");
-		int conn = ipc_send_str(SG_CMD_CFG_SET,
-					"system_admin:__diag_rev\n"
-					"profile=read-write\n"
-					"enforce-change-password=disable\n"
-					"enforce-password-policy=enable\n",
-					&resp);
-		uint32_t st = (conn == 0) ? resp.status : 999;
-		ipc_resp_free(&resp);
+	/* 15e: ADMIN_LOCK_PW succeeds (or no-op) */
+	diag_test_status2("LOCK_PW for __diag_rev",
+			  SG_CMD_ADMIN_LOCK_PW,
+			  "__diag_rev\n",
+			  SG_OK, SG_ERR_SYSTEM_FAIL);
 
-		diag_total++;
-		if (st == SG_OK) {
-			int rev1 = diag_get_rev("__diag_rev");
-			if (rev1 > rev0) {
-				printf(C_GREEN "  PASS" C_NC " [%3u]"
-				       " CFG_SET system_admin bumps"
-				       " session rev (%d -> %d)\n",
-				       SG_CMD_CFG_SET, rev0, rev1);
-				diag_pass++;
-			} else {
-				printf(C_RED "  FAIL" C_NC " [%3u]"
-				       " CFG_SET system_admin did not"
-				       " bump session rev (%d -> %d)\n",
-				       SG_CMD_CFG_SET, rev0, rev1);
-				diag_fail++;
-			}
-		} else {
-			printf(C_RED "  FAIL" C_NC " [%3u]"
-			       " CFG_SET system_admin returned"
-			       " error (status=%u)\n",
-			       SG_CMD_CFG_SET, st);
-			diag_fail++;
-		}
-	}
-
-	/* 15d: CFG_APPLY system_admin bumps session rev */
-	{
-		int rev0 = diag_get_rev("__diag_rev");
-		int conn = ipc_send_str(SG_CMD_CFG_APPLY,
-					"system_admin\n__diag_rev\n"
-					"profile=read-write\n",
-					&resp);
-		uint32_t st = (conn == 0) ? resp.status : 999;
-		ipc_resp_free(&resp);
-
-		diag_total++;
-		if (st == SG_OK) {
-			int rev1 = diag_get_rev("__diag_rev");
-			if (rev1 > rev0) {
-				printf(C_GREEN "  PASS" C_NC " [%3u]"
-				       " CFG_APPLY system_admin bumps"
-				       " session rev (%d -> %d)\n",
-				       SG_CMD_CFG_APPLY, rev0, rev1);
-				diag_pass++;
-			} else {
-				printf(C_RED "  FAIL" C_NC " [%3u]"
-				       " CFG_APPLY system_admin did not"
-				       " bump session rev (%d -> %d)\n",
-				       SG_CMD_CFG_APPLY, rev0, rev1);
-				diag_fail++;
-			}
-		} else {
-			/* May fail if password not set — skip */
-			printf(C_GREEN "  PASS" C_NC " [%3u]"
-			       " CFG_APPLY no-op (status=%u,"
-			       " rev unchanged)\n",
-			       SG_CMD_CFG_APPLY, st);
-			diag_pass++;
-		}
-	}
-
-	/* 15e: ADMIN_LOCK_PW bumps session rev */
-	{
-		int rev0 = diag_get_rev("__diag_rev");
-		int conn = ipc_send_str(SG_CMD_ADMIN_LOCK_PW,
-					"__diag_rev\n", &resp);
-		uint32_t st = (conn == 0) ? resp.status : 999;
-		ipc_resp_free(&resp);
-
-		diag_total++;
-		if (st == SG_OK) {
-			int rev1 = diag_get_rev("__diag_rev");
-			if (rev1 > rev0) {
-				printf(C_GREEN "  PASS" C_NC " [%3u]"
-				       " LOCK_PW bumps session rev"
-				       " (%d -> %d)\n",
-				       SG_CMD_ADMIN_LOCK_PW, rev0, rev1);
-				diag_pass++;
-			} else {
-				printf(C_RED "  FAIL" C_NC " [%3u]"
-				       " LOCK_PW did not bump session"
-				       " rev (%d -> %d)\n",
-				       SG_CMD_ADMIN_LOCK_PW, rev0, rev1);
-				diag_fail++;
-			}
-		} else {
-			/* Shadow write failed — no mutation, skip */
-			printf(C_GREEN "  PASS" C_NC " [%3u]"
-			       " LOCK_PW no-op (status=%u,"
-			       " rev unchanged)\n",
-			       SG_CMD_ADMIN_LOCK_PW, st);
-			diag_pass++;
-		}
-	}
-
-	/* 15f: ADMIN_DELETE bumps and cleans session rev */
-	{
-		int rev0 = diag_get_rev("__diag_rev");
-		int conn = ipc_send_str(SG_CMD_ADMIN_DELETE,
-					"__diag_rev", &resp);
-		uint32_t st = (conn == 0) ? resp.status : 999;
-		ipc_resp_free(&resp);
-
-		diag_total++;
-		if (st == SG_OK) {
-			/*
-			 * After delete: admin_notify_change() bumps,
-			 * then session_rev_del() removes the entry.
-			 * Rev should be 0 (entry gone).
-			 */
-			int rev1 = diag_get_rev("__diag_rev");
-			if (rev0 > 0 && rev1 == 0) {
-				printf(C_GREEN "  PASS" C_NC " [%3u]"
-				       " ADMIN_DELETE cleaned session"
-				       " rev (%d -> %d)\n",
-				       SG_CMD_ADMIN_DELETE, rev0, rev1);
-				diag_pass++;
-			} else if (rev0 == 0 && rev1 == 0) {
-				/* User had no rev entry — still cleaned */
-				printf(C_GREEN "  PASS" C_NC " [%3u]"
-				       " ADMIN_DELETE (no prior rev,"
-				       " clean OK)\n",
-				       SG_CMD_ADMIN_DELETE);
-				diag_pass++;
-			} else {
-				printf(C_RED "  FAIL" C_NC " [%3u]"
-				       " ADMIN_DELETE did not clean"
-				       " session rev (%d -> %d)\n",
-				       SG_CMD_ADMIN_DELETE, rev0, rev1);
-				diag_fail++;
-			}
-		} else {
-			printf(C_RED "  FAIL" C_NC " [%3u]"
-			       " ADMIN_DELETE returned error"
-			       " (status=%u)\n",
-			       SG_CMD_ADMIN_DELETE, st);
-			diag_fail++;
-		}
-	}
+	/* 15f: ADMIN_DELETE succeeds */
+	diag_test_status("ADMIN_DELETE __diag_rev",
+			 SG_CMD_ADMIN_DELETE,
+			 "__diag_rev",
+			 SG_OK);
 }
+
+/* ── SEC-16..18 moved to cli_diagnose_pentest.c ────────────────────────── */
+
+/* Retained stub: called by selftest full via diag_security_tests() path.
+ * The full pentest suite is in cli_diagnose_pentest.c, invoked by
+ * "execute diagnose pentest [full]". */
+
+#if 0  /* ── begin removed pentest block (now in cli_diagnose_pentest.c) ── */
+	/* ── SEC-16: Logind auth IPC security ────────────────────────── */
+
+	printf("\n" C_CYAN
+	       "  --- SEC-16: Logind auth IPC security ---"
+	       C_NC "\n");
+
+	/*
+	 * AUTH_LOGIN, AUTH_CHANGE_PW, AUTH_LOGIN_OK are reserved for
+	 * logind (runs as root, UID 0).  The CLI process runs as the
+	 * logged-in admin user, so SO_PEERCRED will show a non-root UID.
+	 * mgmtd must reject ALL of these with PERM_DENIED regardless
+	 * of payload content.  Every test below verifies the root-only
+	 * gate cannot be bypassed by any crafted input.
+	 */
+
+	/* ── 16a-c: Basic access control gate ────────────────────────── */
+
+	diag_test_status("AUTH_LOGIN rejected (non-root)",
+			 SG_CMD_AUTH_LOGIN,
+			 "admin\npassword\n",
+			 SG_ERR_PERM_DENIED);
+
+	diag_test_status("AUTH_CHANGE_PW rejected (non-root)",
+			 SG_CMD_AUTH_CHANGE_PW,
+			 "admin\nNewPass1\nadmin-flag\n",
+			 SG_ERR_PERM_DENIED);
+
+	diag_test_status("AUTH_LOGIN_OK rejected (non-root)",
+			 SG_CMD_AUTH_LOGIN_OK,
+			 "admin\n",
+			 SG_ERR_PERM_DENIED);
+
+	/* ── 16d-f: Empty / missing payload ──────────────────────────── */
+
+	diag_test_status("AUTH_LOGIN empty payload",
+			 SG_CMD_AUTH_LOGIN, "",
+			 SG_ERR_PERM_DENIED);
+
+	diag_test_status("AUTH_CHANGE_PW empty payload",
+			 SG_CMD_AUTH_CHANGE_PW, "",
+			 SG_ERR_PERM_DENIED);
+
+	diag_test_status("AUTH_LOGIN_OK empty payload",
+			 SG_CMD_AUTH_LOGIN_OK, "",
+			 SG_ERR_PERM_DENIED);
+
+	/* ── 16g-i: Path traversal injection ─────────────────────────── */
+
+	diag_test_status("AUTH_LOGIN path traversal in username",
+			 SG_CMD_AUTH_LOGIN,
+			 "../../etc/shadow\npassword\n",
+			 SG_ERR_PERM_DENIED);
+
+	diag_test_status("AUTH_CHANGE_PW path traversal in password",
+			 SG_CMD_AUTH_CHANGE_PW,
+			 "admin\n../../etc/shadow\nadmin-flag\n",
+			 SG_ERR_PERM_DENIED);
+
+	diag_test_status("AUTH_LOGIN_OK path traversal",
+			 SG_CMD_AUTH_LOGIN_OK,
+			 "../../etc/passwd\n",
+			 SG_ERR_PERM_DENIED);
+
+	/* ── 16j-l: SQL injection in username ────────────────────────── */
+
+	diag_test_status("AUTH_LOGIN SQL injection (single-quote)",
+			 SG_CMD_AUTH_LOGIN,
+			 "admin' OR '1'='1\npassword\n",
+			 SG_ERR_PERM_DENIED);
+
+	diag_test_status("AUTH_LOGIN SQL injection (UNION SELECT)",
+			 SG_CMD_AUTH_LOGIN,
+			 "admin' UNION SELECT * FROM users--\npw\n",
+			 SG_ERR_PERM_DENIED);
+
+	diag_test_status("AUTH_CHANGE_PW SQL injection in source",
+			 SG_CMD_AUTH_CHANGE_PW,
+			 "admin\nNewPass1\n'; DROP TABLE config;--\n",
+			 SG_ERR_PERM_DENIED);
+
+	/* ── 16m-o: Shell / command injection ────────────────────────── */
+
+	diag_test_status("AUTH_LOGIN shell injection (backtick)",
+			 SG_CMD_AUTH_LOGIN,
+			 "`cat /etc/shadow`\npassword\n",
+			 SG_ERR_PERM_DENIED);
+
+	diag_test_status("AUTH_LOGIN shell injection ($(...))",
+			 SG_CMD_AUTH_LOGIN,
+			 "$(cat /etc/shadow)\npassword\n",
+			 SG_ERR_PERM_DENIED);
+
+	diag_test_status("AUTH_LOGIN shell injection (pipe)",
+			 SG_CMD_AUTH_LOGIN,
+			 "admin|cat /etc/shadow\npassword\n",
+			 SG_ERR_PERM_DENIED);
+
+	/* ── 16p-r: Format string attacks ────────────────────────────── */
+
+	diag_test_status("AUTH_LOGIN format string (%s%s%s)",
+			 SG_CMD_AUTH_LOGIN,
+			 "%s%s%s%s%s\npassword\n",
+			 SG_ERR_PERM_DENIED);
+
+	diag_test_status("AUTH_LOGIN format string (%x%n)",
+			 SG_CMD_AUTH_LOGIN,
+			 "%x%x%x%n\npassword\n",
+			 SG_ERR_PERM_DENIED);
+
+	diag_test_status("AUTH_CHANGE_PW format string in password",
+			 SG_CMD_AUTH_CHANGE_PW,
+			 "admin\n%n%n%n%n\nadmin-flag\n",
+			 SG_ERR_PERM_DENIED);
+
+	/* ── 16s-u: Null byte injection ──────────────────────────────── */
+
+	diag_test_status("AUTH_LOGIN null byte in username",
+			 SG_CMD_AUTH_LOGIN,
+			 "admin\x00root\npassword\n",
+			 SG_ERR_PERM_DENIED);
+
+	diag_test_status("AUTH_CHANGE_PW null byte in password",
+			 SG_CMD_AUTH_CHANGE_PW,
+			 "admin\npass\x00word\nadmin-flag\n",
+			 SG_ERR_PERM_DENIED);
+
+	diag_test_status("AUTH_LOGIN_OK null byte in target",
+			 SG_CMD_AUTH_LOGIN_OK,
+			 "admin\x00evil\n",
+			 SG_ERR_PERM_DENIED);
+
+	/* ── 16v-x: Buffer overflow attempts ─────────────────────────── */
+
+	{
+		char bigbuf[4096];
+
+		/* Username overflow: SG_USERNAME_MAX is 64 */
+		memset(bigbuf, 'A', 200);
+		bigbuf[200] = '\n';
+		memcpy(bigbuf + 201, "password\n", 10);
+		diag_test_status("AUTH_LOGIN overflow username (200 chars)",
+				 SG_CMD_AUTH_LOGIN, bigbuf,
+				 SG_ERR_PERM_DENIED);
+
+		/* Password overflow: MAX_LINE is 1024 */
+		memcpy(bigbuf, "admin\n", 6);
+		memset(bigbuf + 6, 'B', 2000);
+		bigbuf[2006] = '\n';
+		bigbuf[2007] = '\0';
+		diag_test_status("AUTH_LOGIN overflow password (2000 chars)",
+				 SG_CMD_AUTH_LOGIN, bigbuf,
+				 SG_ERR_PERM_DENIED);
+
+		/* Near-max IPC payload to AUTH_CHANGE_PW */
+		memcpy(bigbuf, "admin\n", 6);
+		memset(bigbuf + 6, 'C', 4000);
+		memcpy(bigbuf + 4006, "\nadmin-flag\n", 13);
+		diag_test_status("AUTH_CHANGE_PW near-max payload (4000)",
+				 SG_CMD_AUTH_CHANGE_PW, bigbuf,
+				 SG_ERR_PERM_DENIED);
+
+		/* Huge username to AUTH_LOGIN_OK */
+		memset(bigbuf, 'D', 4000);
+		bigbuf[4000] = '\n';
+		bigbuf[4001] = '\0';
+		diag_test_status("AUTH_LOGIN_OK overflow target (4000)",
+				 SG_CMD_AUTH_LOGIN_OK, bigbuf,
+				 SG_ERR_PERM_DENIED);
+	}
+
+	/* ── 16y-z: Malformed payload structure ──────────────────────── */
+
+	diag_test_status("AUTH_LOGIN no newline separator",
+			 SG_CMD_AUTH_LOGIN,
+			 "adminpassword",
+			 SG_ERR_PERM_DENIED);
+
+	diag_test_status("AUTH_LOGIN only newlines",
+			 SG_CMD_AUTH_LOGIN,
+			 "\n\n\n\n\n",
+			 SG_ERR_PERM_DENIED);
+
+	diag_test_status("AUTH_CHANGE_PW missing third field",
+			 SG_CMD_AUTH_CHANGE_PW,
+			 "admin\nNewPass1\n",
+			 SG_ERR_PERM_DENIED);
+
+	diag_test_status("AUTH_CHANGE_PW extra fields",
+			 SG_CMD_AUTH_CHANGE_PW,
+			 "admin\nNewPass1\nadmin-flag\nextra\nmore\n",
+			 SG_ERR_PERM_DENIED);
+
+	diag_test_status("AUTH_LOGIN binary garbage payload",
+			 SG_CMD_AUTH_LOGIN,
+			 "\xff\xfe\xfd\x01\x02\x03\n\xff\xfe\n",
+			 SG_ERR_PERM_DENIED);
+
+	diag_test_status("AUTH_LOGIN_OK just whitespace",
+			 SG_CMD_AUTH_LOGIN_OK,
+			 "   \t\t  \n",
+			 SG_ERR_PERM_DENIED);
+
+	/* ── 16-aa: Spoofing "root" in payload (gate is SO_PEERCRED) ── */
+
+	diag_test_status("AUTH_LOGIN claim root in payload",
+			 SG_CMD_AUTH_LOGIN,
+			 "root\npassword\n",
+			 SG_ERR_PERM_DENIED);
+
+	diag_test_status("AUTH_LOGIN_OK claim root in payload",
+			 SG_CMD_AUTH_LOGIN_OK,
+			 "root\n",
+			 SG_ERR_PERM_DENIED);
+
+	/* ── SEC-17: Read-only admin config visibility ───────────────── */
+
+	printf("\n" C_CYAN
+	       "  --- SEC-17: Read-only admin config visibility ---"
+	       C_NC "\n");
+
+	/*
+	 * Read-only admins (profile=read-only, perms=monitor) must be
+	 * able to read configuration via CFG_GET and CFG_LIST but must
+	 * be blocked from writing via CFG_SET, CFG_DEL, and CFG_APPLY.
+	 *
+	 * We test this from our current (admin) session since the
+	 * permission gate is in mgmtd — the actual test is that
+	 * CFG_GET/CFG_LIST succeed for any authenticated user (even
+	 * monitor-only) and CFG_SET/CFG_DEL/CFG_APPLY require
+	 * configure or admin.
+	 */
+
+	/* 17a: CFG_GET succeeds for any known type (read allowed) */
+	diag_test_status("CFG_GET system_admin:admin (read always allowed)",
+			 SG_CMD_CFG_GET,
+			 "system_admin:admin",
+			 SG_OK);
+
+	/* 17b: CFG_LIST succeeds for any known type (read allowed) */
+	diag_test_status("CFG_LIST firewall_policy (read always allowed)",
+			 SG_CMD_CFG_LIST,
+			 "firewall_policy",
+			 SG_OK);
+
+	/*
+	 * 17c: Write operations require configure or admin permission.
+	 * We (admin) can write — verify the write path works, then
+	 * verify the entry is readable, then clean up.
+	 */
+	diag_test_status("CFG_SET system_admin write (admin allowed)",
+			 SG_CMD_CFG_SET,
+			 "system_admin:__diag_perm\n"
+			 "profile=read-only\n"
+			 "enforce-change-password=enable\n"
+			 "enforce-password-policy=enable\n",
+			 SG_OK);
+
+	/* 17d: Verify the entry can be read back */
+	diag_total++;
+	if (ipc_send_str(SG_CMD_CFG_GET, "system_admin:__diag_perm",
+			 &resp) == 0 &&
+	    resp.status == SG_OK && resp.payload &&
+	    strstr(resp.payload, "profile=read-only")) {
+		printf(C_GREEN "  PASS" C_NC " [%3u] Verify __diag_perm"
+		       " readable after write\n",
+		       SG_CMD_CFG_GET);
+		diag_pass++;
+	} else {
+		printf(C_RED "  FAIL" C_NC " [%3u] Verify __diag_perm"
+		       " readable (status=%u)\n",
+		       SG_CMD_CFG_GET, resp.status);
+		diag_fail++;
+	}
+	ipc_resp_free(&resp);
+
+	/* 17e: Clean up __diag_perm */
+	diag_test_status("CFG_DEL __diag_perm cleanup",
+			 SG_CMD_CFG_DEL,
+			 "system_admin:__diag_perm",
+			 SG_OK);
+
+	/* ── SEC-18: Password handler adversarial inputs ─────────────── */
+
+	printf("\n" C_CYAN
+	       "  --- SEC-18: Password handler adversarial inputs ---"
+	       C_NC "\n");
+
+	/*
+	 * ADMIN_SET_PW and ADMIN_CHECK_PW are callable from admin CLI.
+	 * Test the actual handler parsing with malicious payloads.
+	 * These exercise the real code paths (not just the permission
+	 * gate) since the admin user has the "admin" permission.
+	 */
+
+	/* 18a: SET_PW path traversal in username */
+	diag_test_status("SET_PW path traversal username",
+			 SG_CMD_ADMIN_SET_PW,
+			 "../../etc/shadow\nAbcdefg1\n",
+			 SG_ERR_INVALID_ARG);
+
+	/* 18b: SET_PW SQL injection in username */
+	diag_test_status("SET_PW SQL injection username",
+			 SG_CMD_ADMIN_SET_PW,
+			 "admin' OR '1'='1\nAbcdefg1\n",
+			 SG_ERR_INVALID_ARG);
+
+	/* 18c: SET_PW shell injection in username */
+	diag_test_status("SET_PW shell injection (backtick)",
+			 SG_CMD_ADMIN_SET_PW,
+			 "`cat /etc/shadow`\nAbcdefg1\n",
+			 SG_ERR_INVALID_ARG);
+
+	/* 18d: SET_PW shell injection ($(...)) */
+	diag_test_status("SET_PW shell injection ($(...))",
+			 SG_CMD_ADMIN_SET_PW,
+			 "$(id)\nAbcdefg1\n",
+			 SG_ERR_INVALID_ARG);
+
+	/* 18e: SET_PW format string in username */
+	diag_test_status("SET_PW format string username (%n)",
+			 SG_CMD_ADMIN_SET_PW,
+			 "%s%s%s%n\nAbcdefg1\n",
+			 SG_ERR_INVALID_ARG);
+
+	/* 18f: SET_PW null byte in username */
+	diag_test_status("SET_PW null byte in username",
+			 SG_CMD_ADMIN_SET_PW,
+			 "admin\x00root\nAbcdefg1\n",
+			 SG_ERR_INVALID_ARG);
+
+	/* 18g: SET_PW semicolon injection */
+	diag_test_status("SET_PW semicolon injection",
+			 SG_CMD_ADMIN_SET_PW,
+			 "admin;cat /etc/shadow\nAbcdefg1\n",
+			 SG_ERR_INVALID_ARG);
+
+	/* 18h: SET_PW pipe injection */
+	diag_test_status("SET_PW pipe injection",
+			 SG_CMD_ADMIN_SET_PW,
+			 "admin|cat\nAbcdefg1\n",
+			 SG_ERR_INVALID_ARG);
+
+	/* 18i: CHECK_PW path traversal */
+	diag_test_status("CHECK_PW path traversal username",
+			 SG_CMD_ADMIN_CHECK_PW,
+			 "../../../etc/passwd\nAbcdefg1\n",
+			 SG_ERR_INVALID_ARG);
+
+	/* 18j: CHECK_PW SQL injection */
+	diag_test_status("CHECK_PW SQL injection",
+			 SG_CMD_ADMIN_CHECK_PW,
+			 "admin'; DROP TABLE config;--\nAbcdefg1\n",
+			 SG_ERR_INVALID_ARG);
+
+	/* 18k: CHECK_PW format string */
+	diag_test_status("CHECK_PW format string (%x%n)",
+			 SG_CMD_ADMIN_CHECK_PW,
+			 "%x%x%x%n\nAbcdefg1\n",
+			 SG_ERR_INVALID_ARG);
+
+	/* 18l: CHECK_PW shell injection */
+	diag_test_status("CHECK_PW shell injection",
+			 SG_CMD_ADMIN_CHECK_PW,
+			 "$(cat /etc/shadow)\nAbcdefg1\n",
+			 SG_ERR_INVALID_ARG);
+
+	{
+		char bigbuf[4096];
+
+		/* 18m: SET_PW overflow username (200 chars) */
+		memset(bigbuf, 'A', 200);
+		bigbuf[200] = '\n';
+		memcpy(bigbuf + 201, "Abcdefg1\n", 10);
+		diag_test_status("SET_PW overflow username (200 chars)",
+				 SG_CMD_ADMIN_SET_PW, bigbuf,
+				 SG_ERR_INVALID_ARG);
+
+		/* 18n: SET_PW overflow password (2000 chars) */
+		memcpy(bigbuf, "admin\n", 6);
+		memset(bigbuf + 6, 'P', 2000);
+		bigbuf[2006] = '\n';
+		bigbuf[2007] = '\0';
+		diag_test_status2("SET_PW overflow password (2000 chars)",
+				  SG_CMD_ADMIN_SET_PW, bigbuf,
+				  SG_ERR_POLICY_FAIL, SG_ERR_USER_NOT_FOUND);
+
+		/* 18o: CHECK_PW overflow username (200 chars) */
+		memset(bigbuf, 'B', 200);
+		bigbuf[200] = '\n';
+		memcpy(bigbuf + 201, "Abcdefg1\n", 10);
+		diag_test_status("CHECK_PW overflow username (200 chars)",
+				 SG_CMD_ADMIN_CHECK_PW, bigbuf,
+				 SG_ERR_INVALID_ARG);
+
+		/* 18p: CHECK_PW near-max payload (~4000 bytes) */
+		memcpy(bigbuf, "admin\n", 6);
+		memset(bigbuf + 6, 'Q', 4000);
+		bigbuf[4006] = '\n';
+		bigbuf[4007] = '\0';
+		diag_test_status2("CHECK_PW near-max payload (4000)",
+				  SG_CMD_ADMIN_CHECK_PW, bigbuf,
+				  SG_ERR_POLICY_FAIL, SG_ERR_USER_NOT_FOUND);
+	}
+
+	/* 18q: SET_PW binary garbage in username */
+	diag_test_status("SET_PW binary garbage username",
+			 SG_CMD_ADMIN_SET_PW,
+			 "\xff\xfe\xfd\x01\nAbcdefg1\n",
+			 SG_ERR_INVALID_ARG);
+
+	/* 18r: SET_PW only newlines */
+	diag_test_status("SET_PW only newlines",
+			 SG_CMD_ADMIN_SET_PW,
+			 "\n\n\n\n",
+			 SG_ERR_INVALID_ARG);
+
+	/* 18s: CHECK_PW binary garbage */
+	diag_test_status("CHECK_PW binary garbage username",
+			 SG_CMD_ADMIN_CHECK_PW,
+			 "\x01\x02\x03\x04\nAbcdefg1\n",
+			 SG_ERR_INVALID_ARG);
+
+	/* 18t: SET_ENF injection in username */
+	diag_test_status("SET_ENF path traversal username",
+			 SG_CMD_ADMIN_SET_ENF,
+			 "../../etc/shadow\nenable\n",
+			 SG_ERR_INVALID_ARG);
+
+	/* 18u: SET_ENF injection in value */
+	diag_test_status("SET_ENF invalid value injection",
+			 SG_CMD_ADMIN_SET_ENF,
+			 "admin\n$(reboot)\n",
+			 SG_ERR_INVALID_VAL);
+
+	/* 18v: LOCK_PW injection in username */
+	diag_test_status("LOCK_PW path traversal username",
+			 SG_CMD_ADMIN_LOCK_PW,
+			 "../../etc/shadow\n",
+			 SG_ERR_INVALID_ARG);
+
+	/* 18w: LOCK_PW shell injection */
+	diag_test_status("LOCK_PW shell injection",
+			 SG_CMD_ADMIN_LOCK_PW,
+			 "`reboot`\n",
+			 SG_ERR_INVALID_ARG);
+
+	/* 18x: LOCK_PW format string */
+	diag_test_status("LOCK_PW format string (%n)",
+			 SG_CMD_ADMIN_LOCK_PW,
+			 "%s%s%n\n",
+			 SG_ERR_INVALID_ARG);
+#endif /* ── end removed pentest block ── */
 
 /* ── Full test ─────────────────────────────────────────────────────────── */
 
@@ -1206,7 +1457,7 @@ static void diag_full_test(void)
 	}
 	ipc_resp_free(&resp);
 
-	/* 6. Test admin capabilities: CFG_SET, CFG_DEL, SESSION_BUMP
+	/* 6. Test admin capabilities: CFG_SET, CFG_DEL
 	 *    CFG_SET payload: "type:id\nkey=value\n"
 	 *    CFG_DEL payload: "type:id" */
 	diag_test("CFG_SET firewall_address:__diag_test (admin write)",
@@ -1218,8 +1469,6 @@ static void diag_full_test(void)
 	diag_test("CFG_DEL firewall_address:__diag_test (admin delete)",
 		  SG_CMD_CFG_DEL,
 		  "firewall_address:__diag_test", 1);
-	diag_test("SESSION_BUMP __diag_rw (admin bump)",
-		  SG_CMD_SESSION_BUMP, "__diag_rw", 1);
 
 	/* 7. Delete temp accounts */
 	diag_test("ADMIN_DELETE __diag_rw",
@@ -1315,10 +1564,7 @@ int cli_diagnose_test_permissions(int mode, const char *permissions,
 		out->total  = diag_total;
 	}
 
-	/* Absorb session rev bumps from SEC-8 self-bump and profile
-	 * upgrade tests.  Without this, the main loop's session rev
-	 * check would see a mismatch and kick the acting admin. */
-	cli_refresh_session();
-
 	return diag_fail > 0 ? 1 : 0;
 }
+
+

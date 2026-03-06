@@ -37,6 +37,7 @@ typedef enum {
 	SG_ERR_AUTH_FAIL     = 201,
 	SG_ERR_LOCKED        = 202,
 	SG_ERR_PROFILE_DENY  = 203,
+	SG_ERR_SESSION_EXPIRED = 204, /* Session tag no longer valid  */
 
 	/* Not found errors (300-399) */
 	SG_ERR_NOT_FOUND     = 300,
@@ -76,9 +77,14 @@ typedef enum {
 	SG_CMD_ADMIN_CHECK_PW = 304,  /* Validate password against policy */
 	SG_CMD_ADMIN_LOCK_PW  = 305,  /* Lock (invalidate) admin password */
 
+	/* Auth login flow (31x) — used by stargazer-logind */
+	SG_CMD_AUTH_LOGIN      = 310,  /* Authenticate user via shadow     */
+	SG_CMD_AUTH_CHANGE_PW  = 311,  /* Change password (logind forced)  */
+	SG_CMD_AUTH_LOGIN_OK   = 312,  /* Confirm login success (audit)    */
+
 	/* Session/auth (4xx) */
-	SG_CMD_SESSION_REV   = 400,   /* Get session revision for user   */
-	SG_CMD_SESSION_BUMP  = 401,   /* Bump session revision           */
+	SG_CMD_SESSION_TAG_NEW = 400, /* Acquire a new session tag       */
+	SG_CMD_SESSION_TAG_DEL = 401, /* Release session tag (logout)    */
 
 	/* Config revision management (5xx) — CLI sends these, mgmtd not yet implemented */
 	SG_CMD_COMMIT        = 500,   /* Record config revision (stub)   */
@@ -140,7 +146,7 @@ typedef enum {
 /* ── Message header ─────────────────────────────────────────────────────── */
 
 #define SG_MSG_MAGIC     0x5347    /* "SG" */
-#define SG_MSG_VERSION   1
+#define SG_MSG_VERSION   2
 #define SG_PAYLOAD_MAX   4096
 #define SG_RESPONSE_MAX  65536    /* Max response payload (diagnostics etc) */
 #define SG_USERNAME_MAX  64
@@ -154,7 +160,8 @@ typedef enum {
  * Request: CLI → mgmtd
  *
  * Wire format (fixed header + variable payload):
- *   [ magic:2 | version:1 | debug_flags:1 | cmd:4 | user[64] | payload_len:4 | payload[...] ]
+ *   [ magic:2 | version:1 | debug_flags:1 | cmd:4 | user[64] |
+ *     payload_len:4 | session_tag:8 | payload[...] ]
  */
 typedef struct {
 	uint16_t  magic;                     /* SG_MSG_MAGIC               */
@@ -163,6 +170,7 @@ typedef struct {
 	uint32_t  cmd;                       /* sg_cmd_t                   */
 	char      username[SG_USERNAME_MAX]; /* authenticated user         */
 	uint32_t  payload_len;               /* length of payload data     */
+	uint64_t  session_tag;               /* session tag (0 = untagged) */
 	/* followed by payload_len bytes of payload (key=value lines, etc) */
 } __attribute__((packed)) sg_request_hdr_t;
 
@@ -197,6 +205,7 @@ static inline const char *sg_status_str(sg_status_t s)
 	case SG_ERR_AUTH_FAIL:         return "Authentication failed";
 	case SG_ERR_LOCKED:            return "Account is locked";
 	case SG_ERR_PROFILE_DENY:      return "Profile does not allow this operation";
+	case SG_ERR_SESSION_EXPIRED:   return "Session expired";
 	case SG_ERR_NOT_FOUND:         return "Not found";
 	case SG_ERR_USER_NOT_FOUND:    return "User not found";
 	case SG_ERR_PROFILE_NOT_FOUND: return "Profile not found";

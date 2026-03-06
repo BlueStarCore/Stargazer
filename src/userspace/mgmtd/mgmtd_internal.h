@@ -53,18 +53,16 @@ int  audit_log(const char *user, const char *event, const char *msg);
 void debug_buf_push(const char *fmt, ...)
 	__attribute__((format(printf, 1, 2)));
 
-/* ── Session (defined in stargazer-mgmtd.c) ──────────────────────────────── */
+/* ── Session tags (defined in stargazer-mgmtd.c) ─────────────────────────── */
 
-int  session_rev_get(const char *user);
-int  session_rev_bump(const char *user);
-void session_rev_del(const char *user);
+void session_tag_purge_user(const char *user);
 void admin_notify_change(const char *user);
 
 /* ── Auth / permissions (defined in stargazer-mgmtd.c) ───────────────────── */
 
 const char *get_user_permissions(const char *username);
 int  has_permission(const char *perms_csv, const char *perm);
-int  check_type_permission(const char *user, const char *type_name);
+const char *get_type_permission(const char *type_name);
 
 /* ── Config validation (defined in stargazer-mgmtd.c) ────────────────────── */
 
@@ -96,6 +94,15 @@ int handle_admin_set_enf(int client_fd, const char *user,
 int handle_admin_check_pw(int client_fd, const char *user,
 			  const char *payload, const sg_request_hdr_t *hdr);
 int handle_admin_lock_pw(int client_fd, const char *user,
+			 const char *payload, const sg_request_hdr_t *hdr);
+
+/* ── Auth login handlers (defined in mgmtd_user.c) ────────────────────────── */
+
+int handle_auth_login(int client_fd, const char *user,
+		      const char *payload, const sg_request_hdr_t *hdr);
+int handle_auth_change_pw(int client_fd, const char *user,
+			  const char *payload, const sg_request_hdr_t *hdr);
+int handle_auth_login_ok(int client_fd, const char *user,
 			 const char *payload, const sg_request_hdr_t *hdr);
 
 /* ── Firmware upgrade handlers (defined in mgmtd_firmware.c) ──────────────── */

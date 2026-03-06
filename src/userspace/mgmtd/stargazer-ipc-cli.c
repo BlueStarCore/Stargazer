@@ -103,8 +103,8 @@ static void usage(const char *prog)
 	fprintf(stderr, "  301  ADMIN_DELETE <username>\n");
 	fprintf(stderr, "  302  ADMIN_SET_PW <user>\\n<password>\n");
 	fprintf(stderr, "  303  ADMIN_SET_ENF <user>\\n<enable|disable>\n");
-	fprintf(stderr, "  400  SESSION_REV  <username>\n");
-	fprintf(stderr, "  401  SESSION_BUMP <username>\n");
+	fprintf(stderr, "  400  SESSION_TAG_NEW\n");
+	fprintf(stderr, "  401  SESSION_TAG_DEL\n");
 	fprintf(stderr, "  600  SYS_POWEROFF\n");
 	fprintf(stderr, "  601  SYS_REBOOT\n");
 	fprintf(stderr, "  610  SHOW_STATUS\n");
@@ -112,6 +112,97 @@ static void usage(const char *prog)
 	fprintf(stderr, "  612  SHOW_ROUTES\n");
 	fprintf(stderr, "  900  PING\n");
 }
+
+/* ── IPC round-trip helper ─────────────────────────────────────────────── */
+
+/*
+ * Send a single IPC request and read the response.
+ * Caller must free *out_payload.
+ * Returns 0 on success, -1 on communication error.
+ */
+static int ipc_roundtrip(uint32_t cmd, const char *user, uint64_t tag,
+			 const void *payload, size_t payload_len,
+			 sg_response_hdr_t *out_resp, char **out_payload)
+{
+	*out_payload = NULL;
+
+	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0) return -1;
+
+	struct sockaddr_un addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", SG_MGMTD_SOCK);
+
+	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		close(fd);
+		return -1;
+	}
+
+	sg_request_hdr_t hdr;
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.magic       = SG_MSG_MAGIC;
+	hdr.version     = SG_MSG_VERSION;
+	hdr.cmd         = cmd;
+	snprintf(hdr.username, sizeof(hdr.username), "%s", user);
+	hdr.payload_len = (uint32_t)payload_len;
+	hdr.session_tag = tag;
+
+	if (safe_write(fd, &hdr, sizeof(hdr)) < 0) {
+		close(fd);
+		return -1;
+	}
+	if (payload_len > 0 && payload &&
+	    safe_write(fd, payload, payload_len) < 0) {
+		close(fd);
+		return -1;
+	}
+
+	ssize_t n = safe_read(fd, out_resp, sizeof(*out_resp));
+	if (n < (ssize_t)sizeof(*out_resp) ||
+	    out_resp->magic != SG_MSG_MAGIC) {
+		close(fd);
+		return -1;
+	}
+
+	if (out_resp->payload_len > 0 &&
+	    out_resp->payload_len <= SG_PAYLOAD_MAX) {
+		*out_payload = malloc(out_resp->payload_len + 1);
+		if (*out_payload) {
+			n = safe_read(fd, *out_payload, out_resp->payload_len);
+			if (n >= 0)
+				(*out_payload)[n] = '\0';
+			else {
+				free(*out_payload);
+				*out_payload = NULL;
+			}
+		}
+	}
+
+	close(fd);
+	return 0;
+}
+
+/* Commands exempt from session tag (must match mgmtd validation gate) */
+static int cmd_needs_tag(int cmd)
+{
+	return cmd != (int)SG_CMD_SESSION_TAG_NEW &&
+	       cmd != (int)SG_CMD_SESSION_TAG_DEL &&
+	       cmd != (int)SG_CMD_WHOAMI &&
+	       cmd != (int)SG_CMD_DEBUG_FETCH;
+}
+
+/* Release a session tag (best-effort, ignores errors) */
+static void release_tag(const char *user, uint64_t tag)
+{
+	sg_response_hdr_t del_resp;
+	char *del_payload = NULL;
+	ipc_roundtrip(SG_CMD_SESSION_TAG_DEL, user, tag,
+		      NULL, 0, &del_resp, &del_payload);
+	free(del_payload);
+}
+
+/* ── Main ──────────────────────────────────────────────────────────────── */
 
 int main(int argc, char *argv[])
 {
@@ -171,81 +262,47 @@ int main(int argc, char *argv[])
 	if (!user) user = getenv("USER");
 	if (!user) user = "unknown";
 
-	/* Connect to mgmtd */
-	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-	if (fd < 0) {
-		fprintf(stderr, "Error: socket: %s\n", strerror(errno));
-		free(payload);
-		return 1;
+	/* Auto-acquire session tag for commands that need it */
+	uint64_t session_tag = 0;
+	if (cmd_needs_tag(cmd_id)) {
+		sg_response_hdr_t tag_resp;
+		char *tag_payload = NULL;
+		if (ipc_roundtrip(SG_CMD_SESSION_TAG_NEW, user, 0,
+				  NULL, 0, &tag_resp, &tag_payload) < 0 ||
+		    tag_resp.status != SG_OK || !tag_payload) {
+			fprintf(stderr, "Error: cannot connect to mgmtd");
+			if (tag_payload)
+				fprintf(stderr, " (%s)", tag_resp.extra);
+			fprintf(stderr, "\nIs stargazer-mgmtd running?\n");
+			free(tag_payload);
+			free(payload);
+			return 1;
+		}
+		session_tag = strtoull(tag_payload, NULL, 10);
+		free(tag_payload);
+		if (session_tag == 0) {
+			fprintf(stderr, "Error: failed to acquire session tag\n");
+			free(payload);
+			return 1;
+		}
 	}
 
-	struct sockaddr_un addr;
-	memset(&addr, 0, sizeof(addr));
-	addr.sun_family = AF_UNIX;
-	snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", SG_MGMTD_SOCK);
-
-	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		fprintf(stderr, "Error: cannot connect to mgmtd: %s\n", strerror(errno));
-		fprintf(stderr, "Is stargazer-mgmtd running?\n");
-		close(fd);
-		free(payload);
-		return 1;
-	}
-
-	/* Build request */
-	sg_request_hdr_t hdr;
-	memset(&hdr, 0, sizeof(hdr));
-	hdr.magic = SG_MSG_MAGIC;
-	hdr.version = SG_MSG_VERSION;
-	hdr.cmd = (uint32_t)cmd_id;
-	snprintf(hdr.username, sizeof(hdr.username), "%s", user);
-	hdr.payload_len = (uint32_t)payload_len;
-
-	/* Send header + payload */
-	if (safe_write(fd, &hdr, sizeof(hdr)) < 0) {
-		fprintf(stderr, "Error: write header: %s\n", strerror(errno));
-		close(fd);
-		free(payload);
-		return 1;
-	}
-	if (payload_len > 0 && safe_write(fd, payload, payload_len) < 0) {
-		fprintf(stderr, "Error: write payload: %s\n", strerror(errno));
-		close(fd);
+	/* Send the actual command */
+	sg_response_hdr_t resp;
+	char *resp_payload = NULL;
+	if (ipc_roundtrip((uint32_t)cmd_id, user, session_tag,
+			  payload, payload_len, &resp, &resp_payload) < 0) {
+		fprintf(stderr, "Error: communication with mgmtd failed\n");
+		if (session_tag != 0)
+			release_tag(user, session_tag);
 		free(payload);
 		return 1;
 	}
 	free(payload);
 
-	/* Read response header */
-	sg_response_hdr_t resp;
-	ssize_t n = safe_read(fd, &resp, sizeof(resp));
-	if (n < (ssize_t)sizeof(resp)) {
-		fprintf(stderr, "Error: short response (%zd bytes)\n", n);
-		close(fd);
-		return 1;
-	}
-
-	if (resp.magic != SG_MSG_MAGIC) {
-		fprintf(stderr, "Error: bad response magic\n");
-		close(fd);
-		return 1;
-	}
-
-	/* Read response payload */
-	char *resp_payload = NULL;
-	if (resp.payload_len > 0 && resp.payload_len <= SG_PAYLOAD_MAX) {
-		resp_payload = malloc(resp.payload_len + 1);
-		if (resp_payload) {
-			n = safe_read(fd, resp_payload, resp.payload_len);
-			if (n >= 0)
-				resp_payload[n] = '\0';
-			else {
-				free(resp_payload);
-				resp_payload = NULL;
-			}
-		}
-	}
-	close(fd);
+	/* Release session tag (best effort) */
+	if (session_tag != 0)
+		release_tag(user, session_tag);
 
 	/* Output:
 	 * Line 1: status code

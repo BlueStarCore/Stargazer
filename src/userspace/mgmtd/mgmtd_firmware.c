@@ -335,8 +335,27 @@ int handle_upgrade_start(int client_fd, const char *user,
 	fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged /tmp/sg-fw-boot");
 	fw_run_cmd_ignore("mkdir -p /tmp/sg-fw-download /tmp/sg-fw-staged /tmp/sg-fw-boot");
 
+	/* Determine protocol label for progress messages */
+	const char *proto_label;
+	if (strncmp(url, "tftp://", 7) == 0)
+		proto_label = "TFTP";
+	else if (strncmp(url, "https://", 8) == 0)
+		proto_label = "HTTPS";
+	else if (strncmp(url, "http://", 7) == 0)
+		proto_label = "HTTP";
+	else {
+		fw_write_state(1, 6, "error", "Unsupported URL scheme", "");
+		sg_db_close();
+		_exit(1);
+	}
+
 	/* Step 1: Download firmware package (non-blocking with progress) */
-	fw_write_state(1, 6, "running", "Downloading firmware... (0 KB)", "");
+	{
+		char init_msg[128];
+		snprintf(init_msg, sizeof(init_msg),
+			 "Downloading firmware... (0 KB) via %s", proto_label);
+		fw_write_state(1, 6, "running", init_msg, "");
+	}
 	mgmt_log("INFO", "firmware upgrade: downloading from %s", url);
 
 	#define FW_DL_FILE "/tmp/sg-fw-download/firmware.tar.gz"
@@ -457,7 +476,7 @@ int handle_upgrade_start(int client_fd, const char *user,
 	}
 
 	/* Poll download file size while wget/tftp runs */
-	long total_kb = total_bytes > 0 ? (total_bytes + 1023) / 1024 : -1;
+	(void)total_bytes;  /* size probe kept for future use */
 	int dl_status = 0;
 	for (;;) {
 		/* Update progress first so the final iteration shows 100% */
@@ -466,15 +485,9 @@ int handle_upgrade_start(int client_fd, const char *user,
 		if (stat(FW_DL_FILE, &st) == 0)
 			kb = (long)(st.st_size / 1024);
 		char msg[128];
-		if (total_kb > 0) {
-			int pct = (int)(kb * 100 / total_kb);
-			snprintf(msg, sizeof(msg),
-				 "Downloading firmware... %d%% (%ld/%ld KB)",
-				 pct, kb, total_kb);
-		} else {
-			snprintf(msg, sizeof(msg),
-				 "Downloading firmware... (%ld KB)", kb);
-		}
+		snprintf(msg, sizeof(msg),
+			 "Downloading firmware... (%ld KB) via %s",
+			 kb, proto_label);
 		fw_write_state(1, 6, "running", msg, "");
 
 		int wret = waitpid(dl_pid, &dl_status, WNOHANG);
@@ -527,6 +540,14 @@ int handle_upgrade_start(int client_fd, const char *user,
 		fw_write_state(1, 6, "error", errmsg, "");
 		sg_db_close();
 		_exit(1);
+	}
+
+	/* Download complete — write final [1/6] with 100% */
+	{
+		char done_msg[128];
+		snprintf(done_msg, sizeof(done_msg),
+			 "Downloading firmware... 100%% via %s", proto_label);
+		fw_write_state(1, 6, "running", done_msg, "");
 	}
 
 	/* Cancel check: before step 2 */

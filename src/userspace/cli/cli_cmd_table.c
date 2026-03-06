@@ -281,24 +281,40 @@ static int cmd_fw_upgrade(const char *args, const char *permissions)
 		int total = atoi(total_s);
 
 		/* When the step advances and we have an in-place progress
-		 * line (e.g. "84%"), overwrite it with 100% before moving
-		 * on.  This handles the race where mgmtd advances to the
+		 * line, overwrite it with 100% before moving on.
+		 * This handles the race where mgmtd advances to the
 		 * next step before the CLI polls the final progress. */
 		if (step > last_step && last_step > 0 && have_inline) {
-			char *pct = strstr(last_msg, "% ");
-			if (!pct)
-				pct = strstr(last_msg, "%(");
-			if (pct) {
-				/* Find start of the number before '%' */
-				char *np = pct;
-				while (np > last_msg && np[-1] >= '0' &&
-				       np[-1] <= '9')
-					np--;
-				/* Rewrite: keep prefix, replace "NN% ..." with "100%" */
-				printf("\r\033[K  [%d/%d] %.*s100%%",
-				       last_step, total,
-				       (int)(np - last_msg), last_msg);
+			if (last_step == 1) {
+				/* Download step: show 100% with protocol */
+				const char *via = strstr(last_msg, " via ");
+				if (via)
+					printf("\r\033[K  [1/%d] "
+					       "Downloading firmware..."
+					       " 100%%%s",
+					       total, via);
+				else
+					printf("\r\033[K  [1/%d] "
+					       "Downloading firmware..."
+					       " 100%%", total);
 				fflush(stdout);
+			} else {
+				char *pct = strstr(last_msg, "% ");
+				if (!pct)
+					pct = strstr(last_msg, "%(");
+				if (pct) {
+					char *np = pct;
+					while (np > last_msg &&
+					       np[-1] >= '0' &&
+					       np[-1] <= '9')
+						np--;
+					printf("\r\033[K  [%d/%d] "
+					       "%.*s100%%",
+					       last_step, total,
+					       (int)(np - last_msg),
+					       last_msg);
+					fflush(stdout);
+				}
 			}
 		}
 
@@ -502,6 +518,36 @@ static int cmd_diag_selftest(const char *args, const char *permissions)
 		printf(C_GREEN "  All test suites passed." C_NC "\n");
 	else
 		printf(C_RED "  %d test suite(s) had failures." C_NC "\n", fail);
+	printf("  ══════════════════════════════════════\n\n");
+	return 0;
+}
+
+static int cmd_diag_pentest(const char *args, const char *permissions)
+{
+	int mode = 0;
+	if (args) {
+		while (*args == ' ')
+			args++;
+		if (strcmp(args, "full") == 0)
+			mode = 1;
+		else if (*args != '\0') {
+			printf("  Unknown argument: %s\n", args);
+			printf("  Usage: execute diagnose pentest [full]\n");
+			return 0;
+		}
+	}
+	diag_result_t r = {0, 0, 0};
+	int fail = cli_diagnose_test_pentest(mode, permissions, &r);
+
+	printf("  ══════════════════════════════════════\n");
+	printf("  Pentest: %d/%d passed", r.passed, r.total);
+	if (r.failed > 0)
+		printf(C_RED ", %d FAILED" C_NC, r.failed);
+	printf("\n");
+	if (fail == 0)
+		printf(C_GREEN "  All pentest checks passed." C_NC "\n");
+	else
+		printf(C_RED "  %d pentest check(s) failed." C_NC "\n", r.failed);
 	printf("  ══════════════════════════════════════\n\n");
 	return 0;
 }

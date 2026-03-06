@@ -59,7 +59,7 @@
 #endif
 #define AUDIT_LOG        "/var/log/stargazer-audit.log"
 #define AUDIT_LOG_FB     "/tmp/stargazer-audit.log"
-#define SESSION_REV_FILE "/run/stargazer-session.rev"
+#define MAX_SESSION_TAGS  16
 #define MAX_CLIENTS_QUEUE 8
 #define BUF_SIZE         (sizeof(sg_request_hdr_t) + SG_PAYLOAD_MAX)
 #define DEBUG_STATE_FILE  "/tmp/stargazer-debug.conf"
@@ -511,7 +511,8 @@ void send_ok_audited(int fd, const char *extra, const char *payload,
 
 /* Forward declaration (defined below, after password/user helpers) */
 static sg_status_t apply_config(const char *type, const char *id,
-				const char *data, char *result, size_t rsize);
+				const char *data,
+				char *result, size_t rsize);
 
 /* ── FIFO signaling to init ─────────────────────────────────────────────── */
 
@@ -1376,8 +1377,8 @@ static void mgmtd_replay_config(void)
 				sg_db_set(single_types[i], "0", clean);
 
 			sg_status_t rc = apply_config(single_types[i], "0",
-						      use, result,
-						      sizeof(result));
+						      use,
+						      result, sizeof(result));
 			mgmt_log(rc == SG_OK ? "INFO" : "WARN",
 				 "replay %s: %s", single_types[i], result);
 			free(data);
@@ -1447,82 +1448,84 @@ static void mgmtd_replay_config(void)
 	}
 }
 
-/* ── Session revision tracking ──────────────────────────────────────────── */
+/* ── Session tag table ──────────────────────────────────────────────────── */
 
-int session_rev_get(const char *user)
+/*
+ * In-memory table of active session tags.  At login, CLI acquires a random
+ * 64-bit tag via SG_CMD_SESSION_TAG_NEW.  Every subsequent IPC request
+ * carries the tag in the header.  mgmtd validates the tag on every request.
+ * When admin accounts are mutated, all tags for affected users are purged.
+ */
+
+typedef struct {
+	uint64_t tag;
+	char     user[SG_USERNAME_MAX];
+} session_tag_entry_t;
+
+static session_tag_entry_t g_session_tags[MAX_SESSION_TAGS];
+
+static uint64_t session_tag_generate(void)
 {
-	FILE *fp = fopen(SESSION_REV_FILE, "r");
-	if (!fp) return 0;
-
-	char line[MAX_LINE];
-	int rev = 0;
-	size_t ulen = strlen(user);
-
-	while (fgets(line, sizeof(line), fp)) {
-		if (strncmp(line, user, ulen) == 0 && line[ulen] == ':') {
-			errno = 0;
-			long val = strtol(line + ulen + 1, NULL, 10);
-			if (errno == 0 && val > 0 && val <= INT_MAX)
-				rev = (int)val;
-			break;
-		}
-	}
-	fclose(fp);
-	return rev;
+	uint64_t tag = 0;
+	int fd = open("/dev/urandom", O_RDONLY);
+	if (fd < 0) return 0;
+	ssize_t n = read(fd, &tag, sizeof(tag));
+	close(fd);
+	if (n != (ssize_t)sizeof(tag)) return 0;
+	/* Ensure non-zero (0 means untagged) */
+	if (tag == 0) tag = 1;
+	return tag;
 }
 
-static void session_rev_set(const char *user, int rev)
+static uint64_t session_tag_new(const char *user)
 {
-	char tmppath[128];
-	snprintf(tmppath, sizeof(tmppath), "%s.tmp.%d", SESSION_REV_FILE, (int)getpid());
+	uint64_t tag = session_tag_generate();
+	if (tag == 0) return 0;
 
-	FILE *out = fopen(tmppath, "w");
-	if (!out) return;
-
-	size_t ulen = strlen(user);
-
-	int write_ok = 1;
-
-	FILE *in = fopen(SESSION_REV_FILE, "r");
-	if (in) {
-		char line[MAX_LINE];
-		while (fgets(line, sizeof(line), in)) {
-			if (strncmp(line, user, ulen) != 0 || line[ulen] != ':') {
-				if (fputs(line, out) == EOF)
-					write_ok = 0;
-			}
+	for (int i = 0; i < MAX_SESSION_TAGS; i++) {
+		if (g_session_tags[i].tag == 0) {
+			g_session_tags[i].tag = tag;
+			snprintf(g_session_tags[i].user,
+				 sizeof(g_session_tags[i].user),
+				 "%s", user);
+			return tag;
 		}
-		fclose(in);
 	}
+	return 0; /* table full */
+}
 
-	if (fprintf(out, "%s:%d\n", user, rev) < 0)
-		write_ok = 0;
-	if (fflush(out) != 0)
-		write_ok = 0;
-	if (fsync(fileno(out)) != 0)
-		write_ok = 0;
-	fchmod(fileno(out), 0644);
-	fclose(out);
+static int session_tag_validate(const char *user, uint64_t tag)
+{
+	if (tag == 0) return 0;
+	for (int i = 0; i < MAX_SESSION_TAGS; i++) {
+		if (g_session_tags[i].tag == tag &&
+		    strcmp(g_session_tags[i].user, user) == 0)
+			return 1;
+	}
+	return 0;
+}
 
-	if (write_ok) {
-		if (rename(tmppath, SESSION_REV_FILE) != 0) {
-			mgmt_log("ERROR", "session_rev_set: rename failed: %s",
-				 strerror(errno));
-			unlink(tmppath);
+static void session_tag_delete(const char *user, uint64_t tag)
+{
+	for (int i = 0; i < MAX_SESSION_TAGS; i++) {
+		if (g_session_tags[i].tag == tag &&
+		    strcmp(g_session_tags[i].user, user) == 0) {
+			g_session_tags[i].tag = 0;
+			g_session_tags[i].user[0] = '\0';
+			return;
 		}
-	} else {
-		mgmt_log("ERROR", "session_rev_set: write failed for user '%s'",
-			 user);
-		unlink(tmppath);
 	}
 }
 
-int session_rev_bump(const char *user)
+void session_tag_purge_user(const char *user)
 {
-	int rev = session_rev_get(user);
-	rev = (rev >= INT_MAX - 1) ? 1 : rev + 1;
-	session_rev_set(user, rev);
-	return rev;
+	for (int i = 0; i < MAX_SESSION_TAGS; i++) {
+		if (g_session_tags[i].tag != 0 &&
+		    strcmp(g_session_tags[i].user, user) == 0) {
+			g_session_tags[i].tag = 0;
+			g_session_tags[i].user[0] = '\0';
+		}
+	}
 }
 
 /*
@@ -1532,60 +1535,7 @@ int session_rev_bump(const char *user)
  */
 void admin_notify_change(const char *user)
 {
-	session_rev_bump(user);
-}
-
-void session_rev_del(const char *user)
-{
-	char tmppath[128];
-	snprintf(tmppath, sizeof(tmppath), "%s.tmp.%d",
-		 SESSION_REV_FILE, (int)getpid());
-
-	FILE *out = fopen(tmppath, "w");
-	if (!out) return;
-
-	size_t ulen = strlen(user);
-	int write_ok = 1;
-	int found = 0;
-
-	FILE *in = fopen(SESSION_REV_FILE, "r");
-	if (in) {
-		char line[MAX_LINE];
-		while (fgets(line, sizeof(line), in)) {
-			if (strncmp(line, user, ulen) == 0 &&
-			    line[ulen] == ':') {
-				found = 1;
-			} else {
-				if (fputs(line, out) == EOF)
-					write_ok = 0;
-			}
-		}
-		fclose(in);
-	}
-
-	if (fflush(out) != 0)
-		write_ok = 0;
-	if (fsync(fileno(out)) != 0)
-		write_ok = 0;
-	fchmod(fileno(out), 0644);
-	fclose(out);
-
-	if (!found) {
-		unlink(tmppath);
-		return;
-	}
-
-	if (write_ok) {
-		if (rename(tmppath, SESSION_REV_FILE) != 0) {
-			mgmt_log("ERROR", "session_rev_del: rename failed: %s",
-				 strerror(errno));
-			unlink(tmppath);
-		}
-	} else {
-		mgmt_log("ERROR", "session_rev_del: write failed for user '%s'",
-			 user);
-		unlink(tmppath);
-	}
+	session_tag_purge_user(user);
 }
 
 /* ── Apply config to running system ─────────────────────────────────────── */
@@ -1626,7 +1576,8 @@ void extract_val(const char *data, const char *key,
 /* ── Apply config to running system ─────────────────────────────────────── */
 
 static sg_status_t apply_config(const char *type, const char *id,
-				const char *data, char *result, size_t rsize)
+				const char *data,
+				char *result, size_t rsize)
 {
 	result[0] = '\0';
 
@@ -1661,7 +1612,10 @@ static sg_status_t apply_config(const char *type, const char *id,
 			snprintf(result, rsize, "Profile '%s' loaded (perms: %s)." AUDIT_WARN, id, perms);
 		else
 			snprintf(result, rsize, "Profile '%s' loaded (perms: %s).", id, perms);
-		session_rev_bump(id);
+
+		/* Session purge deferred to CFG_SET cascade — apply_config()
+		 * is called before save, so purging here would kill the tag
+		 * before the save can complete. */
 		return SG_OK;
 	}
 
@@ -1738,7 +1692,9 @@ static sg_status_t apply_config(const char *type, const char *id,
 			snprintf(result, rsize, "Admin '%s' applied (profile: %s)." AUDIT_WARN, id, profile);
 		else
 			snprintf(result, rsize, "Admin '%s' applied (profile: %s).", id, profile);
-		admin_notify_change(id);
+		/* Session purge deferred to CFG_SET cascade — apply_config()
+		 * is called before save, so purging here would kill the tag
+		 * before the save can complete. */
 		return SG_OK;
 	}
 
@@ -1809,16 +1765,15 @@ int has_permission(const char *perms_csv, const char *perm)
  * "admin" perm types require "admin".
  * "configure" perm types require "configure" OR "admin".
  */
-int check_type_permission(const char *user, const char *type_name)
+/*
+ * Return the permission required to access a config type.
+ * Returns "admin", "configure", etc., or NULL if the type is unknown.
+ * Callers decide what user permissions satisfy the requirement
+ * based on the operation (read vs write).
+ */
+const char *get_type_permission(const char *type_name)
 {
-	const char *required = sg_reg_type_perm(type_name);
-	if (!required)
-		return 0; /* unknown type → deny */
-	const char *perms = get_user_permissions(user);
-	if (strcmp(required, "admin") == 0)
-		return has_permission(perms, "admin");
-	/* "configure" types: configure OR admin */
-	return has_permission(perms, "configure") || has_permission(perms, "admin");
+	return sg_reg_type_perm(type_name);
 }
 
 /* ── Referential integrity check ────────────────────────────────────────── */
@@ -2004,6 +1959,32 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 		debug_buf_push("[MGMTD-DBG] user=%s cmd=%u payload_len=%u\n",
 			       user, hdr->cmd, hdr->payload_len);
 
+	/* Session tag validation gate.
+	 * Commands exempt from tag validation (no tag required):
+	 *   - SESSION_TAG_NEW: acquiring a tag (no tag yet)
+	 *   - SESSION_TAG_DEL: releasing a tag (best-effort cleanup)
+	 *   - WHOAMI: identity query (used before tag acquisition)
+	 *   - DEBUG_FETCH: debug trace retrieval
+	 *   - HISTORY_LOAD/SAVE: called during login before tag acquisition
+	 * All other commands (including PING) require a valid tag.
+	 * PING is intentionally NOT exempt so the idle callback can
+	 * detect expired sessions by sending a tag-validated PING. */
+	if (cmd != SG_CMD_SESSION_TAG_NEW &&
+	    cmd != SG_CMD_SESSION_TAG_DEL &&
+	    cmd != SG_CMD_WHOAMI &&
+	    cmd != SG_CMD_DEBUG_FETCH &&
+	    cmd != SG_CMD_HISTORY_LOAD &&
+	    cmd != SG_CMD_HISTORY_SAVE &&
+	    cmd != SG_CMD_AUTH_LOGIN &&
+	    cmd != SG_CMD_AUTH_CHANGE_PW &&
+	    cmd != SG_CMD_AUTH_LOGIN_OK) {
+		if (!session_tag_validate(user, hdr->session_tag)) {
+			send_error(client_fd, SG_ERR_SESSION_EXPIRED,
+				   "Session tag invalid or expired");
+			return 0;
+		}
+	}
+
 	switch (cmd) {
 
 	/* ── Config read ────────────────────────────────────────────────── */
@@ -2032,8 +2013,16 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid type name");
 			return 0;
 		}
-		if (!check_type_permission(user, db_type)) {
-			send_error(client_fd, SG_ERR_ENTRY_NOT_FOUND, section);
+		if (!get_type_permission(db_type)) {
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "Unknown config type");
+			return 0;
+		}
+		/* Read operations: any authenticated user can view config */
+
+		if (db_id[0] && !sg_reg_validate_entry_id(db_type, db_id)) {
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "Invalid entry ID");
 			return 0;
 		}
 
@@ -2062,10 +2051,12 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid type prefix");
 			return 0;
 		}
-		if (!check_type_permission(user, prefix)) {
-			send_ok(client_fd, "No entries", "");
+		if (!get_type_permission(prefix)) {
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "Unknown config type");
 			return 0;
 		}
+		/* Read operations: any authenticated user can list */
 
 		char *list = sg_db_list(prefix);
 		if (list) {
@@ -2129,9 +2120,28 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Unknown config type");
 			return 0;
 		}
-		if (!check_type_permission(user, db_type)) {
-			send_error(client_fd, SG_ERR_INVALID_ARG, "Unknown config type");
-			return 0;
+		{
+			const char *req = get_type_permission(db_type);
+			if (!req) {
+				send_error(client_fd, SG_ERR_INVALID_ARG,
+					   "Unknown config type");
+				return 0;
+			}
+			const char *perms = get_user_permissions(user);
+			if (strcmp(req, "admin") == 0) {
+				if (!has_permission(perms, "admin")) {
+					send_error(client_fd, SG_ERR_PERM_DENIED,
+						   "Requires 'admin' permission");
+					return 0;
+				}
+			} else {
+				if (!has_permission(perms, "configure") &&
+				    !has_permission(perms, "admin")) {
+					send_error(client_fd, SG_ERR_PERM_DENIED,
+						   "Requires 'configure' permission");
+					return 0;
+				}
+			}
 		}
 		if (!sg_reg_validate_entry_id(db_type, db_id)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid entry ID");
@@ -2210,11 +2220,13 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 			return 0;
 		}
 
-		/* Bump session for admin/profile/policy config changes */
+		/* Invalidate sessions for admin/profile/policy config changes.
+		 * All affected admins are purged so they re-authenticate,
+		 * including the acting user. */
 		if (strcmp(db_type, "system_admin") == 0) {
 			admin_notify_change(db_id);
 		} else if (strcmp(db_type, "system_password-policy") == 0) {
-			/* Policy change affects all admins — bump everyone */
+			/* Policy change affects all admins — purge everyone */
 			char *admins = sg_db_list("system_admin");
 			if (admins) {
 				const char *p = admins;
@@ -2228,14 +2240,14 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 						len = sizeof(aname) - 1;
 					memcpy(aname, p, len);
 					aname[len] = '\0';
-					session_rev_bump(aname);
+					session_tag_purge_user(aname);
 					p += len;
 					if (eol) p++;
 				}
 				free(admins);
 			}
 		} else if (strcmp(db_type, "system_admin-profile") == 0) {
-			/* Bump all users that have this profile */
+			/* Purge all admins that use this profile */
 			char *admins = sg_db_list("system_admin");
 			if (admins) {
 				const char *p = admins;
@@ -2249,13 +2261,12 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 						len = sizeof(aname) - 1;
 					memcpy(aname, p, len);
 					aname[len] = '\0';
-
 					char *prof = sg_db_get_val(
 						"system_admin", aname,
 						"profile");
 					if (prof) {
 						if (strcmp(prof, db_id) == 0)
-							session_rev_bump(aname);
+							session_tag_purge_user(aname);
 						free(prof);
 					}
 					p += len;
@@ -2295,12 +2306,34 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Unknown config type");
 			return 0;
 		}
-		if (!check_type_permission(user, db_type)) {
-			send_error(client_fd, SG_ERR_INVALID_ARG, "Unknown config type");
-			return 0;
+		{
+			const char *req = get_type_permission(db_type);
+			if (!req) {
+				send_error(client_fd, SG_ERR_INVALID_ARG, "Unknown config type");
+				return 0;
+			}
+			const char *perms = get_user_permissions(user);
+			if (strcmp(req, "admin") == 0) {
+				if (!has_permission(perms, "admin")) {
+					send_error(client_fd, SG_ERR_PERM_DENIED,
+						   "Requires 'admin' permission");
+					return 0;
+				}
+			} else {
+				if (!has_permission(perms, "configure") &&
+				    !has_permission(perms, "admin")) {
+					send_error(client_fd, SG_ERR_PERM_DENIED,
+						   "Requires 'configure' permission");
+					return 0;
+				}
+			}
 		}
 		if (db_id[0] == '\0') {
 			send_error(client_fd, SG_ERR_INVALID_ARG, "Missing entry ID");
+			return 0;
+		}
+		if (!sg_reg_validate_entry_id(db_type, db_id)) {
+			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid entry ID");
 			return 0;
 		}
 
@@ -2324,11 +2357,10 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 			return 0;
 		}
 
-		/* If deleting admin, bump session and delete system user */
+		/* If deleting admin, purge tags and delete system user */
 		if (strcmp(db_type, "system_admin") == 0) {
 			admin_notify_change(db_id);
 			delete_system_user(db_id);
-			session_rev_del(db_id);
 		}
 
 		if (sg_db_del(db_type, db_id) != 0) {
@@ -2369,14 +2401,39 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 		memcpy(id_str, p, ilen);
 		id_str[ilen] = '\0';
 
-		if (!check_type_permission(user, type_str)) {
-			send_error(client_fd, SG_ERR_INVALID_ARG, "Unknown config type");
+		{
+			const char *req = get_type_permission(type_str);
+			if (!req) {
+				send_error(client_fd, SG_ERR_INVALID_ARG, "Unknown config type");
+				return 0;
+			}
+			const char *perms = get_user_permissions(user);
+			if (strcmp(req, "admin") == 0) {
+				if (!has_permission(perms, "admin")) {
+					send_error(client_fd, SG_ERR_PERM_DENIED,
+						   "Requires 'admin' permission");
+					return 0;
+				}
+			} else {
+				if (!has_permission(perms, "configure") &&
+				    !has_permission(perms, "admin")) {
+					send_error(client_fd, SG_ERR_PERM_DENIED,
+						   "Requires 'configure' permission");
+					return 0;
+				}
+			}
+		}
+
+		if (!sg_reg_validate_entry_id(type_str, id_str)) {
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "Invalid entry ID");
 			return 0;
 		}
 
 		const char *data = nl2 + 1;
 		char result[512];
-		sg_status_t st = apply_config(type_str, id_str, data, result, sizeof(result));
+		sg_status_t st = apply_config(type_str, id_str, data,
+					      result, sizeof(result));
 
 		if (st == SG_OK) {
 			char audit_msg[512];
@@ -2403,47 +2460,37 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 	case SG_CMD_ADMIN_LOCK_PW:
 		return handle_admin_lock_pw(client_fd, user, payload, hdr);
 
-	/* ── Session ────────────────────────────────────────────────────── */
-	case SG_CMD_SESSION_REV: {
-		if (!payload) { send_error(client_fd, SG_ERR_MISSING_ARG, NULL); return 0; }
-		char target[128] = {0};
-		snprintf(target, sizeof(target), "%s", payload);
-		size_t tlen = strlen(target);
-		if (tlen > 0 && target[tlen-1] == '\n') target[--tlen] = '\0';
+	/* ── Auth login flow (logind privilege separation) ─────────────── */
+	case SG_CMD_AUTH_LOGIN:
+		return handle_auth_login(client_fd, user, payload, hdr);
+	case SG_CMD_AUTH_CHANGE_PW:
+		return handle_auth_change_pw(client_fd, user, payload, hdr);
+	case SG_CMD_AUTH_LOGIN_OK:
+		return handle_auth_login_ok(client_fd, user, payload, hdr);
 
-		if (!sg_is_safe_id(target)) {
-			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid username");
+	/* ── Session tag ───────────────────────────────────────────────── */
+	case SG_CMD_SESSION_TAG_NEW: {
+		if (!sg_is_safe_id(user)) {
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "Invalid username");
 			return 0;
 		}
-
-		int rev = session_rev_get(target);
-		char revstr[32];
-		snprintf(revstr, sizeof(revstr), "%d", rev);
-		send_ok(client_fd, NULL, revstr);
+		uint64_t tag = session_tag_new(user);
+		if (tag == 0) {
+			send_error(client_fd, SG_ERR_SYSTEM_FAIL,
+				   "Session table full");
+			return 0;
+		}
+		char tagstr[32];
+		snprintf(tagstr, sizeof(tagstr), "%llu",
+			 (unsigned long long)tag);
+		send_ok(client_fd, NULL, tagstr);
 		return 0;
 	}
 
-	case SG_CMD_SESSION_BUMP: {
-		const char *perms = get_user_permissions(user);
-		if (!has_permission(perms, "admin")) {
-			send_error(client_fd, SG_ERR_PERM_DENIED, NULL);
-			return 0;
-		}
-		if (!payload) { send_error(client_fd, SG_ERR_MISSING_ARG, NULL); return 0; }
-		char target[128] = {0};
-		snprintf(target, sizeof(target), "%s", payload);
-		size_t tlen = strlen(target);
-		if (tlen > 0 && target[tlen-1] == '\n') target[--tlen] = '\0';
-
-		if (!sg_is_safe_id(target)) {
-			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid username");
-			return 0;
-		}
-
-		int rev = session_rev_bump(target);
-		char revstr[32];
-		snprintf(revstr, sizeof(revstr), "%d", rev);
-		send_ok(client_fd, NULL, revstr);
+	case SG_CMD_SESSION_TAG_DEL: {
+		session_tag_delete(user, hdr->session_tag);
+		send_ok(client_fd, "Session released", NULL);
 		return 0;
 	}
 
@@ -2889,7 +2936,6 @@ int main(void)
 	/* Harden file permissions — mgmtd is the sole file accessor */
 	chmod(SG_DB_PATH, 0600);
 	chmod(AUDIT_LOG, 0600);
-	chmod(SESSION_REV_FILE, 0600);
 
 	/* Boot integrity check — single source of truth for first-boot detection */
 	boot_state_t boot = mgmtd_check_boot_integrity();

@@ -1,46 +1,51 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * stargazer-logind — Stargazer NGFW login daemon
+ * stargazer-logind — Stargazer NGFW login daemon (privilege-separated)
  *
- * Replaces BusyBox login + LOGIN_PRE_SUID_SCRIPT with a single C binary.
  * Flow:
- *   1. Receive username as argv[1]
- *   2. Prompt for password (stty -echo equivalent via termios)
- *   3. Authenticate via shadow + crypt(3)
- *   4. Check enforce-change-password policy from SQLite database
- *   5. If enforced: prompt new password, update shadow, clear flag
- *   6. Audit log all events
- *   7. Drop privileges (setgid/setuid)
- *   8. exec user shell
+ *   Phase 1 (full root):
+ *     1. Cache user data (getpwnam, initgroups)
+ *     2. Open /dev/console for terminal
+ *   Phase 1.5:
+ *     3. Install seccomp-bpf sandbox (logind_drop_privileges)
+ *   Phase 2 (sandboxed, still root UID):
+ *     4. Prompt for password
+ *     5. Authenticate via IPC to mgmtd (SG_CMD_AUTH_LOGIN)
+ *     6. Handle forced password change via IPC (SG_CMD_AUTH_CHANGE_PW)
+ *     7. Notify login success via IPC (SG_CMD_AUTH_LOGIN_OK)
+ *   Phase 3:
+ *     8. Drop privileges (setgid/setuid)
+ *     9. exec user shell
+ *
+ * All privileged operations (shadow, DB, audit) are delegated to mgmtd.
+ * After seccomp install, logind cannot open files, fork, or exec arbitrary
+ * binaries. It can only talk to the terminal and mgmtd over AF_UNIX IPC.
  */
 
 #define _GNU_SOURCE
-#include <crypt.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
 #include <pwd.h>
-#include <shadow.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <termios.h>
-#include <time.h>
 #include <unistd.h>
-#include <sys/file.h>
 #include <sys/ioctl.h>
-#include <sys/stat.h>
+#include <sys/prctl.h>
+#include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/un.h>
+#include <linux/audit.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 
-#include "password_policy.h"
-#include "sg_db.h"
+#include "stargazer_ipc.h"
 
-#define AUDIT_LOG         "/var/log/stargazer-audit.log"
-#define AUDIT_LOG_FALLBACK "/tmp/stargazer-audit.log"
 #define MAX_PASS_LEN      256
-#define MAX_LINE_LEN      1024
-#define MAX_SALT_LEN      32
 #define EXIT_SIGINT       130  /* Convention: 128 + SIGINT(2) */
 
 /* ── SIGINT handling (Ctrl+C returns to login prompt) ───────────────────── */
@@ -71,35 +76,6 @@ static void install_sigint_handler(void)
 	sigemptyset(&sa.sa_mask);
 	sa.sa_flags = 0;  /* explicitly NO SA_RESTART */
 	sigaction(SIGINT, &sa, NULL);
-}
-
-/* ── Audit logging ──────────────────────────────────────────────────────── */
-
-static void audit_log(const char *user, const char *event, const char *msg)
-{
-	const char *path = AUDIT_LOG;
-	time_t now = time(NULL);
-	struct tm tm;
-	char ts[64];
-	FILE *fp;
-
-	if (access("/var/log", W_OK) != 0)
-		path = AUDIT_LOG_FALLBACK;
-
-	localtime_r(&now, &tm);
-	strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S%z", &tm);
-
-	fp = fopen(path, "a");
-	if (fp) {
-		char *tty = ttyname(STDIN_FILENO);
-		fprintf(fp, "%s user=%s event=%s msg=%s pid=%d tty=%s\n",
-			ts, user, event, msg, (int)getpid(),
-			tty ? tty : "unknown");
-		fclose(fp);
-	} else {
-		fprintf(stderr, "[logind] audit_log: cannot write to %s: %s (event=%s user=%s)\n",
-			path, strerror(errno), event, user);
-	}
 }
 
 /* ── Password prompt (echo disabled) ────────────────────────────────────── */
@@ -146,358 +122,423 @@ static int read_password(const char *prompt, char *buf, size_t buflen)
 	return 0;
 }
 
-/* ── Shadow authentication ──────────────────────────────────────────────── */
+/* ── IPC client (self-contained) ───────────────────────────────────────── */
 
-static int authenticate(const char *username, const char *password)
+static ssize_t logind_safe_write(int fd, const void *buf, size_t len)
 {
-	/*
-	 * Constant-time defense: always call crypt() even if the user
-	 * doesn't exist, so the response latency doesn't leak whether
-	 * a username is valid. (BUG-AUTH-01)
-	 */
-	static const char dummy_hash[] =
-		"$6$dummy.salt.value$"
-		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-
-	struct spwd *sp = getspnam(username);
-	const char *hash = sp ? sp->sp_pwdp : dummy_hash;
-
-	/* Always call crypt to keep timing constant */
-	char *result = crypt(password, hash);
-
-	/* User not found — fail after crypt */
-	if (!sp)
-		return -1;
-
-	/* Empty password hash: allow login with empty password (first-login) */
-	if (sp->sp_pwdp[0] == '\0' && password[0] == '\0')
-		return 0;
-
-	/* Locked account */
-	if (sp->sp_pwdp[0] == '!' || sp->sp_pwdp[0] == '*')
-		return -1;
-
-	if (!result)
-		return -1;
-
-	return strcmp(result, sp->sp_pwdp) == 0 ? 0 : -1;
+	size_t done = 0;
+	while (done < len) {
+		ssize_t n = write(fd, (const char *)buf + done, len - done);
+		if (n <= 0) {
+			if (n < 0 && errno == EINTR) continue;
+			return -1;
+		}
+		done += (size_t)n;
+	}
+	return (ssize_t)done;
 }
 
-/* ── Shadow update (atomic tmpfile + rename) ────────────────────────────── */
-
-static int update_shadow(const char *username, const char *hash)
+static ssize_t logind_safe_read(int fd, void *buf, size_t len)
 {
-	/* Acquire advisory lock for shadow file manipulation */
-	int lockfd = open("/etc/shadow.lock", O_CREAT | O_RDWR, 0600);
-	if (lockfd < 0)
-		return -1;
-	if (flock(lockfd, LOCK_EX) != 0) {
-		close(lockfd);
-		return -1;
+	size_t done = 0;
+	while (done < len) {
+		ssize_t n = read(fd, (char *)buf + done, len - done);
+		if (n <= 0) {
+			if (n < 0 && errno == EINTR) continue;
+			return n == 0 ? (ssize_t)done : -1;
+		}
+		done += (size_t)n;
+	}
+	return (ssize_t)done;
+}
+
+/*
+ * Send IPC request to mgmtd and receive response.
+ * Returns 0 on successful IPC exchange, -1 on transport failure.
+ */
+static int logind_ipc(uint32_t cmd, const char *username,
+		      const char *payload_str,
+		      uint32_t *out_status,
+		      char *out_extra, size_t extra_sz,
+		      char **out_payload)
+{
+	int ret = -1;
+	*out_status = SG_ERR_SYSTEM_FAIL;
+	if (out_extra) out_extra[0] = '\0';
+	if (out_payload) *out_payload = NULL;
+
+	size_t plen = payload_str ? strlen(payload_str) : 0;
+	if (plen > SG_PAYLOAD_MAX) return -1;
+
+	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0) return -1;
+
+	struct sockaddr_un addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", SG_MGMTD_SOCK);
+
+	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+		goto out;
+
+	sg_request_hdr_t req;
+	memset(&req, 0, sizeof(req));
+	req.magic       = SG_MSG_MAGIC;
+	req.version     = SG_MSG_VERSION;
+	req.cmd         = cmd;
+	req.payload_len = (uint32_t)plen;
+	req.session_tag = 0;  /* logind has no session */
+	snprintf(req.username, sizeof(req.username), "%s", username);
+
+	if (logind_safe_write(fd, &req, sizeof(req)) < 0) goto out;
+	if (plen > 0 && logind_safe_write(fd, payload_str, plen) < 0) goto out;
+
+	sg_response_hdr_t rhdr;
+	if (logind_safe_read(fd, &rhdr, sizeof(rhdr)) < (ssize_t)sizeof(rhdr))
+		goto out;
+	if (rhdr.magic != SG_MSG_MAGIC) goto out;
+
+	*out_status = rhdr.status;
+	if (out_extra) {
+		size_t csz = extra_sz < SG_EXTRA_MAX ? extra_sz : SG_EXTRA_MAX;
+		memcpy(out_extra, rhdr.extra, csz);
+		out_extra[csz - 1] = '\0';
 	}
 
-	FILE *fp = fopen("/etc/shadow", "r");
-	if (!fp) {
-		flock(lockfd, LOCK_UN);
-		close(lockfd);
-		return -1;
-	}
-
-	char tmppath[64];
-	snprintf(tmppath, sizeof(tmppath), "/etc/shadow.XXXXXX");
-	int tfd = mkstemp(tmppath);
-	if (tfd < 0) {
-		fclose(fp);
-		flock(lockfd, LOCK_UN);
-		close(lockfd);
-		return -1;
-	}
-	fchmod(tfd, 0640);
-	FILE *out = fdopen(tfd, "w");
-	if (!out) {
-		close(tfd);
-		unlink(tmppath);
-		fclose(fp);
-		flock(lockfd, LOCK_UN);
-		close(lockfd);
-		return -1;
-	}
-
-	char line[MAX_LINE_LEN];
-	int found = 0;
-	size_t ulen = strlen(username);
-
-	while (fgets(line, sizeof(line), fp)) {
-		if (strncmp(line, username, ulen) == 0 && line[ulen] == ':') {
-			/* Replace the password field (field 2) */
-			char *rest = strchr(line + ulen + 1, ':');
-			if (rest)
-				fprintf(out, "%s:%s%s", username, hash, rest);
-			else
-				fprintf(out, "%s:%s:19700:0:99999:7:::\n", username, hash);
-			found = 1;
-		} else {
-			fputs(line, out);
+	if (rhdr.payload_len > 0 && rhdr.payload_len <= SG_RESPONSE_MAX &&
+	    out_payload) {
+		*out_payload = malloc(rhdr.payload_len + 1);
+		if (*out_payload) {
+			if (logind_safe_read(fd, *out_payload,
+					     rhdr.payload_len) <
+			    (ssize_t)rhdr.payload_len) {
+				free(*out_payload);
+				*out_payload = NULL;
+				goto out;
+			}
+			(*out_payload)[rhdr.payload_len] = '\0';
 		}
 	}
 
-	fclose(fp);
-	fclose(out);
-
-	if (!found) {
-		unlink(tmppath);
-		flock(lockfd, LOCK_UN);
-		close(lockfd);
-		return -1;
-	}
-
-	if (rename(tmppath, "/etc/shadow") != 0) {
-		unlink(tmppath);
-		flock(lockfd, LOCK_UN);
-		close(lockfd);
-		return -1;
-	}
-	flock(lockfd, LOCK_UN);
-	close(lockfd);
-	return 0;
-}
-
-/* ── Salt generation for crypt(3) ───────────────────────────────────────── */
-
-static int generate_salt(char *salt, size_t saltlen)
-{
-	static const char charset[] =
-		"abcdefghijklmnopqrstuvwxyz"
-		"ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-		"0123456789./";
-
-	int fd = open("/dev/urandom", O_RDONLY);
-	if (fd < 0)
-		return -1;
-
-	unsigned char raw[16];
-	ssize_t n = read(fd, raw, sizeof(raw));
+	ret = 0;
+out:
 	close(fd);
-	if (n != (ssize_t)sizeof(raw))
-		return -1;
-
-	/* SHA-512 prefix */
-	size_t off = 0;
-	salt[off++] = '$';
-	salt[off++] = '6';
-	salt[off++] = '$';
-
-	for (size_t i = 0; i < sizeof(raw) && off < saltlen - 2; i++)
-		salt[off++] = charset[raw[i] % (sizeof(charset) - 1)];
-
-	salt[off++] = '$';
-	salt[off] = '\0';
-	return 0;
+	return ret;
 }
 
-/* ── Password policy ────────────────────────────────────────────────────── */
+/* ── Interactive password change via IPC ───────────────────────────────── */
 
 /*
- * Read global password policy from SQLite (system_password-policy).
- * Missing keys default to 0 (no requirement).
+ * Returns 0 on success, -1 on error, -2 on Ctrl+C.
  */
-static void read_password_policy(struct password_policy *pol)
-{
-	char *v;
-
-	pol->min_length = 0;
-	pol->min_uppercase = 0;
-	pol->min_lowercase = 0;
-	pol->min_digit = 0;
-	pol->min_special = 0;
-
-	v = sg_db_get_val("system_password-policy", "0", "min-length");
-	if (v) { int n = atoi(v); pol->min_length = (n > 0 && n <= 256) ? n : 0; free(v); }
-	v = sg_db_get_val("system_password-policy", "0", "min-uppercase");
-	if (v) { int n = atoi(v); pol->min_uppercase = (n > 0 && n <= 128) ? n : 0; free(v); }
-	v = sg_db_get_val("system_password-policy", "0", "min-lowercase");
-	if (v) { int n = atoi(v); pol->min_lowercase = (n > 0 && n <= 128) ? n : 0; free(v); }
-	v = sg_db_get_val("system_password-policy", "0", "min-digit");
-	if (v) { int n = atoi(v); pol->min_digit = (n > 0 && n <= 128) ? n : 0; free(v); }
-	v = sg_db_get_val("system_password-policy", "0", "min-special");
-	if (v) { int n = atoi(v); pol->min_special = (n > 0 && n <= 128) ? n : 0; free(v); }
-}
-
-/*
- * Check if user has enforce-password-policy=enable in their admin config.
- * Returns 1 if enforced, 0 if not.
- */
-static int is_password_policy_enforced(const char *username)
-{
-	char *val = sg_db_get_val("system_admin", username,
-				  "enforce-password-policy");
-	if (!val)
-		return 0; /* key missing → not enforced */
-
-	int enforced = (strcmp(val, "enable") == 0) ? 1 : 0;
-	free(val);
-	return enforced;
-}
-
-/* ── Password change core ──────────────────────────────────────────────── */
-
-/*
- * Print password requirements line.
- * Used by both enforce_password_change and enforce_policy_compliance.
- */
-static void print_requirements(int eff_min_len, int has_policy,
-			       const struct password_policy *pol)
-{
-	fprintf(stderr, " Requirements: minimum %d characters", eff_min_len);
-	if (has_policy) {
-		if (pol->min_uppercase > 0)
-			fprintf(stderr, ", %d uppercase", pol->min_uppercase);
-		if (pol->min_lowercase > 0)
-			fprintf(stderr, ", %d lowercase", pol->min_lowercase);
-		if (pol->min_digit > 0)
-			fprintf(stderr, ", %d digit(s)", pol->min_digit);
-		if (pol->min_special > 0)
-			fprintf(stderr, ", %d special", pol->min_special);
-	}
-	fprintf(stderr, ".\n\n");
-}
-
-/*
- * Core password change loop — prompts, validates, hashes, updates shadow.
- * Returns: 0 on success, -1 on error, -2 on Ctrl+C.
- * Does NOT read or write any config flags — caller handles that.
- */
-static int force_password_change(const char *username, int eff_min_len,
-				 int has_policy,
-				 const struct password_policy *pol)
+static int ipc_password_change(const char *username, const char *source)
 {
 	char pw1[MAX_PASS_LEN], pw2[MAX_PASS_LEN];
 	int rc;
 
+	fprintf(stderr, "\n");
+	if (strcmp(source, "admin-flag") == 0) {
+		fprintf(stderr, " PASSWORD CHANGE REQUIRED\n");
+		fprintf(stderr, " Account '%s' must change password now.\n\n",
+			username);
+	} else {
+		fprintf(stderr, " NOTICE: Password Policy Changed\n");
+		fprintf(stderr, " Your current password does not meet the "
+				"updated\n global password policy. "
+				"You must set a new password.\n\n");
+	}
+
 	while (1) {
 		rc = read_password("New password: ", pw1, sizeof(pw1));
-		if (rc == -2) return -2; /* interrupted */
-		if (rc != 0)  return -1;
+		if (rc == -2) return -2;
+		if (rc != 0) return -1;
 
-		if ((int)strlen(pw1) < eff_min_len) {
-			fprintf(stderr, "Too short: password must be at least %d characters.\n\n",
-				eff_min_len);
+		if (strlen(pw1) == 0) {
+			fprintf(stderr, "Password cannot be empty.\n\n");
 			continue;
-		}
-
-		if (has_policy) {
-			int prc = pw_check_policy(pw1, username, pol);
-			if (prc != 1) {
-				fprintf(stderr, "  %s\n\n", pw_policy_reason(prc));
-				continue;
-			}
 		}
 
 		rc = read_password("Retype password: ", pw2, sizeof(pw2));
-		if (rc == -2) { explicit_bzero(pw1, sizeof(pw1)); return -2; }
-		if (rc != 0)  { explicit_bzero(pw1, sizeof(pw1)); return -1; }
+		if (rc == -2) {
+			explicit_bzero(pw1, sizeof(pw1));
+			return -2;
+		}
+		if (rc != 0) {
+			explicit_bzero(pw1, sizeof(pw1));
+			return -1;
+		}
 
 		if (strcmp(pw1, pw2) != 0) {
 			fprintf(stderr, "Passwords don't match. Try again.\n\n");
+			explicit_bzero(pw1, sizeof(pw1));
+			explicit_bzero(pw2, sizeof(pw2));
+			continue;
+		}
+		explicit_bzero(pw2, sizeof(pw2));
+
+		/* Send to mgmtd for validation + shadow update */
+		char payload[MAX_PASS_LEN + SG_USERNAME_MAX + 64];
+		snprintf(payload, sizeof(payload), "%s\n%s\n%s\n",
+			 username, pw1, source);
+		explicit_bzero(pw1, sizeof(pw1));
+
+		uint32_t status;
+		char extra[SG_EXTRA_MAX];
+		rc = logind_ipc(SG_CMD_AUTH_CHANGE_PW, username, payload,
+				&status, extra, sizeof(extra), NULL);
+		explicit_bzero(payload, sizeof(payload));
+
+		if (rc != 0) {
+			fprintf(stderr,
+				"Communication error with management daemon.\n\n");
+			return -1;
+		}
+
+		if (status == SG_OK) {
+			fprintf(stderr, "\n  Password set successfully.\n\n");
+			return 0;
+		}
+
+		if (status == SG_ERR_POLICY_FAIL) {
+			fprintf(stderr, "  %s\n\n",
+				extra[0] ? extra : "Policy violation");
 			continue;
 		}
 
-		/* Hash and update shadow */
-		char salt[MAX_SALT_LEN];
-		if (generate_salt(salt, sizeof(salt)) != 0) {
-			fprintf(stderr, "Failed to generate salt.\n\n");
-			continue;
-		}
+		fprintf(stderr, "  Password change failed: %s\n\n",
+			extra[0] ? extra : "Unknown error");
+		continue;
+	}
+}
 
-		char *hash = crypt(pw1, salt);
-		if (!hash) {
-			fprintf(stderr, "Failed to hash password.\n\n");
-			continue;
-		}
+/* ── Privilege drop: seccomp-bpf sandbox ───────────────────────────────── */
 
-		if (update_shadow(username, hash) != 0) {
-			fprintf(stderr, "Failed to update shadow file. Try again.\n\n");
-			continue;
-		}
+/*
+ * aarch64 syscall numbers (from asm-generic/unistd.h).
+ * The aarch64 ABI uses the generic syscall table.
+ */
+#define SC_dup3             24
+#define SC_fcntl            25
+#define SC_ioctl            29
+#define SC_close            57
+#define SC_read             63
+#define SC_write            64
+#define SC_writev           66
+#define SC_exit_group       94
+#define SC_set_tid_address  96
+#define SC_futex            98
+#define SC_set_robust_list  99
+#define SC_nanosleep       101
+#define SC_clock_gettime   113
+#define SC_rt_sigaction    134
+#define SC_rt_sigprocmask  135
+#define SC_rt_sigreturn    139
+#define SC_setgid          144
+#define SC_setuid          146
+#define SC_setsid          157
+#define SC_prctl           167
+#define SC_getpid          172
+#define SC_getuid          174
+#define SC_gettid          178
+#define SC_socket          198
+#define SC_connect         203
+#define SC_sendto          206
+#define SC_recvfrom        207
+#define SC_getsockopt      209
+#define SC_brk             214
+#define SC_munmap          215
+#define SC_mremap          216
+#define SC_execve          221
+#define SC_mmap            222
+#define SC_mprotect        226
+#define SC_madvise         233
+#define SC_getrandom       278
+#define SC_newfstatat       79
+#define SC_readv            65
 
-		break;
+/* Terminal ioctl values */
+#define IOCTL_TCGETS     0x5401
+#define IOCTL_TCSETS     0x5402
+#define IOCTL_TCSETSW    0x5403
+#define IOCTL_TCSETSF    0x5404
+#define IOCTL_TIOCGWINSZ 0x5413
+#define IOCTL_TIOCSCTTY  0x540E
+
+/* AF_UNIX = 1, SOCK_STREAM = 1 */
+#define AF_UNIX_VAL     1
+#define SOCK_STREAM_VAL 1
+
+/* PROT_EXEC = 0x4 */
+#define PROT_EXEC_VAL 4
+
+/* BPF convenience macros */
+#define SC_ALLOW(nr) \
+	BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (nr), 0, 1), \
+	BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)
+
+/*
+ * seccomp_data offsets (hardcoded because offsetof(struct seccomp_data, ...)
+ * confuses the BPF_STMT macro with musl's cross-compiler).
+ *   nr=0, arch=4, ip=8, args[0]=16, args[1]=24, args[2]=32
+ */
+#define OFF_NR   0
+#define OFF_ARCH 4
+#define OFF_ARG0 16
+#define OFF_ARG1 24
+#define OFF_ARG2 32
+
+/*
+ * Build modes for the default seccomp action:
+ *   SANDBOX_LOG_ONLY:  SECCOMP_RET_LOG — violations logged in dmesg,
+ *     syscall proceeds normally. Use for testing without killing.
+ *   Default:           SECCOMP_RET_KILL_PROCESS — production mode.
+ */
+/* TODO: Remove SANDBOX_LOG_ONLY after testing */
+#define SANDBOX_LOG_ONLY
+#ifdef SANDBOX_LOG_ONLY
+#define SECCOMP_RET_DEFAULT SECCOMP_RET_LOG
+#else
+#define SECCOMP_RET_DEFAULT SECCOMP_RET_KILL_PROCESS
+#endif
+
+static int logind_drop_privileges(void)
+{
+	/* Phase 1 complete: user data cached, console FD opened.
+	 * Now lock down the process. */
+
+	/* 1. Prevent privilege escalation */
+	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+		fprintf(stderr, "logind: PR_SET_NO_NEW_PRIVS failed: %s\n",
+			strerror(errno));
+		return -1;
 	}
 
-	explicit_bzero(pw1, sizeof(pw1));
-	explicit_bzero(pw2, sizeof(pw2));
+	/* 2. Prevent core dumps leaking passwords */
+	prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 
-	fprintf(stderr, "\n  Password set successfully.\n\n");
-	return 0;
-}
+	/* 3. seccomp-bpf filter */
+	struct sock_filter filter[] = {
+		/* ── Verify architecture is aarch64 ──────────────── */
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_ARCH),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 1, 0),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
 
-/* ── Enforce password change (admin-controlled flag) ───────────────────── */
+		/* ── Load syscall number ─────────────────────────── */
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_NR),
 
-static int enforce_password_change(const char *username)
-{
-	char *val = sg_db_get_val("system_admin", username,
-				  "enforce-change-password");
-	if (!val)
-		return 0; /* no key → skip */
+		/* ── I/O on pre-opened fds ───────────────────────── */
+		SC_ALLOW(SC_read),
+		SC_ALLOW(SC_readv),
+		SC_ALLOW(SC_write),
+		SC_ALLOW(SC_writev),
+		SC_ALLOW(SC_close),
 
-	int need_change = (strcmp(val, "enable") == 0);
-	free(val);
-	if (!need_change)
-		return 0;
+		/* ── socket(): only AF_UNIX + SOCK_STREAM ────────── */
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SC_socket, 0, 7),
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_ARG0),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_UNIX_VAL, 0, 4),
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_ARG1),
+		BPF_STMT(BPF_ALU | BPF_AND | BPF_K, 0xFF),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SOCK_STREAM_VAL, 0, 1),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_NR),
 
-	/* Read password policy for requirements */
-	struct password_policy pol;
-	int has_policy = is_password_policy_enforced(username);
-	if (has_policy)
-		read_password_policy(&pol);
-	else
-		memset(&pol, 0, sizeof(pol));
+		/* ── IPC socket ops ──────────────────────────────── */
+		SC_ALLOW(SC_connect),
+		SC_ALLOW(SC_sendto),
+		SC_ALLOW(SC_recvfrom),
+		SC_ALLOW(SC_getsockopt),
 
-	int eff_min_len = has_policy
-		? ((pol.min_length > 0) ? pol.min_length : PW_MIN_PASS_LEN)
-		: PW_MIN_PASS_LEN_ABS;
+		/* ── dup3 (musl dup2 wrapper on aarch64) ─────────── */
+		SC_ALLOW(SC_dup3),
 
-	fprintf(stderr, "\n");
-	fprintf(stderr, " PASSWORD CHANGE REQUIRED\n");
-	fprintf(stderr, " Account '%s' must change password now.\n", username);
-	print_requirements(eff_min_len, has_policy, &pol);
+		/* ── ioctl(): only terminal ioctls ───────────────── *
+		 * If not ioctl, skip 10 instructions forward.       */
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SC_ioctl, 0, 10),
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_ARG1),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IOCTL_TCGETS, 6, 0),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IOCTL_TCSETS, 5, 0),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IOCTL_TCSETSW, 4, 0),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IOCTL_TCSETSF, 3, 0),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IOCTL_TIOCGWINSZ, 2, 0),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IOCTL_TIOCSCTTY, 1, 0),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_DEFAULT),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+		/* Reload syscall number */
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_NR),
 
-	int rc = force_password_change(username, eff_min_len, has_policy, &pol);
-	if (rc != 0)
-		return rc;
+		/* ── Session / privilege drop (one-time) ─────────── */
+		SC_ALLOW(SC_setsid),
+		SC_ALLOW(SC_setgid),
+		SC_ALLOW(SC_setuid),
 
-	/* Clear admin-controlled enforce flag */
-	sg_db_set_val("system_admin", username,
-		      "enforce-change-password", "disable");
+		/* ── exec shell ──────────────────────────────────── */
+		SC_ALLOW(SC_execve),
 
-	audit_log(username, "password_force_change", "source=admin-flag");
-	return 0;
-}
+		/* ── Memory management ───────────────────────────── */
 
-/* ── Enforce policy compliance (triggered by global policy change) ─────── */
+		/* mmap: deny PROT_EXEC (arg2 & 0x4 must be 0) */
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SC_mmap, 0, 5),
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_ARG2),
+		BPF_STMT(BPF_ALU | BPF_AND | BPF_K, PROT_EXEC_VAL),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_DEFAULT),
 
-static int enforce_policy_compliance(const char *username,
-				     const struct password_policy *pol)
-{
-	fprintf(stderr, "\n");
-	fprintf(stderr, " NOTICE: Password Policy Changed\n");
-	fprintf(stderr, " Your current password does not meet the updated\n");
-	fprintf(stderr, " global password policy. You must set a new password.\n");
-	print_requirements(
-		(pol->min_length > 0) ? pol->min_length : PW_MIN_PASS_LEN,
-		1, pol);
+		SC_ALLOW(SC_munmap),
+		SC_ALLOW(SC_mremap),
+		SC_ALLOW(SC_madvise),
 
-	int rc = force_password_change(username,
-		(pol->min_length > 0) ? pol->min_length : PW_MIN_PASS_LEN,
-		1, pol);
-	if (rc != 0)
-		return rc;
+		/* mprotect: deny PROT_EXEC (arg2 & 0x4 must be 0) */
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SC_mprotect, 0, 5),
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_ARG2),
+		BPF_STMT(BPF_ALU | BPF_AND | BPF_K, PROT_EXEC_VAL),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_DEFAULT),
 
-	/* NOTE: enforce-change-password is NOT touched here.
-	 * This is a system-triggered change due to policy update,
-	 * not an admin-controlled flag. */
+		SC_ALLOW(SC_brk),
 
-	audit_log(username, "password_policy_change", "source=policy-mismatch");
+		/* ── Signals ─────────────────────────────────────── */
+		SC_ALLOW(SC_rt_sigaction),
+		SC_ALLOW(SC_rt_sigprocmask),
+		SC_ALLOW(SC_rt_sigreturn),
+
+		/* ── Timing ──────────────────────────────────────── */
+		SC_ALLOW(SC_clock_gettime),
+		SC_ALLOW(SC_nanosleep),
+
+		/* ── Identity ────────────────────────────────────── */
+		SC_ALLOW(SC_getpid),
+		SC_ALLOW(SC_getuid),
+		SC_ALLOW(SC_gettid),
+
+		/* ── musl internals ──────────────────────────────── */
+		SC_ALLOW(SC_futex),
+		SC_ALLOW(SC_getrandom),
+		SC_ALLOW(SC_set_tid_address),
+		SC_ALLOW(SC_set_robust_list),
+
+		/* ── Misc ────────────────────────────────────────── */
+		SC_ALLOW(SC_fcntl),
+		SC_ALLOW(SC_newfstatat),
+		SC_ALLOW(SC_exit_group),
+
+		/* ── Default: KILL ───────────────────────────────── */
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_DEFAULT),
+	};
+
+	struct sock_fprog prog = {
+		.len    = (unsigned short)(sizeof(filter) / sizeof(filter[0])),
+		.filter = filter,
+	};
+
+	if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0) {
+		fprintf(stderr, "logind: seccomp install failed: %s\n",
+			strerror(errno));
+		return -1;
+	}
+
 	return 0;
 }
 
@@ -512,188 +553,177 @@ int main(int argc, char *argv[])
 
 	const char *username = argv[1];
 
-	/* Install Ctrl+C handler WITHOUT SA_RESTART so fgets() returns on EINTR */
+	/* ── Phase 0: Signal handlers ────────────────────────────────── */
 	install_sigint_handler();
 	signal(SIGQUIT, SIG_IGN);
 
-	/* Open config database (read password policy, enforce flags) */
-	if (sg_db_open(SG_DB_PATH) != 0) {
-		fprintf(stderr, "stargazer-logind: failed to open config database\n");
+	/* ── Phase 1: Cache user data (requires root + file access) ── */
+
+	/*
+	 * getpwnam() reads /etc/passwd — must happen before seccomp
+	 * blocks openat(). Cache all fields since the returned pointer
+	 * is static and may be overwritten.
+	 */
+	struct passwd *pw = getpwnam(username);
+	if (!pw) {
+		/* Don't reveal whether username exists — same error as bad pw */
+		fprintf(stderr, "Invalid credentials\n");
+		return 1;
+	}
+	uid_t cached_uid = pw->pw_uid;
+	gid_t cached_gid = pw->pw_gid;
+	char cached_shell[256], cached_home[256];
+	snprintf(cached_shell, sizeof(cached_shell), "%s",
+		 (pw->pw_shell && pw->pw_shell[0]) ? pw->pw_shell : "/bin/sh");
+	snprintf(cached_home, sizeof(cached_home), "%s",
+		 pw->pw_dir ? pw->pw_dir : "/");
+
+	/*
+	 * initgroups() reads /etc/group — must happen before seccomp.
+	 * Setting supplementary groups as root is harmless; they only
+	 * take effect after setuid().
+	 */
+	if (initgroups(username, cached_gid) != 0)
+		perror("initgroups");
+
+	/*
+	 * Open console fd for later use (before seccomp blocks openat).
+	 * The actual dup2() + TIOCSCTTY happen in Phase 3.
+	 */
+	int console_fd = open("/dev/console", O_RDWR);
+
+	/* ── Phase 1.5: Install seccomp sandbox ──────────────────────── */
+	if (logind_drop_privileges() != 0) {
+		fprintf(stderr, "stargazer-logind: sandbox install failed\n");
 		return 1;
 	}
 
-	int ret = 0;
+	/*
+	 * From this point on:
+	 *   - open/openat BLOCKED (no file access)
+	 *   - fork/clone  BLOCKED (no process creation)
+	 *   - ptrace      BLOCKED (no debugging)
+	 *   - Only AF_UNIX sockets allowed (IPC to mgmtd)
+	 */
 
-	/* Authenticate */
+	/* ── Phase 2: Authentication via IPC (sandboxed) ─────────────── */
+
 	char password[MAX_PASS_LEN];
 	int pw_rc = read_password("Password: ", password, sizeof(password));
 	if (pw_rc == -2) {
-		/* Ctrl+C during password — return to login prompt */
 		explicit_bzero(password, sizeof(password));
-		ret = EXIT_SIGINT;
-		goto db_cleanup;
+		return EXIT_SIGINT;
 	}
 	if (pw_rc != 0) {
-		audit_log(username, "login_fail", "reason=read-error");
-		ret = 1;
-		goto db_cleanup;
-	}
-
-	if (authenticate(username, password) != 0) {
-		explicit_bzero(password, sizeof(password));
-		audit_log(username, "login_fail", "reason=bad-password");
-		fprintf(stderr, "Invalid credentials\n");
-		ret = 1;
-		goto db_cleanup;
-	}
-
-	/*
-	 * Check if current password meets policy — store result but don't
-	 * act yet. We need the plaintext password for the check, but the
-	 * admin-controlled enforce-change-password flag takes priority.
-	 */
-	struct password_policy login_pol;
-	int policy_mismatch = 0;
-	if (is_password_policy_enforced(username)) {
-		read_password_policy(&login_pol);
-		int prc = pw_check_policy(password, username, &login_pol);
-		if (prc != 1) {
-			policy_mismatch = 1;
-			audit_log(username, "password_policy_mismatch",
-				  pw_policy_reason(prc));
-		}
-	}
-
-	explicit_bzero(password, sizeof(password));
-
-	/*
-	 * Read admin flag BEFORE calling enforce_password_change so we
-	 * know whether it will actually trigger a change or just skip.
-	 */
-	int admin_flag_set = 0;
-	{
-		char *epc_val = sg_db_get_val("system_admin", username,
-					      "enforce-change-password");
-		if (epc_val) {
-			if (strcmp(epc_val, "enable") == 0)
-				admin_flag_set = 1;
-			free(epc_val);
-		}
-	}
-
-	/*
-	 * Path 1: Admin-controlled enforce-change-password flag.
-	 * If triggered, the new password is validated against policy too,
-	 * so a successful change here satisfies both the admin flag AND
-	 * any policy mismatch — we can skip the policy path entirely.
-	 */
-	int epc_rc = enforce_password_change(username);
-	if (epc_rc == -2) {
-		audit_log(username, "login_fail", "reason=password-change-interrupted");
-		ret = EXIT_SIGINT;
-		goto db_cleanup;
-	}
-	if (epc_rc != 0) {
-		audit_log(username, "login_fail", "reason=enforce-change-failed");
-		ret = 1;
-		goto db_cleanup;
-	}
-
-	/*
-	 * Path 2: Policy mismatch — system-triggered, does NOT touch
-	 * enforce-change-password config. Only runs if the admin flag
-	 * did NOT trigger (if it did, the new password already meets policy).
-	 */
-	if (policy_mismatch && !admin_flag_set) {
-		int pm_rc = enforce_policy_compliance(username, &login_pol);
-		if (pm_rc == -2) {
-			audit_log(username, "login_fail",
-				  "reason=policy-change-interrupted");
-			ret = EXIT_SIGINT;
-			goto db_cleanup;
-		}
-		if (pm_rc != 0) {
-			audit_log(username, "login_fail",
-				  "reason=policy-change-failed");
-			ret = 1;
-			goto db_cleanup;
-		}
-	}
-
-db_cleanup:
-	/* Close config database before dropping privileges */
-	sg_db_close();
-	if (ret != 0)
-		return ret;
-
-	/* Restore signals */
-	signal(SIGINT, SIG_DFL);
-	signal(SIGQUIT, SIG_DFL);
-
-	/* Look up user for privilege drop */
-	struct passwd *pw = getpwnam(username);
-	if (!pw) {
-		audit_log(username, "login_fail", "reason=no-passwd-entry");
-		fprintf(stderr, "Invalid credentials\n");
 		return 1;
 	}
 
-	audit_log(username, "login_success", "source=logind");
+	/* Send credentials to mgmtd for authentication */
+	char auth_payload[MAX_PASS_LEN + SG_USERNAME_MAX + 4];
+	snprintf(auth_payload, sizeof(auth_payload), "%s\n%s\n",
+		 username, password);
+	explicit_bzero(password, sizeof(password));
+
+	uint32_t status;
+	char extra[SG_EXTRA_MAX];
+	char *resp_payload = NULL;
+	int ipc_rc = logind_ipc(SG_CMD_AUTH_LOGIN, username, auth_payload,
+				&status, extra, sizeof(extra), &resp_payload);
+	explicit_bzero(auth_payload, sizeof(auth_payload));
+
+	if (ipc_rc != 0) {
+		fprintf(stderr,
+			"stargazer-logind: cannot contact management daemon\n");
+		return 1;
+	}
+
+	if (status != SG_OK) {
+		/* Don't reveal whether it's bad password vs locked — same msg */
+		fprintf(stderr, "Invalid credentials\n");
+		free(resp_payload);
+		return 1;
+	}
+
+	/* Parse response: "enforce_change=0|1\npolicy_mismatch=0|1\n" */
+	int enforce_change = 0, policy_mismatch = 0;
+	if (resp_payload) {
+		const char *p;
+		p = strstr(resp_payload, "enforce_change=");
+		if (p) enforce_change = atoi(p + 15);
+		p = strstr(resp_payload, "policy_mismatch=");
+		if (p) policy_mismatch = atoi(p + 16);
+		free(resp_payload);
+		resp_payload = NULL;
+	}
+
+	/* Handle forced password changes */
+	if (enforce_change) {
+		int rc = ipc_password_change(username, "admin-flag");
+		if (rc == -2) return EXIT_SIGINT;
+		if (rc != 0)  return 1;
+		/* Admin flag change satisfies policy too */
+		policy_mismatch = 0;
+	}
+
+	if (policy_mismatch) {
+		int rc = ipc_password_change(username, "policy-mismatch");
+		if (rc == -2) return EXIT_SIGINT;
+		if (rc != 0)  return 1;
+	}
+
+	/* Audit successful login */
+	char login_payload[SG_USERNAME_MAX + 4];
+	snprintf(login_payload, sizeof(login_payload), "%s\n", username);
+	logind_ipc(SG_CMD_AUTH_LOGIN_OK, username, login_payload,
+		   &status, extra, sizeof(extra), NULL);
+
+	/* ── Phase 3: Privilege drop + exec ──────────────────────────── */
+
+	/* Restore signals to default before exec */
+	signal(SIGINT, SIG_DFL);
+	signal(SIGQUIT, SIG_DFL);
 
 	/*
 	 * Establish clean session and redirect stdio to /dev/console.
 	 *
 	 * setsid() creates a new session so the CLI is isolated from the
 	 * login shell's process group.  TIOCSCTTY(0) attempts to set the
-	 * controlling terminal — this may silently fail if the parent
-	 * session (from init's "setsid -c") still owns /dev/console, but
-	 * that is fine: the CLI detects Ctrl+C by polling the tty fd
-	 * directly, without relying on SIGINT from a controlling terminal.
+	 * controlling terminal.
 	 */
 	(void)setsid();
-	int tfd = open("/dev/console", O_RDWR);
-	if (tfd >= 0) {
-		(void)ioctl(tfd, TIOCSCTTY, 0);
-		dup2(tfd, STDIN_FILENO);
-		dup2(tfd, STDOUT_FILENO);
-		dup2(tfd, STDERR_FILENO);
-		if (tfd > STDERR_FILENO)
-			close(tfd);
+	if (console_fd >= 0) {
+		(void)ioctl(console_fd, TIOCSCTTY, 0);
+		dup2(console_fd, STDIN_FILENO);
+		dup2(console_fd, STDOUT_FILENO);
+		dup2(console_fd, STDERR_FILENO);
+		if (console_fd > STDERR_FILENO)
+			close(console_fd);
 	}
 
 	/*
 	 * Drop to actual user credentials.
-	 * All privileged operations are delegated to stargazer-mgmtd via
-	 * Unix domain socket IPC. CLI scripts run as the logged-in user
-	 * and never touch system files directly.
+	 * After setuid(), the process cannot regain root.
 	 */
-	if (initgroups(username, pw->pw_gid) != 0)
-		perror("initgroups");
-
-	if (setgid(pw->pw_gid) != 0) {
+	if (setgid(cached_gid) != 0) {
 		perror("setgid");
 		return 1;
 	}
-	if (setuid(pw->pw_uid) != 0) {
+	if (setuid(cached_uid) != 0) {
 		perror("setuid");
 		return 1;
 	}
 
 	/* Set environment */
-	setenv("HOME", pw->pw_dir, 1);
-	setenv("SHELL", pw->pw_shell, 1);
+	setenv("HOME", cached_home, 1);
+	setenv("SHELL", cached_shell, 1);
 	setenv("USER", username, 1);
 	setenv("LOGNAME", username, 1);
 	setenv("STARGAZER_USER", username, 1);
-	setenv("PATH", "/bin:/sbin:/usr/bin:/usr/sbin", 0); /* preserve if set */
-	setenv("TMOUT", "900", 1); /* 15-min idle session timeout (IMPROVE-AUTH-02) */
+	setenv("PATH", "/bin:/sbin:/usr/bin:/usr/sbin", 0);
+	setenv("TMOUT", "900", 1); /* 15-min idle session timeout */
 
 	/* exec user shell */
-	const char *shell = pw->pw_shell;
-	if (!shell || shell[0] == '\0')
-		shell = "/bin/sh";
-
-	execl(shell, shell, (char *)NULL);
+	execl(cached_shell, cached_shell, (char *)NULL);
 	perror("exec");
 	return 1;
 }
