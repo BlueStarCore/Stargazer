@@ -408,7 +408,7 @@ static int logind_drop_privileges(void)
 
 	/* 1. Prevent privilege escalation */
 	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
-		fprintf(stderr, "logind: PR_SET_NO_NEW_PRIVS failed: %s\n",
+		fprintf(stderr, "logind: security hardening failed (step 1): %s\n",
 			strerror(errno));
 		return -1;
 	}
@@ -534,7 +534,7 @@ static int logind_drop_privileges(void)
 	};
 
 	if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0) {
-		fprintf(stderr, "logind: seccomp install failed: %s\n",
+		fprintf(stderr, "logind: process restriction failed (step 3): %s\n",
 			strerror(errno));
 		return -1;
 	}
@@ -597,7 +597,7 @@ int main(int argc, char *argv[])
 
 	/* ── Phase 1.5: Install seccomp sandbox ──────────────────────── */
 	if (logind_drop_privileges() != 0) {
-		fprintf(stderr, "stargazer-logind: sandbox install failed\n");
+		fprintf(stderr, "stargazer-logind: security initialization failed\n");
 		return 1;
 	}
 
