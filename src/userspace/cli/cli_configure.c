@@ -321,7 +321,7 @@ static void register_value_completions(const char *key, const char *kind)
 	if (!kind || !*kind)
 		return;
 
-	char regpath[CLI_MAX_LINE], regdesc[CLI_MAX_LINE];
+	char regpath[CLI_MAX_LINE + 272], regdesc[CLI_MAX_LINE + 272];
 
 	/* ── enum:a,b,c ──────────────────────────────────────────────── */
 	if (strncmp(kind, "enum:", 5) == 0) {
@@ -489,7 +489,7 @@ static void register_set_cmds(const char *type_name)
 		char saved = *end;
 		*end = '\0';
 
-		char regpath[CLI_MAX_LINE], regdesc[CLI_MAX_LINE];
+		char regpath[CLI_MAX_LINE + 272], regdesc[CLI_MAX_LINE + 272];
 		const char *desc = sg_reg_field_desc(type_name, tok);
 		snprintf(regpath, sizeof(regpath), "set %s", tok);
 		snprintf(regdesc, sizeof(regdesc), "%s", desc);
@@ -525,7 +525,7 @@ static void register_unset_get_cmds(const char *type_name)
 		char saved = *end;
 		*end = '\0';
 
-		char regpath[CLI_MAX_LINE], regdesc[CLI_MAX_LINE];
+		char regpath[CLI_MAX_LINE + 272], regdesc[CLI_MAX_LINE + 272];
 		snprintf(regpath, sizeof(regpath), "unset %s", tok);
 		snprintf(regdesc, sizeof(regdesc), "Unset %s", tok);
 		cli_register(regpath, regdesc);
@@ -655,10 +655,9 @@ static int apply_config(const char *type_name, const char *id,
 			fprintf(stderr,
 				"[CFG-DBG] apply: FAILED status=%u\n",
 				resp.status);
-		if (resp.extra[0])
-			printf("  Error: %s\n", resp.extra);
-		else
-			printf("  Error: %s\n", sg_status_str(resp.status));
+		const char *msg = resp.extra[0] ? resp.extra
+					       : sg_status_str(resp.status);
+		printf("  Error [%u]: %s\n", resp.status, msg);
 		ipc_resp_free(&resp);
 		return -1;
 	}
@@ -689,10 +688,9 @@ static int handle_password(const char *entry_id, struct kv_buf *b)
 	struct ipc_response resp;
 	if (ipc_send_str(SG_CMD_ADMIN_CHECK_PW, policy_payload, &resp) == 0) {
 		if (resp.status == SG_ERR_POLICY_FAIL) {
-			if (resp.extra[0])
-				printf("  Error: %s\n", resp.extra);
-			else
-				printf("  Error: password does not meet policy\n");
+			const char *msg = resp.extra[0] ? resp.extra
+						       : "password does not meet policy";
+			printf("  Error [%u]: %s\n", resp.status, msg);
 			ipc_resp_free(&resp);
 			explicit_bzero(policy_payload, sizeof(policy_payload));
 			return -1;
@@ -1074,12 +1072,15 @@ static int context_entry(const char *type_name, const char *label,
 						payload, total, &sresp);
 					if (rc != 0 ||
 					    sresp.status != SG_OK) {
-						printf("  WARNING: applied"
-						       " but failed to"
-						       " save config.\n");
+						printf("  WARNING [%u]:"
+						       " applied but"
+						       " failed to"
+						       " save config.",
+						       sresp.status);
 						if (sresp.extra[0])
-							printf("  %s\n",
+							printf(" %s",
 							       sresp.extra);
+						printf("\n");
 					}
 					if (cfg_dbg())
 						fprintf(stderr,
@@ -1618,12 +1619,15 @@ static int context_single(const char *type_name, const char *label)
 						payload, total, &sresp);
 					if (rc != 0 ||
 					    sresp.status != SG_OK) {
-						printf("  WARNING: applied"
-						       " but failed to"
-						       " save config.\n");
+						printf("  WARNING [%u]:"
+						       " applied but"
+						       " failed to"
+						       " save config.",
+						       sresp.status);
 						if (sresp.extra[0])
-							printf("  %s\n",
+							printf(" %s",
 							       sresp.extra);
+						printf("\n");
 					}
 					if (cfg_dbg())
 						fprintf(stderr,
