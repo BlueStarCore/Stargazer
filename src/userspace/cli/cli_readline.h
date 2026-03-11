@@ -13,10 +13,10 @@
 
 #include <stddef.h>
 
-#define CLI_MAX_LINE   4096
-#define CLI_MAX_COMPS  1024
+#define CLI_MAX_LINE   512
+#define CLI_MAX_COMPS  128
 #define CLI_MAX_HIST   100
-#define CLI_MAX_DESC   256
+#define CLI_MAX_DESC   128
 #define CLI_MAX_STACK  8
 
 /* Initialize terminal I/O (opens /dev/tty). Returns 0 on success. */
