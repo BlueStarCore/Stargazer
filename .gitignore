@@ -40,6 +40,8 @@ docs/*.pdf
 .env
 
 # Cache
-
 .cache
 *.tmp
+
+# AI conversation exchange
+ai-conversation/

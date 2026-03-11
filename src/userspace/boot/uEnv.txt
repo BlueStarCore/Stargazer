@@ -1,0 +1,22 @@
+# Stargazer NGFW — U-Boot environment override for BPI-R4
+# frank-w U-Boot loads this from partition 5 (mmc 0:5) and imports it.
+# We override the boot flow to use booti with kernel + initramfs
+# instead of the default FIT image (bpi-r4.itb).
+
+# Boot partition (matches frank-w layout: partition 5)
+partition=0:5
+
+# Kernel load addresses — spaced to avoid overlap
+# Kernel Image is ~44MB, so DTB/initramfs must be placed after it
+kaddr=0x46000000
+dtaddr=0x49000000
+rdaddr=0x4A000000
+
+# Kernel args
+board=bpi-r4
+console=ttyS0,115200n8 earlycon=uart8250,mmio32,0x11000000
+root=
+bootopts=rw
+
+# Override newboot: load kernel + initramfs + DTB, boot with booti
+newboot=run buildargs; if load mmc ${partition} ${kaddr} kernel; then if load mmc ${partition} ${dtaddr} bpi-r4.dtb; then if load mmc ${partition} ${rdaddr} initramfs.gz; then booti ${kaddr} ${rdaddr}:${filesize} ${dtaddr}; else booti ${kaddr} - ${dtaddr}; fi; else echo "DTB not found, using U-Boot DTB"; if load mmc ${partition} ${rdaddr} initramfs.gz; then booti ${kaddr} ${rdaddr}:${filesize} ${fdtcontroladdr}; else booti ${kaddr} - ${fdtcontroladdr}; fi; fi; fi
