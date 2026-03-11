@@ -574,8 +574,7 @@ int handle_admin_create(int client_fd, const char *user,
 			       newuser);
 	char msg[CMD_BUF_SIZE];
 	snprintf(msg, sizeof(msg), "User '%s' created with profile '%s'", newuser, newprof);
-	send_ok_audited(client_fd, msg, NULL,
-			user, "admin_create", newuser);
+	send_ok(client_fd, msg, NULL);
 	return 0;
 }
 
@@ -643,8 +642,7 @@ int handle_admin_delete(int client_fd, const char *user,
 			       target);
 	char msg[CMD_BUF_SIZE];
 	snprintf(msg, sizeof(msg), "User '%s' deleted", target);
-	send_ok_audited(client_fd, msg, NULL,
-			user, "admin_delete", target);
+	send_ok(client_fd, msg, NULL);
 	return 0;
 }
 
@@ -711,8 +709,7 @@ int handle_admin_set_pw(int client_fd, const char *user,
 	if (g_debug_flags & SG_DBG_FLAG_AUTH)
 		debug_buf_push("[AUTH-DBG] set_password user=%s result=ok\n",
 			       target);
-	send_ok_audited(client_fd, "Password updated", NULL,
-			user, "admin_password_set", target);
+	send_ok(client_fd, "Password updated", NULL);
 	return 0;
 }
 
@@ -781,8 +778,7 @@ int handle_admin_set_enf(int client_fd, const char *user,
 	free(existing);
 	free(newdata);
 	admin_notify_change(target);
-	send_ok_audited(client_fd, "Enforce policy updated", NULL,
-			user, "admin_set_enforce", target);
+	send_ok(client_fd, "Enforce policy updated", NULL);
 	return 0;
 }
 
@@ -892,8 +888,7 @@ int handle_admin_lock_pw(int client_fd, const char *user,
 	if (g_debug_flags & SG_DBG_FLAG_AUTH)
 		debug_buf_push("[AUTH-DBG] lock_password user=%s result=ok\n",
 			       lock_target);
-	send_ok_audited(client_fd, "Password locked", NULL,
-			user, "admin_password_locked", lock_target);
+	send_ok(client_fd, "Password locked", NULL);
 	return 0;
 }
 
@@ -982,7 +977,6 @@ int handle_auth_login(int client_fd, const char *user,
 	} else if (sp->sp_pwdp[0] == '!' || sp->sp_pwdp[0] == '*') {
 		/* Locked account */
 		explicit_bzero(password, sizeof(password));
-		audit_log(target, "login_fail", "reason=account-locked");
 		send_error(client_fd, SG_ERR_LOCKED, "Account is locked");
 		return 0;
 	} else if (sp->sp_pwdp[0] == '\0' && password[0] == '\0') {
@@ -994,7 +988,6 @@ int handle_auth_login(int client_fd, const char *user,
 
 	if (!auth_ok) {
 		explicit_bzero(password, sizeof(password));
-		audit_log(target, "login_fail", "reason=bad-password");
 		send_error(client_fd, SG_ERR_AUTH_FAIL, "Invalid credentials");
 		return 0;
 	}
@@ -1130,18 +1123,11 @@ int handle_auth_change_pw(int client_fd, const char *user,
 			      "enforce-change-password", "disable");
 	}
 
-	const char *event = (strcmp(source, "admin-flag") == 0)
-				? "password_force_change"
-				: "password_policy_change";
-	char amsg[128];
-	snprintf(amsg, sizeof(amsg), "source=%s", source);
-
 	if (g_debug_flags & SG_DBG_FLAG_AUTH)
 		debug_buf_push("[AUTH-DBG] auth_change_pw user=%s source=%s "
 			       "result=ok\n", target, source);
 
-	send_ok_audited(client_fd, "Password changed", NULL,
-			target, event, amsg);
+	send_ok(client_fd, "Password changed", NULL);
 	return 0;
 }
 
@@ -1176,7 +1162,6 @@ int handle_auth_login_ok(int client_fd, const char *user,
 	if (g_debug_flags & SG_DBG_FLAG_AUTH)
 		debug_buf_push("[AUTH-DBG] auth_login_ok user=%s\n", target);
 
-	send_ok_audited(client_fd, NULL, NULL,
-			target, "login_success", "source=logind");
+	send_ok(client_fd, NULL, NULL);
 	return 0;
 }

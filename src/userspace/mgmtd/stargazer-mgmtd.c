@@ -341,9 +341,12 @@ static ssize_t safe_write(int fd, const void *buf, size_t len)
 
 /* ── Response builder ───────────────────────────────────────────────────── */
 
+static sg_status_t g_last_response_status;
+
 static void send_response(int fd, sg_status_t status, const char *extra,
 			   const char *payload, uint32_t payload_len)
 {
+	g_last_response_status = status;
 	sg_response_hdr_t resp;
 	memset(&resp, 0, sizeof(resp));
 	resp.magic = SG_MSG_MAGIC;
@@ -405,16 +408,20 @@ int stream_exec(int client_fd, const char *const argv[])
 {
 	int pipefd[2];
 	if (pipe(pipefd) < 0) {
+		mgmt_log("ERROR", "stream_exec: pipe() failed: %s",
+			 strerror(errno));
 		send_error(client_fd, SG_ERR_SYSTEM_FAIL,
-			   "Failed to create pipe");
+			   "Internal error");
 		return 0;
 	}
 	pid_t pid = fork();
 	if (pid < 0) {
+		mgmt_log("ERROR", "stream_exec: fork() failed: %s",
+			 strerror(errno));
 		close(pipefd[0]);
 		close(pipefd[1]);
 		send_error(client_fd, SG_ERR_SYSTEM_FAIL,
-			   "Failed to fork");
+			   "Internal error");
 		return 0;
 	}
 	if (pid == 0) {
@@ -493,20 +500,6 @@ int stream_exec(int client_fd, const char *const argv[])
 		send_ok(client_fd, NULL, NULL);
 	close(client_fd);
 	return 1;
-}
-
-/* send_ok with inline audit — appends warning to extra if audit fails */
-void send_ok_audited(int fd, const char *extra, const char *payload,
-		     const char *user, const char *event, const char *amsg)
-{
-	if (audit_log(user, event, amsg) != 0) {
-		char warn[SG_EXTRA_MAX];
-		snprintf(warn, sizeof(warn), "%s%s",
-			 extra ? extra : "", AUDIT_WARN);
-		send_ok(fd, warn, payload);
-	} else {
-		send_ok(fd, extra, payload);
-	}
 }
 
 /* Forward declaration (defined below, after password/user helpers) */
@@ -947,6 +940,20 @@ static void mgmtd_sync_interfaces(void)
 	/* 3. Detect first boot: no interface entries in DB yet */
 	int first_boot = (sg_db_count("system_interface") == 0);
 
+	/* On first boot, pick management and WAN NICs:
+	 * - "lan3" gets static management IP (fallback: first NIC)
+	 * - "wan" gets DHCP mode for upstream connectivity */
+	int mgmt_idx = 0;
+	int wan_idx = -1;
+	if (first_boot) {
+		for (int i = 0; i < nic_count; i++) {
+			if (strcmp(nics[i], "lan3") == 0)
+				mgmt_idx = i;
+			else if (strcmp(nics[i], "wan") == 0)
+				wan_idx = i;
+		}
+	}
+
 	/* 4. Create/protect entries for each discovered NIC */
 	for (int i = 0; i < nic_count; i++) {
 		char *existing = sg_db_get("system_interface", nics[i]);
@@ -958,8 +965,9 @@ static void mgmtd_sync_interfaces(void)
 				cur_mtu = 1500;
 
 			char seed[256];
-			if (first_boot && i == 0) {
+			if (first_boot && i == mgmt_idx) {
 				snprintf(seed, sizeof(seed),
+					 "mode=static\n"
 					 "ip=" MGMT_DEFAULT_IP "\n"
 					 "allowaccess=ping\n"
 					 "status=up\n"
@@ -968,6 +976,17 @@ static void mgmtd_sync_interfaces(void)
 				sg_db_set("system_interface", nics[i], seed);
 				mgmt_log("INFO",
 					 "interface %s: created (management IP " MGMT_DEFAULT_IP ", mtu %d)",
+					 nics[i], cur_mtu);
+			} else if (first_boot && i == wan_idx) {
+				snprintf(seed, sizeof(seed),
+					 "mode=dhcp\n"
+					 "allowaccess=ping\n"
+					 "status=up\n"
+					 "mtu=%d\n"
+					 "builtin=yes\n", cur_mtu);
+				sg_db_set("system_interface", nics[i], seed);
+				mgmt_log("INFO",
+					 "interface %s: created (dhcp, mtu %d)",
 					 nics[i], cur_mtu);
 			} else {
 				snprintf(seed, sizeof(seed),
@@ -1608,10 +1627,7 @@ static sg_status_t apply_config(const char *type, const char *id,
 			snprintf(result, rsize, "'permissions' not set.");
 			return SG_ERR_MISSING_ARG;
 		}
-		if (audit_log("mgmtd", "admin_profile_apply", perms) != 0)
-			snprintf(result, rsize, "Profile '%s' loaded (perms: %s)." AUDIT_WARN, id, perms);
-		else
-			snprintf(result, rsize, "Profile '%s' loaded (perms: %s).", id, perms);
+		snprintf(result, rsize, "Profile '%s' loaded (perms: %s).", id, perms);
 
 		/* Session purge deferred to CFG_SET cascade — apply_config()
 		 * is called before save, so purging here would kill the tag
@@ -1666,7 +1682,6 @@ static sg_status_t apply_config(const char *type, const char *id,
 				return SG_ERR_SYSTEM_FAIL;
 			}
 			explicit_bzero(password, sizeof(password));
-			(void)audit_log(id, "admin_password_set", "source=mgmtd");
 		}
 
 		/* Ensure admin has a usable password (new or existing) */
@@ -1688,10 +1703,7 @@ static sg_status_t apply_config(const char *type, const char *id,
 			}
 		}
 
-		if (audit_log(id, "admin_apply", profile) != 0)
-			snprintf(result, rsize, "Admin '%s' applied (profile: %s)." AUDIT_WARN, id, profile);
-		else
-			snprintf(result, rsize, "Admin '%s' applied (profile: %s).", id, profile);
+		snprintf(result, rsize, "Admin '%s' applied (profile: %s).", id, profile);
 		/* Session purge deferred to CFG_SET cascade — apply_config()
 		 * is called before save, so purging here would kill the tag
 		 * before the save can complete. */
@@ -1941,10 +1953,23 @@ sg_status_t validate_cfg_data(const char *type, const char *data,
 	return SG_OK;
 }
 
+/* ── Audit detail extraction ─────────────────────────────────────────── */
+
+static void audit_detail(const char *payload, uint32_t len,
+			 char *out, size_t outsz)
+{
+	if (!payload || !len) { out[0] = '\0'; return; }
+	const char *nl = memchr(payload, '\n', len);
+	size_t n = nl ? (size_t)(nl - payload) : len;
+	if (n >= outsz) n = outsz - 1;
+	memcpy(out, payload, n);
+	out[n] = '\0';
+}
+
 /* ── Request handler ────────────────────────────────────────────────────── */
 
-static int handle_request(int client_fd, sg_request_hdr_t *hdr,
-			  const char *payload)
+static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
+				    const char *payload)
 {
 	sg_cmd_t cmd = (sg_cmd_t)hdr->cmd;
 	const char *user = hdr->username;
@@ -2276,8 +2301,7 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 			}
 		}
 
-		send_ok_audited(client_fd, "Config saved", NULL,
-				user, "cfg_set", section);
+		send_ok(client_fd, "Config saved", NULL);
 		return 0;
 	}
 
@@ -2367,8 +2391,7 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 			send_error(client_fd, SG_ERR_IO_FAIL, "Failed to delete section");
 			return 0;
 		}
-		send_ok_audited(client_fd, "Deleted", NULL,
-				user, "cfg_del", section);
+		send_ok(client_fd, "Deleted", NULL);
 		return 0;
 	}
 
@@ -2436,10 +2459,7 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 					      result, sizeof(result));
 
 		if (st == SG_OK) {
-			char audit_msg[512];
-			snprintf(audit_msg, sizeof(audit_msg), "%s:%s", type_str, id_str);
-			send_ok_audited(client_fd, result, NULL,
-					user, "cfg_apply", audit_msg);
+			send_ok(client_fd, result, NULL);
 		} else {
 			send_error(client_fd, st, result);
 		}
@@ -2558,7 +2578,7 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 		if (lsmod_out && strstr(lsmod_out, "pkt_forward"))
 			mod_status = "loaded";
 		n = snprintf(status_buf + spos, sizeof(status_buf) - spos,
-			     "Module pkt_forward: %s\n", mod_status);
+			     "Firewall engine: %s\n", mod_status);
 		if (n > 0 && (size_t)n < sizeof(status_buf) - spos)
 			spos += (size_t)n;
 		free(lsmod_out);
@@ -2631,18 +2651,36 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 			p = eol + 1;
 		}
 
-		/* Build output from ring buffer */
+		/* Build output from ring buffer, stripping kernel module
+		 * prefix ("pkt_forward: ") from lines to avoid exposing
+		 * internal module names to the CLI user. */
 		char buf[4096];
 		size_t used = 0;
 		int count = nmatches < 20 ? nmatches : 20;
 		int start = nmatches <= 20 ? 0 : nmatches % 20;
 		for (int i = 0; i < count && used < sizeof(buf) - 2; i++) {
 			int idx = (start + i) % 20;
+			const char *ls = ring[idx].s;
 			size_t llen = ring[idx].len;
-			if (used + llen + 2 > sizeof(buf))
-				llen = sizeof(buf) - used - 2;
-			memcpy(buf + used, ring[idx].s, llen);
-			used += llen;
+			/* Strip "pkt_forward: " from the line content */
+			const char *mod = memmem(ls, llen, "pkt_forward: ", 13);
+			if (mod) {
+				/* Keep everything before the module prefix,
+				 * skip "pkt_forward: ", keep the rest */
+				size_t pre = (size_t)(mod - ls);
+				size_t post = llen - pre - 13;
+				if (used + pre + post + 2 > sizeof(buf))
+					break;
+				memcpy(buf + used, ls, pre);
+				used += pre;
+				memcpy(buf + used, mod + 13, post);
+				used += post;
+			} else {
+				if (used + llen + 2 > sizeof(buf))
+					llen = sizeof(buf) - used - 2;
+				memcpy(buf + used, ls, llen);
+				used += llen;
+			}
 			buf[used++] = '\n';
 		}
 		buf[used] = '\0';
@@ -2898,6 +2936,37 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 		send_error(client_fd, SG_ERR_INVALID_CMD, "Unknown command");
 		return 0;
 	}
+}
+
+/* ── Central audit hook wrapper ─────────────────────────────────────────── */
+
+static int handle_request(int client_fd, sg_request_hdr_t *hdr,
+			  const char *payload)
+{
+	sg_cmd_t cmd = (sg_cmd_t)hdr->cmd;
+	const char *user = hdr->username;
+
+	g_last_response_status = SG_OK;
+	int rc = handle_request_dispatch(client_fd, hdr, payload);
+
+	if (!sg_cmd_audit_skip(cmd)) {
+		char event[16], detail[256];
+		snprintf(event, sizeof(event), "%u", (unsigned)cmd);
+		audit_detail(payload, hdr->payload_len, detail, sizeof(detail));
+
+		char amsg[512];
+		if (g_last_response_status == SG_OK) {
+			snprintf(amsg, sizeof(amsg), "OK %s", detail);
+		} else {
+			snprintf(amsg, sizeof(amsg), "FAILED %s: %s",
+				 sg_status_str(g_last_response_status), detail);
+		}
+		if (audit_log(user, event, amsg) != 0)
+			mgmt_log("WARN", "audit write failed: cmd=%u by %s",
+				 (unsigned)cmd, user);
+	}
+
+	return rc;
 }
 
 /* ── Main ───────────────────────────────────────────────────────────────── */

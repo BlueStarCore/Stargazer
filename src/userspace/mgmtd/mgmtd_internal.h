@@ -29,7 +29,6 @@
 #define SHADOW_LAST_CHANGED  "19700"
 #define SHADOW_MAX_DAYS      "99999"
 #define SHADOW_WARN_DAYS     "7"
-#define AUDIT_WARN " [WARNING: audit log write failed]"
 
 /* ── Per-request debug flags (defined in stargazer-mgmtd.c) ─────────────── */
 
@@ -39,13 +38,13 @@ extern uint8_t g_debug_flags;
 
 void send_ok(int fd, const char *extra, const char *payload);
 void send_error(int fd, sg_status_t status, const char *extra);
-void send_ok_audited(int fd, const char *extra, const char *payload,
-		     const char *user, const char *event, const char *amsg);
 int  send_stream_chunk(int fd, const char *data, size_t len);
 int  stream_exec(int client_fd, const char *const argv[]);
 
 /* ── Logging (defined in stargazer-mgmtd.c) ──────────────────────────────── */
 
+void mgmt_log(const char *level, const char *fmt, ...)
+	__attribute__((format(printf, 2, 3)));
 int  audit_log(const char *user, const char *event, const char *msg);
 
 /* ── Debug (defined in stargazer-mgmtd.c) ────────────────────────────────── */

@@ -221,4 +221,32 @@ static inline const char *sg_status_str(sg_status_t s)
 	}
 }
 
+/*
+ * Commands excluded from central audit logging.
+ *
+ * These fire at high frequency during normal CLI operation and
+ * carry no meaningful security or operational information:
+ *   PING          — idle keepalive, every 30 seconds
+ *   DEBUG_FETCH   — pulls debug buffer, after every CLI command
+ *   WHOAMI        — permission check, on login + idle polling
+ *   HISTORY_SAVE  — persists readline history on logout
+ *   HISTORY_LOAD  — loads readline history on login
+ *
+ * All other commands (reads, writes, diagnostics, session tags)
+ * are audited automatically by the central dispatch hook.
+ */
+static inline int sg_cmd_audit_skip(sg_cmd_t cmd)
+{
+	switch (cmd) {
+	case SG_CMD_PING:
+	case SG_CMD_DEBUG_FETCH:
+	case SG_CMD_WHOAMI:
+	case SG_CMD_HISTORY_SAVE:
+	case SG_CMD_HISTORY_LOAD:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
 #endif /* STARGAZER_IPC_H */
