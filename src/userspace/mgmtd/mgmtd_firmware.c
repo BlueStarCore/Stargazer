@@ -116,14 +116,12 @@ static void fw_run_cmd_ignore(const char *cmd)
 /* ── Cancel check (child process only) ───────────────────────────────────── */
 
 /*
- * fw_cancel_cleanup — clean up temp files and optionally unmount boot.
+ * fw_cancel_cleanup — clean up temp files.
  * Called by fw_check_cancel() when cancel is detected.
  */
-static void fw_cancel_cleanup(int boot_mounted)
+static void fw_cancel_cleanup(void)
 {
-	if (boot_mounted)
-		fw_run_cmd_ignore("umount /tmp/sg-fw-boot 2>/dev/null");
-	fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged /tmp/sg-fw-boot");
+	fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
 	unlink(FW_CANCEL_FILE);
 }
 
@@ -134,10 +132,8 @@ static void fw_cancel_cleanup(int boot_mounted)
  * calls _exit(1).  Does NOT return in that case.
  *
  * If not cancelled: returns 0.
- *
- * boot_mounted: set to 1 if boot partition is currently mounted.
  */
-static int fw_check_cancel(int boot_mounted)
+static int fw_check_cancel(void)
 {
 	if (access(FW_CANCEL_FILE, F_OK) != 0)
 		return 0;
@@ -145,7 +141,7 @@ static int fw_check_cancel(int boot_mounted)
 	mgmt_log("INFO", "firmware upgrade cancelled by user");
 	fw_write_state(0, 6, "cancelled",
 		       "Firmware upgrade cancelled by user.", "");
-	fw_cancel_cleanup(boot_mounted);
+	fw_cancel_cleanup();
 	sg_db_close();
 	_exit(1);
 	/* NOTREACHED */
@@ -209,32 +205,69 @@ int handle_upgrade_status(int client_fd, const char *user,
 					staged_ver);
 	}
 
-	/* Boot partition device */
-	const char *bdev_argv[] = {"findfs", "LABEL=boot", NULL};
-	char *bdev = safe_exec(bdev_argv);
-	if (!bdev || !bdev[0]) {
-		free(bdev);
-		const char *blkid_argv[] = {"blkid", "-L", "boot", NULL};
-		bdev = safe_exec(blkid_argv);
+	/* Firmware partition device (raw FIT image, GPT name "firmware").
+	 * BusyBox blkid does NOT show PARTLABEL (it reads filesystem
+	 * superblocks, not GPT entries).  A raw FIT partition has no
+	 * filesystem, so blkid returns nothing.  Instead, read the GPT
+	 * partition name from sysfs: /sys/class/block/<dev>/uevent
+	 * contains PARTNAME=<gpt_name> on all kernels with GPT support. */
+	{
+		const char *kcands[] = {
+			"mmcblk0p4", "mmcblk1p4", NULL
+		};
+		char *kdev = NULL;
+		for (int i = 0; kcands[i]; i++) {
+			char devpath[64];
+			snprintf(devpath, sizeof(devpath),
+				 "/dev/%s", kcands[i]);
+			if (access(devpath, F_OK) != 0)
+				continue;
+			/* Read GPT partition name from sysfs uevent */
+			char uevent[128];
+			snprintf(uevent, sizeof(uevent),
+				 "/sys/class/block/%s/uevent", kcands[i]);
+			FILE *f = fopen(uevent, "r");
+			if (!f)
+				continue;
+			char line[256];
+			while (fgets(line, sizeof(line), f)) {
+				if (strncmp(line, "PARTNAME=", 9) == 0) {
+					char *name = line + 9;
+					/* Strip trailing newline */
+					size_t nl = strlen(name);
+					if (nl > 0 && name[nl - 1] == '\n')
+						name[nl - 1] = '\0';
+					if (strcmp(name, "firmware") == 0 ||
+					    strcmp(name, "kernel") == 0) {
+						kdev = malloc(strlen(devpath) + 1);
+						if (kdev)
+							strcpy(kdev, devpath);
+					}
+					break;
+				}
+			}
+			fclose(f);
+			if (kdev)
+				break;
+		}
+		if (kdev) {
+			off += snprintf(result + off,
+					sizeof(result) - (size_t)off,
+					"  Firmware partition: %s\n", kdev);
+		} else {
+			off += snprintf(result + off,
+					sizeof(result) - (size_t)off,
+					"  Firmware partition: not found\n");
+		}
+		free(kdev);
 	}
-	if (bdev && bdev[0]) {
-		char *nl = strchr(bdev, '\n');
-		if (nl) *nl = '\0';
-		off += snprintf(result + off, sizeof(result) - (size_t)off,
-				"  Boot partition: %s\n", bdev);
-	} else {
-		off += snprintf(result + off, sizeof(result) - (size_t)off,
-				"  Boot partition: not found\n");
-	}
-	free(bdev);
 
 	(void)off;
 	send_ok(client_fd, NULL, result);
 	return 0;
 }
 
-int handle_upgrade_start(int client_fd, const char *user,
-			 const char *payload, const sg_request_hdr_t *hdr)
+int handle_upgrade_start(int client_fd, const char *user, const char *payload, const sg_request_hdr_t *hdr)
 {
 	const char *perms = get_user_permissions(user);
 	if (!has_permission(perms, "admin")) {
@@ -332,8 +365,8 @@ int handle_upgrade_start(int client_fd, const char *user,
 		mgmt_log("WARN", "firmware child: failed to reopen db");
 
 	/* Prepare working directories */
-	fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged /tmp/sg-fw-boot");
-	fw_run_cmd_ignore("mkdir -p /tmp/sg-fw-download /tmp/sg-fw-staged /tmp/sg-fw-boot");
+	fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+	fw_run_cmd_ignore("mkdir -p /tmp/sg-fw-download /tmp/sg-fw-staged");
 
 	/* Determine protocol label for progress messages */
 	const char *proto_label;
@@ -501,7 +534,7 @@ int handle_upgrade_start(int client_fd, const char *user,
 			mgmt_log("INFO", "firmware upgrade cancelled during download");
 			fw_write_state(0, 6, "cancelled",
 				       "Firmware upgrade cancelled by user.", "");
-			fw_cancel_cleanup(0);
+			fw_cancel_cleanup();
 			sg_db_close();
 			_exit(1);
 		}
@@ -551,7 +584,7 @@ int handle_upgrade_start(int client_fd, const char *user,
 	}
 
 	/* Cancel check: before step 2 */
-	fw_check_cancel(0);
+	fw_check_cancel();
 
 	/* Step 2: Extract firmware package */
 	fw_write_state(2, 6, "running", "Extracting firmware package...", "");
@@ -578,212 +611,163 @@ int handle_upgrade_start(int client_fd, const char *user,
 		fclose(mf);
 	}
 
-	char fw_version[64], kernel_sha[128], initramfs_sha[128];
+	char fw_version[64], fit_sha[128];
 	extract_val(manifest, "version", fw_version, sizeof(fw_version));
-	extract_val(manifest, "kernel_sha256", kernel_sha, sizeof(kernel_sha));
-	extract_val(manifest, "initramfs_sha256", initramfs_sha,
-		    sizeof(initramfs_sha));
+	extract_val(manifest, "fit_sha256", fit_sha, sizeof(fit_sha));
 
-	if (!fw_version[0] || !kernel_sha[0] || !initramfs_sha[0]) {
+	if (!fw_version[0] || !fit_sha[0]) {
 		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
 		fw_write_state(2, 6, "error",
-			       "Incomplete manifest (missing version or checksums)", "");
+			       "Incomplete manifest (missing version or fit_sha256)", "");
+		sg_db_close();
+		_exit(1);
+	}
+
+	/* Verify stargazer.itb exists */
+	if (access("/tmp/sg-fw-staged/stargazer.itb", F_OK) != 0) {
+		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+		fw_write_state(2, 6, "error",
+			       "Invalid firmware package (missing stargazer.itb)", "");
 		sg_db_close();
 		_exit(1);
 	}
 
 	/* Cancel check: before step 3 */
-	fw_check_cancel(0);
+	fw_check_cancel();
 
-	/* Step 3: Verify checksums */
-	fw_write_state(3, 6, "running", "Verifying checksums...", "");
-	char *ksum = fw_run_cmd("sha256sum /tmp/sg-fw-staged/kernel 2>/dev/null "
-			     "| cut -d' ' -f1");
-	char *isum = fw_run_cmd("sha256sum /tmp/sg-fw-staged/initramfs.gz 2>/dev/null "
+	/* Step 3: Verify FIT image checksum */
+	fw_write_state(3, 6, "running", "Verifying FIT image checksum...", "");
+	char *fsum = fw_run_cmd("sha256sum /tmp/sg-fw-staged/stargazer.itb 2>/dev/null "
 			     "| cut -d' ' -f1");
 
-	/* Trim trailing newlines */
-	if (ksum) { char *nl = strchr(ksum, '\n'); if (nl) *nl = '\0'; }
-	if (isum) { char *nl = strchr(isum, '\n'); if (nl) *nl = '\0'; }
+	if (fsum) { char *nl = strchr(fsum, '\n'); if (nl) *nl = '\0'; }
 
-	if (!ksum || !isum ||
-	    strcmp(ksum, kernel_sha) != 0 ||
-	    strcmp(isum, initramfs_sha) != 0) {
+	if (!fsum || strcmp(fsum, fit_sha) != 0) {
 		mgmt_log("ERROR", "firmware checksum mismatch: "
-			 "kernel=%s (expect %s) initramfs=%s (expect %s)",
-			 ksum ? ksum : "null", kernel_sha,
-			 isum ? isum : "null", initramfs_sha);
-		free(ksum);
-		free(isum);
+			 "fit=%s (expect %s)",
+			 fsum ? fsum : "null", fit_sha);
+		free(fsum);
 		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
 		fw_write_state(3, 6, "error",
 			       "Firmware checksum verification failed", "");
 		sg_db_close();
 		_exit(1);
 	}
-	free(ksum);
-	free(isum);
+	free(fsum);
 
 	mgmt_log("INFO", "firmware v%s verified, installing...", fw_version);
 
 	/* Cancel check: before step 4 */
-	fw_check_cancel(0);
+	fw_check_cancel();
 
-	/* Step 4: Find and mount boot partition */
-	fw_write_state(4, 6, "running", "Mounting boot partition...", "");
-	const char *bdev_argv[] = {"findfs", "LABEL=boot", NULL};
-	char *bdev = safe_exec(bdev_argv);
-	if (!bdev || !bdev[0]) {
-		free(bdev);
-		const char *blkid_argv[] = {"blkid", "-L", "boot", NULL};
-		bdev = safe_exec(blkid_argv);
-	}
-	if (!bdev || !bdev[0]) {
-		free(bdev);
-		/* Scan common device paths */
+	/* Step 4: Find firmware partition via sysfs PARTNAME (see status path) */
+	fw_write_state(4, 6, "running",
+		       "Locating firmware partition...", "");
+	char kpart[64] = {0};
+	{
 		const char *candidates[] = {
-			"/dev/mmcblk0p1", "/dev/mmcblk1p1",
-			"/dev/vda1", "/dev/sda1", NULL
+			"mmcblk0p4", "mmcblk1p4", NULL
 		};
 		for (int i = 0; candidates[i]; i++) {
-			if (access(candidates[i], F_OK) != 0)
+			char devpath[64];
+			snprintf(devpath, sizeof(devpath),
+				 "/dev/%s", candidates[i]);
+			if (access(devpath, F_OK) != 0)
 				continue;
-			char bcmd[256];
-			snprintf(bcmd, sizeof(bcmd),
-				 "blkid -s LABEL -o value '%s' 2>/dev/null",
+			char uevent[128];
+			snprintf(uevent, sizeof(uevent),
+				 "/sys/class/block/%s/uevent",
 				 candidates[i]);
-			char *lbl = fw_run_cmd(bcmd);
-			if (lbl) {
-				char *nl = strchr(lbl, '\n');
-				if (nl) *nl = '\0';
-				if (strcmp(lbl, "boot") == 0) {
-					bdev = malloc(strlen(candidates[i]) + 1);
-					if (bdev)
-						strcpy(bdev, candidates[i]);
-					free(lbl);
+			FILE *f = fopen(uevent, "r");
+			if (!f)
+				continue;
+			char line[256];
+			while (fgets(line, sizeof(line), f)) {
+				if (strncmp(line, "PARTNAME=", 9) == 0) {
+					char *name = line + 9;
+					size_t nl = strlen(name);
+					if (nl > 0 && name[nl - 1] == '\n')
+						name[nl - 1] = '\0';
+					if (strcmp(name, "firmware") == 0 ||
+					    strcmp(name, "kernel") == 0) {
+						snprintf(kpart, sizeof(kpart),
+							 "%s", devpath);
+					}
 					break;
 				}
-				free(lbl);
 			}
+			fclose(f);
+			if (kpart[0])
+				break;
 		}
 	}
 
-	if (!bdev || !bdev[0]) {
-		free(bdev);
+	if (!kpart[0]) {
 		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
 		fw_write_state(4, 6, "error",
-			       "Boot partition (LABEL=boot) not found", "");
+			       "Firmware partition not found (expected \"firmware\" or \"kernel\")", "");
 		sg_db_close();
 		_exit(1);
 	}
 
-	/* Trim trailing newline from device path */
-	{
-		char *nl = strchr(bdev, '\n');
-		if (nl) *nl = '\0';
-	}
+	mgmt_log("INFO", "firmware partition: %s", kpart);
 
-	/* Mount boot partition */
-	char mntcmd[512];
-	snprintf(mntcmd, sizeof(mntcmd),
-		 "mount '%s' /tmp/sg-fw-boot 2>&1", bdev);
-	char *mntout = fw_run_cmd(mntcmd);
-	if (access("/tmp/sg-fw-boot/kernel", F_OK) != 0 &&
-	    access("/tmp/sg-fw-boot/initramfs.gz", F_OK) != 0) {
-		/* Boot partition mounted but seems empty — still ok
-		 * for first firmware install */
-		mgmt_log("WARN", "boot partition %s appears empty", bdev);
-	}
-	free(mntout);
-
-	/* Verify mount succeeded by checking mountpoint */
-	char *mpcheck = fw_run_cmd("mountpoint -q /tmp/sg-fw-boot && echo ok 2>/dev/null");
-	if (!mpcheck || strncmp(mpcheck, "ok", 2) != 0) {
-		mgmt_log("ERROR", "failed to mount boot partition %s", bdev);
-		free(mpcheck);
-		free(bdev);
-		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
-		fw_write_state(4, 6, "error",
-			       "Failed to mount boot partition", "");
-		sg_db_close();
-		_exit(1);
-	}
-	free(mpcheck);
-
-	/* Last cancel checkpoint — boot partition is mounted but files
-	 * are not yet touched.  After this point we are committed. */
-	fw_check_cancel(1);
-
-	/* Log boot partition space before install */
-	char *df_before = fw_run_cmd("df -h /tmp/sg-fw-boot 2>/dev/null | tail -1");
-	mgmt_log("INFO", "boot partition before install: %s",
-		 df_before ? df_before : "(unknown)");
-	free(df_before);
+	/* Last cancel checkpoint — partition is identified but not yet
+	 * written.  After this point we are committed. */
+	fw_check_cancel();
 
 	/* ── Point of no return ── Steps 5 and 6 run to completion ── */
 
-	/* Remove existing files to free space (64MB partition can't
-	 * hold old + new simultaneously with a ~44MB kernel) */
-	fw_run_cmd_ignore("rm -f /tmp/sg-fw-boot/kernel "
-		      "/tmp/sg-fw-boot/initramfs.gz "
-		      "/tmp/sg-fw-boot/kernel.bak "
-		      "/tmp/sg-fw-boot/initramfs.gz.bak 2>/dev/null");
-
-	/* Step 5: Install firmware files */
+	/* Step 5: Write FIT image raw to kernel partition */
 	fw_write_state(5, 6, "running",
-		       "Installing kernel and initramfs...", "");
+		       "Writing FIT image to kernel partition...", "");
 
-	int install_ok = 1;
+	char ddcmd[512];
+	snprintf(ddcmd, sizeof(ddcmd),
+		 "dd if=/tmp/sg-fw-staged/stargazer.itb of='%s' bs=512k 2>&1",
+		 kpart);
+	char *ddout = fw_run_cmd(ddcmd);
+	if (ddout)
+		mgmt_log("INFO", "dd output: %s", ddout);
+	free(ddout);
 
-	char *cpk = fw_run_cmd("cp /tmp/sg-fw-staged/kernel /tmp/sg-fw-boot/kernel 2>&1");
-	if (cpk && cpk[0])
-		mgmt_log("WARN", "kernel copy: %s", cpk);
-	free(cpk);
-
-	char *vk = fw_run_cmd("cmp -s /tmp/sg-fw-staged/kernel /tmp/sg-fw-boot/kernel "
-			   "&& echo ok");
-	if (!vk || strncmp(vk, "ok", 2) != 0) {
-		mgmt_log("ERROR", "kernel verify failed");
-		install_ok = 0;
+	/* Verify: read back and compare sha256 */
+	{
+		struct stat fit_st;
+		if (stat("/tmp/sg-fw-staged/stargazer.itb", &fit_st) != 0) {
+			fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+			fw_write_state(5, 6, "error",
+				       "Cannot stat FIT image", "");
+			sg_db_close();
+			_exit(1);
+		}
+		char vfycmd[512];
+		snprintf(vfycmd, sizeof(vfycmd),
+			 "dd if='%s' bs=512k count=%ld iflag=count_bytes 2>/dev/null "
+			 "| sha256sum | cut -d' ' -f1",
+			 kpart, (long)fit_st.st_size);
+		char *vfysum = fw_run_cmd(vfycmd);
+		if (vfysum) {
+			char *nl = strchr(vfysum, '\n');
+			if (nl) *nl = '\0';
+		}
+		if (!vfysum || strcmp(vfysum, fit_sha) != 0) {
+			mgmt_log("ERROR", "FIT readback verify failed: "
+				 "got=%s expected=%s",
+				 vfysum ? vfysum : "null", fit_sha);
+			free(vfysum);
+			fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+			fw_write_state(5, 6, "error",
+				       "FIT image write verification failed", "");
+			sg_db_close();
+			_exit(1);
+		}
+		free(vfysum);
 	}
-	free(vk);
 
-	char *cpi = fw_run_cmd("cp /tmp/sg-fw-staged/initramfs.gz /tmp/sg-fw-boot/initramfs.gz 2>&1");
-	if (cpi && cpi[0])
-		mgmt_log("WARN", "initramfs copy: %s", cpi);
-	free(cpi);
-
-	char *vi = fw_run_cmd("cmp -s /tmp/sg-fw-staged/initramfs.gz /tmp/sg-fw-boot/initramfs.gz "
-			   "&& echo ok");
-	if (!vi || strncmp(vi, "ok", 2) != 0) {
-		mgmt_log("ERROR", "initramfs verify failed");
-		install_ok = 0;
-	}
-	free(vi);
-
-	if (!install_ok) {
-		char *df_fail = fw_run_cmd("df -h /tmp/sg-fw-boot 2>/dev/null | tail -1");
-		mgmt_log("ERROR", "firmware install failed, boot partition: %s",
-			 df_fail ? df_fail : "(unknown)");
-		free(df_fail);
-		fw_run_cmd_ignore("sync");
-		fw_run_cmd_ignore("umount /tmp/sg-fw-boot 2>/dev/null");
-		free(bdev);
-		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
-		fw_write_state(5, 6, "error", "Firmware install failed", "");
-		sg_db_close();
-		_exit(1);
-	}
-
-	/* Copy manifest to boot partition for version tracking */
-	fw_run_cmd_ignore("cp /tmp/sg-fw-staged/manifest.txt /tmp/sg-fw-boot/manifest.txt 2>/dev/null");
-
-	/* Step 6: Sync, unmount, and finalize */
-	fw_write_state(6, 6, "running",
-		       "Syncing and unmounting boot partition...", "");
+	/* Step 6: Sync and finalize */
+	fw_write_state(6, 6, "running", "Syncing...", "");
 	fw_run_cmd_ignore("sync");
-	fw_run_cmd_ignore("umount /tmp/sg-fw-boot 2>/dev/null");
-	free(bdev);
 
 	/* Cleanup download artifacts */
 	fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download");
