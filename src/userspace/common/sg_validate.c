@@ -70,6 +70,7 @@ static const struct field_entry field_table[] = {
 	{ "network_nat", "status",      "enum:enable,disable",   0, "enable", "Enable or disable this rule"  },
 
 	/* system_interface */
+	{ "system_interface", "mode",        "enum:static,dhcp", 0, "static", "Addressing mode"              },
 	{ "system_interface", "ip",          "cidr",             0, NULL,   "Interface IP address and mask"  },
 	{ "system_interface", "status",      "enum:up,down",     0, "up",   "Administrative state"           },
 	{ "system_interface", "mtu",         "uint:576:65535",   0, "1500", "Maximum transmission unit"      },

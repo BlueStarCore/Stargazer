@@ -39,7 +39,7 @@ KERNEL_DTB     := $(BUILD_DIR)/bpi-r4.dtb
 
 # Output
 ISO_FILE       := $(BUILD_DIR)/stargazer-bpi-r4-$(VERSION).iso
-IMG_FILE       := $(BUILD_DIR)/stargazer-bpi-r4-$(VERSION).img
+IMG_FILE       := $(BUILD_DIR)/stargazer-bpi-r4-EMMC-$(VERSION).img
 MODULE_NAME    := pkt_forward
 
 # BusyBox settings
@@ -85,6 +85,23 @@ MUSL_CROSS     := $(MUSL_CROSS_DIR)/bin/aarch64-linux-musl-
 UBOOT_DEB_URL  := http://archive.ubuntu.com/ubuntu/pool/main/u/u-boot/u-boot-qemu_2022.01+dfsg-2ubuntu2.7_all.deb
 UBOOT_BIN      := $(BUILD_DIR)/u-boot/u-boot.bin
 
+# BPI-R4 eMMC bootloader (built from mtk-openwrt ATF/U-Boot source)
+# BL2 (EMMC_BOOT header): written to eMMC boot0 HW partition (mmcblk0boot0).
+#   eMMC is 8GTF4R 7.28GiB with boot0/boot1 partitions (HS400 mode).
+#   Boot ROM reads BL2 from boot0 when DIP switch selects eMMC.
+# FIP (BL31 + U-Boot): written to GPT "fip" partition.
+# Built by 'make bpi-r4-bootloader' or automatically by 'make image'
+BPIR4_BL2        := $(BUILD_DIR)/bpi-r4/bl2_emmc_mtk.img
+BPIR4_FIP        := $(BUILD_DIR)/bpi-r4/fip_emmc_mtk.bin
+
+# BPI-R4 NAND bootloader header (BL2 + env + factory + FIP, first 0x780000 bytes)
+# Extracted from stock MTK NAND image. UBI partition starts right after.
+BPIR4_NAND_BOOT  := $(BUILD_DIR)/bpi-r4/nand_bootloader.bin
+
+# ubinize from mtd-utils (extracted without root — see .cache/mtd-utils-extracted/)
+UBINIZE          := $(PROJECT_ROOT)/.cache/mtd-utils-extracted/usr/sbin/ubinize
+UBINIZE_LDPATH   := $(PROJECT_ROOT)/.cache/mtd-utils-extracted/usr/lib/x86_64-linux-gnu
+
 # Source watch: any .c/.h/Makefile change under src/ triggers rebuild.
 # Sub-Makefiles have fine-grained deps; this just ensures they get invoked.
 SRC_WATCH := $(shell find $(PROJECT_ROOT)/src -name '*.c' -o -name '*.h' -o -name 'Makefile' -o -name 'Kbuild' 2>/dev/null)
@@ -93,7 +110,7 @@ SRC_WATCH := $(shell find $(PROJECT_ROOT)/src -name '*.c' -o -name '*.h' -o -nam
 # Main targets
 # =============================================================================
 
-.PHONY: all kernel modules busybox musl-toolchain dash iptables logind mgmtd cli uboot rootfs iso image firmware test-build test test-run lanvm clean help
+.PHONY: all kernel modules busybox musl-toolchain dash iptables logind mgmtd cli tools uboot bpi-r4-bootloader rootfs iso nand-fit nand-image image firmware test-build test test-run lanvm clean help
 
 all: image
 
@@ -109,7 +126,16 @@ $(KERNEL_IMAGE): | kernel-source kernel-config
 	$(MAKE) -C $(KERNEL_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) -j$$(nproc) Image dtbs modules
 	@mkdir -p $(BUILD_DIR)
 	cp $(KERNEL_DIR)/arch/$(ARCH)/boot/Image $(KERNEL_IMAGE)
-	cp $(KERNEL_DIR)/arch/$(ARCH)/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dtb $(KERNEL_DTB) 2>/dev/null || true
+	# Merge eMMC overlay into base DTB (eMMC controller is disabled in base DTS)
+	@cp $(KERNEL_DIR)/arch/$(ARCH)/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dtb $(KERNEL_DTB).base 2>/dev/null || true
+	@if [ -f "$(KERNEL_DTB).base" ] && [ -f "$(KERNEL_DIR)/arch/$(ARCH)/boot/dts/mediatek/mt7988a-bananapi-bpi-r4-emmc.dtbo" ]; then \
+		fdtoverlay -i $(KERNEL_DTB).base -o $(KERNEL_DTB) \
+			$(KERNEL_DIR)/arch/$(ARCH)/boot/dts/mediatek/mt7988a-bananapi-bpi-r4-emmc.dtbo; \
+		echo "  DTB: merged eMMC overlay"; \
+	else \
+		cp $(KERNEL_DTB).base $(KERNEL_DTB) 2>/dev/null || true; \
+	fi
+	@rm -f $(KERNEL_DTB).base
 	@echo "[1/5] Kernel ready: $(KERNEL_IMAGE)"
 
 kernel-source:
@@ -120,15 +146,44 @@ kernel-source:
 
 kernel-config:
 	@if [ ! -f "$(KERNEL_DIR)/.config" ]; then \
-		echo "Configuring kernel..."; \
-		$(MAKE) -C $(KERNEL_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) defconfig; \
+		echo "Configuring kernel for BPI-R4 (MT7988A)..."; \
+		$(MAKE) -C $(KERNEL_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) mt7988a_bpi-r4_defconfig; \
 		$(KERNEL_DIR)/scripts/config --file $(KERNEL_DIR)/.config \
-			--enable NETFILTER --enable NF_CONNTRACK \
-			--enable NF_CT_NETLINK \
+			--enable NETFILTER \
+			--enable NF_CONNTRACK \
+			--enable NF_NAT \
+			--enable NF_DEFRAG_IPV4 \
+			--enable NF_DEFRAG_IPV6 \
+			--enable IP_NF_IPTABLES \
+			--enable IP_NF_FILTER \
+			--enable IP_NF_NAT \
+			--enable IP_NF_MANGLE \
+			--enable IP_NF_TARGET_MASQUERADE \
+			--enable IP_NF_TARGET_REJECT \
 			--enable IP_NF_RAW \
+			--enable IP6_NF_IPTABLES \
+			--enable IP6_NF_FILTER \
+			--enable IP6_NF_NAT \
+			--enable IP6_NF_MANGLE \
+			--enable IP6_NF_TARGET_MASQUERADE \
+			--enable IP6_NF_TARGET_REJECT \
 			--enable NETFILTER_XT_TARGET_CT \
+			--enable NETFILTER_XT_MATCH_CONNTRACK \
+			--enable NETFILTER_XT_MATCH_STATE \
+			--enable NETFILTER_XT_MATCH_LIMIT \
+			--enable NETFILTER_XT_TARGET_LOG \
+			--enable NETFILTER_XT_TARGET_CHECKSUM \
+			--enable NETFILTER_XT_MARK \
+			--enable NETFILTER_XT_CONNMARK \
+			--enable NF_LOG_IPV4 \
+			--enable NF_REJECT_IPV4 \
+			--enable NF_LOG_IPV6 \
+			--enable NF_REJECT_IPV6 \
+			--enable NF_CT_NETLINK \
 			--module NF_CONNTRACK_TFTP \
 			--module NF_NAT_TFTP \
+			--module NF_FLOW_TABLE \
+			--module NF_FLOW_TABLE_INET \
 			--enable VIRTIO --enable VIRTIO_PCI --enable VIRTIO_NET \
 			--enable VIRTIO_BLK --enable VIRTIO_MMIO \
 			--enable MODULES --enable MODULE_UNLOAD \
@@ -147,8 +202,8 @@ $(BUILD_DIR)/modules/$(MODULE_NAME).ko: $(KERNEL_IMAGE) $(SRC_WATCH)
 	$(MAKE) -C $(KERNEL_DIR) M=$(MODULE_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) modules KBUILD_MODPOST_WARN=1
 	@mkdir -p $(BUILD_DIR)/modules
 	cp $(MODULE_DIR)/*.ko $(BUILD_DIR)/modules/
-	# Copy netfilter conntrack helper modules (TFTP etc.)
-	@for m in nf_conntrack_tftp.ko nf_nat_tftp.ko; do \
+	# Copy netfilter helper/offload modules (TFTP, flow offload)
+	@for m in nf_conntrack_tftp.ko nf_nat_tftp.ko nf_flow_table.ko nf_flow_table_inet.ko; do \
 		[ -f $(KERNEL_DIR)/net/netfilter/$$m ] && \
 		cp $(KERNEL_DIR)/net/netfilter/$$m $(BUILD_DIR)/modules/ || true; \
 	done
@@ -287,7 +342,7 @@ $(DASH_BIN): $(MUSL_CC)
 		$(MAKE) -C $(DASH_DIR) distclean 2>/dev/null || true; \
 	fi
 	cd $(DASH_DIR) && ./configure --host=aarch64-linux-musl \
-		CC=$(MUSL_CC) CFLAGS="-Os -static" LDFLAGS="-static"
+		CC=$(MUSL_CC) CFLAGS="-Os -static -no-pie" LDFLAGS="-static -no-pie"
 	# Fix CC_FOR_BUILD: configure copies the cross compiler but
 	# helper tools (mknodes, mksyntax, mksignames) must run on host.
 	sed -i 's|^CC_FOR_BUILD = .*|CC_FOR_BUILD = gcc|' $(DASH_DIR)/src/Makefile
@@ -391,7 +446,23 @@ $(BUILD_DIR)/cli/stargazer-cli: $(MUSL_CC) $(SRC_WATCH)
 	@echo "[3g/5] CLI binary ready."
 
 # =============================================================================
-# 3h. U-Boot bootloader (for QEMU disk-based boot)
+# 3h. Tools (sg-partinit — first-boot partition creator)
+# =============================================================================
+
+TOOLS_DIR := $(PROJECT_ROOT)/src/userspace/tools
+
+tools: $(BUILD_DIR)/tools/sg-partinit
+
+$(BUILD_DIR)/tools/sg-partinit: $(MUSL_CC) $(TOOLS_DIR)/sg-partinit.c
+	@echo "[3h/5] Building tools (musl static)..."
+	@mkdir -p $(BUILD_DIR)/tools
+	$(MAKE) -C $(TOOLS_DIR) \
+		CROSS_COMPILE=$(MUSL_CROSS) \
+		BUILD_DIR=$(BUILD_DIR)/tools
+	@echo "[3h/5] Tools ready."
+
+# =============================================================================
+# 3i. U-Boot bootloader (for QEMU disk-based boot)
 # =============================================================================
 
 uboot: $(UBOOT_BIN)
@@ -407,12 +478,73 @@ $(UBOOT_BIN):
 	@echo "[3h/5] U-Boot ready: $(UBOOT_BIN)"
 
 # =============================================================================
+# 3j. BPI-R4 eMMC bootloader (BL2 + FIP from ATF/U-Boot source)
+# =============================================================================
+# Builds ARM Trusted Firmware BL2 (eMMC preloader) and FIP (BL31 + U-Boot)
+# from mtk-openwrt repos. BL2 uses EMMC_BOOT header for MT7988A boot ROM.
+#
+# BPI-R4 eMMC (8GTF4R 7.28GiB) has boot0/boot1 HW partitions and runs HS400.
+# BL2 goes to boot0, FIP goes to GPT "fip" partition. Boot ROM reads boot0
+# when DIP switch selects eMMC mode.
+#
+# Note: MSDC0 muxes between SD and eMMC based on DIP switch. Only one is
+# visible as mmcblk0 at a time. When booted from SD, eMMC is NOT accessible.
+#
+# Must use MTK U-Boot (not frank-w) — frank-w U-Boot rewrites NMBM tables
+# on SPI-NAND during boot, corrupting the NAND installation.
+#
+# Sources cached in .cache/uboot-mtk/ and .cache/atf-mtk/
+
+UBOOT_MTK_DIR  := $(PROJECT_ROOT)/.cache/uboot-mtk
+ATF_MTK_DIR    := $(PROJECT_ROOT)/.cache/atf-mtk
+
+bpi-r4-bootloader: $(BPIR4_BL2) $(BPIR4_FIP)
+
+# Build U-Boot for eMMC, then ATF (BL2 + FIP)
+$(BPIR4_BL2) $(BPIR4_FIP): $(UBOOT_MTK_DIR)/.stamp $(ATF_MTK_DIR)/.stamp
+	@echo "Building eMMC bootloader (BL2 + FIP)..."
+	@mkdir -p $(BUILD_DIR)/bpi-r4
+	# Build U-Boot (BL33 input for FIP)
+	cd $(UBOOT_MTK_DIR) && \
+		$(MAKE) mt7988_emmc_rfb_defconfig CROSS_COMPILE=$(CROSS_COMPILE) && \
+		sed -i 's/CONFIG_MTK_DEFAULT_FIT_BOOT_CONF=.*/CONFIG_MTK_DEFAULT_FIT_BOOT_CONF="conf-base"/' .config && \
+		sed -i 's/CONFIG_TOOLS_KWBIMAGE=y/\# CONFIG_TOOLS_KWBIMAGE is not set/' .config && \
+		sed -i 's/CONFIG_TOOLS_LIBCRYPTO=y/\# CONFIG_TOOLS_LIBCRYPTO is not set/' .config && \
+		$(MAKE) olddefconfig CROSS_COMPILE=$(CROSS_COMPILE) && \
+		$(MAKE) CROSS_COMPILE=$(CROSS_COMPILE) -j$$(nproc)
+	# Build ATF with eMMC BL2 + FIP (includes BL31 + U-Boot)
+	cd $(ATF_MTK_DIR) && \
+		$(MAKE) PLAT=mt7988 BOOT_DEVICE=emmc DRAM_USE_COMB=1 \
+			BL33=$(UBOOT_MTK_DIR)/u-boot.bin \
+			USE_MKIMAGE=1 MKIMAGE=$(UBOOT_MTK_DIR)/tools/mkimage \
+			CROSS_COMPILE=$(CROSS_COMPILE) all fip -j$$(nproc)
+	cp $(ATF_MTK_DIR)/build/mt7988/release/bl2.img $(BPIR4_BL2)
+	cp $(ATF_MTK_DIR)/build/mt7988/release/fip.bin $(BPIR4_FIP)
+	@echo "  BL2: $(BPIR4_BL2) ($$(stat -c %s $(BPIR4_BL2)) bytes)"
+	@echo "  FIP: $(BPIR4_FIP) ($$(stat -c %s $(BPIR4_FIP)) bytes)"
+
+# Clone U-Boot and ATF repos if not present
+$(UBOOT_MTK_DIR)/.stamp:
+	@if [ ! -d "$(UBOOT_MTK_DIR)/.git" ]; then \
+		echo "Cloning mtk-openwrt/u-boot..."; \
+		git clone --depth=1 https://github.com/mtk-openwrt/u-boot.git $(UBOOT_MTK_DIR); \
+	fi
+	@touch $@
+
+$(ATF_MTK_DIR)/.stamp:
+	@if [ ! -d "$(ATF_MTK_DIR)/.git" ]; then \
+		echo "Cloning mtk-openwrt/arm-trusted-firmware..."; \
+		git clone --depth=1 --branch mtksoc https://github.com/mtk-openwrt/arm-trusted-firmware.git $(ATF_MTK_DIR); \
+	fi
+	@touch $@
+
+# =============================================================================
 # 4. Rootfs (userspace)
 # =============================================================================
 
 rootfs: $(ROOTFS_DIR)/.stamp
 
-$(ROOTFS_DIR)/.stamp: modules busybox dash iptables logind mgmtd cli
+$(ROOTFS_DIR)/.stamp: modules busybox dash iptables logind mgmtd cli tools
 	@echo "[4/5] Creating rootfs..."
 	@rm -rf $(ROOTFS_DIR)
 	@mkdir -p $(ROOTFS_DIR)
@@ -460,6 +592,10 @@ $(ROOTFS_DIR)/.stamp: modules busybox dash iptables logind mgmtd cli
 	# Install C CLI binary as primary CLI
 	cp $(BUILD_DIR)/cli/stargazer-cli $(ROOTFS_DIR)/sbin/stargazer-cli
 	@chmod +x $(ROOTFS_DIR)/sbin/stargazer-cli
+
+	# Install tools (sg-partinit — first-boot partition creator)
+	cp $(BUILD_DIR)/tools/sg-partinit $(ROOTFS_DIR)/sbin/sg-partinit
+	@chmod +x $(ROOTFS_DIR)/sbin/sg-partinit
 
 	# Create /sbin/nologin stub (blocks direct root login)
 	@printf '#!/bin/sh\necho "Direct login disabled."\nexit 1\n' > $(ROOTFS_DIR)/sbin/nologin
@@ -564,44 +700,203 @@ $(ISO_FILE): $(ROOTFS_DIR)/.stamp
 	@echo "============================================"
 
 # =============================================================================
+# NAND FIT Image (for BPI-R4 SPI-NAND boot via UBI)
+# =============================================================================
+
+NAND_FIT := $(BUILD_DIR)/stargazer-nand.itb
+
+nand-fit: rootfs
+	@echo "[5/5] Building NAND FIT image..."
+	@mkdir -p $(BUILD_DIR)/image/fit-nand
+	cd $(ROOTFS_DIR) && find . | sort | cpio -o -H newc 2>/dev/null | gzip -n -9 > $(BUILD_DIR)/image/fit-nand/initramfs.gz
+	lzma -z -k -f $(KERNEL_IMAGE) -c > $(BUILD_DIR)/image/fit-nand/Image.lzma
+	# Use pre-merged DTB (base + eMMC overlay) so eMMC is accessible for sgdata
+	cp $(KERNEL_DTB) $(BUILD_DIR)/image/fit-nand/bpi-r4.dtb
+	# Clear stale bootargs (root=/dev/fit0 etc.) — U-Boot sets args at runtime
+	fdtput -t s $(BUILD_DIR)/image/fit-nand/bpi-r4.dtb /chosen bootargs \
+		"console=ttyS0,115200n1 earlycon=uart8250,mmio32,0x11000000"
+	# Fix SPI-NAND partition table to match MTK SDK layout.
+	# The stock DTB has UBI starting at 0x200000 (OpenWrt layout) which overlaps
+	# the FIP area at 0x580000. UBI's wear leveling erases the FIP, killing boot.
+	# MTK SDK layout: bl2(1M) + env(512K) + factory(4M) + fip(2M) + ubi(rest)
+	@_P="$(BUILD_DIR)/image/fit-nand/bpi-r4.dtb"; \
+	_PARTS="/soc/spi@11007000/spi_nand@0/partitions"; \
+	fdtput -t x "$$_P" "$$_PARTS/partition@0" reg 0x0 0x100000; \
+	fdtput -c "$$_P" "$$_PARTS/partition@580000" 2>/dev/null || true; \
+	fdtput -t s "$$_P" "$$_PARTS/partition@580000" label "fip"; \
+	fdtput -t x "$$_P" "$$_PARTS/partition@580000" reg 0x580000 0x200000; \
+	fdtput -t x "$$_P" "$$_PARTS/partition@200000" reg 0x780000 0x7880000
+	cp $(USERSPACE_DIR)/boot/stargazer-nand.its $(BUILD_DIR)/image/fit-nand/stargazer-nand.its
+	mkimage -f $(BUILD_DIR)/image/fit-nand/stargazer-nand.its $(NAND_FIT)
+	cp $(PROJECT_ROOT)/scripts/flash-nand.sh $(BUILD_DIR)/flash-nand.sh
+	@echo ""
+	@echo "============================================"
+	@echo " NAND FIT Image Ready!"
+	@echo "============================================"
+	@echo " FIT:    $(NAND_FIT)"
+	@echo " Script: $(BUILD_DIR)/flash-nand.sh"
+	@echo " Size:   $$(du -h $(NAND_FIT) | cut -f1)"
+	@echo ""
+	@echo " Flash from SD card or eMMC OpenWrt:"
+	@echo "   1. Copy to USB drive:"
+	@echo "      stargazer-nand.itb"
+	@echo "      flash-nand.sh"
+	@echo "      mtk-bpi-r4-*-NAND-*.img  (stock MTK image)"
+	@echo ""
+	@echo "   2. Boot BPI-R4 from SD card (or eMMC)"
+	@echo "   3. Mount USB:  mount /dev/sda1 /mnt"
+	@echo "   4. Full flash (first time):"
+	@echo "      sh /mnt/flash-nand.sh /mnt/mtk-*.img /mnt/stargazer-nand.itb"
+	@echo ""
+	@echo "   5. Kernel-only update (subsequent):"
+	@echo "      sh /mnt/flash-nand.sh --kernel-only /mnt/stargazer-nand.itb"
+	@echo "============================================"
+
+# =============================================================================
+# Complete NAND Image (dd-able, like stock MTK image)
+# =============================================================================
+# Layout: BL2(1MB) + env(512K) + factory(4MB) + FIP(2MB) + UBI(kernel FIT)
+# Flash:  mtd erase /dev/mtd0 && dd if=stargazer-*.img of=/dev/mtdblock0
+#
+# Requires: NAND bootloader header extracted from stock MTK NAND image.
+# One-time setup:
+#   dd if=mtk-bpi-r4-*-NAND-*.img of=build/bpi-r4/nand_bootloader.bin \
+#      bs=$$((0x780000)) count=1
+
+NAND_IMG := $(BUILD_DIR)/stargazer-bpi-r4-NAND-$(VERSION).img
+
+nand-image: nand-fit
+	@echo "[6/6] Building complete NAND image..."
+	@# Verify bootloader header exists
+	@if [ ! -f "$(BPIR4_NAND_BOOT)" ]; then \
+		echo "ERROR: NAND bootloader header not found: $(BPIR4_NAND_BOOT)"; \
+		echo ""; \
+		echo "Extract it from your stock MTK NAND image:"; \
+		echo "  dd if=mtk-bpi-r4-*-NAND-*.img of=$(BPIR4_NAND_BOOT) bs=\$$((0x780000)) count=1"; \
+		exit 1; \
+	fi
+	@# Verify ubinize is available
+	@if [ ! -x "$(UBINIZE)" ]; then \
+		echo "ERROR: ubinize not found at $(UBINIZE)"; \
+		echo ""; \
+		echo "Install mtd-utils (no root needed):"; \
+		echo "  cd .cache && apt-get download mtd-utils libiniparser1"; \
+		echo "  dpkg-deb -x mtd-utils_*.deb mtd-utils-extracted/"; \
+		echo "  dpkg-deb -x libiniparser1_*.deb mtd-utils-extracted/"; \
+		exit 1; \
+	fi
+	@# Create ubinize config (kernel volume only — config storage uses eMMC,
+	@# because UBIFS on NAND gets ECC errors through the NMBM/mtdblock path)
+	@printf '[kernel-vol]\nmode=ubi\nimage=stargazer-nand.itb\nvol_id=0\nvol_size=20MiB\nvol_type=dynamic\nvol_name=kernel\n' \
+		> $(BUILD_DIR)/image/ubinize-nand.cfg
+	@# Build UBI image (SPI-NAND: 2048B page, 128KB erase block)
+	cd $(BUILD_DIR) && LD_LIBRARY_PATH="$(UBINIZE_LDPATH):$$LD_LIBRARY_PATH" \
+		$(UBINIZE) -o $(BUILD_DIR)/image/ubi-nand.img \
+		-m 2048 -p 128KiB -s 2048 \
+		$(BUILD_DIR)/image/ubinize-nand.cfg
+	@# Assemble: bootloader header (7.5MB) + UBI image
+	cat $(BPIR4_NAND_BOOT) $(BUILD_DIR)/image/ubi-nand.img > $(NAND_IMG)
+	@echo ""
+	@echo "============================================"
+	@echo " NAND Image Ready!"
+	@echo "============================================"
+	@echo " Image: $(NAND_IMG)"
+	@echo " Size:  $$(du -h $(NAND_IMG) | cut -f1)"
+	@echo ""
+	@echo " Flash from SD card or eMMC:"
+	@echo "   mtd erase /dev/mtd0"
+	@echo "   dd if=$(notdir $(NAND_IMG)) of=/dev/mtdblock0"
+	@echo "============================================"
+
+# =============================================================================
 # Disk Image (for real hardware — persistent config partition)
 # =============================================================================
 
-image: rootfs
+image: rootfs bpi-r4-bootloader
 	@echo "[5/5] Creating disk image with persistent storage..."
-	@mkdir -p $(BUILD_DIR)/image/boot/extlinux
+	@mkdir -p $(BUILD_DIR)/image/fit
 
-	# Prepare boot partition contents (with extlinux.conf for U-Boot)
-	cp $(KERNEL_IMAGE) $(BUILD_DIR)/image/boot/kernel
-	@if [ -f "$(KERNEL_DTB)" ]; then cp $(KERNEL_DTB) $(BUILD_DIR)/image/boot/; fi
-	cd $(ROOTFS_DIR) && find . | sort | cpio -o -H newc 2>/dev/null | gzip -n -9 > $(BUILD_DIR)/image/boot/initramfs.gz
-	cp $(USERSPACE_DIR)/boot/extlinux.conf $(BUILD_DIR)/image/boot/extlinux/extlinux.conf
+	# Build FIT image (kernel + DTB + initramfs in single .itb)
+	# MTK U-Boot reads the "firmware" partition as a raw FIT image
+	cd $(ROOTFS_DIR) && find . | sort | cpio -o -H newc 2>/dev/null | gzip -n -9 > $(BUILD_DIR)/image/fit/initramfs.gz
+	lzma -z -k -f $(KERNEL_IMAGE) -c > $(BUILD_DIR)/image/fit/Image.lzma
+	cp $(KERNEL_DIR)/arch/$(ARCH)/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dtb $(BUILD_DIR)/image/fit/bpi-r4.dtb
+	# Clear hardcoded bootargs from base DTB (root=/dev/fit0, ubi.block etc.)
+	# U-Boot sets bootargs at runtime; stale DTB args conflict with initramfs boot
+	fdtput -t s $(BUILD_DIR)/image/fit/bpi-r4.dtb /chosen bootargs \
+		"console=ttyS0,115200n1 earlycon=uart8250,mmio32,0x11000000"
+	# Pre-merge eMMC overlay into base DTB (U-Boot lacks CONFIG_OF_LIBFDT_OVERLAY)
+	@if [ -f "$(KERNEL_DIR)/arch/$(ARCH)/boot/dts/mediatek/mt7988a-bananapi-bpi-r4-emmc.dtbo" ]; then \
+		echo "  Merging eMMC overlay into base DTB..."; \
+		fdtoverlay -i $(BUILD_DIR)/image/fit/bpi-r4.dtb \
+			-o $(BUILD_DIR)/image/fit/bpi-r4-merged.dtb \
+			$(KERNEL_DIR)/arch/$(ARCH)/boot/dts/mediatek/mt7988a-bananapi-bpi-r4-emmc.dtbo; \
+		mv $(BUILD_DIR)/image/fit/bpi-r4-merged.dtb $(BUILD_DIR)/image/fit/bpi-r4.dtb; \
+	else \
+		echo "  WARNING: eMMC overlay not found, eMMC may not be detected by kernel"; \
+	fi
+	# Fix SPI-NAND partition table — same fix as nand-image target.
+	# Stock DTB has UBI at 0x200000, overlapping our raw FIP at 0x580000.
+	# UBI wear-leveling erases the FIP area, killing NAND boot.
+	# Correct: bl2(1M) + fip(0x580000,2M) + ubi(0x780000,rest)
+	@_P="$(BUILD_DIR)/image/fit/bpi-r4.dtb"; \
+	_PARTS="/soc/spi@11007000/spi_nand@0/partitions"; \
+	fdtput -t x "$$_P" "$$_PARTS/partition@0" reg 0x0 0x100000; \
+	fdtput -c "$$_P" "$$_PARTS/partition@580000" 2>/dev/null || true; \
+	fdtput -t s "$$_P" "$$_PARTS/partition@580000" label "fip"; \
+	fdtput -t x "$$_P" "$$_PARTS/partition@580000" reg 0x580000 0x200000; \
+	fdtput -t x "$$_P" "$$_PARTS/partition@200000" reg 0x780000 0x7880000
+	cp $(USERSPACE_DIR)/boot/stargazer.its $(BUILD_DIR)/image/fit/stargazer.its
+	mkimage -f $(BUILD_DIR)/image/fit/stargazer.its $(BUILD_DIR)/image/bpi-r4.itb
 
-	# Create boot partition image (64MB ext2, populated with kernel+initramfs+extlinux)
-	mke2fs -t ext2 -L boot -d $(BUILD_DIR)/image/boot \
-		$(BUILD_DIR)/image/boot.img 64M 2>/dev/null
-
-	# Create data partition image (512MB ext2, empty)
-	mke2fs -t ext2 -L sgdata $(BUILD_DIR)/image/data.img 512M 2>/dev/null
-
-	# Assemble: empty image → GPT → partitions
-	# Boot: 64MB (131072 sectors), Data: 512MB (1048576 sectors), 1MB GPT header
-	dd if=/dev/zero of=$(IMG_FILE) bs=1M count=578 2>/dev/null
-	printf 'label: gpt\nfirst-lba: 2048\n\n' > $(BUILD_DIR)/image/sfdisk.script
-	printf 'start=2048, size=131072, type=linux, name="boot"\n' >> $(BUILD_DIR)/image/sfdisk.script
-	printf 'start=133120, size=1048576, type=linux, name="data"\n' >> $(BUILD_DIR)/image/sfdisk.script
+	# Assemble: GPT + FIP + FIT only. sgdata/sglogs formatted on first boot.
+	# BL2 lives in boot0 HW partition (separate dd). GPT has FIP + kernel + data.
+	# Layout (verified against stock OpenWrt eMMC on BPI-R4, 8GTF4R 7.28GiB):
+	#   boot0 HW partition: BL2 (EMMC_BOOT header) — flashed separately
+	#   Sector 0:         Protective MBR
+	#   Sector 1:         GPT header
+	#   Sector 2-33:      GPT entries
+	#   P1 "u-boot-env":  sector 8192   size 1024   — U-Boot saved environment
+	#   P2 "factory":     sector 9216   size 8192   — factory calibration data (4MB)
+	#   P3 "fip":         sector 17408  size 4096   — FIP (BL31+U-Boot), BL2 finds by name
+	#   P4 "firmware":    sector 21504  size 131072 — kernel+initramfs+DTB FIT (64MB)
+	#   P5 "sgdata":      sector 152576 size 1048576 — persistent config (/etc/stargazer)
+	#   P6 "sglogs":      sector 1201152 size 1048576 — audit/system logs (512MB)
+	truncate -s 1200M $(IMG_FILE)
+	printf 'label: gpt\nfirst-lba: 34\n\n' > $(BUILD_DIR)/image/sfdisk.script
+	printf 'start=8192, size=1024, type=linux, name="u-boot-env"\n' >> $(BUILD_DIR)/image/sfdisk.script
+	printf 'start=9216, size=8192, type=linux, name="factory"\n' >> $(BUILD_DIR)/image/sfdisk.script
+	printf 'start=17408, size=4096, type=linux, name="fip"\n' >> $(BUILD_DIR)/image/sfdisk.script
+	printf 'start=21504, size=131072, type=linux, name="firmware"\n' >> $(BUILD_DIR)/image/sfdisk.script
+	printf 'start=152576, size=1048576, type=linux, name="sgdata"\n' >> $(BUILD_DIR)/image/sfdisk.script
+	printf 'start=1201152, size=1048576, type=linux, name="sglogs"\n' >> $(BUILD_DIR)/image/sfdisk.script
 	sfdisk $(IMG_FILE) < $(BUILD_DIR)/image/sfdisk.script
-	dd if=$(BUILD_DIR)/image/boot.img of=$(IMG_FILE) bs=512 seek=2048 conv=notrunc 2>/dev/null
-	dd if=$(BUILD_DIR)/image/data.img of=$(IMG_FILE) bs=512 seek=133120 conv=notrunc 2>/dev/null
+	# Write FIP into partition 3 "fip"
+	dd if=$(BPIR4_FIP) of=$(IMG_FILE) bs=512 seek=17408 conv=notrunc 2>/dev/null
+	# Write FIT image raw into partition 4 "firmware"
+	dd if=$(BUILD_DIR)/image/bpi-r4.itb of=$(IMG_FILE) bs=512 seek=21504 conv=notrunc 2>/dev/null
+	# Truncate after FIT data — sgdata/sglogs are blank, init formats on first boot
+	@_fit_sectors=$$(( ($$(stat -c %s $(BUILD_DIR)/image/bpi-r4.itb) + 511) / 512 )); \
+	 _end_sector=$$(( 21504 + $$_fit_sectors )); \
+	 truncate -s $$(( $$_end_sector * 512 )) $(IMG_FILE); \
+	 echo "  IMG: truncated to $$(($$_end_sector * 512 / 1024 / 1024))MB (GPT + FIP + FIT)"
+
+	# Copy BL2 alongside image (user writes this to mmcblk0boot0 separately)
+	cp $(BPIR4_BL2) $(BUILD_DIR)/bl2_emmc.img
 
 	@echo ""
 	@echo "============================================"
 	@echo " Build Complete!"
 	@echo "============================================"
 	@echo " Image: $(IMG_FILE)"
+	@echo " BL2:   $(BUILD_DIR)/bl2_emmc.img"
+	@echo " Size:  $$(du -h $(IMG_FILE) | cut -f1)"
 	@echo ""
-	@echo " Deploy to BPI-R4 SD/eMMC:"
-	@echo "   dd if=$(IMG_FILE) of=/dev/mmcblk0 bs=4M status=progress"
+	@echo " Flash to BPI-R4 eMMC (from eMMC OpenWrt):"
+	@echo "   echo 0 > /sys/block/mmcblk0boot0/force_ro"
+	@echo "   dd if=bl2_emmc.img of=/dev/mmcblk0boot0"
+	@echo "   dd if=$(notdir $(IMG_FILE)) of=/dev/mmcblk0 bs=4M"
+	@echo "   sync && reboot -f"
 	@echo "============================================"
 
 # =============================================================================
@@ -612,17 +907,37 @@ FW_PKG := $(BUILD_DIR)/stargazer-fw-$(VERSION).tar.gz
 
 firmware: rootfs
 	@echo "Building firmware upgrade package..."
-	@mkdir -p $(BUILD_DIR)/firmware
-	cp $(KERNEL_IMAGE) $(BUILD_DIR)/firmware/kernel
-	cd $(ROOTFS_DIR) && find . | sort | cpio -o -H newc 2>/dev/null | gzip -n -9 > $(BUILD_DIR)/firmware/initramfs.gz
-	@# Generate manifest with checksums
-	@KSHA=$$(sha256sum $(BUILD_DIR)/firmware/kernel | cut -d' ' -f1); \
-	ISHA=$$(sha256sum $(BUILD_DIR)/firmware/initramfs.gz | cut -d' ' -f1); \
-	printf 'version=%s\nbuild_date=%s\nkernel_sha256=%s\ninitramfs_sha256=%s\n' \
-		"$(VERSION)" "$$(date -u +%Y-%m-%dT%H:%M:%S)" "$$KSHA" "$$ISHA" \
+	@mkdir -p $(BUILD_DIR)/firmware $(BUILD_DIR)/firmware/fit
+	# Build FIT image (same as image target)
+	cd $(ROOTFS_DIR) && find . | sort | cpio -o -H newc 2>/dev/null | gzip -n -9 > $(BUILD_DIR)/firmware/fit/initramfs.gz
+	lzma -z -k -f $(KERNEL_IMAGE) -c > $(BUILD_DIR)/firmware/fit/Image.lzma
+	cp $(KERNEL_DIR)/arch/$(ARCH)/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dtb $(BUILD_DIR)/firmware/fit/bpi-r4.dtb
+	fdtput -t s $(BUILD_DIR)/firmware/fit/bpi-r4.dtb /chosen bootargs \
+		"console=ttyS0,115200n1 earlycon=uart8250,mmio32,0x11000000"
+	# Pre-merge eMMC overlay into base DTB
+	@if [ -f "$(KERNEL_DIR)/arch/$(ARCH)/boot/dts/mediatek/mt7988a-bananapi-bpi-r4-emmc.dtbo" ]; then \
+		fdtoverlay -i $(BUILD_DIR)/firmware/fit/bpi-r4.dtb \
+			-o $(BUILD_DIR)/firmware/fit/bpi-r4-merged.dtb \
+			$(KERNEL_DIR)/arch/$(ARCH)/boot/dts/mediatek/mt7988a-bananapi-bpi-r4-emmc.dtbo; \
+		mv $(BUILD_DIR)/firmware/fit/bpi-r4-merged.dtb $(BUILD_DIR)/firmware/fit/bpi-r4.dtb; \
+	fi
+	# Fix SPI-NAND partition table (same as image/nand-image targets)
+	@_P="$(BUILD_DIR)/firmware/fit/bpi-r4.dtb"; \
+	_PARTS="/soc/spi@11007000/spi_nand@0/partitions"; \
+	fdtput -t x "$$_P" "$$_PARTS/partition@0" reg 0x0 0x100000; \
+	fdtput -c "$$_P" "$$_PARTS/partition@580000" 2>/dev/null || true; \
+	fdtput -t s "$$_P" "$$_PARTS/partition@580000" label "fip"; \
+	fdtput -t x "$$_P" "$$_PARTS/partition@580000" reg 0x580000 0x200000; \
+	fdtput -t x "$$_P" "$$_PARTS/partition@200000" reg 0x780000 0x7880000
+	cp $(USERSPACE_DIR)/boot/stargazer.its $(BUILD_DIR)/firmware/fit/stargazer.its
+	mkimage -f $(BUILD_DIR)/firmware/fit/stargazer.its $(BUILD_DIR)/firmware/stargazer.itb
+	@# Generate manifest with FIT checksum
+	@FSHA=$$(sha256sum $(BUILD_DIR)/firmware/stargazer.itb | cut -d' ' -f1); \
+	printf 'version=%s\nbuild_date=%s\nfit_sha256=%s\n' \
+		"$(VERSION)" "$$(date -u +%Y-%m-%dT%H:%M:%S)" "$$FSHA" \
 		> $(BUILD_DIR)/firmware/manifest.txt
 	@# Package into tar.gz
-	cd $(BUILD_DIR)/firmware && tar -czf $(FW_PKG) manifest.txt kernel initramfs.gz
+	cd $(BUILD_DIR)/firmware && tar -czf $(FW_PKG) manifest.txt stargazer.itb
 	@# Clean staging
 	@rm -rf $(BUILD_DIR)/firmware
 	@echo ""
@@ -640,7 +955,7 @@ firmware: rootfs
 # Test in QEMU
 # =============================================================================
 
-test-build: modules busybox dash iptables logind mgmtd cli uboot
+test-build: modules busybox dash iptables logind mgmtd cli tools uboot
 	@echo "Building test initramfs..."
 	@mkdir -p $(BUILD_DIR)/test
 
@@ -685,6 +1000,10 @@ test-build: modules busybox dash iptables logind mgmtd cli uboot
 	# Install C CLI binary as primary CLI
 	cp $(BUILD_DIR)/cli/stargazer-cli $(BUILD_DIR)/test/initramfs/sbin/stargazer-cli
 	@chmod +x $(BUILD_DIR)/test/initramfs/sbin/stargazer-cli
+
+	# Install tools (sg-partinit — first-boot partition creator)
+	cp $(BUILD_DIR)/tools/sg-partinit $(BUILD_DIR)/test/initramfs/sbin/sg-partinit
+	@chmod +x $(BUILD_DIR)/test/initramfs/sbin/sg-partinit
 
 	# Install iptables (xtables-legacy-multi with symlinks)
 	cp $(IPTABLES_BIN) $(BUILD_DIR)/test/initramfs/sbin/xtables-legacy-multi
@@ -762,6 +1081,9 @@ test-build: modules busybox dash iptables logind mgmtd cli uboot
 	cp $(KERNEL_IMAGE) $(BUILD_DIR)/test/boot-contents/kernel
 	cd $(BUILD_DIR)/test/initramfs && find . | sort | cpio -o -H newc 2>/dev/null | gzip -n -9 > $(BUILD_DIR)/test/boot-contents/initramfs.gz
 	cp $(USERSPACE_DIR)/boot/extlinux.conf $(BUILD_DIR)/test/boot-contents/extlinux/extlinux.conf
+	# Override console for QEMU virt machine (ttyAMA0 instead of BPI-R4 ttyS0)
+	sed -i 's/console=ttyS0,115200n8 earlycon=[^ ]*/console=ttyAMA0/' \
+		$(BUILD_DIR)/test/boot-contents/extlinux/extlinux.conf
 	mke2fs -t ext2 -L boot -d $(BUILD_DIR)/test/boot-contents \
 		$(BUILD_DIR)/test/boot-fs.img 64M 2>/dev/null
 	@# Wrap filesystem in a partitioned image (1MB MBR + 64MB partition)
@@ -850,11 +1172,14 @@ clean:
 	$(MAKE) -C $(LOGIND_DIR) clean BUILD_DIR=$(BUILD_DIR)/logind 2>/dev/null || true
 	$(MAKE) -C $(MGMTD_DIR) clean BUILD_DIR=$(BUILD_DIR)/mgmtd 2>/dev/null || true
 	$(MAKE) -C $(CLI_DIR) clean BUILD_DIR=$(BUILD_DIR)/cli 2>/dev/null || true
+	$(MAKE) -C $(TOOLS_DIR) clean BUILD_DIR=$(BUILD_DIR)/tools 2>/dev/null || true
 	@# Remove build subdirectories but keep kernel.img
 	rm -rf $(BUILD_DIR)/busybox $(BUILD_DIR)/cli $(BUILD_DIR)/dash \
 	       $(BUILD_DIR)/image $(BUILD_DIR)/iptables $(BUILD_DIR)/logind \
 	       $(BUILD_DIR)/mgmtd $(BUILD_DIR)/modules $(BUILD_DIR)/rootfs \
-	       $(BUILD_DIR)/test $(BUILD_DIR)/u-boot $(BUILD_DIR)/firmware
+	       $(BUILD_DIR)/test $(BUILD_DIR)/tools $(BUILD_DIR)/u-boot \
+	       $(BUILD_DIR)/bpi-r4 $(BUILD_DIR)/bl2_emmc.img \
+	       $(BUILD_DIR)/firmware
 	@echo "Clean complete (kernel + source caches preserved)"
 
 help:

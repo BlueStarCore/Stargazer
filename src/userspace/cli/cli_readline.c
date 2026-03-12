@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -103,10 +104,22 @@ static int open_terminal(void)
 	return -1;
 }
 
+/*
+ * disable_raw() — leave raw mode but keep ECHO off.
+ *
+ * Between readline calls the CLI dispatches commands.  If we restored
+ * orig_termios (which has ECHO on), any keystrokes typed during command
+ * output would be echoed into the display.  Instead we switch to a
+ * "quiet" mode: OPOST on (so printf works), ECHO off (no stray input),
+ * ICANON off (don't buffer).  cli_term_cleanup() restores the true
+ * original settings on exit.
+ */
 static void disable_raw(void)
 {
 	if (raw_mode && tty_fd >= 0) {
-		tcsetattr(tty_fd, TCSANOW, &orig_termios);
+		struct termios quiet = orig_termios;
+		quiet.c_lflag &= ~(unsigned)(ECHO | ICANON);
+		tcsetattr(tty_fd, TCSANOW, &quiet);
 		raw_mode = 0;
 	}
 }
@@ -247,6 +260,10 @@ int cli_term_init(void)
 	if (tty_fd < 0)
 		return -1;
 
+	/* Discard any input typed before CLI was ready (during boot/login).
+	 * Without this, stale keystrokes echo into the first prompt. */
+	tcflush(tty_fd, TCIFLUSH);
+
 	current_comps.count = 0;
 	stack_depth = 0;
 	return 0;
@@ -254,8 +271,9 @@ int cli_term_init(void)
 
 void cli_term_cleanup(void)
 {
-	disable_raw();
+	/* Restore true original terminal settings (with ECHO) on exit */
 	if (tty_fd >= 0) {
+		tcsetattr(tty_fd, TCSANOW, &orig_termios);
 		close(tty_fd);
 		tty_fd = -1;
 	}
@@ -329,27 +347,203 @@ void cli_print_help(void)
 	printf("\n  Press Tab for completion, ? for context help.\n\n");
 }
 
-/* ── Redraw ───────────────────────────────────────────────────────────── */
+/* ── Terminal dimensions ───────────────────────────────────────────────── */
 
-static void redraw_at(const char *prompt, const char *buf, int cursor)
+static int get_term_cols(void)
 {
-	int len = (int)strlen(buf);
-
-	/* Move to start, clear line, write prompt + buffer */
-	tty_write(tty_fd, "\r\033[K", 4);
-	tty_write(tty_fd, prompt, strlen(prompt));
-	tty_write(tty_fd, buf, (size_t)len);
-	/* Move cursor back if not at end */
-	if (cursor < len) {
-		char esc[16];
-		int n = snprintf(esc, sizeof(esc), "\033[%dD", len - cursor);
-		tty_write(tty_fd, esc, (size_t)n);
-	}
+	struct winsize ws;
+	if (tty_fd >= 0 && ioctl(tty_fd, TIOCGWINSZ, &ws) == 0 &&
+	    ws.ws_col > 0)
+		return ws.ws_col;
+	return 80;
 }
 
-static void redraw(const char *prompt, const char *buf)
+/* ── Redraw ───────────────────────────────────────────────────────────── */
+
+/*
+ * Track which terminal row the cursor sits on (0-based, relative to
+ * the start of the prompt).  Needed so full-redraw can move the
+ * terminal cursor back to row 0 before clearing + rewriting.
+ */
+static int rl_cursor_row;
+
+/*
+ * Full redraw: moves to the start of the prompt, clears everything
+ * below (multi-row safe), writes prompt + full buffer, then positions
+ * the cursor at the requested offset.  The terminal wraps naturally
+ * when content exceeds the width — no horizontal scrolling.
+ *
+ * All output is batched into one write() to avoid flicker on serial.
+ */
+static void redraw_at(const char *prompt, const char *buf, int cursor)
 {
-	redraw_at(prompt, buf, (int)strlen(buf));
+	int cols = get_term_cols();
+	int plen = (int)strlen(prompt);
+	int blen = (int)strlen(buf);
+
+	char out[CLI_MAX_LINE + CLI_MAX_LINE + 128];
+	int o = 0;
+
+	/* Step 1: move to the first row of our content */
+	if (rl_cursor_row > 0)
+		o += snprintf(out + o, sizeof(out) - (size_t)o,
+			      "\033[%dA", rl_cursor_row);
+	out[o++] = '\r';
+
+	/* Step 2: clear from here to end of screen (all wrapped rows) */
+	memcpy(out + o, "\033[J", 3);
+	o += 3;
+
+	/* Step 3: write prompt + buffer (terminal wraps naturally) */
+	memcpy(out + o, prompt, (size_t)plen);
+	o += plen;
+	if (blen > 0) {
+		memcpy(out + o, buf, (size_t)blen);
+		o += blen;
+	}
+
+	/* Step 4: position cursor at the requested offset.
+	 * After writing, cursor is at char position (plen + blen).
+	 * We want it at (plen + cursor). */
+	int end_abs  = plen + blen;
+	int end_row  = cols > 0 ? end_abs / cols : 0;
+	int want_abs = plen + cursor;
+	int want_row = cols > 0 ? want_abs / cols : 0;
+	int want_col = cols > 0 ? want_abs % cols : 0;
+
+	if (end_row > want_row)
+		o += snprintf(out + o, sizeof(out) - (size_t)o,
+			      "\033[%dA", end_row - want_row);
+	/* Set column absolutely (1-based) */
+	o += snprintf(out + o, sizeof(out) - (size_t)o,
+		      "\033[%dG", want_col + 1);
+
+	tty_write(tty_fd, out, (size_t)o);
+	rl_cursor_row = want_row;
+}
+
+
+/*
+ * Redraw buffer only — keeps the prompt on screen.
+ * Moves cursor to the start of the buffer (right after prompt),
+ * clears everything after, writes the new buffer, positions cursor.
+ * Used for history up/down, tab completion, ctrl-u.
+ */
+static void redraw_buf(const char *prompt, const char *buf, int cursor)
+{
+	int cols = get_term_cols();
+	int plen = (int)strlen(prompt);
+	int blen = (int)strlen(buf);
+
+	/* Where the buffer starts (right after prompt) */
+	int buf_start_row = cols > 0 ? plen / cols : 0;
+	int buf_start_col = cols > 0 ? plen % cols : 0;
+
+	char out[CLI_MAX_LINE + 128];
+	int o = 0;
+
+	/* Move cursor to buffer start position */
+	if (rl_cursor_row > buf_start_row)
+		o += snprintf(out + o, sizeof(out) - (size_t)o,
+			      "\033[%dA", rl_cursor_row - buf_start_row);
+	else if (rl_cursor_row < buf_start_row)
+		o += snprintf(out + o, sizeof(out) - (size_t)o,
+			      "\033[%dB", buf_start_row - rl_cursor_row);
+	o += snprintf(out + o, sizeof(out) - (size_t)o,
+		      "\033[%dG", buf_start_col + 1);
+
+	/* Clear from here to end of screen */
+	memcpy(out + o, "\033[J", 3);
+	o += 3;
+
+	/* Write buffer */
+	if (blen > 0) {
+		memcpy(out + o, buf, (size_t)blen);
+		o += blen;
+	}
+
+	/* Position cursor */
+	int end_abs  = plen + blen;
+	int end_row  = cols > 0 ? end_abs / cols : 0;
+	int want_abs = plen + cursor;
+	int want_row = cols > 0 ? want_abs / cols : 0;
+	int want_col = cols > 0 ? want_abs % cols : 0;
+
+	if (end_row > want_row)
+		o += snprintf(out + o, sizeof(out) - (size_t)o,
+			      "\033[%dA", end_row - want_row);
+	o += snprintf(out + o, sizeof(out) - (size_t)o,
+		      "\033[%dG", want_col + 1);
+
+	tty_write(tty_fd, out, (size_t)o);
+	rl_cursor_row = want_row;
+}
+
+/*
+ * Redraw from a given buffer position to end of buffer.
+ *
+ * @from:   buffer offset where rewriting starts (clear + rewrite)
+ * @cursor: buffer offset where the terminal cursor should end up
+ *
+ * Positions the terminal cursor at @from (using absolute escapes,
+ * so callers don't need to pre-position), clears to end of screen,
+ * writes buf[from..blen-1], then positions cursor at @cursor.
+ *
+ * Used for delete/backspace/insert in the middle of the line.
+ * For delete/backspace: from == cursor (both at the deletion point).
+ * For insert-in-middle: from = cursor - inserted_len (start at the
+ * inserted text), cursor = after the inserted text.
+ */
+static void redraw_from(const char *prompt, const char *buf,
+			int from, int cursor)
+{
+	int cols = get_term_cols();
+	int plen = (int)strlen(prompt);
+	int blen = (int)strlen(buf);
+	int tail = blen - from;
+
+	char out[CLI_MAX_LINE + 128];
+	int o = 0;
+
+	/* Step 1: move terminal cursor to the 'from' position */
+	int from_abs = plen + from;
+	int from_row = cols > 0 ? from_abs / cols : 0;
+	int from_col = cols > 0 ? from_abs % cols : 0;
+
+	if (rl_cursor_row > from_row)
+		o += snprintf(out + o, sizeof(out) - (size_t)o,
+			      "\033[%dA", rl_cursor_row - from_row);
+	else if (rl_cursor_row < from_row)
+		o += snprintf(out + o, sizeof(out) - (size_t)o,
+			      "\033[%dB", from_row - rl_cursor_row);
+	o += snprintf(out + o, sizeof(out) - (size_t)o,
+		      "\033[%dG", from_col + 1);
+
+	/* Step 2: clear from here to end of screen */
+	memcpy(out + o, "\033[J", 3);
+	o += 3;
+
+	/* Step 3: write buffer from 'from' to end */
+	if (tail > 0) {
+		memcpy(out + o, buf + from, (size_t)tail);
+		o += tail;
+	}
+
+	/* Step 4: position cursor at 'cursor' */
+	int end_abs  = plen + blen;
+	int end_row  = cols > 0 ? end_abs / cols : 0;
+	int want_abs = plen + cursor;
+	int want_row = cols > 0 ? want_abs / cols : 0;
+	int want_col = cols > 0 ? want_abs % cols : 0;
+
+	if (end_row > want_row)
+		o += snprintf(out + o, sizeof(out) - (size_t)o,
+			      "\033[%dA", end_row - want_row);
+	o += snprintf(out + o, sizeof(out) - (size_t)o,
+		      "\033[%dG", want_col + 1);
+
+	tty_write(tty_fd, out, (size_t)o);
+	rl_cursor_row = want_row;
 }
 
 /* ── Word extraction (nth word from string) ───────────────────────────── */
@@ -917,6 +1111,13 @@ const char *cli_readline(const char *prompt)
 		paste_pos = paste_len = 0;
 	}
 
+	/* Discard any input typed during command execution.  ECHO is off
+	 * between readline calls so keystrokes aren't visible, but they
+	 * still accumulate in the kernel tty buffer.  Flush them before
+	 * switching to raw mode so they don't leak into the next command. */
+	if (paste_pos >= paste_len)
+		tcflush(tty_fd, TCIFLUSH);
+
 	if (enable_raw() != 0) {
 		/* Fallback: just read a line in cooked mode.
 		 * Arrow keys and history will NOT work. */
@@ -945,9 +1146,14 @@ const char *cli_readline(const char *prompt)
 		return line_buf;
 	}
 
+	rl_cursor_row = 0;
 	tty_write(tty_fd, prompt, strlen(prompt));
-	if (pos > 0)
+	if (pos > 0) {
 		tty_write(tty_fd, buf, (size_t)pos);
+		int cols = get_term_cols();
+		rl_cursor_row = cols > 0
+		    ? ((int)strlen(prompt) + pos) / cols : 0;
+	}
 
 	while (1) {
 		/* ── Idle callback with 5-second poll ────────────── */
@@ -1011,8 +1217,25 @@ const char *cli_readline(const char *prompt)
 			return line_buf;
 
 		case 1: /* Ctrl-A — move cursor to start of line */
-			cursor = 0;
-			redraw_at(prompt, buf, cursor);
+			if (cursor > 0) {
+				cursor = 0;
+				int cols = get_term_cols();
+				int plen = (int)strlen(prompt);
+				int wr = cols > 0 ? plen / cols : 0;
+				int wc = cols > 0 ? plen % cols : 0;
+				char esc[32];
+				int el = 0;
+				if (rl_cursor_row > wr)
+					el += snprintf(esc + el,
+						       sizeof(esc) - (size_t)el,
+						       "\033[%dA",
+						       rl_cursor_row - wr);
+				el += snprintf(esc + el,
+					       sizeof(esc) - (size_t)el,
+					       "\033[%dG", wc + 1);
+				tty_write(tty_fd, esc, (size_t)el);
+				rl_cursor_row = wr;
+			}
 			break;
 
 		case 4: /* Ctrl-D — EOF on empty line, delete char otherwise */
@@ -1031,13 +1254,30 @@ const char *cli_readline(const char *prompt)
 				memmove(buf + cursor, buf + next,
 					(size_t)(pos - next + 1));
 				pos -= (next - cursor);
-				redraw_at(prompt, buf, cursor);
+				redraw_from(prompt, buf, cursor, cursor);
 			}
 			break;
 
 		case 5: /* Ctrl-E — move cursor to end of line */
-			cursor = pos;
-			redraw_at(prompt, buf, cursor);
+			if (cursor < pos) {
+				cursor = pos;
+				int cols = get_term_cols();
+				int wa = (int)strlen(prompt) + pos;
+				int wr = cols > 0 ? wa / cols : 0;
+				int wc = cols > 0 ? wa % cols : 0;
+				char esc[32];
+				int el = 0;
+				if (wr > rl_cursor_row)
+					el += snprintf(esc + el,
+						       sizeof(esc) - (size_t)el,
+						       "\033[%dB",
+						       wr - rl_cursor_row);
+				el += snprintf(esc + el,
+					       sizeof(esc) - (size_t)el,
+					       "\033[%dG", wc + 1);
+				tty_write(tty_fd, esc, (size_t)el);
+				rl_cursor_row = wr;
+			}
 			break;
 
 		case 21: /* Ctrl-U — clear line */
@@ -1046,7 +1286,7 @@ const char *cli_readline(const char *prompt)
 			cursor = 0;
 			tab_count = 0;
 			tab_active = 0;
-			redraw(prompt, buf);
+			redraw_buf(prompt, buf, cursor);
 			break;
 
 		case 23: /* Ctrl-W — delete word before cursor */
@@ -1062,7 +1302,7 @@ const char *cli_readline(const char *prompt)
 			}
 			tab_count = 0;
 			tab_active = 0;
-			redraw_at(prompt, buf, cursor);
+			redraw_from(prompt, buf, cursor, cursor);
 			break;
 
 		case 27: { /* ESC sequence */
@@ -1090,7 +1330,7 @@ const char *cli_readline(const char *prompt)
 							 hist[hist_idx]);
 						pos = (int)strlen(buf);
 						cursor = pos;
-						redraw(prompt, buf);
+						redraw_buf(prompt, buf, cursor);
 					}
 					tab_count = 0;
 					tab_active = 0;
@@ -1111,33 +1351,106 @@ const char *cli_readline(const char *prompt)
 							pos = (int)strlen(buf);
 						}
 						cursor = pos;
-						redraw(prompt, buf);
+						redraw_buf(prompt, buf, cursor);
 					}
 					tab_count = 0;
 					tab_active = 0;
 				} else if (seq[1] == 'C') { /* Right */
 					if (cursor < pos) {
-						/* Skip UTF-8 continuation bytes */
+						int prev = cursor;
 						cursor++;
 						while (cursor < pos &&
 						       (buf[cursor] & 0xC0) == 0x80)
 							cursor++;
-						redraw_at(prompt, buf, cursor);
+						int cols = get_term_cols();
+						int pa = (int)strlen(prompt) + prev;
+						int na = (int)strlen(prompt) + cursor;
+						int pr2 = cols > 0 ? pa / cols : 0;
+						int nr = cols > 0 ? na / cols : 0;
+						if (nr == pr2) {
+							char esc[16];
+							int el = snprintf(esc, sizeof(esc),
+									  "\033[%dC",
+									  cursor - prev);
+							tty_write(tty_fd, esc, (size_t)el);
+						} else {
+							int nc = cols > 0 ? na % cols : 0;
+							char esc[32];
+							int el = snprintf(esc, sizeof(esc),
+									  "\033[B\033[%dG",
+									  nc + 1);
+							tty_write(tty_fd, esc, (size_t)el);
+						}
+						rl_cursor_row = nr;
 					}
 				} else if (seq[1] == 'D') { /* Left */
 					if (cursor > 0) {
+						int prev = cursor;
 						cursor--;
 						while (cursor > 0 &&
 						       (buf[cursor] & 0xC0) == 0x80)
 							cursor--;
-						redraw_at(prompt, buf, cursor);
+						int cols = get_term_cols();
+						int pa = (int)strlen(prompt) + prev;
+						int na = (int)strlen(prompt) + cursor;
+						int pr2 = cols > 0 ? pa / cols : 0;
+						int nr = cols > 0 ? na / cols : 0;
+						if (nr == pr2) {
+							char esc[16];
+							int el = snprintf(esc, sizeof(esc),
+									  "\033[%dD",
+									  prev - cursor);
+							tty_write(tty_fd, esc, (size_t)el);
+						} else {
+							int nc = cols > 0 ? na % cols : 0;
+							char esc[32];
+							int el = snprintf(esc, sizeof(esc),
+									  "\033[A\033[%dG",
+									  nc + 1);
+							tty_write(tty_fd, esc, (size_t)el);
+						}
+						rl_cursor_row = nr;
 					}
 				} else if (seq[1] == 'H') { /* Home */
-					cursor = 0;
-					redraw_at(prompt, buf, cursor);
+					if (cursor > 0) {
+						cursor = 0;
+						int cols = get_term_cols();
+						int plen = (int)strlen(prompt);
+						int wr = cols > 0 ? plen / cols : 0;
+						int wc = cols > 0 ? plen % cols : 0;
+						char esc[32];
+						int el = 0;
+						if (rl_cursor_row > wr)
+							el += snprintf(esc + el,
+								       sizeof(esc) - (size_t)el,
+								       "\033[%dA",
+								       rl_cursor_row - wr);
+						el += snprintf(esc + el,
+							       sizeof(esc) - (size_t)el,
+							       "\033[%dG", wc + 1);
+						tty_write(tty_fd, esc, (size_t)el);
+						rl_cursor_row = wr;
+					}
 				} else if (seq[1] == 'F') { /* End */
-					cursor = pos;
-					redraw_at(prompt, buf, cursor);
+					if (cursor < pos) {
+						cursor = pos;
+						int cols = get_term_cols();
+						int wa = (int)strlen(prompt) + pos;
+						int wr = cols > 0 ? wa / cols : 0;
+						int wc = cols > 0 ? wa % cols : 0;
+						char esc[32];
+						int el = 0;
+						if (wr > rl_cursor_row)
+							el += snprintf(esc + el,
+								       sizeof(esc) - (size_t)el,
+								       "\033[%dB",
+								       wr - rl_cursor_row);
+						el += snprintf(esc + el,
+							       sizeof(esc) - (size_t)el,
+							       "\033[%dG", wc + 1);
+						tty_write(tty_fd, esc, (size_t)el);
+						rl_cursor_row = wr;
+					}
 				} else if (seq[0] == '[' &&
 					   seq[1] == '3') {
 					/* Delete key: \033[3~ */
@@ -1152,8 +1465,8 @@ const char *cli_readline(const char *prompt)
 							buf + next,
 							(size_t)(pos - next + 1));
 						pos -= (next - cursor);
-						redraw_at(prompt, buf,
-							  cursor);
+						redraw_from(prompt, buf,
+							    cursor, cursor);
 					}
 				}
 			}
@@ -1172,7 +1485,30 @@ const char *cli_readline(const char *prompt)
 					(size_t)(pos - cursor + 1));
 				pos -= del_len;
 				cursor = prev;
-				redraw_at(prompt, buf, cursor);
+				if (cursor == pos && del_len == 1) {
+					/* Backspace at end, single byte:
+					 * just erase visually — no redraw */
+					int cols = get_term_cols();
+					int plen = (int)strlen(prompt);
+					int old_abs = plen + cursor + 1;
+					int new_abs = plen + cursor;
+					int old_row = cols > 0 ? old_abs / cols : 0;
+					int new_row = cols > 0 ? new_abs / cols : 0;
+					if (old_row == new_row) {
+						tty_write(tty_fd, "\b \b", 3);
+					} else {
+						/* Crossed row boundary upward */
+						int nc = cols > 0 ? new_abs % cols : 0;
+						char esc[32];
+						int el = snprintf(esc, sizeof(esc),
+								  "\033[A\033[%dG\033[K",
+								  nc + 1);
+						tty_write(tty_fd, esc, (size_t)el);
+					}
+					rl_cursor_row = new_row;
+				} else {
+					redraw_from(prompt, buf, cursor, cursor);
+				}
 			}
 			tab_count = 0;
 			tab_active = 0;
@@ -1197,7 +1533,7 @@ const char *cli_readline(const char *prompt)
 					 tab_matches[tab_idx]);
 				pos = (int)strlen(buf);
 				cursor = pos;
-				redraw(prompt, buf);
+				redraw_buf(prompt, buf, cursor);
 			}
 			break;
 		}
@@ -1205,7 +1541,10 @@ const char *cli_readline(const char *prompt)
 		case '?': /* Help */
 			tty_write(tty_fd, "\r\n", 2);
 			show_help(buf);
-			redraw(prompt, buf);
+			/* Help output scrolled the terminal — our row
+			 * tracking is invalid.  Reset before redraw. */
+			rl_cursor_row = 0;
+			redraw_at(prompt, buf, cursor);
 			tab_count = 0;
 			tab_active = 0;
 			break;
@@ -1245,7 +1584,24 @@ const char *cli_readline(const char *prompt)
 						       (size_t)got);
 						pos += got;
 						cursor += got;
-						redraw_at(prompt, buf, cursor);
+						if (cursor == pos) {
+							/* Append at end: just
+							 * echo — terminal
+							 * wraps naturally. */
+							tty_write(tty_fd, ins,
+								  (size_t)got);
+							int plen = (int)
+							    strlen(prompt);
+							int cols =
+							    get_term_cols();
+							rl_cursor_row = cols > 0
+							    ? (plen + cursor) / cols
+							    : 0;
+						} else {
+							redraw_from(prompt, buf,
+								    cursor - got,
+								    cursor);
+						}
 					}
 				}
 				tab_count = 0;

@@ -83,7 +83,7 @@ static int parse_cpu_samples(const char *data, struct cpu_sample *out, int max)
 	return count;
 }
 
-/* Parse thermal_zoneN=<millidegrees> lines from IPC response */
+/* Parse thermal_zoneN=<millidegrees> type=<name> lines from IPC response */
 static void print_thermal_from_response(const char *data)
 {
 	printf("  Temperatures:\n");
@@ -95,12 +95,58 @@ static void print_thermal_from_response(const char *data)
 			const char *eq = strchr(p, '=');
 			const char *nl = strchr(p, '\n');
 			if (eq) {
-				int zone = atoi(p + 12);
 				int tv = atoi(eq + 1);
-				printf("    thermal_zone%d : %d\u00b0C\n",
-				       zone, tv / 1000);
+				int deg = tv / 1000;
+				int frac = (tv % 1000) / 100;
+
+				/* Extract type= field */
+				char tname[48] = "sensor";
+				const char *tp = strstr(p, "type=");
+				if (tp && (!nl || tp < nl)) {
+					const char *tv2 = tp + 5;
+					int ti = 0;
+					while (*tv2 && *tv2 != ' ' && *tv2 != '\n' &&
+					       ti < (int)sizeof(tname) - 1)
+						tname[ti++] = *tv2++;
+					tname[ti] = '\0';
+				}
+
+				printf("    %-20s : %d.%d C\n",
+				       tname, deg, frac);
 				found = 1;
 			}
+			if (!nl) break;
+			p = nl + 1;
+			continue;
+		}
+		const char *nl = strchr(p, '\n');
+		if (!nl) break;
+		p = nl + 1;
+	}
+
+	/* hwmon sensors: "hwmon=<label> temp=<millidegrees>" */
+	p = data;
+	while (*p) {
+		if (strncmp(p, "hwmon=", 6) == 0) {
+			const char *nl = strchr(p, '\n');
+
+			char label[48] = "sensor";
+			const char *ls = p + 6;
+			int li = 0;
+			while (*ls && *ls != ' ' && *ls != '\n' &&
+			       li < (int)sizeof(label) - 1)
+				label[li++] = *ls++;
+			label[li] = '\0';
+
+			int tv = 0;
+			const char *tp = strstr(p, "temp=");
+			if (tp && (!nl || tp < nl))
+				tv = atoi(tp + 5);
+
+			printf("    %-20s : %d.%d C\n",
+			       label, tv / 1000, (tv % 1000) / 100);
+			found = 1;
+
 			if (!nl) break;
 			p = nl + 1;
 			continue;
@@ -122,7 +168,7 @@ void diag_show_cpu(void)
 	struct ipc_response r1 = {0};
 	if (ipc_send_str(SG_CMD_DIAG_CPU, "", &r1) != 0 ||
 	    r1.status != SG_OK || !r1.payload) {
-		printf("  (mgmtd unavailable)\n\n");
+		printf("  (service unavailable)\n\n");
 		ipc_resp_free(&r1);
 		return;
 	}
@@ -181,6 +227,20 @@ void diag_show_cpu(void)
 
 /* ── RAM ─────────────────────────────────────────────────────────────── */
 
+static long ram_parse(const char *payload, const char *key)
+{
+	const char *p = payload;
+	size_t klen = strlen(key);
+	while (*p) {
+		if (strncmp(p, key, klen) == 0 && p[klen] == '=')
+			return atol(p + klen + 1);
+		const char *nl = strchr(p, '\n');
+		if (!nl) break;
+		p = nl + 1;
+	}
+	return 0;
+}
+
 void diag_show_ram(void)
 {
 	printf("\n---RAM resources:\n");
@@ -188,22 +248,19 @@ void diag_show_ram(void)
 	struct ipc_response resp = {0};
 	if (ipc_send_str(SG_CMD_DIAG_RAM, "", &resp) != 0 ||
 	    resp.status != SG_OK || !resp.payload) {
-		printf("  (mgmtd unavailable)\n\n");
+		printf("  (service unavailable)\n\n");
 		ipc_resp_free(&resp);
 		return;
 	}
 
-	long mt = 0, ma = 0;
-	const char *p = resp.payload;
-	while (*p) {
-		if (strncmp(p, "MemTotal=", 9) == 0)
-			mt = atol(p + 9);
-		else if (strncmp(p, "MemAvailable=", 13) == 0)
-			ma = atol(p + 13);
-		const char *nl = strchr(p, '\n');
-		if (!nl) break;
-		p = nl + 1;
-	}
+	long mt     = ram_parse(resp.payload, "MemTotal");
+	long mf     = ram_parse(resp.payload, "MemFree");
+	long ma     = ram_parse(resp.payload, "MemAvailable");
+	long buf    = ram_parse(resp.payload, "Buffers");
+	long cached = ram_parse(resp.payload, "Cached");
+	long slab   = ram_parse(resp.payload, "Slab");
+	long st     = ram_parse(resp.payload, "SwapTotal");
+	long sf     = ram_parse(resp.payload, "SwapFree");
 	ipc_resp_free(&resp);
 
 	if (mt <= 0) {
@@ -212,45 +269,91 @@ void diag_show_ram(void)
 	}
 
 	long mu = mt - ma;
-	long pct_x100 = mt > 0 ? mu * 10000 / mt : 0;
-	printf("  Used: %ld.%02ld%% (%ld MiB / %ld MiB), Available: %ld MiB\n",
-	       pct_x100 / 100, pct_x100 % 100,
-	       mu / 1024, mt / 1024, ma / 1024);
+	long pct_x100 = mu * 10000 / mt;
+	printf("  Total:     %ld MiB\n", mt / 1024);
+	printf("  Used:      %ld MiB (%ld.%02ld%%)\n",
+	       mu / 1024, pct_x100 / 100, pct_x100 % 100);
+	printf("  Free:      %ld MiB\n", mf / 1024);
+	printf("  Available: %ld MiB\n", ma / 1024);
+	printf("  Buffers:   %ld MiB\n", buf / 1024);
+	printf("  Cached:    %ld MiB\n", cached / 1024);
+	printf("  Slab:      %ld MiB\n", slab / 1024);
+	if (st > 0) {
+		long su = st - sf;
+		printf("  Swap:      %ld / %ld MiB\n", su / 1024, st / 1024);
+	} else {
+		printf("  Swap:      disabled\n");
+	}
 	printf("\n");
 }
 
 /* ── Disk ────────────────────────────────────────────────────────────── */
 
-void diag_show_disk(void)
+static unsigned long disk_parse_val(const char *payload, const char *key)
 {
-	printf("\n---Disk resources:\n");
-
-	struct ipc_response resp = {0};
-	if (ipc_send_str(SG_CMD_DIAG_DISK, "", &resp) != 0 ||
-	    resp.status != SG_OK || !resp.payload) {
-		printf("  N/A (mgmtd unavailable)\n\n");
-		ipc_resp_free(&resp);
-		return;
-	}
-
-	unsigned long blocks = 0, bfree = 0, bavail = 0, frsize = 0;
-	const char *p = resp.payload;
+	const char *p = payload;
+	size_t klen = strlen(key);
 	while (*p) {
-		if (strncmp(p, "blocks=", 7) == 0)
-			blocks = strtoul(p + 7, NULL, 10);
-		else if (strncmp(p, "bfree=", 6) == 0)
-			bfree = strtoul(p + 6, NULL, 10);
-		else if (strncmp(p, "bavail=", 7) == 0)
-			bavail = strtoul(p + 7, NULL, 10);
-		else if (strncmp(p, "frsize=", 7) == 0)
-			frsize = strtoul(p + 7, NULL, 10);
+		if (strncmp(p, key, klen) == 0 && p[klen] == '=')
+			return strtoul(p + klen + 1, NULL, 10);
 		const char *nl = strchr(p, '\n');
 		if (!nl) break;
 		p = nl + 1;
 	}
-	ipc_resp_free(&resp);
+	return 0;
+}
 
-	(void)bfree; /* bfree is for root; bavail is for unprivileged */
+static unsigned long long disk_parse_ull(const char *payload, const char *key)
+{
+	const char *p = payload;
+	size_t klen = strlen(key);
+	while (*p) {
+		if (strncmp(p, key, klen) == 0 && p[klen] == '=')
+			return strtoull(p + klen + 1, NULL, 10);
+		const char *nl = strchr(p, '\n');
+		if (!nl) break;
+		p = nl + 1;
+	}
+	return 0;
+}
+
+static const char *disk_parse_str(const char *payload, const char *key,
+				  char *out, size_t out_sz)
+{
+	const char *p = payload;
+	size_t klen = strlen(key);
+	while (*p) {
+		if (strncmp(p, key, klen) == 0 && p[klen] == '=') {
+			const char *v = p + klen + 1;
+			const char *nl = strchr(v, '\n');
+			size_t vlen = nl ? (size_t)(nl - v) : strlen(v);
+			if (vlen >= out_sz) vlen = out_sz - 1;
+			memcpy(out, v, vlen);
+			out[vlen] = '\0';
+			return out;
+		}
+		const char *nl = strchr(p, '\n');
+		if (!nl) break;
+		p = nl + 1;
+	}
+	out[0] = '\0';
+	return out;
+}
+
+static void disk_print_part(const char *label, const char *payload,
+			    const char *prefix)
+{
+	char key[64];
+	snprintf(key, sizeof(key), "%s_blocks", prefix);
+	unsigned long blocks = disk_parse_val(payload, key);
+	if (blocks == 0) {
+		printf("  %-10s  not mounted\n", label);
+		return;
+	}
+	snprintf(key, sizeof(key), "%s_bavail", prefix);
+	unsigned long bavail = disk_parse_val(payload, key);
+	snprintf(key, sizeof(key), "%s_frsize", prefix);
+	unsigned long frsize = disk_parse_val(payload, key);
 
 	unsigned long long total = (unsigned long long)blocks * frsize;
 	unsigned long long avail = (unsigned long long)bavail * frsize;
@@ -263,9 +366,45 @@ void diag_show_disk(void)
 	unsigned long pct_x100 = total > 0
 		? (unsigned long)(used * 10000 / total) : 0;
 
-	printf("  Filesystem  Size: %llu MiB  Used: %llu MiB  Avail: %llu MiB  Use%%: %lu.%02lu%%\n",
-	       total_mb, used_mb, avail_mb,
+	printf("  %-10s  Size: %4llu MiB  Used: %4llu MiB  Avail: %4llu MiB  Use: %lu.%02lu%%\n",
+	       label, total_mb, used_mb, avail_mb,
 	       pct_x100 / 100, pct_x100 % 100);
+}
+
+void diag_show_disk(void)
+{
+	printf("\n---Disk resources:\n");
+
+	struct ipc_response resp = {0};
+	if (ipc_send_str(SG_CMD_DIAG_DISK, "", &resp) != 0 ||
+	    resp.status != SG_OK || !resp.payload) {
+		printf("  N/A (service unavailable)\n\n");
+		ipc_resp_free(&resp);
+		return;
+	}
+
+	/* eMMC overall */
+	char emmc_dev[32];
+	disk_parse_str(resp.payload, "emmc_dev", emmc_dev, sizeof(emmc_dev));
+	unsigned long long emmc_bytes = disk_parse_ull(resp.payload, "emmc_bytes");
+
+	if (emmc_bytes > 0) {
+		unsigned long long emmc_mb = emmc_bytes / (1024ULL * 1024);
+		unsigned long long emmc_gb = emmc_mb / 1024;
+		unsigned long long emmc_gb_frac = (emmc_mb % 1024) * 10 / 1024;
+		printf("  eMMC (%s): %llu.%llu GiB total\n",
+		       emmc_dev, emmc_gb, emmc_gb_frac);
+	} else {
+		printf("  eMMC: not detected\n");
+	}
+
+	printf("\n");
+
+	/* Per-partition usage */
+	disk_print_part("sgdata", resp.payload, "sgdata");
+	disk_print_part("sglogs", resp.payload, "sglogs");
+
+	ipc_resp_free(&resp);
 	printf("\n");
 }
 
@@ -323,6 +462,28 @@ static int parse_iface_samples(const char *data, struct iface_sample *out, int m
 	return count;
 }
 
+/* Extract a field value from within a single iface line */
+static const char *iface_field(const char *line, const char *line_end,
+			       const char *key, char *out, size_t out_sz)
+{
+	size_t klen = strlen(key);
+	const char *p = line;
+	while (p < line_end) {
+		if (strncmp(p, key, klen) == 0 && p[klen] == '=') {
+			const char *v = p + klen + 1;
+			int i = 0;
+			while (v < line_end && *v != ' ' && *v != '\n' &&
+			       i < (int)out_sz - 1)
+				out[i++] = *v++;
+			out[i] = '\0';
+			return out;
+		}
+		p++;
+	}
+	out[0] = '\0';
+	return out;
+}
+
 void diag_show_interface(void)
 {
 	printf("\n---Interface resources:\n");
@@ -331,7 +492,7 @@ void diag_show_interface(void)
 	struct ipc_response r1 = {0};
 	if (ipc_send_str(SG_CMD_DIAG_IFACE_STATS, "", &r1) != 0 ||
 	    r1.status != SG_OK || !r1.payload) {
-		printf("  (mgmtd unavailable)\n\n");
+		printf("  (service unavailable)\n\n");
 		ipc_resp_free(&r1);
 		return;
 	}
@@ -355,63 +516,80 @@ void diag_show_interface(void)
 	struct iface_sample s2[MAX_IFACES];
 	int n2 = parse_iface_samples(r2.payload, s2, MAX_IFACES);
 
-	printf("  Throughput (1s window):\n");
-	for (int i = 0; i < n1 && i < n2; i++) {
-		if (strcmp(s1[i].name, s2[i].name) != 0)
-			continue;
-		long long drx = (long long)(s2[i].rx_bytes - s1[i].rx_bytes);
-		long long dtx = (long long)(s2[i].tx_bytes - s1[i].tx_bytes);
-		if (drx < 0) drx = 0;
-		if (dtx < 0) dtx = 0;
-
-		long long rx_kbs_x100 = drx * 100 / 1024;
-		long long tx_kbs_x100 = dtx * 100 / 1024;
-
-		printf("    %-10s rx=%5lld.%02lld KB/s  tx=%5lld.%02lld KB/s\n",
-		       s1[i].name,
-		       rx_kbs_x100 / 100, rx_kbs_x100 % 100,
-		       tx_kbs_x100 / 100, tx_kbs_x100 % 100);
-	}
-
-	/* Link speed from latest response */
-	printf("  Link speed (best effort):\n");
-	{
-		const char *p = r2.payload;
-		while (*p) {
-			if (strncmp(p, "iface=", 6) == 0) {
-				const char *ns = p + 6;
-				const char *sp = ns;
-				while (*sp && *sp != ' ' && *sp != '\n') sp++;
-				char iname[32];
-				size_t nlen = (size_t)(sp - ns);
-				if (nlen >= sizeof(iname))
-					nlen = sizeof(iname) - 1;
-				memcpy(iname, ns, nlen);
-				iname[nlen] = '\0';
-
-				const char *spdp = strstr(p, "speed=");
-				const char *nl = strchr(p, '\n');
-				/* Only use speed= if it's on same line */
-				if (spdp && (!nl || spdp < nl)) {
-					char spd[32];
-					const char *sv = spdp + 6;
-					int si = 0;
-					while (*sv && *sv != ' ' && *sv != '\n' &&
-					       si < (int)sizeof(spd) - 1)
-						spd[si++] = *sv++;
-					spd[si] = '\0';
-					printf("    %s: speed=%sMbps\n", iname, spd);
-				} else {
-					printf("    %s: speed=unknownMbps\n", iname);
-				}
-			}
+	/* Print per-interface detail from latest response */
+	const char *p = r2.payload;
+	int iidx = 0;
+	while (*p) {
+		if (strncmp(p, "iface=", 6) != 0) {
 			const char *nl = strchr(p, '\n');
 			if (!nl) break;
 			p = nl + 1;
+			continue;
 		}
-	}
-	printf("\n");
 
+		const char *nl = strchr(p, '\n');
+		const char *line_end = nl ? nl : p + strlen(p);
+		char val[64];
+
+		/* Interface name */
+		iface_field(p, line_end, "iface", val, sizeof(val));
+		printf("\n  %s:\n", val);
+
+		/* State + MAC + Speed + MTU */
+		char state[16], mac[20], speed[16], mtu[8];
+		iface_field(p, line_end, "state", state, sizeof(state));
+		iface_field(p, line_end, "mac", mac, sizeof(mac));
+		iface_field(p, line_end, "speed", speed, sizeof(speed));
+		iface_field(p, line_end, "mtu", mtu, sizeof(mtu));
+
+		printf("    State: %-8s  MAC: %-18s  MTU: %s\n",
+		       state[0] ? state : "unknown",
+		       mac[0] ? mac : "N/A",
+		       mtu[0] ? mtu : "?");
+		if (speed[0] && strcmp(speed, "-1") != 0)
+			printf("    Speed: %s Mbps\n", speed);
+		else
+			printf("    Speed: no link\n");
+
+		/* Counters */
+		char rx_b[20], tx_b[20], rx_p[20], tx_p[20];
+		char rx_e[20], tx_e[20], rx_d[20], tx_d[20];
+		iface_field(p, line_end, "rx_bytes", rx_b, sizeof(rx_b));
+		iface_field(p, line_end, "tx_bytes", tx_b, sizeof(tx_b));
+		iface_field(p, line_end, "rx_pkts", rx_p, sizeof(rx_p));
+		iface_field(p, line_end, "tx_pkts", tx_p, sizeof(tx_p));
+		iface_field(p, line_end, "rx_errs", rx_e, sizeof(rx_e));
+		iface_field(p, line_end, "tx_errs", tx_e, sizeof(tx_e));
+		iface_field(p, line_end, "rx_drop", rx_d, sizeof(rx_d));
+		iface_field(p, line_end, "tx_drop", tx_d, sizeof(tx_d));
+
+		printf("    RX: %s bytes, %s pkts, %s errs, %s drops\n",
+		       rx_b[0] ? rx_b : "0", rx_p[0] ? rx_p : "0",
+		       rx_e[0] ? rx_e : "0", rx_d[0] ? rx_d : "0");
+		printf("    TX: %s bytes, %s pkts, %s errs, %s drops\n",
+		       tx_b[0] ? tx_b : "0", tx_p[0] ? tx_p : "0",
+		       tx_e[0] ? tx_e : "0", tx_d[0] ? tx_d : "0");
+
+		/* Throughput (1s delta) */
+		if (iidx < n1 && iidx < n2 &&
+		    strcmp(s1[iidx].name, s2[iidx].name) == 0) {
+			long long drx = (long long)(s2[iidx].rx_bytes - s1[iidx].rx_bytes);
+			long long dtx = (long long)(s2[iidx].tx_bytes - s1[iidx].tx_bytes);
+			if (drx < 0) drx = 0;
+			if (dtx < 0) dtx = 0;
+			long long rx_kbs_x100 = drx * 100 / 1024;
+			long long tx_kbs_x100 = dtx * 100 / 1024;
+			printf("    Throughput: rx=%lld.%02lld KB/s  tx=%lld.%02lld KB/s\n",
+			       rx_kbs_x100 / 100, rx_kbs_x100 % 100,
+			       tx_kbs_x100 / 100, tx_kbs_x100 % 100);
+		}
+
+		iidx++;
+		if (!nl) break;
+		p = nl + 1;
+	}
+
+	printf("\n");
 	ipc_resp_free(&r1);
 	ipc_resp_free(&r2);
 }
@@ -572,9 +750,7 @@ void diag_show_top(int interval, int max_procs)
 	if (interval < 1) interval = 1;
 	if (max_procs < 1) max_procs = 20;
 
-	long page_size_kb = sysconf(_SC_PAGESIZE);
-	if (page_size_kb <= 0) page_size_kb = 4096;
-	page_size_kb /= 1024;
+	/* RSS is now reported in kB directly from VmRSS (no page conversion) */
 
 	/* Enter raw tty mode for q/Ctrl+C detection */
 	ipc_install_interrupt_handler();
@@ -584,7 +760,7 @@ void diag_show_top(int interval, int max_procs)
 	if (ipc_send_str(SG_CMD_DIAG_PROCTOP, "", &r1) != 0 ||
 	    r1.status != SG_OK || !r1.payload) {
 		ipc_resp_free(&r1);
-		printf("  (mgmtd unavailable)\n");
+		printf("  (service unavailable)\n");
 		ipc_restore_interrupt_handler();
 		return;
 	}
@@ -642,7 +818,7 @@ void diag_show_top(int interval, int max_procs)
 			}
 
 			if (cur.mem_total_kb > 0 && cur.procs[i].rss > 0)
-				cur.procs[i].ram_bp = (unsigned long)(cur.procs[i].rss * page_size_kb * 10000 / cur.mem_total_kb);
+				cur.procs[i].ram_bp = (unsigned long)(cur.procs[i].rss * 10000 / cur.mem_total_kb);
 		}
 
 		/* Sort by CPU% descending */
@@ -685,7 +861,7 @@ void diag_show_top(int interval, int max_procs)
 		int show = cur.nprocs < max_procs ? cur.nprocs : max_procs;
 		for (int i = 0; i < show; i++) {
 			struct proc_info *pi = &cur.procs[i];
-			long rss_kib = pi->rss * page_size_kb;
+			long rss_kib = pi->rss;
 			printf("  %-7d %-20.20s   %c   %3lu.%02lu  %3lu.%02lu  %10ld\n",
 			       pi->pid, pi->comm, pi->state,
 			       pi->cpu_bp / 100, pi->cpu_bp % 100,

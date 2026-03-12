@@ -1539,9 +1539,9 @@ int cli_diagnose_test_permissions(int mode, const char *permissions,
 	printf("  =====================================\n\n");
 
 	if (!ipc_available()) {
-		printf(C_RED "  ERROR" C_NC ": mgmtd socket not found (%s)\n",
-		       SG_MGMTD_SOCK);
-		printf("  Is stargazer-mgmtd running?\n\n");
+		printf(C_RED "  ERROR" C_NC
+		       ": management service unavailable\n");
+		printf("  Is the management daemon running?\n\n");
 		return 1;
 	}
 

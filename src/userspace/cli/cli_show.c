@@ -35,7 +35,7 @@ static void show_ipc(uint32_t cmd, const char *payload_str,
 
 	if (header)
 		printf("  %s\n", header);
-	printf("  (mgmtd unavailable)\n");
+	printf("  (service unavailable)\n");
 }
 
 /* ── show status ──────────────────────────────────────────────────────── */
@@ -50,7 +50,7 @@ void show_status(void)
 		return;
 	}
 	ipc_resp_free(&resp);
-	printf("  (mgmtd unavailable — cannot show status)\n");
+	printf("  (service unavailable — cannot show status)\n");
 }
 
 /* ── show sessions ────────────────────────────────────────────────────── */
@@ -295,7 +295,7 @@ void show_config(void)
 			p = eol + 1;
 		}
 	} else {
-		printf("  (mgmtd unavailable — cannot show config)\n");
+		printf("  (service unavailable — cannot show config)\n");
 	}
 	ipc_resp_free(&resp);
 }

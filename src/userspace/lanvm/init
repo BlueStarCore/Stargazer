@@ -7,9 +7,9 @@
 # Gateway: 192.168.99.99 (Stargazer management IP)
 # DNS:     8.8.8.8
 #
-# Note: Stargazer assigns 192.168.99.99/24 to its first NIC on first boot.
+# Note: Stargazer assigns 192.168.99.99/24 to lan3 on first boot.
 #       In the test topology, assign this IP to the LAN-facing interface
-#       (eth1) via: configure system interface → edit eth1 → set ip 192.168.99.99/24
+#       via: configure system interface → edit lan3 → set ip 192.168.99.99/24
 #
 # =============================================================================
 

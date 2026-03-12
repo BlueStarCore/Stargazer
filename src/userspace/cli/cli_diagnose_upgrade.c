@@ -397,10 +397,9 @@ int cli_diagnose_test_upgrade(int mode, diag_result_t *out)
 	if (mode == 1) {
 		if (!ipc_available()) {
 			printf(C_RED "\n  ERROR" C_NC
-			       ": mgmtd socket not found (%s)\n",
-			       SG_MGMTD_SOCK);
+			       ": management service unavailable\n");
 			printf("  IPC tests skipped."
-			       " Start stargazer-mgmtd for full tests.\n");
+			       " Start the management daemon for full tests.\n");
 		} else {
 			test_upgrade_status_reachability();
 			test_upgrade_progress_idle();

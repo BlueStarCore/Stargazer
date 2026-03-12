@@ -25,6 +25,19 @@
 #include <string.h>
 #include <unistd.h>
 
+/* ── Error display helper ─────────────────────────────────────────────── */
+
+/*
+ * Print an IPC error with numeric status code for troubleshooting.
+ * Output: "  Error [501]: I/O error\n"
+ * The code lets engineers correlate with daemon journal entries.
+ */
+static void print_ipc_error(const char *prefix, const struct ipc_response *r)
+{
+	const char *msg = r->extra[0] ? r->extra : sg_status_str(r->status);
+	printf("  %s [%u]: %s\n", prefix, r->status, msg);
+}
+
 /* ── Thin handler wrappers ────────────────────────────────────────────── */
 
 static int cmd_help(const char *args, const char *permissions)
@@ -214,8 +227,7 @@ static int cmd_fw_upgrade(const char *args, const char *permissions)
 	}
 
 	if (resp.status != SG_OK) {
-		printf("  Firmware upgrade failed: %s\n",
-		       resp.extra[0] ? resp.extra : sg_status_str(resp.status));
+		print_ipc_error("Firmware upgrade failed", &resp);
 		ipc_resp_free(&resp);
 		return 0;
 	}
@@ -364,12 +376,18 @@ static int cmd_fw_upgrade(const char *args, const char *permissions)
 				printf("\n");
 			printf("\n  System is rebooting now...\n");
 			ipc_resp_free(&pr);
-			break;
+			/* Block until SIGTERM — prevent CLI from
+			 * returning to prompt before reboot. */
+			for (;;) pause();
 		}
 		if (strcmp(status, "error") == 0) {
 			if (have_inline)
 				printf("\n");
-			printf("\n  Firmware upgrade failed.\n");
+			if (message[0])
+				printf("\n  Firmware upgrade failed: %s\n",
+				       message);
+			else
+				printf("\n  Firmware upgrade failed.\n");
 			ipc_resp_free(&pr);
 			break;
 		}
@@ -404,8 +422,18 @@ static int cmd_sys_shutdown(const char *args, const char *permissions)
 	(void)args;
 	(void)permissions;
 	struct ipc_response resp;
-	printf("  System shutting down...\n");
-	ipc_send_str(SG_CMD_SYS_POWEROFF, "", &resp);
+	if (ipc_send_str(SG_CMD_SYS_POWEROFF, "", &resp) != 0) {
+		printf("  Error: could not contact management daemon.\n");
+	} else if (resp.status == SG_OK) {
+		printf("  System shutting down...\n");
+		ipc_resp_free(&resp);
+		/* Block until SIGTERM arrives — prevents the CLI from
+		 * returning to the prompt and printing "stargazer>" before
+		 * the shutdown script kills us. */
+		for (;;) pause();
+	} else {
+		print_ipc_error("Error", &resp);
+	}
 	ipc_resp_free(&resp);
 	return 0;
 }
@@ -415,8 +443,15 @@ static int cmd_sys_reboot(const char *args, const char *permissions)
 	(void)args;
 	(void)permissions;
 	struct ipc_response resp;
-	printf("  System rebooting...\n");
-	ipc_send_str(SG_CMD_SYS_REBOOT, "", &resp);
+	if (ipc_send_str(SG_CMD_SYS_REBOOT, "", &resp) != 0) {
+		printf("  Error: could not contact management daemon.\n");
+	} else if (resp.status == SG_OK) {
+		printf("  System rebooting...\n");
+		ipc_resp_free(&resp);
+		for (;;) pause();
+	} else {
+		print_ipc_error("Error", &resp);
+	}
 	ipc_resp_free(&resp);
 	return 0;
 }
@@ -577,8 +612,7 @@ static int cmd_diag_fw_policy(const char *args, const char *permissions)
 	}
 
 	if (resp.status != SG_OK) {
-		printf("  Failed: %s\n",
-		       resp.extra[0] ? resp.extra : sg_status_str(resp.status));
+		print_ipc_error("Failed", &resp);
 		ipc_resp_free(&resp);
 		return 0;
 	}
@@ -603,8 +637,7 @@ static int cmd_diag_fw_conntrack(const char *args, const char *permissions)
 	}
 
 	if (resp.status != SG_OK) {
-		printf("  Failed: %s\n",
-		       resp.extra[0] ? resp.extra : sg_status_str(resp.status));
+		print_ipc_error("Failed", &resp);
 		ipc_resp_free(&resp);
 		return 0;
 	}
@@ -631,8 +664,7 @@ static int cmd_diag_routes(const char *args, const char *permissions)
 	}
 
 	if (resp.status != SG_OK) {
-		printf("  Failed: %s\n",
-		       resp.extra[0] ? resp.extra : sg_status_str(resp.status));
+		print_ipc_error("Failed", &resp);
 		ipc_resp_free(&resp);
 		return 0;
 	}
@@ -710,8 +742,7 @@ static int cmd_nslookup(const char *args, const char *permissions)
 	}
 
 	if (resp.status != SG_OK) {
-		printf("  Nslookup failed: %s\n",
-		       resp.extra[0] ? resp.extra : sg_status_str(resp.status));
+		print_ipc_error("Nslookup failed", &resp);
 		ipc_resp_free(&resp);
 		return 0;
 	}

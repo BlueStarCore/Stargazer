@@ -270,10 +270,10 @@ int main(int argc, char *argv[])
 		if (ipc_roundtrip(SG_CMD_SESSION_TAG_NEW, user, 0,
 				  NULL, 0, &tag_resp, &tag_payload) < 0 ||
 		    tag_resp.status != SG_OK || !tag_payload) {
-			fprintf(stderr, "Error: cannot connect to mgmtd");
+			fprintf(stderr, "Error: cannot connect to management service");
 			if (tag_payload)
 				fprintf(stderr, " (%s)", tag_resp.extra);
-			fprintf(stderr, "\nIs stargazer-mgmtd running?\n");
+			fprintf(stderr, "\nIs the management daemon running?\n");
 			free(tag_payload);
 			free(payload);
 			return 1;
@@ -281,7 +281,7 @@ int main(int argc, char *argv[])
 		session_tag = strtoull(tag_payload, NULL, 10);
 		free(tag_payload);
 		if (session_tag == 0) {
-			fprintf(stderr, "Error: failed to acquire session tag\n");
+			fprintf(stderr, "Error: failed to acquire session\n");
 			free(payload);
 			return 1;
 		}
@@ -292,7 +292,7 @@ int main(int argc, char *argv[])
 	char *resp_payload = NULL;
 	if (ipc_roundtrip((uint32_t)cmd_id, user, session_tag,
 			  payload, payload_len, &resp, &resp_payload) < 0) {
-		fprintf(stderr, "Error: communication with mgmtd failed\n");
+		fprintf(stderr, "Error: communication with management service failed\n");
 		if (session_tag != 0)
 			release_tag(user, session_tag);
 		free(payload);

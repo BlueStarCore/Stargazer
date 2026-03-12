@@ -4,12 +4,12 @@
  *
  * Flow:
  *   Phase 1 (full root):
- *     1. Cache user data (getpwnam, initgroups)
- *     2. Open /dev/console for terminal
+ *     1. Cache user data (getpwnam — if user not found, still proceed)
+ *     2. initgroups (if user found), open /dev/console
  *   Phase 1.5:
  *     3. Install seccomp-bpf sandbox (logind_drop_privileges)
  *   Phase 2 (sandboxed, still root UID):
- *     4. Prompt for password
+ *     4. Prompt for password (always, even if user not in /etc/passwd)
  *     5. Authenticate via IPC to mgmtd (SG_CMD_AUTH_LOGIN)
  *     6. Handle forced password change via IPC (SG_CMD_AUTH_CHANGE_PW)
  *     7. Notify login success via IPC (SG_CMD_AUTH_LOGIN_OK)
@@ -408,7 +408,7 @@ static int logind_drop_privileges(void)
 
 	/* 1. Prevent privilege escalation */
 	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
-		fprintf(stderr, "logind: PR_SET_NO_NEW_PRIVS failed: %s\n",
+		fprintf(stderr, "logind: security hardening failed (step 1): %s\n",
 			strerror(errno));
 		return -1;
 	}
@@ -534,7 +534,7 @@ static int logind_drop_privileges(void)
 	};
 
 	if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0) {
-		fprintf(stderr, "logind: seccomp install failed: %s\n",
+		fprintf(stderr, "logind: process restriction failed (step 3): %s\n",
 			strerror(errno));
 		return -1;
 	}
@@ -563,27 +563,30 @@ int main(int argc, char *argv[])
 	 * getpwnam() reads /etc/passwd — must happen before seccomp
 	 * blocks openat(). Cache all fields since the returned pointer
 	 * is static and may be overwritten.
+	 *
+	 * If the user doesn't exist in /etc/passwd, we still proceed
+	 * to the password prompt so the attacker cannot distinguish
+	 * "user not found" from "bad password" by timing or behavior.
+	 * mgmtd's AUTH_LOGIN handles non-existent users with constant-
+	 * time crypt to prevent timing side-channels.
 	 */
 	struct passwd *pw = getpwnam(username);
-	if (!pw) {
-		/* Don't reveal whether username exists — same error as bad pw */
-		fprintf(stderr, "Invalid credentials\n");
-		return 1;
-	}
-	uid_t cached_uid = pw->pw_uid;
-	gid_t cached_gid = pw->pw_gid;
+	int user_found = (pw != NULL);
+	uid_t cached_uid = pw ? pw->pw_uid : 65534;
+	gid_t cached_gid = pw ? pw->pw_gid : 65534;
 	char cached_shell[256], cached_home[256];
 	snprintf(cached_shell, sizeof(cached_shell), "%s",
-		 (pw->pw_shell && pw->pw_shell[0]) ? pw->pw_shell : "/bin/sh");
+		 (pw && pw->pw_shell && pw->pw_shell[0])
+			? pw->pw_shell : "/bin/sh");
 	snprintf(cached_home, sizeof(cached_home), "%s",
-		 pw->pw_dir ? pw->pw_dir : "/");
+		 (pw && pw->pw_dir) ? pw->pw_dir : "/");
 
 	/*
 	 * initgroups() reads /etc/group — must happen before seccomp.
 	 * Setting supplementary groups as root is harmless; they only
-	 * take effect after setuid().
+	 * take effect after setuid(). Skip if user doesn't exist.
 	 */
-	if (initgroups(username, cached_gid) != 0)
+	if (user_found && initgroups(username, cached_gid) != 0)
 		perror("initgroups");
 
 	/*
@@ -594,7 +597,7 @@ int main(int argc, char *argv[])
 
 	/* ── Phase 1.5: Install seccomp sandbox ──────────────────────── */
 	if (logind_drop_privileges() != 0) {
-		fprintf(stderr, "stargazer-logind: sandbox install failed\n");
+		fprintf(stderr, "stargazer-logind: security initialization failed\n");
 		return 1;
 	}
 
@@ -640,6 +643,18 @@ int main(int argc, char *argv[])
 	if (status != SG_OK) {
 		/* Don't reveal whether it's bad password vs locked — same msg */
 		fprintf(stderr, "Invalid credentials\n");
+		free(resp_payload);
+		return 1;
+	}
+
+	/*
+	 * Defense-in-depth: if mgmtd authenticated a user that doesn't
+	 * exist in /etc/passwd, we cannot safely setuid/exec.  This
+	 * should never happen (mgmtd checks shadow which requires a
+	 * passwd entry), but catch it here rather than exec as nobody.
+	 */
+	if (!user_found) {
+		fprintf(stderr, "Internal error: user not in passwd\n");
 		free(resp_payload);
 		return 1;
 	}

@@ -9,6 +9,7 @@
 #include "mgmtd_apply.h"
 
 #include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -146,16 +147,66 @@ static int apply_allowaccess(const char *iface, const char *services)
 	return errors == 0 ? 0 : -1;
 }
 
+/* ── udhcpc lifecycle ───────────────────────────────────────────────── */
+
+/* Per-interface pidfile: /var/run/udhcpc.<iface>.pid */
+static void dhcpc_pidfile(const char *iface, char *buf, size_t sz)
+{
+	snprintf(buf, sz, "/var/run/udhcpc.%s.pid", iface);
+}
+
+/* Kill any running udhcpc for this interface via its pidfile */
+static void dhcpc_stop(const char *iface)
+{
+	char pf[128];
+	dhcpc_pidfile(iface, pf, sizeof(pf));
+
+	FILE *fp = fopen(pf, "r");
+	if (!fp)
+		return;
+	char line[32];
+	if (fgets(line, sizeof(line), fp)) {
+		pid_t pid = (pid_t)atoi(line);
+		if (pid > 1)
+			kill(pid, SIGTERM);
+	}
+	fclose(fp);
+	unlink(pf);
+	mgmt_log("INFO", "dhcpc: stopped on %s", iface);
+}
+
+/* Start a persistent udhcpc for this interface */
+static void dhcpc_start(const char *iface)
+{
+	char pf[128];
+	dhcpc_pidfile(iface, pf, sizeof(pf));
+
+	const char *argv[] = {
+		"udhcpc", "-i", iface,
+		"-p", pf,
+		"-s", "/usr/share/udhcpc/default.script",
+		"-b",	/* background after first attempt */
+		NULL
+	};
+	free(safe_exec(argv));
+	mgmt_log("INFO", "dhcpc: started on %s (pidfile %s)", iface, pf);
+}
+
 sg_status_t apply_interface(const char *id, const char *data,
 			    char *result, size_t rsize)
 {
-	char ip[VALBUFSZ], status[VALBUFSZ], mtu[VALBUFSZ], desc[VALBUFSZ];
-	char allowaccess[VALBUFSZ];
+	char mode[VALBUFSZ], ip[VALBUFSZ], status[VALBUFSZ];
+	char mtu[VALBUFSZ], desc[VALBUFSZ], allowaccess[VALBUFSZ];
+	extract_val(data, "mode", mode, sizeof(mode));
 	extract_val(data, "ip", ip, sizeof(ip));
 	extract_val(data, "status", status, sizeof(status));
 	extract_val(data, "mtu", mtu, sizeof(mtu));
 	extract_val(data, "description", desc, sizeof(desc));
 	extract_val(data, "allowaccess", allowaccess, sizeof(allowaccess));
+
+	/* Default mode to static if not set */
+	if (!mode[0])
+		snprintf(mode, sizeof(mode), "static");
 
 	/* Validate inputs */
 	if (!sg_is_iface_name(id)) {
@@ -167,7 +218,7 @@ sg_status_t apply_interface(const char *id, const char *data,
 			 "Interface '%s' not present, skipping.", id);
 		return SG_ERR_NOT_FOUND;
 	}
-	if (ip[0] && !sg_is_cidr(ip)) {
+	if (strcmp(mode, "static") == 0 && ip[0] && !sg_is_cidr(ip)) {
 		snprintf(result, rsize, "Invalid IP '%s'.", ip);
 		return SG_ERR_INVALID_VAL;
 	}
@@ -187,12 +238,10 @@ sg_status_t apply_interface(const char *id, const char *data,
 		return SG_ERR_INVALID_VAL;
 	}
 
-	if (ip[0]) {
-		const char *a1[] = {"ip", "addr", "flush", "dev", id, NULL};
-		free(safe_exec(a1));
-		const char *a2[] = {"ip", "addr", "add", ip, "dev", id, NULL};
-		free(safe_exec(a2));
-	}
+	/* Always stop existing udhcpc first — mode may have changed */
+	dhcpc_stop(id);
+
+	/* Link state */
 	if (strcmp(status, "up") == 0) {
 		const char *a[] = {"ip", "link", "set", id, "up", NULL};
 		free(safe_exec(a));
@@ -200,9 +249,31 @@ sg_status_t apply_interface(const char *id, const char *data,
 		const char *a[] = {"ip", "link", "set", id, "down", NULL};
 		free(safe_exec(a));
 	}
+
+	/* MTU */
 	if (mtu[0]) {
 		const char *a[] = {"ip", "link", "set", id, "mtu", mtu, NULL};
 		free(safe_exec(a));
+	}
+
+	/* Address: DHCP or static */
+	if (strcmp(mode, "dhcp") == 0) {
+		/* Flush any static IP before starting DHCP */
+		const char *a1[] = {"ip", "addr", "flush", "dev", id, NULL};
+		free(safe_exec(a1));
+		/* Start udhcpc if interface is up */
+		if (strcmp(status, "down") != 0)
+			dhcpc_start(id);
+	} else {
+		/* Static mode */
+		if (ip[0]) {
+			const char *a1[] = {"ip", "addr", "flush", "dev",
+					    id, NULL};
+			free(safe_exec(a1));
+			const char *a2[] = {"ip", "addr", "add", ip, "dev",
+					    id, NULL};
+			free(safe_exec(a2));
+		}
 	}
 
 	/* Apply allowaccess iptables rules */
@@ -213,6 +284,6 @@ sg_status_t apply_interface(const char *id, const char *data,
 		return SG_OK;  /* non-fatal: interface is configured */
 	}
 
-	snprintf(result, rsize, "Interface %s configured.", id);
+	snprintf(result, rsize, "Interface %s configured (%s).", id, mode);
 	return SG_OK;
 }

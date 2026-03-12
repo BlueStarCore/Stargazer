@@ -105,18 +105,68 @@ int handle_diag_cpu(int client_fd, const char *user,
 		}
 	}
 
-	/* Read thermal zones */
-	char path[128], tbuf[32];
+	/* Read thermal zones with type names */
+	char path[128], tbuf[32], ttype[64];
 	for (int z = 0; z < 16; z++) {
 		snprintf(path, sizeof(path),
 			 "/sys/class/thermal/thermal_zone%d/temp", z);
 		if (read_small_file(path, tbuf, sizeof(tbuf)) > 0) {
-			/* Trim newline */
 			size_t len = strlen(tbuf);
 			while (len > 0 && (tbuf[len-1] == '\n' || tbuf[len-1] == '\r'))
 				tbuf[--len] = '\0';
+
+			/* Read zone type for a meaningful label */
+			ttype[0] = '\0';
+			snprintf(path, sizeof(path),
+				 "/sys/class/thermal/thermal_zone%d/type", z);
+			if (read_small_file(path, ttype, sizeof(ttype)) > 0) {
+				len = strlen(ttype);
+				while (len > 0 && (ttype[len-1] == '\n' || ttype[len-1] == '\r'))
+					ttype[--len] = '\0';
+			}
+
 			buf_appendf(resp, sizeof(resp), &pos,
-				    "thermal_zone%d=%s\n", z, tbuf);
+				    "thermal_zone%d=%s type=%s\n",
+				    z, tbuf, ttype[0] ? ttype : "unknown");
+		}
+	}
+
+	/* hwmon sensors (chips not exposed as thermal_zone) */
+	for (int hw = 0; hw < 16; hw++) {
+		char hpath[128], hname[64];
+		snprintf(hpath, sizeof(hpath),
+			 "/sys/class/hwmon/hwmon%d/name", hw);
+		if (read_small_file(hpath, hname, sizeof(hname)) <= 0)
+			continue;
+		size_t hlen = strlen(hname);
+		while (hlen > 0 && (hname[hlen-1] == '\n' || hname[hlen-1] == '\r'))
+			hname[--hlen] = '\0';
+
+		for (int ti = 1; ti <= 8; ti++) {
+			char tpath[128];
+			snprintf(tpath, sizeof(tpath),
+				 "/sys/class/hwmon/hwmon%d/temp%d_input", hw, ti);
+			if (read_small_file(tpath, tbuf, sizeof(tbuf)) <= 0)
+				break;
+			size_t tlen = strlen(tbuf);
+			while (tlen > 0 && (tbuf[tlen-1] == '\n' || tbuf[tlen-1] == '\r'))
+				tbuf[--tlen] = '\0';
+
+			/* Label if available, else use chip name */
+			char tlabel[64];
+			snprintf(tpath, sizeof(tpath),
+				 "/sys/class/hwmon/hwmon%d/temp%d_label", hw, ti);
+			if (read_small_file(tpath, tlabel, sizeof(tlabel)) > 0) {
+				tlen = strlen(tlabel);
+				while (tlen > 0 && (tlabel[tlen-1] == '\n' || tlabel[tlen-1] == '\r'))
+					tlabel[--tlen] = '\0';
+			} else {
+				snprintf(tlabel, sizeof(tlabel), "%.50s-temp%d",
+					 hname, ti);
+			}
+
+			buf_appendf(resp, sizeof(resp), &pos,
+				    "hwmon=%s temp=%s\n", tlabel, tbuf);
 		}
 	}
 
@@ -140,26 +190,44 @@ int handle_diag_ram(int client_fd, const char *user,
 
 	char meminfo[2048];
 	if (read_small_file("/proc/meminfo", meminfo, sizeof(meminfo)) < 0) {
+		mgmt_log("ERROR", "diag_ram: cannot read /proc/meminfo: %s",
+			 strerror(errno));
 		send_error(client_fd, SG_ERR_IO_FAIL,
-			   "cannot read /proc/meminfo");
+			   "cannot read memory information");
 		return 0;
 	}
 
-	long mt = 0, ma = 0;
+	long mt = 0, mf = 0, ma = 0, buf = 0, cached = 0, slab = 0;
+	long st = 0, sf = 0;
 	const char *p = meminfo;
 	while (*p) {
 		if (strncmp(p, "MemTotal:", 9) == 0)
 			mt = atol(p + 9);
+		else if (strncmp(p, "MemFree:", 8) == 0)
+			mf = atol(p + 8);
 		else if (strncmp(p, "MemAvailable:", 13) == 0)
 			ma = atol(p + 13);
+		else if (strncmp(p, "Buffers:", 8) == 0)
+			buf = atol(p + 8);
+		else if (strncmp(p, "Cached:", 7) == 0)
+			cached = atol(p + 7);
+		else if (strncmp(p, "Slab:", 5) == 0)
+			slab = atol(p + 5);
+		else if (strncmp(p, "SwapTotal:", 10) == 0)
+			st = atol(p + 10);
+		else if (strncmp(p, "SwapFree:", 9) == 0)
+			sf = atol(p + 9);
 		const char *nl = strchr(p, '\n');
 		if (!nl) break;
 		p = nl + 1;
 	}
 
-	char resp[256];
-	snprintf(resp, sizeof(resp), "MemTotal=%ld\nMemAvailable=%ld\n",
-		 mt, ma);
+	char resp[512];
+	snprintf(resp, sizeof(resp),
+		 "MemTotal=%ld\nMemFree=%ld\nMemAvailable=%ld\n"
+		 "Buffers=%ld\nCached=%ld\nSlab=%ld\n"
+		 "SwapTotal=%ld\nSwapFree=%ld\n",
+		 mt, mf, ma, buf, cached, slab, st, sf);
 	send_ok(client_fd, NULL, resp);
 	return 0;
 }
@@ -178,19 +246,69 @@ int handle_diag_disk(int client_fd, const char *user,
 		return 0;
 	}
 
+	char resp[1024];
+	size_t pos = 0;
+
+	/* eMMC total size from sysfs (512-byte sectors) */
+	unsigned long long emmc_bytes = 0;
+	const char *blk_paths[] = {
+		"/sys/block/mmcblk0/size",
+		"/sys/block/mmcblk1/size",
+		NULL
+	};
+	const char *emmc_dev = "none";
+	for (int i = 0; blk_paths[i]; i++) {
+		char sbuf[64];
+		if (read_small_file(blk_paths[i], sbuf, sizeof(sbuf)) > 0) {
+			emmc_bytes = strtoull(sbuf, NULL, 10) * 512ULL;
+			/* Extract device name from path */
+			emmc_dev = (i == 0) ? "/dev/mmcblk0" : "/dev/mmcblk1";
+			break;
+		}
+	}
+	int n = snprintf(resp + pos, sizeof(resp) - pos,
+			 "emmc_dev=%s\nemmc_bytes=%llu\n",
+			 emmc_dev, emmc_bytes);
+	if (n > 0) pos += (size_t)n;
+
+	/* sgdata partition: /etc/stargazer */
 	struct statvfs sv;
-	if (statvfs("/", &sv) != 0) {
-		send_error(client_fd, SG_ERR_IO_FAIL, "statvfs failed");
-		return 0;
+	if (statvfs("/etc/stargazer", &sv) == 0) {
+		n = snprintf(resp + pos, sizeof(resp) - pos,
+			     "sgdata_blocks=%lu\nsgdata_bfree=%lu\n"
+			     "sgdata_bavail=%lu\nsgdata_frsize=%lu\n",
+			     (unsigned long)sv.f_blocks,
+			     (unsigned long)sv.f_bfree,
+			     (unsigned long)sv.f_bavail,
+			     (unsigned long)sv.f_frsize);
+		if (n > 0) pos += (size_t)n;
+	} else {
+		n = snprintf(resp + pos, sizeof(resp) - pos,
+			     "sgdata_blocks=0\n");
+		if (n > 0) pos += (size_t)n;
 	}
 
-	char resp[256];
-	snprintf(resp, sizeof(resp),
-		 "blocks=%lu\nbfree=%lu\nbavail=%lu\nfrsize=%lu\n",
-		 (unsigned long)sv.f_blocks,
-		 (unsigned long)sv.f_bfree,
-		 (unsigned long)sv.f_bavail,
-		 (unsigned long)sv.f_frsize);
+	/* sglogs partition: /etc/stargazer/logs */
+	if (statvfs("/etc/stargazer/logs", &sv) == 0) {
+		/* Only report if it's a different device than sgdata */
+		struct statvfs sv2;
+		int different = 1;
+		if (statvfs("/etc/stargazer", &sv2) == 0 &&
+		    sv.f_blocks == sv2.f_blocks &&
+		    sv.f_frsize == sv2.f_frsize)
+			different = 0;
+		if (different) {
+			n = snprintf(resp + pos, sizeof(resp) - pos,
+				     "sglogs_blocks=%lu\nsglogs_bfree=%lu\n"
+				     "sglogs_bavail=%lu\nsglogs_frsize=%lu\n",
+				     (unsigned long)sv.f_blocks,
+				     (unsigned long)sv.f_bfree,
+				     (unsigned long)sv.f_bavail,
+				     (unsigned long)sv.f_frsize);
+			if (n > 0) pos += (size_t)n;
+		}
+	}
+
 	send_ok(client_fd, NULL, resp);
 	return 0;
 }
@@ -240,33 +358,77 @@ int handle_diag_iface_stats(int client_fd, const char *user,
 
 					/* Skip lo */
 					if (strcmp(iname, "lo") != 0) {
-						/* Parse rx_bytes (field 1) and tx_bytes (field 9) */
+						/* /proc/net/dev fields after colon:
+						 * rx: bytes packets errs drop fifo frame compressed multicast
+						 * tx: bytes packets errs drop fifo colls carrier compressed */
 						const char *fp = colon + 1;
 						while (*fp == ' ') fp++;
-						unsigned long long rx = strtoull(fp, NULL, 10);
-
-						for (int f = 0; f < 8; f++) {
+						unsigned long long rx_bytes = strtoull(fp, NULL, 10);
+						unsigned long long vals[16];
+						vals[0] = rx_bytes;
+						for (int f = 1; f < 16; f++) {
 							while (*fp && *fp != ' ' && *fp != '\n') fp++;
 							while (*fp == ' ') fp++;
+							vals[f] = strtoull(fp, NULL, 10);
 						}
-						unsigned long long tx = strtoull(fp, NULL, 10);
+						/* vals: 0=rx_bytes 1=rx_pkts 2=rx_errs 3=rx_drop
+						 *       8=tx_bytes 9=tx_pkts 10=tx_errs 11=tx_drop */
 
 						buf_appendf(resp, sizeof(resp), &pos,
-							    "iface=%s rx_bytes=%llu tx_bytes=%llu",
-							    iname, rx, tx);
+							    "iface=%s rx_bytes=%llu tx_bytes=%llu"
+							    " rx_pkts=%llu tx_pkts=%llu"
+							    " rx_errs=%llu tx_errs=%llu"
+							    " rx_drop=%llu tx_drop=%llu",
+							    iname, vals[0], vals[8],
+							    vals[1], vals[9],
+							    vals[2], vals[10],
+							    vals[3], vals[11]);
 
 						/* Link speed */
-						char spath[128], spd[32];
+						char spath[128], sbuf[64];
 						snprintf(spath, sizeof(spath),
-							 "/sys/class/net/%s/speed",
-							 iname);
-						if (read_small_file(spath, spd, sizeof(spd)) > 0) {
-							size_t slen = strlen(spd);
-							while (slen > 0 && (spd[slen-1] == '\n' || spd[slen-1] == '\r'))
-								spd[--slen] = '\0';
+							 "/sys/class/net/%s/speed", iname);
+						if (read_small_file(spath, sbuf, sizeof(sbuf)) > 0) {
+							size_t slen = strlen(sbuf);
+							while (slen > 0 && (sbuf[slen-1] == '\n' || sbuf[slen-1] == '\r'))
+								sbuf[--slen] = '\0';
 							buf_appendf(resp, sizeof(resp), &pos,
-								    " speed=%s", spd);
+								    " speed=%s", sbuf);
 						}
+
+						/* Operstate (up/down) */
+						snprintf(spath, sizeof(spath),
+							 "/sys/class/net/%s/operstate", iname);
+						if (read_small_file(spath, sbuf, sizeof(sbuf)) > 0) {
+							size_t slen = strlen(sbuf);
+							while (slen > 0 && (sbuf[slen-1] == '\n' || sbuf[slen-1] == '\r'))
+								sbuf[--slen] = '\0';
+							buf_appendf(resp, sizeof(resp), &pos,
+								    " state=%s", sbuf);
+						}
+
+						/* MAC address */
+						snprintf(spath, sizeof(spath),
+							 "/sys/class/net/%s/address", iname);
+						if (read_small_file(spath, sbuf, sizeof(sbuf)) > 0) {
+							size_t slen = strlen(sbuf);
+							while (slen > 0 && (sbuf[slen-1] == '\n' || sbuf[slen-1] == '\r'))
+								sbuf[--slen] = '\0';
+							buf_appendf(resp, sizeof(resp), &pos,
+								    " mac=%s", sbuf);
+						}
+
+						/* MTU */
+						snprintf(spath, sizeof(spath),
+							 "/sys/class/net/%s/mtu", iname);
+						if (read_small_file(spath, sbuf, sizeof(sbuf)) > 0) {
+							size_t slen = strlen(sbuf);
+							while (slen > 0 && (sbuf[slen-1] == '\n' || sbuf[slen-1] == '\r'))
+								sbuf[--slen] = '\0';
+							buf_appendf(resp, sizeof(resp), &pos,
+								    " mtu=%s", sbuf);
+						}
+
 						buf_appendf(resp, sizeof(resp), &pos, "\n");
 					}
 				}
@@ -390,14 +552,29 @@ int handle_diag_proctop(int client_fd, const char *user,
 				while (*pp == ' ') pp++;
 			}
 			unsigned long vsize = strtoul(pp, NULL, 10);
-			while (*pp && *pp != ' ') pp++;
-			while (*pp == ' ') pp++;
-			long rss = strtol(pp, NULL, 10);
+
+			/* Read VmRSS from /proc/<pid>/status (in kB).
+			 * This is more reliable than field 24 of
+			 * /proc/<pid>/stat (pages) which requires
+			 * knowing the page size. */
+			long rss_kb = 0;
+			{
+				char spath[280], sbuf[2048];
+				snprintf(spath, sizeof(spath),
+					 "/proc/%s/status", ent->d_name);
+				if (read_small_file(spath, sbuf,
+						    sizeof(sbuf)) > 0) {
+					const char *vr = strstr(sbuf,
+							"VmRSS:");
+					if (vr)
+						rss_kb = atol(vr + 6);
+				}
+			}
 
 			buf_appendf(resp, sizeof(resp), &pos,
 				    "proc=%d %s %c %lu %lu %lu %ld\n",
 				    pid, comm, state,
-				    utime, stime, vsize, rss);
+				    utime, stime, vsize, rss_kb);
 
 			/* Check remaining space */
 			if (pos >= sizeof(resp) - 200)

@@ -205,6 +205,10 @@ auth_is_locked() {
 # ── Ctrl+C resets to fresh login prompt (no process restart) ──
 _login_interrupted=0
 trap '_login_interrupted=1' INT
+# ── SIGTERM = system shutdown/reboot: exit silently ──
+trap 'exit 0' TERM
+# PID file so the shutdown script can kill this shell first
+echo $$ > /tmp/stargazer-login.pid
 
 while true; do
 	# ── Clean ALL login context at start of each iteration ──
