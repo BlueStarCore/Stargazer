@@ -2387,6 +2387,89 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			delete_system_user(db_id);
 		}
 
+		/* Unapply runtime state before removing from DB.
+		 * Config SET takes effect immediately via apply_config();
+		 * deletion must also take effect immediately. */
+		if (strcmp(db_type, "network_route_static") == 0) {
+			char *data = sg_db_get(db_type, db_id);
+			if (data) {
+				char dst[VALBUFSZ], gw[VALBUFSZ];
+				char dev[VALBUFSZ], dist[VALBUFSZ];
+				extract_val(data, "dst", dst, sizeof(dst));
+				extract_val(data, "gateway", gw, sizeof(gw));
+				extract_val(data, "device", dev, sizeof(dev));
+				extract_val(data, "distance", dist, sizeof(dist));
+				if (dst[0] && sg_is_cidr(dst)) {
+					const char *argv[14];
+					int ac = 0;
+					argv[ac++] = "ip";
+					argv[ac++] = "route";
+					argv[ac++] = "del";
+					argv[ac++] = dst;
+					if (gw[0])   { argv[ac++] = "via";
+						       argv[ac++] = gw; }
+					if (dev[0])  { argv[ac++] = "dev";
+						       argv[ac++] = dev; }
+					if (dist[0]) { argv[ac++] = "metric";
+						       argv[ac++] = dist; }
+					argv[ac] = NULL;
+					free(safe_exec(argv));
+				}
+				free(data);
+			}
+		} else if (strcmp(db_type, "network_nat") == 0) {
+			char *data = sg_db_get(db_type, db_id);
+			if (data) {
+				char nattype[VALBUFSZ], srcintf[VALBUFSZ];
+				char dstport[VALBUFSZ], mapped_ip[VALBUFSZ];
+				char mapped_port[VALBUFSZ];
+				extract_val(data, "type", nattype,
+					    sizeof(nattype));
+				extract_val(data, "srcintf", srcintf,
+					    sizeof(srcintf));
+				extract_val(data, "dstport", dstport,
+					    sizeof(dstport));
+				extract_val(data, "mapped-ip", mapped_ip,
+					    sizeof(mapped_ip));
+				extract_val(data, "mapped-port", mapped_port,
+					    sizeof(mapped_port));
+
+				if (strcmp(nattype, "snat") == 0 &&
+				    srcintf[0]) {
+					const char *a[] = {
+						"iptables", "-t", "nat",
+						"-D", "POSTROUTING",
+						"-o", srcintf,
+						"-j", "MASQUERADE", NULL};
+					free(safe_exec(a));
+				} else if (strcmp(nattype, "dnat") == 0 &&
+					   dstport[0] && mapped_ip[0]) {
+					char tgt[VALBUFSZ * 2 + 4];
+					if (mapped_port[0])
+						snprintf(tgt, sizeof(tgt),
+							 "%s:%s", mapped_ip,
+							 mapped_port);
+					else
+						snprintf(tgt, sizeof(tgt),
+							 "%s", mapped_ip);
+					const char *a[] = {
+						"iptables", "-t", "nat",
+						"-D", "PREROUTING",
+						"-p", "tcp",
+						"--dport", dstport,
+						"-j", "DNAT",
+						"--to-destination", tgt,
+						NULL};
+					free(safe_exec(a));
+				}
+				free(data);
+			}
+		} else if (strcmp(db_type, "network_dhcp-server") == 0) {
+			/* Stop udhcpd daemon, remove firewall rule and
+			 * runtime files for this DHCP pool. */
+			unapply_dhcp(db_id);
+		}
+
 		if (sg_db_del(db_type, db_id) != 0) {
 			send_error(client_fd, SG_ERR_IO_FAIL, "Failed to delete section");
 			return 0;

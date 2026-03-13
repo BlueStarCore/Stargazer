@@ -57,4 +57,6 @@ sg_status_t apply_dns(const char *id, const char *data,
 sg_status_t apply_dhcp(const char *id, const char *data,
 		       char *result, size_t rsize);
 
+void unapply_dhcp(const char *id);
+
 #endif /* MGMTD_APPLY_H */

@@ -353,7 +353,8 @@ killall stargazer-cli 2>/dev/null
 killall stargazer-logind 2>/dev/null
 echo "[stargazer] Stopping management daemon..."
 killall stargazer-mgmtd 2>/dev/null
-echo "[stargazer] Stopping DHCP client..."
+echo "[stargazer] Stopping DHCP services..."
+killall udhcpd 2>/dev/null
 killall udhcpc 2>/dev/null
 echo "[stargazer] Stopping init services..."
 for s in /etc/init.d/*; do [ -x "$s" ] && "$s" stop 2>/dev/null; done
@@ -395,7 +396,8 @@ killall stargazer-cli 2>/dev/null
 killall stargazer-logind 2>/dev/null
 echo "[stargazer] Stopping management daemon..."
 killall stargazer-mgmtd 2>/dev/null
-echo "[stargazer] Stopping DHCP client..."
+echo "[stargazer] Stopping DHCP services..."
+killall udhcpd 2>/dev/null
 killall udhcpc 2>/dev/null
 echo "[stargazer] Stopping init services..."
 for s in /etc/init.d/*; do [ -x "$s" ] && "$s" stop 2>/dev/null; done

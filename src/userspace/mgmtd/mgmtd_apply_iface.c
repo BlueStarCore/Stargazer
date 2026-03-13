@@ -7,6 +7,7 @@
 
 #define _GNU_SOURCE
 #include "mgmtd_apply.h"
+#include "sg_db.h"
 
 #include <errno.h>
 #include <signal.h>
@@ -192,6 +193,45 @@ static void dhcpc_start(const char *iface)
 	mgmt_log("INFO", "dhcpc: started on %s (pidfile %s)", iface, pf);
 }
 
+/*
+ * Check if any enabled DHCP server pool is bound to this interface.
+ * Returns 1 if a conflict exists, 0 if clear.
+ */
+static int
+iface_has_dhcpd_pool(const char *iface)
+{
+	char *list = sg_db_list("network_dhcp-server");
+	if (!list)
+		return 0;
+
+	int found = 0;
+	char *saveptr = NULL;
+	char *tok = strtok_r(list, "\n", &saveptr);
+	while (tok) {
+		char *pool_iface = sg_db_get_val("network_dhcp-server",
+						 tok, "interface");
+		if (pool_iface) {
+			if (strcmp(pool_iface, iface) == 0) {
+				char *pool_status = sg_db_get_val(
+					"network_dhcp-server",
+					tok, "status");
+				/* Schema default for status is "enable",
+				 * so NULL (no explicit key) = enabled */
+				if (!pool_status ||
+				    strcmp(pool_status, "enable") == 0)
+					found = 1;
+				free(pool_status);
+			}
+			free(pool_iface);
+		}
+		if (found)
+			break;
+		tok = strtok_r(NULL, "\n", &saveptr);
+	}
+	free(list);
+	return found;
+}
+
 sg_status_t apply_interface(const char *id, const char *data,
 			    char *result, size_t rsize)
 {
@@ -236,6 +276,14 @@ sg_status_t apply_interface(const char *id, const char *data,
 		snprintf(result, rsize,
 			 "Invalid allowaccess '%s'.", allowaccess);
 		return SG_ERR_INVALID_VAL;
+	}
+
+	/* Reject DHCP client mode if an active DHCP server pool exists
+	 * on this interface — cannot be both client and server. */
+	if (strcmp(mode, "dhcp") == 0 && iface_has_dhcpd_pool(id)) {
+		snprintf(result, rsize,
+			 "Interface %s has active DHCP server pool.", id);
+		return SG_ERR_IN_USE;
 	}
 
 	/* Always stop existing udhcpc first — mode may have changed */
