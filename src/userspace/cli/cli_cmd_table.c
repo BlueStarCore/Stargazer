@@ -578,54 +578,147 @@ static int cmd_diag_disk_smart(const char *args, const char *permissions)
 	return 0;
 }
 
+/* ── Selftest suite table ─────────────────────────────────────────────── */
+
+/*
+ * Each suite has a name (for CLI selection) and a runner function.
+ * Runner signature variants:
+ *   - "perms" variant: takes (mode, permissions, out)
+ *   - "plain" variant: takes (mode, out)
+ *
+ * We unify them through a wrapper that carries 'permissions' via
+ * a file-scoped variable (selftest is single-threaded, non-reentrant).
+ */
+static const char *st_permissions;
+
+typedef int (*st_runner_t)(int mode, diag_result_t *out);
+
+static int st_run_permissions(int mode, diag_result_t *out)
+{
+	return cli_diagnose_test_permissions(mode, st_permissions, out);
+}
+
+static int st_run_configure(int mode, diag_result_t *out)
+{
+	return cli_diagnose_test_configure(mode, out);
+}
+
+static int st_run_firewall(int mode, diag_result_t *out)
+{
+	return cli_diagnose_test_firewall(mode, out);
+}
+
+static int st_run_upgrade(int mode, diag_result_t *out)
+{
+	return cli_diagnose_test_upgrade(mode, out);
+}
+
+static int st_run_sandbox(int mode, diag_result_t *out)
+{
+	return cli_diagnose_test_sandbox(mode, out);
+}
+
+static int st_run_database(int mode, diag_result_t *out)
+{
+	return cli_diagnose_test_database(mode, out);
+}
+
+static int st_run_disk(int mode, diag_result_t *out)
+{
+	return cli_diagnose_test_disk(mode, out);
+}
+
+static int st_run_dhcp(int mode, diag_result_t *out)
+{
+	return cli_diagnose_test_dhcp(mode, out);
+}
+
+static const struct {
+	const char  *name;
+	st_runner_t  run;
+} selftest_suites[] = {
+	{ "permissions", st_run_permissions },
+	{ "configure",   st_run_configure },
+	{ "firewall",    st_run_firewall },
+	{ "upgrade",     st_run_upgrade },
+	{ "sandbox",     st_run_sandbox },
+	{ "database",    st_run_database },
+	{ "disk",        st_run_disk },
+	{ "dhcp",        st_run_dhcp },
+	{ NULL,          NULL }
+};
+
+/*
+ * Run one or more selftest suites and print summary.
+ *
+ * Usage:
+ *   execute diagnose selftest              — all suites, basic mode
+ *   execute diagnose selftest full         — all suites, full mode (IPC)
+ *   execute diagnose selftest disk         — disk suite only, full mode
+ *   execute diagnose selftest database     — database suite only, full mode
+ *
+ * Selecting a specific suite always runs in full mode (mode=1),
+ * since targeting a single suite implies you want the thorough check.
+ */
 static int cmd_diag_selftest(const char *args, const char *permissions)
 {
 	int mode = 0;
+	int suite_idx = -1;  /* -1 = all suites */
+
+	st_permissions = permissions;
+
 	if (args) {
 		while (*args == ' ')
 			args++;
-		if (strcmp(args, "full") == 0)
-			mode = 1;
-		else if (*args != '\0') {
-			printf("  Unknown argument: %s\n", args);
-			printf("  Usage: execute diagnose selftest [full]\n");
-			return 0;
+		if (*args) {
+			if (strcmp(args, "full") == 0) {
+				mode = 1;
+			} else {
+				/* Look up suite name */
+				for (int i = 0; selftest_suites[i].name; i++) {
+					if (strcmp(args,
+						   selftest_suites[i].name) == 0) {
+						suite_idx = i;
+						break;
+					}
+				}
+				if (suite_idx < 0) {
+					printf("  Unknown suite: %s\n", args);
+					printf("  Available suites:");
+					for (int i = 0; selftest_suites[i].name; i++)
+						printf(" %s",
+						       selftest_suites[i].name);
+					printf("\n  Usage: execute diagnose selftest"
+					       " [full | <suite>]\n");
+					return 0;
+				}
+				/* Single suite always runs full */
+				mode = 1;
+			}
 		}
 	}
+
 	int fail = 0;
 	diag_result_t r, totals = {0, 0, 0};
 
-	fail += cli_diagnose_test_permissions(mode, permissions, &r);
-	totals.passed += r.passed;
-	totals.failed += r.failed;
-	totals.total  += r.total;
+	int first_idx = 0;
+	int last_idx = 0;
+	while (selftest_suites[last_idx].name)
+		last_idx++;
+	last_idx--;
 
-	fail += cli_diagnose_test_configure(mode, &r);
-	totals.passed += r.passed;
-	totals.failed += r.failed;
-	totals.total  += r.total;
+	if (suite_idx >= 0) {
+		first_idx = suite_idx;
+		last_idx = suite_idx;
+	}
 
-	fail += cli_diagnose_test_firewall(mode, &r);
-	totals.passed += r.passed;
-	totals.failed += r.failed;
-	totals.total  += r.total;
-
-	fail += cli_diagnose_test_upgrade(mode, &r);
-	totals.passed += r.passed;
-	totals.failed += r.failed;
-	totals.total  += r.total;
-
-	r = (diag_result_t){0, 0, 0};
-	fail += cli_diagnose_test_sandbox(mode, &r);
-	totals.passed += r.passed;
-	totals.failed += r.failed;
-	totals.total  += r.total;
-
-	r = (diag_result_t){0, 0, 0};
-	fail += cli_diagnose_test_database(mode, &r);
-	totals.passed += r.passed;
-	totals.failed += r.failed;
-	totals.total  += r.total;
+	for (int i = first_idx; i <= last_idx; i++) {
+		r = (diag_result_t){0, 0, 0};
+		fail += selftest_suites[i].run(mode, &r);
+		totals.passed += r.passed;
+		totals.failed += r.failed;
+		totals.total  += r.total;
+	}
 
 	printf("\n  ══════════════════════════════════════\n");
 	printf("  Total: %d/%d passed", totals.passed, totals.total);

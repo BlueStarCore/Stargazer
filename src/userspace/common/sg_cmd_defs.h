@@ -84,8 +84,16 @@ X("execute diagnose disk list",             "List available disks",             
 X("execute diagnose disk info",             "Show disk/partition details",             "admin",           1,  cmd_diag_disk_info)
 X("execute diagnose disk smart",            "Show eMMC wear/health",                   "admin",           0,  cmd_diag_disk_smart)
 
-X("execute diagnose selftest",              "Run all built-in self-tests",             "admin",           1,  cmd_diag_selftest)
-X("execute diagnose selftest full",        "Full self-test with IPC round-trip",       "admin",           0,  NULL)
+X("execute diagnose selftest",              "Run built-in self-tests",                 "admin",           1,  cmd_diag_selftest)
+X("execute diagnose selftest full",         "All suites, full mode (with IPC)",        "admin",           0,  NULL)
+X("execute diagnose selftest permissions",  "Permission model tests (full)",           "admin",           0,  NULL)
+X("execute diagnose selftest configure",    "Configuration validation tests (full)",   "admin",           0,  NULL)
+X("execute diagnose selftest firewall",     "Firewall & network tests (full)",         "admin",           0,  NULL)
+X("execute diagnose selftest upgrade",      "Firmware upgrade tests (full)",           "admin",           0,  NULL)
+X("execute diagnose selftest sandbox",      "Seccomp/Landlock sandbox tests (full)",   "admin",           0,  NULL)
+X("execute diagnose selftest database",     "Database health tests (full)",            "admin",           0,  NULL)
+X("execute diagnose selftest disk",         "Disk partition health tests (full)",      "admin",           0,  NULL)
+X("execute diagnose selftest dhcp",         "DHCP client/server cross-validation",     "admin",           0,  NULL)
 X("execute diagnose pentest",              "Run security penetration tests",          "admin",           1,  cmd_diag_pentest)
 X("execute diagnose pentest full",         "Full pentest with SEC-1..18",             "admin",           0,  NULL)
 
