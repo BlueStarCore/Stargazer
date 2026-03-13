@@ -81,4 +81,20 @@ int cli_diagnose_test_pentest(int mode, const char *permissions,
  */
 int cli_diagnose_test_database(int mode, diag_result_t *out);
 
+/*
+ * Run disk health diagnostics (via IPC — CLI sandbox blocks openat).
+ *   mode=0: sgdata checks (mount, fstype, writable, usage, DB file)
+ *   mode=1: full test (adds sglogs + eMMC block device checks)
+ * Returns 0 on all-pass, 1 on any failure.
+ */
+int cli_diagnose_test_disk(int mode, diag_result_t *out);
+
+/*
+ * Run DHCP client/server cross-validation diagnostics.
+ *   mode=0: no local-only tests (all checks need IPC)
+ *   mode=1: full test (IPC round-trips for conflict detection)
+ * Returns 0 on all-pass, 1 on any failure.
+ */
+int cli_diagnose_test_dhcp(int mode, diag_result_t *out);
+
 #endif /* CLI_DIAGNOSE_H */
