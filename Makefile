@@ -1076,6 +1076,14 @@ test-build: modules busybox dash iptables logind mgmtd cli tools uboot
 		echo "Test data disk exists (preserving config): $(BUILD_DIR)/test/data.img"; \
 	fi
 
+	# Create persistent logs disk for QEMU (only if not already present)
+	@if [ ! -f $(BUILD_DIR)/test/logs.img ]; then \
+		mke2fs -t ext2 -L sglogs $(BUILD_DIR)/test/logs.img 64M 2>/dev/null; \
+		echo "Test logs disk created: $(BUILD_DIR)/test/logs.img"; \
+	else \
+		echo "Test logs disk exists (preserving logs): $(BUILD_DIR)/test/logs.img"; \
+	fi
+
 	# Create boot partition disk (with MBR so U-Boot distro boot finds it)
 	@mkdir -p $(BUILD_DIR)/test/boot-contents/extlinux
 	cp $(KERNEL_IMAGE) $(BUILD_DIR)/test/boot-contents/kernel
@@ -1112,12 +1120,18 @@ test-run:
 		mke2fs -t ext2 -L sgdata $(BUILD_DIR)/test/data.img 64M 2>/dev/null; \
 		echo "Test data disk created: $(BUILD_DIR)/test/data.img"; \
 	fi
+	@if [ ! -f $(BUILD_DIR)/test/logs.img ]; then \
+		mke2fs -t ext2 -L sglogs $(BUILD_DIR)/test/logs.img 64M 2>/dev/null; \
+		echo "Test logs disk created: $(BUILD_DIR)/test/logs.img"; \
+	fi
 	# Run QEMU — U-Boot loads kernel+initramfs from boot.img (virtio0)
+	# Drive order: vda=boot, vdb=sgdata, vdc=sglogs
 	qemu-system-aarch64 \
 		-machine virt -cpu cortex-a72 -smp 4 -m 2G \
 		-bios $(UBOOT_BIN) \
 		-drive file=$(BUILD_DIR)/test/boot.img,format=raw,if=virtio \
 		-drive file=$(BUILD_DIR)/test/data.img,format=raw,if=virtio \
+		-drive file=$(BUILD_DIR)/test/logs.img,format=raw,if=virtio \
 		-netdev user,id=net0,hostfwd=tcp::2222-:22,net=10.0.1.0/24,host=10.0.1.1,tftp=$(BUILD_DIR)/test/tftp \
 		-device virtio-net-device,netdev=net0 \
 		-nographic

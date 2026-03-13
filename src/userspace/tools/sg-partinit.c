@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <linux/fs.h>
 
 /* ── GPT structures ─────────────────────────────────────────────────────── */
@@ -324,6 +325,52 @@ int main(int argc, char *argv[])
 	if (ioctl(fd, BLKRRPART) < 0) {
 		fprintf(stderr, "sg-partinit: BLKRRPART failed: %s "
 			"(reboot may be needed)\n", strerror(errno));
+	}
+
+	/*
+	 * Wait for the new partition device node to appear.
+	 *
+	 * BLKRRPART tells the kernel to re-read the partition table, which
+	 * is synchronous — the kernel creates partition block devices before
+	 * the ioctl returns.  However, devtmpfs creates the /dev/ node
+	 * asynchronously via a kernel thread, so there can be a short gap
+	 * between the ioctl returning and the node being visible in /dev.
+	 *
+	 * We wait here so callers (init script) can rely on the device
+	 * node existing when sg-partinit exits successfully.
+	 *
+	 * GPT partition numbers are 1-indexed: entry index 0 → p1, etc.
+	 * For mmcblk devices: /dev/mmcblk0p6.  For sd/vd: /dev/sda6.
+	 */
+	{
+		char part_path[256];
+		const char *base = strrchr(dev, '/');
+		base = base ? base + 1 : dev;
+
+		/* mmcblk0 → mmcblk0p6, sda → sda6 */
+		if (strncmp(base, "mmcblk", 6) == 0 ||
+		    strncmp(base, "loop", 4) == 0 ||
+		    strncmp(base, "nvme", 4) == 0)
+			snprintf(part_path, sizeof(part_path),
+				 "%sp%d", dev, new_idx + 1);
+		else
+			snprintf(part_path, sizeof(part_path),
+				 "%s%d", dev, new_idx + 1);
+
+		struct stat st;
+		int tries = 0;
+		while (stat(part_path, &st) != 0 || !S_ISBLK(st.st_mode)) {
+			if (++tries > 50) { /* 50 × 100ms = 5s */
+				fprintf(stderr, "sg-partinit: WARNING: "
+					"%s not found after 5s — "
+					"devtmpfs may be slow\n",
+					part_path);
+				break;
+			}
+			usleep(100000);
+		}
+		if (tries <= 50)
+			printf("sg-partinit: verified %s exists\n", part_path);
 	}
 
 	printf("sg-partinit: done — partition table updated\n");
