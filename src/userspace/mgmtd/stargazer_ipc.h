@@ -134,6 +134,11 @@ typedef enum {
 	SG_CMD_HISTORY_SAVE      = 663,  /* Save CLI history lines             */
 	SG_CMD_HISTORY_LOAD      = 664,  /* Load CLI history lines             */
 
+	/* Log viewing/management (67x) */
+	SG_CMD_LOG_AUDIT         = 670,  /* Read audit log (tail N lines)      */
+	SG_CMD_LOG_SYSTEM        = 671,  /* Read dmesg output                  */
+	SG_CMD_LOG_CLEAR_AUDIT   = 672,  /* Truncate audit log                 */
+
 	/* DNS/DHCP — Member A (7xx): SG_CMD_DNS_* 700-749, SG_CMD_DHCP_* 750-799 */
 	/* NAT — Member B (8xx): SG_CMD_NAT_* 800-849 */
 
@@ -231,6 +236,8 @@ static inline const char *sg_status_str(sg_status_t s)
  *   WHOAMI        — permission check, on login + idle polling
  *   HISTORY_SAVE  — persists readline history on logout
  *   HISTORY_LOAD  — loads readline history on login
+ *   LOG_AUDIT     — read-only log viewer, no security significance
+ *   LOG_SYSTEM    — read-only dmesg viewer, no security significance
  *
  * All other commands (reads, writes, diagnostics, session tags)
  * are audited automatically by the central dispatch hook.
@@ -243,6 +250,8 @@ static inline int sg_cmd_audit_skip(sg_cmd_t cmd)
 	case SG_CMD_WHOAMI:
 	case SG_CMD_HISTORY_SAVE:
 	case SG_CMD_HISTORY_LOAD:
+	case SG_CMD_LOG_AUDIT:
+	case SG_CMD_LOG_SYSTEM:
 		return 1;
 	default:
 		return 0;

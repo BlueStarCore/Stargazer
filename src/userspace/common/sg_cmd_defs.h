@@ -65,6 +65,12 @@ X("execute debug auth",                     "Enable/disable auth debug tracing",
 X("execute debug auth admin",               "Debug admin authentication",              "admin",           0,  NULL)
 X("execute debug auth user",                "Debug user authentication",               "admin",           0,  NULL)
 
+X("execute log",                             "Log management",                          "monitor",         0,  NULL)
+X("execute log audit",                      "Show audit log entries",                  "monitor",         1,  cmd_log_audit)
+X("execute log system",                     "Show system/kernel log",                  "monitor",         1,  cmd_log_system)
+X("execute log clear",                      "Clear log files",                         "admin",           0,  NULL)
+X("execute log clear audit",                "Clear audit log",                         "admin",           0,  cmd_log_clear_audit)
+
 X("execute diagnose",                       "Run diagnostic tools",                    "admin",           0,  NULL)
 X("execute diagnose top",                   "Show live process monitor (q to quit)",   "admin",           2,  cmd_diag_top)
 X("execute diagnose resources",             "Show system resource usage",              "admin",           1,  cmd_diag_resources)

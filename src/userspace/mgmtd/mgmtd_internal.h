@@ -157,4 +157,13 @@ int handle_history_save(int client_fd, const char *user,
 int handle_history_load(int client_fd, const char *user,
 			const char *payload, const sg_request_hdr_t *hdr);
 
+/* ── Log handlers (defined in stargazer-mgmtd.c) ─────────────────────────── */
+
+int handle_log_audit(int client_fd, const char *user,
+		     const char *payload, const sg_request_hdr_t *hdr);
+int handle_log_system(int client_fd, const char *user,
+		      const char *payload, const sg_request_hdr_t *hdr);
+int handle_log_clear_audit(int client_fd, const char *user,
+			   const char *payload, const sg_request_hdr_t *hdr);
+
 #endif /* MGMTD_INTERNAL_H */

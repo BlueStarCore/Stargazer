@@ -148,6 +148,9 @@ static const char *cmd_name(uint32_t cmd)
 	case SG_CMD_DEBUG_STATE_RESET: return "DEBUG_STATE_RESET";
 	case SG_CMD_HISTORY_SAVE:      return "HISTORY_SAVE";
 	case SG_CMD_HISTORY_LOAD:      return "HISTORY_LOAD";
+	case SG_CMD_LOG_AUDIT:         return "LOG_AUDIT";
+	case SG_CMD_LOG_SYSTEM:        return "LOG_SYSTEM";
+	case SG_CMD_LOG_CLEAR_AUDIT:   return "LOG_CLEAR_AUDIT";
 	case SG_CMD_PING:           return "PING";
 	case SG_CMD_DEBUG_FETCH:    return "DEBUG_FETCH";
 	case SG_CMD_UPGRADE_TEST_SETUP: return "UPGRADE_TEST_SETUP";

@@ -57,8 +57,8 @@
 #ifndef CONF_DIR
 #define CONF_DIR         "/etc/stargazer"
 #endif
-#define AUDIT_LOG        "/var/log/stargazer-audit.log"
-#define AUDIT_LOG_FB     "/tmp/stargazer-audit.log"
+#define AUDIT_LOG        "/etc/stargazer/logs/audit.log"
+#define AUDIT_LOG_FB     "/var/log/stargazer-audit.log"
 #define MAX_SESSION_TAGS  16
 #define MAX_CLIENTS_QUEUE 8
 #define BUF_SIZE         (sizeof(sg_request_hdr_t) + SG_PAYLOAD_MAX)
@@ -281,7 +281,7 @@ void mgmt_log(const char *level, const char *fmt, ...)
 int audit_log(const char *user, const char *event, const char *msg)
 {
 	const char *path = AUDIT_LOG;
-	if (access("/var/log", W_OK) != 0)
+	if (access("/etc/stargazer/logs", W_OK) != 0)
 		path = AUDIT_LOG_FB;
 
 	char ts[64];
@@ -299,6 +299,216 @@ int audit_log(const char *user, const char *event, const char *msg)
 	mgmt_log("ERROR", "audit_log: cannot write to %s: %s (event=%s user=%s msg=%s)",
 		 path, strerror(errno), event, user, msg);
 	return -1;
+}
+
+/* ── Log handlers ───────────────────────────────────────────────────────── */
+
+/*
+ * handle_log_audit — Read last N lines from audit log.
+ * Payload: optional line count as decimal string (default 50, max 200).
+ */
+int handle_log_audit(int client_fd, const char *user,
+		     const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)hdr;
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "Requires 'monitor' permission");
+		return 0;
+	}
+
+	int count = 50;
+	if (payload && payload[0]) {
+		int n = atoi(payload);
+		if (n > 0 && n <= 200)
+			count = n;
+		else if (n > 200)
+			count = 200;
+	}
+
+	/* Try primary path first, fall back to secondary */
+	FILE *fp = fopen(AUDIT_LOG, "r");
+	if (!fp)
+		fp = fopen(AUDIT_LOG_FB, "r");
+	if (!fp) {
+		send_ok(client_fd, NULL, "  No audit log entries.\n");
+		return 0;
+	}
+
+	/* Read all lines, keep last 'count' in a circular buffer */
+	char **lines = calloc((size_t)count, sizeof(char *));
+	if (!lines) {
+		fclose(fp);
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL, "Out of memory");
+		return 0;
+	}
+
+	char linebuf[1024];
+	unsigned int total = 0;
+	while (fgets(linebuf, (int)sizeof(linebuf), fp)) {
+		unsigned int idx = total % (unsigned int)count;
+		free(lines[idx]);
+		lines[idx] = strdup(linebuf);
+		total++;
+	}
+	fclose(fp);
+
+	if (total == 0) {
+		free(lines);
+		send_ok(client_fd, NULL, "  No audit log entries.\n");
+		return 0;
+	}
+
+	/* Build response from circular buffer */
+	size_t bufsz = SG_RESPONSE_MAX;
+	char *buf = malloc(bufsz);
+	if (!buf) {
+		for (int i = 0; i < count; i++)
+			free(lines[i]);
+		free(lines);
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL, "Out of memory");
+		return 0;
+	}
+
+	size_t used = 0;
+	unsigned int ucount = (unsigned int)count;
+	int nlines = total < ucount ? (int)total : count;
+	int start = total < ucount ? 0 : (int)(total % ucount);
+	for (int i = 0; i < nlines && used < bufsz - 1; i++) {
+		int idx = (start + i) % count;
+		if (lines[idx]) {
+			size_t llen = strlen(lines[idx]);
+			if (used + llen >= bufsz - 1)
+				break;
+			memcpy(buf + used, lines[idx], llen);
+			used += llen;
+		}
+	}
+	buf[used] = '\0';
+
+	for (int i = 0; i < count; i++)
+		free(lines[i]);
+	free(lines);
+
+	send_ok(client_fd, NULL, buf);
+	free(buf);
+	return 0;
+}
+
+/*
+ * handle_log_system — Read dmesg output (last N lines).
+ * Payload: optional line count as decimal string (default 50, max 500).
+ * Truncates to fit within SG_RESPONSE_MAX if needed.
+ */
+int handle_log_system(int client_fd, const char *user,
+		      const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)hdr;
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "Requires 'monitor' permission");
+		return 0;
+	}
+
+	int count = 50;
+	if (payload && payload[0]) {
+		int n = atoi(payload);
+		if (n > 0 && n <= 500)
+			count = n;
+		else if (n > 500)
+			count = 500;
+	}
+
+	const char *argv[] = {"dmesg", NULL};
+	char *out = safe_exec(argv);
+	if (!out || !out[0]) {
+		free(out);
+		send_ok(client_fd, NULL, "  No kernel log output.\n");
+		return 0;
+	}
+
+	/* Keep only the last 'count' lines */
+	size_t len = strlen(out);
+	if (count > 0) {
+		/* Walk backwards counting newlines */
+		int nl_seen = 0;
+		const char *p = out + len;
+		while (p > out) {
+			p--;
+			if (*p == '\n') {
+				nl_seen++;
+				if (nl_seen == count + 1) {
+					/* Advance past this newline */
+					p++;
+					size_t keep = (size_t)((out + len) - p);
+					memmove(out, p, keep);
+					out[keep] = '\0';
+					len = keep;
+					break;
+				}
+			}
+		}
+	}
+
+	/* Truncate if still exceeds response limit */
+	size_t max_len = SG_RESPONSE_MAX - 256; /* safely below protocol limit */
+	if (len > max_len) {
+		const char *start = out + len - max_len;
+		const char *nl = strchr(start, '\n');
+		if (nl)
+			start = nl + 1;
+		size_t keep = (size_t)((out + len) - start);
+		memmove(out, start, keep);
+		out[keep] = '\0';
+	}
+
+	send_ok(client_fd, NULL, out);
+	free(out);
+	return 0;
+}
+
+/*
+ * handle_log_clear_audit — Truncate audit log file to 0 bytes.
+ * Requires admin permission.
+ */
+int handle_log_clear_audit(int client_fd, const char *user,
+			   const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)payload;
+	(void)hdr;
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "admin")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "Requires 'admin' permission");
+		return 0;
+	}
+
+	/* Try primary path first, fall back to secondary */
+	const char *path = AUDIT_LOG;
+	if (truncate(path, 0) != 0) {
+		if (errno == ENOENT) {
+			path = AUDIT_LOG_FB;
+			if (truncate(path, 0) != 0 && errno != ENOENT) {
+				mgmt_log("ERROR", "log_clear_audit: truncate %s: %s",
+					 path, strerror(errno));
+				send_error(client_fd, SG_ERR_IO_FAIL,
+					   "Failed to clear audit log");
+				return 0;
+			}
+		} else {
+			mgmt_log("ERROR", "log_clear_audit: truncate %s: %s",
+				 path, strerror(errno));
+			send_error(client_fd, SG_ERR_IO_FAIL,
+				   "Failed to clear audit log");
+			return 0;
+		}
+	}
+
+	audit_log(user, "log_clear", "audit log cleared");
+	send_ok(client_fd, NULL, "  Audit log cleared.\n");
+	return 0;
 }
 
 /* ── Signal handling ────────────────────────────────────────────────────── */
@@ -2991,6 +3201,15 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 	case SG_CMD_HISTORY_LOAD:
 		return handle_history_load(client_fd, user, payload, hdr);
 
+	/* ── Log viewing/management ──────────────────────────────────── */
+
+	case SG_CMD_LOG_AUDIT:
+		return handle_log_audit(client_fd, user, payload, hdr);
+	case SG_CMD_LOG_SYSTEM:
+		return handle_log_system(client_fd, user, payload, hdr);
+	case SG_CMD_LOG_CLEAR_AUDIT:
+		return handle_log_clear_audit(client_fd, user, payload, hdr);
+
 	case SG_CMD_PING:
 		send_ok(client_fd, "pong", NULL);
 		return 0;
@@ -3077,6 +3296,10 @@ int main(void)
 	 * mgmtd is now the sole accessor — CLI reads via IPC only. */
 	mkdir(CONF_DIR, 0700);
 	chmod(CONF_DIR, 0700);
+
+	/* Ensure logs directory exists (sglogs partition) */
+	mkdir(CONF_DIR "/logs", 0700);
+	chmod(CONF_DIR "/logs", 0700);
 
 	/* Open SQLite database */
 	if (sg_db_open(SG_DB_PATH) != 0) {
