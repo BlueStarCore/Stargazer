@@ -122,6 +122,10 @@ typedef enum {
 	SG_CMD_DIAG_IFACE_STATS  = 643,  /* Per-iface rx/tx + link speed       */
 	SG_CMD_DIAG_PROCTOP      = 644,  /* CPU agg + mem + uptime + proc list */
 	SG_CMD_DIAG_THERMAL      = 645,  /* Thermal zone temperatures          */
+	SG_CMD_DIAG_DISK_HEALTH  = 646,  /* Disk health: mount/fs/write/usage  */
+	SG_CMD_DISK_LIST         = 647,  /* List block devices + sizes/mounts  */
+	SG_CMD_DISK_INFO         = 648,  /* Detail for one disk or partition   */
+	SG_CMD_DISK_SMART        = 649,  /* eMMC wear/health (life_time etc)   */
 
 	/* Show data (65x) */
 	SG_CMD_SHOW_SESSIONS     = 650,  /* /proc/stargazer/sessions contents  */
@@ -252,6 +256,9 @@ static inline int sg_cmd_audit_skip(sg_cmd_t cmd)
 	case SG_CMD_HISTORY_LOAD:
 	case SG_CMD_LOG_AUDIT:
 	case SG_CMD_LOG_SYSTEM:
+	case SG_CMD_DISK_LIST:
+	case SG_CMD_DISK_INFO:
+	case SG_CMD_DISK_SMART:
 		return 1;
 	default:
 		return 0;

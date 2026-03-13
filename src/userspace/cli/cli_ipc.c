@@ -141,6 +141,10 @@ static const char *cmd_name(uint32_t cmd)
 	case SG_CMD_DIAG_IFACE_STATS:  return "DIAG_IFACE_STATS";
 	case SG_CMD_DIAG_PROCTOP:      return "DIAG_PROCTOP";
 	case SG_CMD_DIAG_THERMAL:      return "DIAG_THERMAL";
+	case SG_CMD_DIAG_DISK_HEALTH:  return "DIAG_DISK_HEALTH";
+	case SG_CMD_DISK_LIST:         return "DISK_LIST";
+	case SG_CMD_DISK_INFO:         return "DISK_INFO";
+	case SG_CMD_DISK_SMART:        return "DISK_SMART";
 	case SG_CMD_SHOW_SESSIONS:     return "SHOW_SESSIONS";
 	case SG_CMD_SHOW_BOOT_CONFIG:  return "SHOW_BOOT_CONFIG";
 	case SG_CMD_DEBUG_STATE_GET:   return "DEBUG_STATE_GET";

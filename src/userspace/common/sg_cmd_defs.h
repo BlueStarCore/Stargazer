@@ -79,6 +79,11 @@ X("execute diagnose resources ram",         "Show RAM usage",                   
 X("execute diagnose resources disk",        "Show disk usage",                         "admin",           0,  NULL)
 X("execute diagnose resources interface",   "Show interface throughput",               "admin",           0,  NULL)
 X("execute diagnose resources all",         "Show all resource metrics",               "admin",           0,  NULL)
+X("execute diagnose disk",                  "Disk diagnostics",                        "admin",           0,  NULL)
+X("execute diagnose disk list",             "List available disks",                    "admin",           0,  cmd_diag_disk_list)
+X("execute diagnose disk info",             "Show disk/partition details",             "admin",           1,  cmd_diag_disk_info)
+X("execute diagnose disk smart",            "Show eMMC wear/health",                   "admin",           0,  cmd_diag_disk_smart)
+
 X("execute diagnose selftest",              "Run all built-in self-tests",             "admin",           1,  cmd_diag_selftest)
 X("execute diagnose selftest full",        "Full self-test with IPC round-trip",       "admin",           0,  NULL)
 X("execute diagnose pentest",              "Run security penetration tests",          "admin",           1,  cmd_diag_pentest)

@@ -495,6 +495,89 @@ static int cmd_diag_resources(const char *args, const char *permissions)
 	return 0;
 }
 
+/* ── Disk diagnostic handlers ─────────────────────────────────────────── */
+
+static int cmd_diag_disk_list(const char *args, const char *permissions)
+{
+	(void)args;
+	(void)permissions;
+
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_DISK_LIST, "", &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+
+	if (resp.status != SG_OK) {
+		print_ipc_error("Error", &resp);
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	if (resp.payload && resp.payload_len > 0)
+		printf("%s", resp.payload);
+
+	ipc_resp_free(&resp);
+	return 0;
+}
+
+static int cmd_diag_disk_info(const char *args, const char *permissions)
+{
+	(void)permissions;
+
+	if (!args || !*args) {
+		printf("  Usage: execute diagnose disk info <device|partition>\n");
+		printf("  Example: execute diagnose disk info mmcblk0\n");
+		printf("           execute diagnose disk info mmcblk0p3\n");
+		return 0;
+	}
+
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_DISK_INFO, args, &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+
+	if (resp.status != SG_OK) {
+		print_ipc_error("Error", &resp);
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	if (resp.payload && resp.payload_len > 0)
+		printf("%s", resp.payload);
+
+	ipc_resp_free(&resp);
+	return 0;
+}
+
+static int cmd_diag_disk_smart(const char *args, const char *permissions)
+{
+	(void)args;
+	(void)permissions;
+
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_DISK_SMART, "", &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+
+	if (resp.status != SG_OK) {
+		print_ipc_error("Error", &resp);
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	if (resp.payload && resp.payload_len > 0)
+		printf("%s", resp.payload);
+
+	ipc_resp_free(&resp);
+	return 0;
+}
+
 static int cmd_diag_selftest(const char *args, const char *permissions)
 {
 	int mode = 0;

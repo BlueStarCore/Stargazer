@@ -142,6 +142,14 @@ int handle_diag_proctop(int client_fd, const char *user,
 			const char *payload, const sg_request_hdr_t *hdr);
 int handle_diag_thermal(int client_fd, const char *user,
 			const char *payload, const sg_request_hdr_t *hdr);
+int handle_diag_disk_health(int client_fd, const char *user,
+			    const char *payload, const sg_request_hdr_t *hdr);
+int handle_disk_list(int client_fd, const char *user,
+		     const char *payload, const sg_request_hdr_t *hdr);
+int handle_disk_info(int client_fd, const char *user,
+		     const char *payload, const sg_request_hdr_t *hdr);
+int handle_disk_smart(int client_fd, const char *user,
+		      const char *payload, const sg_request_hdr_t *hdr);
 int handle_show_sessions(int client_fd, const char *user,
 			 const char *payload, const sg_request_hdr_t *hdr);
 int handle_show_boot_config(int client_fd, const char *user,

@@ -16,6 +16,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "mgmtd_internal.h"
+#include "mgmtd_apply.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -618,6 +619,695 @@ int handle_diag_thermal(int client_fd, const char *user,
 	}
 
 	send_ok(client_fd, NULL, pos > 0 ? resp : NULL);
+	return 0;
+}
+
+/* ── SG_CMD_DIAG_DISK_HEALTH (646) ─────────────────────────────────────── */
+
+int handle_diag_disk_health(int client_fd, const char *user,
+			    const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)payload; (void)hdr;
+
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "monitor permission required");
+		return 0;
+	}
+
+	char resp[2048];
+	size_t pos = 0;
+
+	/* --- sgdata: /etc/stargazer --- */
+	int sgdata_mounted = 0;
+	char sgdata_fstype[32] = "unknown";
+	{
+		/* Parse /proc/mounts for /etc/stargazer */
+		char mounts[4096];
+		if (read_small_file("/proc/mounts", mounts, sizeof(mounts)) > 0) {
+			const char *p = mounts;
+			while (*p) {
+				const char *eol = strchr(p, '\n');
+				size_t llen = eol ? (size_t)(eol - p) : strlen(p);
+
+				/* Fields: device mountpoint fstype ... */
+				const char *f1 = p;
+				while (f1 < p + llen && *f1 != ' ') f1++;
+				if (f1 < p + llen) f1++;
+				const char *f2 = f1;
+				while (f2 < p + llen && *f2 != ' ') f2++;
+				size_t mplen = (size_t)(f2 - f1);
+
+				if (mplen == 14 &&
+				    strncmp(f1, "/etc/stargazer", 14) == 0 &&
+				    (f2 >= p + llen || *f2 == ' ')) {
+					sgdata_mounted = 1;
+					if (f2 < p + llen) {
+						const char *f3 = f2 + 1;
+						const char *f3e = f3;
+						while (f3e < p + llen && *f3e != ' ')
+							f3e++;
+						size_t tlen = (size_t)(f3e - f3);
+						if (tlen >= sizeof(sgdata_fstype))
+							tlen = sizeof(sgdata_fstype) - 1;
+						memcpy(sgdata_fstype, f3, tlen);
+						sgdata_fstype[tlen] = '\0';
+					}
+				}
+
+				if (!eol) break;
+				p = eol + 1;
+			}
+		}
+	}
+
+	buf_appendf(resp, sizeof(resp), &pos,
+		    "sgdata_mounted=%d\nsgdata_fstype=%s\n",
+		    sgdata_mounted, sgdata_fstype);
+
+	/* sgdata writable — touch + remove temp file */
+	int sgdata_writable = 0;
+	if (sgdata_mounted) {
+		const char *tmp = "/etc/stargazer/.health_check";
+		int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+		if (fd >= 0) {
+			sgdata_writable = 1;
+			close(fd);
+			unlink(tmp);
+		}
+	}
+	buf_appendf(resp, sizeof(resp), &pos,
+		    "sgdata_writable=%d\n", sgdata_writable);
+
+	/* sgdata usage percentage */
+	struct statvfs sv;
+	int sgdata_pct_used = -1;
+	if (sgdata_mounted && statvfs("/etc/stargazer", &sv) == 0 &&
+	    sv.f_blocks > 0) {
+		unsigned long used = sv.f_blocks - sv.f_bfree;
+		sgdata_pct_used = (int)((used * 100) / sv.f_blocks);
+	}
+	buf_appendf(resp, sizeof(resp), &pos,
+		    "sgdata_pct_used=%d\n", sgdata_pct_used);
+
+	/* sgdata DB file exists */
+	int sgdata_db_exists = (access("/etc/stargazer/stargazer.db",
+				       F_OK) == 0) ? 1 : 0;
+	buf_appendf(resp, sizeof(resp), &pos,
+		    "sgdata_db_exists=%d\n", sgdata_db_exists);
+
+	/* --- sglogs: /etc/stargazer/logs --- */
+	int sglogs_mounted = 0;
+	char sglogs_fstype[32] = "unknown";
+	{
+		char mounts[4096];
+		if (read_small_file("/proc/mounts", mounts, sizeof(mounts)) > 0) {
+			const char *p = mounts;
+			while (*p) {
+				const char *eol = strchr(p, '\n');
+				size_t llen = eol ? (size_t)(eol - p) : strlen(p);
+
+				const char *f1 = p;
+				while (f1 < p + llen && *f1 != ' ') f1++;
+				if (f1 < p + llen) f1++;
+				const char *f2 = f1;
+				while (f2 < p + llen && *f2 != ' ') f2++;
+				size_t mplen = (size_t)(f2 - f1);
+
+				if (mplen == 19 &&
+				    strncmp(f1, "/etc/stargazer/logs", 19) == 0 &&
+				    (f2 >= p + llen || *f2 == ' ')) {
+					sglogs_mounted = 1;
+					if (f2 < p + llen) {
+						const char *f3 = f2 + 1;
+						const char *f3e = f3;
+						while (f3e < p + llen && *f3e != ' ')
+							f3e++;
+						size_t tlen = (size_t)(f3e - f3);
+						if (tlen >= sizeof(sglogs_fstype))
+							tlen = sizeof(sglogs_fstype) - 1;
+						memcpy(sglogs_fstype, f3, tlen);
+						sglogs_fstype[tlen] = '\0';
+					}
+				}
+
+				if (!eol) break;
+				p = eol + 1;
+			}
+		}
+	}
+
+	buf_appendf(resp, sizeof(resp), &pos,
+		    "sglogs_mounted=%d\nsglogs_fstype=%s\n",
+		    sglogs_mounted, sglogs_fstype);
+
+	/* sglogs writable */
+	int sglogs_writable = 0;
+	if (sglogs_mounted) {
+		const char *tmp = "/etc/stargazer/logs/.health_check";
+		int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+		if (fd >= 0) {
+			sglogs_writable = 1;
+			close(fd);
+			unlink(tmp);
+		}
+	}
+	buf_appendf(resp, sizeof(resp), &pos,
+		    "sglogs_writable=%d\n", sglogs_writable);
+
+	/* sglogs usage percentage */
+	int sglogs_pct_used = -1;
+	if (sglogs_mounted && statvfs("/etc/stargazer/logs", &sv) == 0 &&
+	    sv.f_blocks > 0) {
+		unsigned long used = sv.f_blocks - sv.f_bfree;
+		sglogs_pct_used = (int)((used * 100) / sv.f_blocks);
+	}
+	buf_appendf(resp, sizeof(resp), &pos,
+		    "sglogs_pct_used=%d\n", sglogs_pct_used);
+
+	/* --- eMMC block device --- */
+	unsigned long long emmc_bytes = 0;
+	const char *emmc_dev = "none";
+	{
+		char sbuf[64];
+		if (read_small_file("/sys/block/mmcblk0/size",
+				    sbuf, sizeof(sbuf)) > 0) {
+			emmc_bytes = strtoull(sbuf, NULL, 10) * 512ULL;
+			emmc_dev = "/dev/mmcblk0";
+		}
+	}
+	buf_appendf(resp, sizeof(resp), &pos,
+		    "emmc_dev=%s\nemmc_bytes=%llu\n",
+		    emmc_dev, emmc_bytes);
+
+	send_ok(client_fd, NULL, resp);
+	return 0;
+}
+
+/* ── Helper: strip trailing newlines/whitespace ────────────────────────── */
+
+static void strip_trailing(char *s)
+{
+	size_t len = strlen(s);
+	while (len > 0 && (s[len - 1] == '\n' || s[len - 1] == '\r' ||
+			   s[len - 1] == ' '))
+		s[--len] = '\0';
+}
+
+/* ── Helper: find mount point for a device from /proc/mounts ──────────── */
+
+/*
+ * Parse /proc/mounts and collect mount points for /dev/<devname>.
+ * Appends comma-separated mount points to buf at *pos.
+ * Returns count of mounts found.
+ */
+static int collect_mounts(const char *devname, char *buf, size_t bufsz,
+			  size_t *pos)
+{
+	char mounts[8192];
+	if (read_small_file("/proc/mounts", mounts, sizeof(mounts)) <= 0)
+		return 0;
+
+	char devpath[128];
+	snprintf(devpath, sizeof(devpath), "/dev/%s", devname);
+	size_t dplen = strlen(devpath);
+
+	int count = 0;
+	const char *p = mounts;
+	while (*p) {
+		const char *eol = strchr(p, '\n');
+		size_t llen = eol ? (size_t)(eol - p) : strlen(p);
+
+		/* Match device field */
+		if (llen > dplen && strncmp(p, devpath, dplen) == 0 &&
+		    p[dplen] == ' ') {
+			/* Extract mount point (second field) */
+			const char *mp = p + dplen + 1;
+			const char *mpe = mp;
+			while (mpe < p + llen && *mpe != ' ')
+				mpe++;
+			size_t mplen = (size_t)(mpe - mp);
+
+			if (count > 0)
+				buf_appendf(buf, bufsz, pos, ",");
+			buf_appendf(buf, bufsz, pos, "%.*s", (int)mplen, mp);
+			count++;
+		}
+
+		if (!eol) break;
+		p = eol + 1;
+	}
+	return count;
+}
+
+/* ── Helper: find mount point + fstype for a device ───────────────────── */
+
+static void get_mount_info(const char *devname, char *mp_out, size_t mpsz,
+			   char *fs_out, size_t fssz)
+{
+	mp_out[0] = '\0';
+	fs_out[0] = '\0';
+
+	char mounts[8192];
+	if (read_small_file("/proc/mounts", mounts, sizeof(mounts)) <= 0)
+		return;
+
+	char devpath[128];
+	snprintf(devpath, sizeof(devpath), "/dev/%s", devname);
+	size_t dplen = strlen(devpath);
+
+	const char *p = mounts;
+	while (*p) {
+		const char *eol = strchr(p, '\n');
+		size_t llen = eol ? (size_t)(eol - p) : strlen(p);
+
+		if (llen > dplen && strncmp(p, devpath, dplen) == 0 &&
+		    p[dplen] == ' ') {
+			/* mount point */
+			const char *mp = p + dplen + 1;
+			const char *mpe = mp;
+			while (mpe < p + llen && *mpe != ' ')
+				mpe++;
+			size_t mplen = (size_t)(mpe - mp);
+			if (mplen >= mpsz) mplen = mpsz - 1;
+			memcpy(mp_out, mp, mplen);
+			mp_out[mplen] = '\0';
+
+			/* fstype (third field) */
+			if (mpe < p + llen) {
+				const char *fs = mpe + 1;
+				const char *fse = fs;
+				while (fse < p + llen && *fse != ' ')
+					fse++;
+				size_t fslen = (size_t)(fse - fs);
+				if (fslen >= fssz) fslen = fssz - 1;
+				memcpy(fs_out, fs, fslen);
+				fs_out[fslen] = '\0';
+			}
+			return;
+		}
+
+		if (!eol) break;
+		p = eol + 1;
+	}
+}
+
+/* ── SG_CMD_DISK_LIST (647) ────────────────────────────────────────────── */
+
+int handle_disk_list(int client_fd, const char *user,
+		     const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)payload; (void)hdr;
+
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "monitor permission required");
+		return 0;
+	}
+
+	char resp[SG_RESPONSE_MAX];
+	size_t pos = 0;
+
+	DIR *dir = opendir("/sys/block");
+	if (!dir) {
+		send_error(client_fd, SG_ERR_IO_FAIL,
+			   "cannot read /sys/block");
+		return 0;
+	}
+
+	struct dirent *ent;
+	while ((ent = readdir(dir)) != NULL) {
+		const char *name = ent->d_name;
+
+		/* Skip . .. loop* ram* and names that are too long */
+		if (name[0] == '.')
+			continue;
+		if (strncmp(name, "loop", 4) == 0)
+			continue;
+		if (strncmp(name, "ram", 3) == 0)
+			continue;
+		if (strlen(name) > 64)
+			continue;
+
+		/* Read size (512-byte sectors) */
+		char path[128], sbuf[64];
+		snprintf(path, sizeof(path), "/sys/block/%.64s/size", name);
+		unsigned long long size_bytes = 0;
+		if (read_small_file(path, sbuf, sizeof(sbuf)) > 0)
+			size_bytes = strtoull(sbuf, NULL, 10) * 512ULL;
+
+		/* Read model if available */
+		char model[128] = "";
+		snprintf(path, sizeof(path),
+			 "/sys/block/%.64s/device/model", name);
+		if (read_small_file(path, model, sizeof(model)) > 0)
+			strip_trailing(model);
+
+		/* Collect mount points */
+		buf_appendf(resp, sizeof(resp), &pos,
+			    "dev=%s size_bytes=%llu model=%s mounts=",
+			    name, size_bytes,
+			    model[0] ? model : "(none)");
+
+		size_t mnt_start = pos;
+		/* List partitions under /sys/block/<dev>/ */
+		char bpath[128];
+		snprintf(bpath, sizeof(bpath), "/sys/block/%.64s", name);
+		DIR *pdir = opendir(bpath);
+		if (pdir) {
+			struct dirent *pent;
+			while ((pent = readdir(pdir)) != NULL) {
+				if (strlen(pent->d_name) > 64)
+					continue;
+				/* Partition dirs start with the device name */
+				if (strncmp(pent->d_name, name,
+					    strlen(name)) != 0)
+					continue;
+				if (strcmp(pent->d_name, name) == 0)
+					continue;
+				/* Check it has a 'size' file (is a partition) */
+				char pspath[196];
+				snprintf(pspath, sizeof(pspath),
+					 "/sys/block/%.64s/%.64s/size",
+					 name, pent->d_name);
+				if (access(pspath, F_OK) == 0)
+					collect_mounts(pent->d_name,
+						       resp,
+						       sizeof(resp),
+						       &pos);
+			}
+			closedir(pdir);
+		}
+
+		/* Also check whole-device mounts */
+		collect_mounts(name, resp, sizeof(resp), &pos);
+
+		if (pos == mnt_start)
+			buf_appendf(resp, sizeof(resp), &pos, "(none)");
+
+		buf_appendf(resp, sizeof(resp), &pos, "\n");
+
+		if (pos >= sizeof(resp) - 512)
+			break;
+	}
+	closedir(dir);
+
+	send_ok(client_fd, NULL, pos > 0 ? resp : "No block devices found.\n");
+	return 0;
+}
+
+/* ── SG_CMD_DISK_INFO (648) ────────────────────────────────────────────── */
+
+int handle_disk_info(int client_fd, const char *user,
+		     const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)hdr;
+
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "monitor permission required");
+		return 0;
+	}
+
+	if (!payload || !payload[0]) {
+		send_error(client_fd, SG_ERR_MISSING_ARG,
+			   "device name required");
+		return 0;
+	}
+
+	/* Validate: alnum + underscore only, max 64 chars (prevent path traversal) */
+	size_t plen = strlen(payload);
+	if (plen > 64) {
+		send_error(client_fd, SG_ERR_INVALID_ARG,
+			   "device name too long");
+		return 0;
+	}
+	for (const char *p = payload; *p; p++) {
+		if (!isalnum((unsigned char)*p) && *p != '_') {
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "invalid device name (alnum/underscore only)");
+			return 0;
+		}
+	}
+
+	char resp[SG_RESPONSE_MAX];
+	size_t pos = 0;
+
+	/* Check if whole disk */
+	char syspath[128];
+	snprintf(syspath, sizeof(syspath), "/sys/block/%.64s", payload);
+	struct stat st;
+	int is_disk = (stat(syspath, &st) == 0 && S_ISDIR(st.st_mode));
+
+	if (is_disk) {
+		/* ── Whole disk info ── */
+		buf_appendf(resp, sizeof(resp), &pos,
+			    "type=disk\ndev=%s\n", payload);
+
+		/* Size */
+		char path[128], sbuf[64];
+		snprintf(path, sizeof(path),
+			 "/sys/block/%.64s/size", payload);
+		if (read_small_file(path, sbuf, sizeof(sbuf)) > 0) {
+			unsigned long long bytes =
+				strtoull(sbuf, NULL, 10) * 512ULL;
+			buf_appendf(resp, sizeof(resp), &pos,
+				    "size_bytes=%llu\n", bytes);
+		}
+
+		/* Model */
+		char val[128];
+		snprintf(path, sizeof(path),
+			 "/sys/block/%.64s/device/model", payload);
+		if (read_small_file(path, val, sizeof(val)) > 0) {
+			strip_trailing(val);
+			buf_appendf(resp, sizeof(resp), &pos,
+				    "model=%s\n", val);
+		}
+
+		/* Serial */
+		snprintf(path, sizeof(path),
+			 "/sys/block/%.64s/device/serial", payload);
+		if (read_small_file(path, val, sizeof(val)) > 0) {
+			strip_trailing(val);
+			buf_appendf(resp, sizeof(resp), &pos,
+				    "serial=%s\n", val);
+		}
+
+		/* Removable */
+		snprintf(path, sizeof(path),
+			 "/sys/block/%.64s/removable", payload);
+		if (read_small_file(path, sbuf, sizeof(sbuf)) > 0) {
+			strip_trailing(sbuf);
+			buf_appendf(resp, sizeof(resp), &pos,
+				    "removable=%s\n", sbuf);
+		}
+
+		/* Read-only */
+		snprintf(path, sizeof(path),
+			 "/sys/block/%.64s/ro", payload);
+		if (read_small_file(path, sbuf, sizeof(sbuf)) > 0) {
+			strip_trailing(sbuf);
+			buf_appendf(resp, sizeof(resp), &pos,
+				    "ro=%s\n", sbuf);
+		}
+
+		/* List partitions */
+		DIR *pdir = opendir(syspath);
+		if (pdir) {
+			struct dirent *pent;
+			while ((pent = readdir(pdir)) != NULL) {
+				if (strlen(pent->d_name) > 64)
+					continue;
+				if (strncmp(pent->d_name, payload,
+					    plen) != 0)
+					continue;
+				if (strcmp(pent->d_name, payload) == 0)
+					continue;
+
+				char pspath[196];
+				snprintf(pspath, sizeof(pspath),
+					 "/sys/block/%.64s/%.64s/size",
+					 payload, pent->d_name);
+				if (read_small_file(pspath, sbuf,
+						    sizeof(sbuf)) <= 0)
+					continue;
+
+				unsigned long long pbytes =
+					strtoull(sbuf, NULL, 10) * 512ULL;
+
+				char mp[256], fs[64];
+				get_mount_info(pent->d_name, mp, sizeof(mp),
+					       fs, sizeof(fs));
+
+				buf_appendf(resp, sizeof(resp), &pos,
+					    "partition=%s size_bytes=%llu"
+					    " mount=%s fstype=%s\n",
+					    pent->d_name, pbytes,
+					    mp[0] ? mp : "(none)",
+					    fs[0] ? fs : "(none)");
+			}
+			closedir(pdir);
+		}
+	} else {
+		/* Partition: find parent in /sys/block */
+		int found = 0;
+		DIR *bdir = opendir("/sys/block");
+		if (bdir) {
+			struct dirent *bent;
+			while ((bent = readdir(bdir)) != NULL) {
+				if (bent->d_name[0] == '.')
+					continue;
+				if (strlen(bent->d_name) > 64)
+					continue;
+				char pspath[196];
+				snprintf(pspath, sizeof(pspath),
+					 "/sys/block/%.64s/%.64s/size",
+					 bent->d_name, payload);
+				char sbuf[64];
+				if (read_small_file(pspath, sbuf,
+						    sizeof(sbuf)) <= 0)
+					continue;
+
+				found = 1;
+				unsigned long long pbytes =
+					strtoull(sbuf, NULL, 10) * 512ULL;
+
+				buf_appendf(resp, sizeof(resp), &pos,
+					    "type=partition\ndev=%s\n"
+					    "parent=%s\nsize_bytes=%llu\n",
+					    payload, bent->d_name, pbytes);
+
+				/* Start offset */
+				snprintf(pspath, sizeof(pspath),
+					 "/sys/block/%.64s/%.64s/start",
+					 bent->d_name, payload);
+				if (read_small_file(pspath, sbuf,
+						    sizeof(sbuf)) > 0) {
+					strip_trailing(sbuf);
+					buf_appendf(resp, sizeof(resp), &pos,
+						    "start_sector=%s\n",
+						    sbuf);
+				}
+
+				/* Mount + fstype */
+				char mp[256], fs[64];
+				get_mount_info(payload, mp, sizeof(mp),
+					       fs, sizeof(fs));
+				buf_appendf(resp, sizeof(resp), &pos,
+					    "mount=%s\nfstype=%s\n",
+					    mp[0] ? mp : "(none)",
+					    fs[0] ? fs : "(none)");
+				break;
+			}
+			closedir(bdir);
+		}
+
+		if (!found) {
+			send_error(client_fd, SG_ERR_NOT_FOUND,
+				   "device or partition not found in sysfs");
+			return 0;
+		}
+	}
+
+	/* Run blkid for UUID/LABEL/TYPE */
+	char devpath[128];
+	snprintf(devpath, sizeof(devpath), "/dev/%s", payload);
+	const char *argv[] = {"blkid", devpath, NULL};
+	char *blkid_out = safe_exec(argv);
+	if (blkid_out && blkid_out[0]) {
+		strip_trailing(blkid_out);
+		buf_appendf(resp, sizeof(resp), &pos,
+			    "blkid=%s\n", blkid_out);
+	}
+	free(blkid_out);
+
+	send_ok(client_fd, NULL, pos > 0 ? resp : NULL);
+	return 0;
+}
+
+/* ── SG_CMD_DISK_SMART (649) ──────────────────────────────────────────── */
+
+int handle_disk_smart(int client_fd, const char *user,
+		      const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)payload; (void)hdr;
+
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "monitor permission required");
+		return 0;
+	}
+
+	char resp[2048];
+	size_t pos = 0;
+	char val[128];
+
+	/* life_time: two hex values (typeA typeB), 0x01-0x0A = 0-100% wear */
+	if (read_small_file("/sys/block/mmcblk0/device/life_time",
+			    val, sizeof(val)) > 0) {
+		strip_trailing(val);
+		buf_appendf(resp, sizeof(resp), &pos,
+			    "life_time=%s\n", val);
+	} else {
+		buf_appendf(resp, sizeof(resp), &pos,
+			    "life_time=unavailable\n");
+	}
+
+	/* pre_eol_info: 0x01=normal, 0x02=warning, 0x03=urgent */
+	if (read_small_file("/sys/block/mmcblk0/device/pre_eol_info",
+			    val, sizeof(val)) > 0) {
+		strip_trailing(val);
+		buf_appendf(resp, sizeof(resp), &pos,
+			    "pre_eol_info=%s\n", val);
+	} else {
+		buf_appendf(resp, sizeof(resp), &pos,
+			    "pre_eol_info=unavailable\n");
+	}
+
+	/* Device name */
+	if (read_small_file("/sys/block/mmcblk0/device/name",
+			    val, sizeof(val)) > 0) {
+		strip_trailing(val);
+		buf_appendf(resp, sizeof(resp), &pos, "name=%s\n", val);
+	}
+
+	/* Firmware revision */
+	if (read_small_file("/sys/block/mmcblk0/device/fwrev",
+			    val, sizeof(val)) > 0) {
+		strip_trailing(val);
+		buf_appendf(resp, sizeof(resp), &pos, "fwrev=%s\n", val);
+	}
+
+	/* Manufacturing date */
+	if (read_small_file("/sys/block/mmcblk0/device/date",
+			    val, sizeof(val)) > 0) {
+		strip_trailing(val);
+		buf_appendf(resp, sizeof(resp), &pos, "date=%s\n", val);
+	}
+
+	/* Card type */
+	if (read_small_file("/sys/block/mmcblk0/device/type",
+			    val, sizeof(val)) > 0) {
+		strip_trailing(val);
+		buf_appendf(resp, sizeof(resp), &pos, "type=%s\n", val);
+	}
+
+	/* Total size for reference */
+	char sbuf[64];
+	if (read_small_file("/sys/block/mmcblk0/size",
+			    sbuf, sizeof(sbuf)) > 0) {
+		unsigned long long bytes =
+			strtoull(sbuf, NULL, 10) * 512ULL;
+		buf_appendf(resp, sizeof(resp), &pos,
+			    "size_bytes=%llu\n", bytes);
+	}
+
+	send_ok(client_fd, NULL, pos > 0 ? resp : "eMMC not found.\n");
 	return 0;
 }
 

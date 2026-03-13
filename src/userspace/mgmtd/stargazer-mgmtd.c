@@ -3184,6 +3184,14 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		return handle_diag_proctop(client_fd, user, payload, hdr);
 	case SG_CMD_DIAG_THERMAL:
 		return handle_diag_thermal(client_fd, user, payload, hdr);
+	case SG_CMD_DIAG_DISK_HEALTH:
+		return handle_diag_disk_health(client_fd, user, payload, hdr);
+	case SG_CMD_DISK_LIST:
+		return handle_disk_list(client_fd, user, payload, hdr);
+	case SG_CMD_DISK_INFO:
+		return handle_disk_info(client_fd, user, payload, hdr);
+	case SG_CMD_DISK_SMART:
+		return handle_disk_smart(client_fd, user, payload, hdr);
 
 	case SG_CMD_SHOW_SESSIONS:
 		return handle_show_sessions(client_fd, user, payload, hdr);
