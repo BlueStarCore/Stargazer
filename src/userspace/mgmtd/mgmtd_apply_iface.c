@@ -10,6 +10,7 @@
 #include "sg_db.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -145,6 +146,7 @@ static int apply_allowaccess(const char *iface, const char *services)
 	if (errors > 0)
 		mgmt_log("ERROR", "allowaccess: %d iptables rule(s) failed for %s",
 			 errors, iface);
+
 	return errors == 0 ? 0 : -1;
 }
 
@@ -168,7 +170,7 @@ static void dhcpc_stop(const char *iface)
 	char line[32];
 	if (fgets(line, sizeof(line), fp)) {
 		pid_t pid = (pid_t)atoi(line);
-		if (pid > 1)
+		if (pid > 1 && kill(pid, 0) == 0)
 			kill(pid, SIGTERM);
 	}
 	fclose(fp);
@@ -176,21 +178,61 @@ static void dhcpc_stop(const char *iface)
 	mgmt_log("INFO", "dhcpc: stopped on %s", iface);
 }
 
-/* Start a persistent udhcpc for this interface */
+/*
+ * Start a persistent udhcpc for this interface.
+ *
+ * Uses fork()+exec() instead of safe_exec() so mgmtd is NOT blocked
+ * waiting for the first DHCP lease attempt.  udhcpc -b will try once,
+ * then double-fork to daemonize and write the daemon PID to the pidfile.
+ *
+ * Safety: the child closes ALL inherited fds (database, listen socket,
+ * client connections) before exec to prevent fd leaks to udhcpc, which
+ * processes untrusted network data from DHCP servers.
+ */
 static void dhcpc_start(const char *iface)
 {
 	char pf[128];
 	dhcpc_pidfile(iface, pf, sizeof(pf));
 
-	const char *argv[] = {
-		"udhcpc", "-i", iface,
-		"-p", pf,
-		"-s", "/usr/share/udhcpc/default.script",
-		"-b",	/* background after first attempt */
-		NULL
-	};
-	free(safe_exec(argv));
-	mgmt_log("INFO", "dhcpc: started on %s (pidfile %s)", iface, pf);
+	pid_t pid = fork();
+	if (pid < 0) {
+		mgmt_log("ERROR", "dhcpc: fork failed for %s: %s",
+			 iface, strerror(errno));
+		return;
+	}
+
+	if (pid == 0) {
+		/* Child: close ALL inherited fds (db, sockets, etc.)
+		 * to prevent leaking privileged resources to udhcpc. */
+		long maxfd = sysconf(_SC_OPEN_MAX);
+		if (maxfd < 0)
+			maxfd = 1024;
+		for (int fd = 3; fd < (int)maxfd; fd++)
+			close(fd);
+
+		/* Redirect stdout/stderr to /dev/null */
+		int devnull = open("/dev/null", O_RDWR);
+		if (devnull >= 0) {
+			dup2(devnull, STDOUT_FILENO);
+			dup2(devnull, STDERR_FILENO);
+			if (devnull > STDERR_FILENO)
+				close(devnull);
+		}
+
+		execl("/sbin/udhcpc", "udhcpc",
+		      "-i", iface,
+		      "-p", pf,
+		      "-s", "/usr/share/udhcpc/default.script",
+		      "-b",   /* background after first lease attempt */
+		      (char *)NULL);
+		_exit(127);
+	}
+
+	/* Parent returns immediately — SIGCHLD is SIG_IGN so the
+	 * intermediate process is auto-reaped.  udhcpc -b double-forks
+	 * and writes the daemon PID to the pidfile. */
+	mgmt_log("INFO", "dhcpc: started on %s (pid %d, pidfile %s)",
+		 iface, (int)pid, pf);
 }
 
 /*
@@ -247,6 +289,13 @@ sg_status_t apply_interface(const char *id, const char *data,
 	/* Default mode to static if not set */
 	if (!mode[0])
 		snprintf(mode, sizeof(mode), "static");
+
+	/* Only "static" and "dhcp" are valid modes */
+	if (strcmp(mode, "static") != 0 && strcmp(mode, "dhcp") != 0) {
+		snprintf(result, rsize, "Invalid mode '%s' (use static or dhcp).",
+			 mode);
+		return SG_ERR_INVALID_VAL;
+	}
 
 	/* Validate inputs */
 	if (!sg_is_iface_name(id)) {
@@ -330,6 +379,18 @@ sg_status_t apply_interface(const char *id, const char *data,
 			 "Interface %s configured, but some firewall rules failed.",
 			 id);
 		return SG_OK;  /* non-fatal: interface is configured */
+	}
+
+	/* Signal webd to rebind listeners (allowaccess may have changed).
+	 * Best-effort: if webd isn't running yet (boot), this is a no-op. */
+	{
+		FILE *fp = fopen("/run/stargazer-webd.pid", "r");
+		if (fp) {
+			int pid;
+			if (fscanf(fp, "%d", &pid) == 1 && pid > 1)
+				kill(pid, SIGHUP);
+			fclose(fp);
+		}
 	}
 
 	snprintf(result, rsize, "Interface %s configured (%s).", id, mode);

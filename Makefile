@@ -199,7 +199,9 @@ modules: $(BUILD_DIR)/modules/$(MODULE_NAME).ko
 
 $(BUILD_DIR)/modules/$(MODULE_NAME).ko: $(KERNEL_IMAGE) $(SRC_WATCH)
 	@echo "[2/5] Building modules..."
-	$(MAKE) -C $(KERNEL_DIR) M=$(MODULE_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) modules KBUILD_MODPOST_WARN=1
+	$(MAKE) -C $(KERNEL_DIR) M=$(MODULE_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) \
+		KCFLAGS='-DPKT_FWD_VERSION="\"$(VERSION)\"" -DSESS_VERSION="\"$(VERSION)\""' \
+		modules KBUILD_MODPOST_WARN=1
 	@mkdir -p $(BUILD_DIR)/modules
 	cp $(MODULE_DIR)/*.ko $(BUILD_DIR)/modules/
 	# Copy netfilter helper/offload modules (TFTP, flow offload)

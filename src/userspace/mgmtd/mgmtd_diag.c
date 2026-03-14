@@ -992,17 +992,29 @@ int handle_disk_list(int client_fd, const char *user,
 				snprintf(pspath, sizeof(pspath),
 					 "/sys/block/%.64s/%.64s/size",
 					 name, pent->d_name);
-				if (access(pspath, F_OK) == 0)
+				if (access(pspath, F_OK) == 0) {
+					if (pos > mnt_start)
+						buf_appendf(resp, sizeof(resp),
+							    &pos, ",");
 					collect_mounts(pent->d_name,
 						       resp,
 						       sizeof(resp),
 						       &pos);
+				}
 			}
 			closedir(pdir);
 		}
 
 		/* Also check whole-device mounts */
-		collect_mounts(name, resp, sizeof(resp), &pos);
+		{
+			size_t before = pos;
+			if (pos > mnt_start)
+				buf_appendf(resp, sizeof(resp), &pos, ",");
+			collect_mounts(name, resp, sizeof(resp), &pos);
+			/* Remove trailing comma if no mounts were added */
+			if (pos == before + 1 && resp[before] == ',')
+				resp[pos = before] = '\0';
+		}
 
 		if (pos == mnt_start)
 			buf_appendf(resp, sizeof(resp), &pos, "(none)");

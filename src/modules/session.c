@@ -21,7 +21,9 @@
 #include <linux/udp.h>
 #include <linux/timekeeping.h>
 
-#define SESS_VERSION "@VERSION@"
+#ifndef SESS_VERSION
+#define SESS_VERSION "unknown"
+#endif
 
 /* Configuration */
 #define SESSION_TABLE_BITS	10		/* 2^10 = 1024 buckets */

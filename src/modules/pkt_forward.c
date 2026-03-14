@@ -20,7 +20,9 @@
 #include <linux/ip.h>
 #include <linux/skbuff.h>
 
-#define PKT_FWD_VERSION "@VERSION@"
+#ifndef PKT_FWD_VERSION
+#define PKT_FWD_VERSION "unknown"
+#endif
 
 /* Statistics counters (atomic for SMP safety) */
 static atomic64_t pkts_forwarded = ATOMIC64_INIT(0);
