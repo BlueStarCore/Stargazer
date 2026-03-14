@@ -1,28 +1,146 @@
 #!/bin/sh
-# Minimal udhcpc default script for Stargazer
+# Hardened udhcpc default script for Stargazer NGFW
 # Called by BusyBox udhcpc with $1 = action
+#
+# All variables ($ip, $mask, $router, $dns, $interface) come from
+# untrusted DHCP servers on the network — validate everything.
+
+DHCP_METRIC=1024
+STATUS_DIR="/var/run"
+
+# ── Validation helpers ──────────────────────────────────────────────────
+
+valid_ipv4() {
+	echo "$1" | grep -qxE \
+		'([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])'
+}
+
+valid_mask() {
+	case "$1" in
+		[0-9]|[12][0-9]|3[0-2]) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+valid_iface() {
+	echo "$1" | grep -qxE '[a-zA-Z0-9][a-zA-Z0-9._-]{0,14}'
+}
+
+# ── Lease status file (for mgmtd / future watchdogd) ───────────────────
+
+write_status() {
+	_sf="${STATUS_DIR}/dhcp-status.${interface}"
+	cat > "${_sf}.tmp" <<-STATUSEOF
+		state=$1
+		ip=${ip:-}
+		mask=${mask:-}
+		router=${router:-}
+		dns=${dns:-}
+		lease=${lease:-}
+		serverid=${serverid:-}
+	STATUSEOF
+	mv "${_sf}.tmp" "$_sf" 2>/dev/null
+}
+
+# ── Validate interface name first ───────────────────────────────────────
+
+if ! valid_iface "$interface"; then
+	logger -t udhcpc "SECURITY: invalid interface name, aborting"
+	exit 1
+fi
+
+# ── Action dispatch ─────────────────────────────────────────────────────
 
 case "$1" in
 	deconfig)
-		ip addr flush dev "$interface" 2>/dev/null
+		# Only remove the DHCP-assigned address (from status file),
+		# not all addresses — preserves manually added secondary IPs.
+		_sf="${STATUS_DIR}/dhcp-status.${interface}"
+		if [ -f "$_sf" ]; then
+			_old_ip=$(grep '^ip=' "$_sf" 2>/dev/null | cut -d= -f2)
+			_old_mask=$(grep '^mask=' "$_sf" 2>/dev/null | cut -d= -f2)
+			if [ -n "$_old_ip" ] && valid_ipv4 "$_old_ip"; then
+				ip addr del "${_old_ip}/${_old_mask:-24}" \
+					dev "$interface" 2>/dev/null
+			fi
+		fi
+		# Remove only DHCP-learned default routes (by metric)
+		ip route del default dev "$interface" metric $DHCP_METRIC \
+			2>/dev/null
 		ip link set "$interface" up
+		write_status "deconfig"
+		logger -t udhcpc "deconfig: iface=$interface"
 		;;
+
 	bound|renew)
-		ip addr flush dev "$interface" 2>/dev/null
+		# Validate IP from DHCP server
+		if ! valid_ipv4 "$ip"; then
+			logger -t udhcpc "SECURITY: invalid IP '$ip' from server"
+			exit 1
+		fi
+		if [ -n "$mask" ] && ! valid_mask "$mask"; then
+			logger -t udhcpc "SECURITY: invalid mask '$mask' from server"
+			exit 1
+		fi
+
+		# Remove old DHCP-assigned address (from status file)
+		_sf="${STATUS_DIR}/dhcp-status.${interface}"
+		if [ -f "$_sf" ]; then
+			_old_ip=$(grep '^ip=' "$_sf" 2>/dev/null | cut -d= -f2)
+			_old_mask=$(grep '^mask=' "$_sf" 2>/dev/null | cut -d= -f2)
+			if [ -n "$_old_ip" ] && valid_ipv4 "$_old_ip"; then
+				ip addr del "${_old_ip}/${_old_mask:-24}" \
+					dev "$interface" 2>/dev/null
+			fi
+		fi
+
+		# Assign new address
 		ip addr add "$ip/${mask:-24}" dev "$interface"
+
+		# Default route: use metric so static routes (lower metric) win
 		if [ -n "$router" ]; then
-			ip route del default 2>/dev/null
+			ip route del default dev "$interface" \
+				metric $DHCP_METRIC 2>/dev/null
 			for r in $router; do
-				ip route add default via "$r" dev "$interface"
+				if valid_ipv4 "$r"; then
+					ip route add default via "$r" \
+						dev "$interface" \
+						metric $DHCP_METRIC 2>/dev/null
+				else
+					logger -t udhcpc \
+						"SECURITY: invalid router '$r', skipped"
+				fi
 			done
 		fi
-		# DNS
+
+		# DNS: write per-interface file, merge with static DNS
 		if [ -n "$dns" ]; then
-			: > /tmp/resolv.conf
+			_dns_file="/var/run/dhcp-dns.${interface}"
+			: > "$_dns_file"
 			for d in $dns; do
-				echo "nameserver $d" >> /tmp/resolv.conf
+				if valid_ipv4 "$d"; then
+					echo "nameserver $d" >> "$_dns_file"
+				else
+					logger -t udhcpc \
+						"SECURITY: invalid DNS '$d', skipped"
+				fi
 			done
-			cp /tmp/resolv.conf /etc/resolv.conf
+			# Merge: static DNS first, then all DHCP DNS
+			{
+				[ -f /etc/resolv.conf.static ] && \
+					cat /etc/resolv.conf.static
+				for _df in /var/run/dhcp-dns.*; do
+					[ -f "$_df" ] && cat "$_df"
+				done
+			} > /etc/resolv.conf
 		fi
+
+		write_status "$1"
+		logger -t udhcpc "$1: ip=$ip/${mask:-24} router=${router:-none} iface=$interface"
+		;;
+
+	leasefail|nak)
+		write_status "$1"
+		logger -t udhcpc "$1: iface=$interface"
 		;;
 esac

@@ -152,6 +152,27 @@ static int apply_allowaccess(const char *iface, const char *services)
 
 /* ── udhcpc lifecycle ───────────────────────────────────────────────── */
 
+/* ── Process identity helper ───────────────────────────────────────────── */
+
+static int
+pid_is_process(pid_t pid, const char *expected_name)
+{
+	char path[64];
+	snprintf(path, sizeof(path), "/proc/%d/comm", (int)pid);
+	FILE *fp = fopen(path, "r");
+	if (!fp)
+		return 0;
+	char comm[64];
+	if (!fgets(comm, sizeof(comm), fp)) {
+		fclose(fp);
+		return 0;
+	}
+	fclose(fp);
+	char *nl = strchr(comm, '\n');
+	if (nl) *nl = '\0';
+	return strcmp(comm, expected_name) == 0;
+}
+
 /* Per-interface pidfile: /var/run/udhcpc.<iface>.pid */
 static void dhcpc_pidfile(const char *iface, char *buf, size_t sz)
 {
@@ -170,8 +191,24 @@ static void dhcpc_stop(const char *iface)
 	char line[32];
 	if (fgets(line, sizeof(line), fp)) {
 		pid_t pid = (pid_t)atoi(line);
-		if (pid > 1 && kill(pid, 0) == 0)
+		if (pid > 1 && pid_is_process(pid, "udhcpc")) {
 			kill(pid, SIGTERM);
+			for (int i = 0; i < 30; i++) {
+				if (kill(pid, 0) != 0)
+					break;
+				usleep(100000);
+			}
+			if (kill(pid, 0) == 0) {
+				mgmt_log("WARN",
+					 "dhcpc: pid %d did not exit,"
+					 " sending SIGKILL", (int)pid);
+				kill(pid, SIGKILL);
+			}
+		} else if (pid > 1) {
+			mgmt_log("WARN",
+				 "dhcpc: pid %d is not udhcpc,"
+				 " not killing", (int)pid);
+		}
 	}
 	fclose(fp);
 	unlink(pf);

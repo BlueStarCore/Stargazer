@@ -17,10 +17,12 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 /* ── IP helpers ────────────────────────────────────────────────────────── */
@@ -94,6 +96,31 @@ dhcpd_fw_del(const char *iface)
 	free(safe_exec(argv));
 }
 
+/* ── Process identity helper ───────────────────────────────────────────── */
+
+/*
+ * Verify that pid belongs to a process named 'expected_name'.
+ * Reads /proc/<pid>/comm to prevent killing a recycled PID.
+ */
+static int
+pid_is_process(pid_t pid, const char *expected_name)
+{
+	char path[64];
+	snprintf(path, sizeof(path), "/proc/%d/comm", (int)pid);
+	FILE *fp = fopen(path, "r");
+	if (!fp)
+		return 0;
+	char comm[64];
+	if (!fgets(comm, sizeof(comm), fp)) {
+		fclose(fp);
+		return 0;
+	}
+	fclose(fp);
+	char *nl = strchr(comm, '\n');
+	if (nl) *nl = '\0';
+	return strcmp(comm, expected_name) == 0;
+}
+
 /* ── Daemon lifecycle ─────────────────────────────────────────────────── */
 
 /*
@@ -110,14 +137,18 @@ dhcpd_read_conf_iface(const char *conf_path, char *out, size_t outsz)
 	char line[256];
 	int found = 0;
 	while (fgets(line, sizeof(line), fp)) {
-		if (strncmp(line, "interface\t", 10) == 0) {
-			char *nl = strchr(line + 10, '\n');
+		if (strncmp(line, "interface", 9) == 0 &&
+		    (line[9] == '\t' || line[9] == ' ')) {
+			const char *val = line + 9;
+			while (*val == '\t' || *val == ' ')
+				val++;
+			char *nl = strchr(val, '\n');
 			if (nl)
 				*nl = '\0';
-			size_t vlen = strlen(line + 10);
+			size_t vlen = strlen(val);
 			if (vlen >= outsz)
 				vlen = outsz - 1;
-			memcpy(out, line + 10, vlen);
+			memcpy(out, val, vlen);
 			out[vlen] = '\0';
 			found = 1;
 			break;
@@ -143,8 +174,27 @@ dhcpd_stop(const char *id)
 		char line[32];
 		if (fgets(line, sizeof(line), fp)) {
 			pid_t pid = (pid_t)atoi(line);
-			if (pid > 1)
+			if (pid > 1 && pid_is_process(pid, "udhcpd")) {
 				kill(pid, SIGTERM);
+				/* Wait up to 3s for exit to avoid
+				 * EADDRINUSE on immediate restart */
+				for (int i = 0; i < 30; i++) {
+					if (kill(pid, 0) != 0)
+						break;
+					usleep(100000);
+				}
+				if (kill(pid, 0) == 0) {
+					mgmt_log("WARN",
+						 "dhcpd: pid %d did not exit,"
+						 " sending SIGKILL",
+						 (int)pid);
+					kill(pid, SIGKILL);
+				}
+			} else if (pid > 1) {
+				mgmt_log("WARN",
+					 "dhcpd: pid %d is not udhcpd,"
+					 " not killing", (int)pid);
+			}
 		}
 		fclose(fp);
 		unlink(pf);
@@ -263,26 +313,46 @@ dhcpd_start(const char *id,
 	if (fp)
 		fclose(fp);
 
-	/* Start udhcpd — it daemonizes and exits the parent.
-	 * On success: empty output.  On failure: error on stderr. */
-	const char *argv[] = {"udhcpd", cf, NULL};
-	char *out = safe_exec(argv);
-	if (!out) {
-		mgmt_log("ERROR", "dhcpd: fork failed for pool %s", id);
+	/* Start udhcpd via fork+exec with fd safety.
+	 * Close ALL inherited fds to prevent leaking database/socket
+	 * to udhcpd, which listens on untrusted network ports.
+	 * udhcpd daemonizes immediately (parent exits fast). */
+	pid_t dpid = fork();
+	if (dpid < 0) {
+		mgmt_log("ERROR", "dhcpd: fork failed for pool %s: %s",
+			 id, strerror(errno));
 		unlink(cf);
 		unlink(lf);
 		return -1;
 	}
-	if (out[0] != '\0') {
-		/* udhcpd printed an error (e.g. can't bind socket) */
-		mgmt_log("ERROR", "dhcpd: udhcpd failed for pool %s: %s",
-			 id, out);
-		free(out);
+	if (dpid == 0) {
+		/* Child: close ALL inherited fds */
+		long maxfd = sysconf(_SC_OPEN_MAX);
+		if (maxfd < 0) maxfd = 1024;
+		for (int fd = 3; fd < (int)maxfd; fd++)
+			close(fd);
+		int devnull = open("/dev/null", O_RDWR);
+		if (devnull >= 0) {
+			dup2(devnull, STDOUT_FILENO);
+			dup2(devnull, STDERR_FILENO);
+			if (devnull > STDERR_FILENO)
+				close(devnull);
+		}
+		execl("/usr/sbin/udhcpd", "udhcpd", cf, (char *)NULL);
+		_exit(127);
+	}
+	/* Parent: wait for udhcpd parent to exit (it double-forks).
+	 * This blocks briefly but udhcpd daemonizes immediately,
+	 * unlike udhcpc which waits for a lease first. */
+	int wstatus;
+	waitpid(dpid, &wstatus, 0);
+	if (!WIFEXITED(wstatus) || WEXITSTATUS(wstatus) != 0) {
+		mgmt_log("ERROR", "dhcpd: udhcpd failed for pool %s (exit %d)",
+			 id, WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1);
 		unlink(cf);
 		unlink(lf);
 		return -1;
 	}
-	free(out);
 
 	mgmt_log("INFO", "dhcpd: started pool %s on %s (%s-%s)",
 		 id, iface, start_ip, end_ip);
@@ -387,6 +457,66 @@ apply_dhcp(const char *id, const char *data,
 			 "DHCP pool %s: start-ip is greater than end-ip.",
 			 id);
 		return SG_ERR_INVALID_VAL;
+	}
+
+	/* Gateway must be in the same subnet as the pool range */
+	if (gateway[0]) {
+		uint32_t g = ip4_to_u32(gateway);
+		if ((g & m) != (s & m)) {
+			snprintf(result, rsize,
+				 "DHCP pool %s: gateway %s is not in subnet "
+				 "(mask %s).", id, gateway, netmask);
+			return SG_ERR_INVALID_VAL;
+		}
+	}
+
+	/* Check for IP range overlap with other enabled pools */
+	{
+		char *plist = sg_db_list("network_dhcp-server");
+		if (plist) {
+			char *sp = NULL;
+			char *pt = strtok_r(plist, "\n", &sp);
+			int overlap = 0;
+			while (pt && !overlap) {
+				if (strcmp(pt, id) == 0) {
+					pt = strtok_r(NULL, "\n", &sp);
+					continue;
+				}
+				char *os = sg_db_get_val("network_dhcp-server",
+							 pt, "status");
+				if (os && strcmp(os, "disable") == 0) {
+					free(os);
+					pt = strtok_r(NULL, "\n", &sp);
+					continue;
+				}
+				free(os);
+				char *o_start = sg_db_get_val(
+					"network_dhcp-server", pt, "start-ip");
+				char *o_end = sg_db_get_val(
+					"network_dhcp-server", pt, "end-ip");
+				if (o_start && o_end &&
+				    sg_is_ipv4(o_start) && sg_is_ipv4(o_end)) {
+					uint32_t os32 = ip4_to_u32(o_start);
+					uint32_t oe32 = ip4_to_u32(o_end);
+					if (s <= oe32 && os32 <= e)
+						overlap = 1;
+				}
+				free(o_start);
+				free(o_end);
+				if (overlap)
+					mgmt_log("WARN",
+						 "dhcpd: pool %s range overlaps"
+						 " with pool %s", id, pt);
+				pt = strtok_r(NULL, "\n", &sp);
+			}
+			free(plist);
+			if (overlap) {
+				snprintf(result, rsize,
+					 "DHCP pool %s: IP range overlaps"
+					 " with another pool.", id);
+				return SG_ERR_IN_USE;
+			}
+		}
 	}
 
 	/* Default lease time if not set */

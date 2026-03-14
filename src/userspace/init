@@ -297,8 +297,9 @@ if [ -x /sbin/stargazer-mgmtd ]; then
 	mkfifo "$_ready" 2>/dev/null
 	/sbin/stargazer-mgmtd &
 	# Block until mgmtd signals readiness via FIFO (zero-CPU wait).
-	# Timeout guard: if mgmtd crashes before writing, unblock after 10s.
-	(sleep 10; echo timeout > "$_ready" 2>/dev/null) &
+	# Config replay applies iptables/ip rules for every interface —
+	# can take 10-20s on large configs.  30s timeout covers worst case.
+	(sleep 30; echo timeout > "$_ready" 2>/dev/null) &
 	_to=$!
 	read _sig < "$_ready"
 	kill "$_to" 2>/dev/null; wait "$_to" 2>/dev/null
@@ -316,6 +317,27 @@ if [ -x /sbin/stargazer-mgmtd ]; then
 		*) echo "[stargazer] WARNING: Management daemon did not start (timeout)."
 			_init_errors="${_init_errors}mgmtd "
 			;;
+	esac
+fi
+
+# Start web daemon (HTTP API — binds to interface IPs per allowaccess config)
+if [ -x /sbin/stargazer-webd ]; then
+	echo "[stargazer] Starting web daemon..."
+	_webd_ready=/run/webd-ready
+	mkfifo "$_webd_ready" 2>/dev/null
+	# Binds to interface IPs based on allowaccess config (http→:80, https→:443).
+	# To enable HTTPS, add TLS cert/key and set allowaccess=https on interfaces:
+	#   --tls-cert /etc/stargazer/tls/cert.pem --tls-key /etc/stargazer/tls/key.pem
+	/sbin/stargazer-webd &
+	(sleep 10; echo timeout > "$_webd_ready" 2>/dev/null) &
+	_wto=$!
+	read _wsig < "$_webd_ready"
+	kill "$_wto" 2>/dev/null; wait "$_wto" 2>/dev/null
+	rm -f "$_webd_ready"
+	case "$_wsig" in
+		ready) echo "[stargazer] Web UI ready." ;;
+		*)     echo "[stargazer] WARNING: Web daemon did not start."
+		       _init_errors="${_init_errors}webd " ;;
 	esac
 fi
 
@@ -351,10 +373,15 @@ sleep 0.3
 # Safety net: kill any stragglers individually
 killall stargazer-cli 2>/dev/null
 killall stargazer-logind 2>/dev/null
+echo "[stargazer] Stopping web daemon..."
+killall stargazer-webd 2>/dev/null
 echo "[stargazer] Stopping management daemon..."
 killall stargazer-mgmtd 2>/dev/null
 echo "[stargazer] Stopping DHCP services..."
 killall udhcpd 2>/dev/null
+# SIGUSR2 triggers DHCP RELEASE before exit (BusyBox udhcpc)
+killall -USR2 udhcpc 2>/dev/null
+sleep 0.5
 killall udhcpc 2>/dev/null
 echo "[stargazer] Stopping init services..."
 for s in /etc/init.d/*; do [ -x "$s" ] && "$s" stop 2>/dev/null; done
@@ -394,10 +421,15 @@ fi
 sleep 0.3
 killall stargazer-cli 2>/dev/null
 killall stargazer-logind 2>/dev/null
+echo "[stargazer] Stopping web daemon..."
+killall stargazer-webd 2>/dev/null
 echo "[stargazer] Stopping management daemon..."
 killall stargazer-mgmtd 2>/dev/null
 echo "[stargazer] Stopping DHCP services..."
 killall udhcpd 2>/dev/null
+# SIGUSR2 triggers DHCP RELEASE before exit (BusyBox udhcpc)
+killall -USR2 udhcpc 2>/dev/null
+sleep 0.5
 killall udhcpc 2>/dev/null
 echo "[stargazer] Stopping init services..."
 for s in /etc/init.d/*; do [ -x "$s" ] && "$s" stop 2>/dev/null; done
