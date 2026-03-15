@@ -2,19 +2,50 @@
 /*
  * mgmtd_apply_dns.c — Apply handler for network_dns
  *
- * Stub — Member A fills in the real DNS forwarding implementation.
+ * Writes /etc/resolv.conf from the saved DNS configuration.
  */
 
 #include "mgmtd_apply.h"
 
 #include <stdio.h>
+#include <string.h>
 
 sg_status_t apply_dns(const char *id, const char *data,
 		      char *result, size_t rsize)
 {
 	(void)id;
-	(void)data;
-	snprintf(result, rsize,
-		 "Config saved (DNS apply handler not implemented).");
+
+	char primary[VALBUFSZ], secondary[VALBUFSZ], status[VALBUFSZ];
+	extract_val(data, "primary",   primary,   sizeof(primary));
+	extract_val(data, "secondary", secondary, sizeof(secondary));
+	extract_val(data, "status",    status,    sizeof(status));
+
+	if (strcmp(status, "disable") == 0) {
+		snprintf(result, rsize, "DNS disabled.");
+		return SG_OK;
+	}
+
+	if (!primary[0] && !secondary[0]) {
+		snprintf(result, rsize, "DNS: no servers configured.");
+		return SG_OK;
+	}
+
+	FILE *fp = fopen("/etc/resolv.conf", "w");
+	if (!fp) {
+		snprintf(result, rsize, "Failed to write /etc/resolv.conf.");
+		return SG_ERR_IO_FAIL;
+	}
+
+	if (primary[0])
+		fprintf(fp, "nameserver %s\n", primary);
+	if (secondary[0])
+		fprintf(fp, "nameserver %s\n", secondary);
+
+	fclose(fp);
+
+	snprintf(result, rsize, "DNS configured (primary: %s%s%s).",
+		 primary[0]   ? primary   : "",
+		 (primary[0] && secondary[0]) ? ", secondary: " : "",
+		 secondary[0] ? secondary : "");
 	return SG_OK;
 }

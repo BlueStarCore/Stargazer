@@ -73,7 +73,9 @@ int  check_references(const char *type, const char *id,
 /* ── User/password helpers (defined in mgmtd_user.c) ─────────────────────── */
 
 int  set_password(const char *username, const char *password);
-int  create_system_user(const char *username, const char *shell);
+int  set_shadow_hash(const char *username, const char *hash);
+int  create_system_user(const char *username, const char *shell,
+			int allow_empty_pw);
 int  delete_system_user(const char *username);
 int  user_has_password(const char *username);
 int  mgmtd_validate_password(const char *username, const char *password,

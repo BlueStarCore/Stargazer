@@ -64,6 +64,7 @@
 #define BUF_SIZE         (sizeof(sg_request_hdr_t) + SG_PAYLOAD_MAX)
 #define DEBUG_STATE_FILE  "/tmp/stargazer-debug.conf"
 #define MGMT_DEFAULT_IP   "192.168.99.99/24" /* first NIC on first boot */
+#define WEBD_SERVICE_UID  900                 /* __webd service account  */
 
 /* Boot integrity states — returned by mgmtd_check_boot_integrity() */
 typedef enum {
@@ -94,7 +95,41 @@ void debug_buf_push(const char *fmt, ...)
 }
 
 static volatile sig_atomic_t g_running = 1;
+static volatile sig_atomic_t g_child_died = 0;
 int g_listen_fd = -1;  /* listen socket fd, for child to close after fork */
+
+/* ── Process supervisor ────────────────────────────────────────────────── */
+
+/*
+ * Supervised child table. mgmtd is the direct parent of all managed
+ * daemons (udhcpc, udhcpd, webd). SIGCHLD + waitpid gives instant
+ * crash detection — no polling, no pidfiles, no watchdogd.
+ */
+
+#define SUP_MAX_CHILDREN 32
+#define SUP_ARGV_STORE   512
+#define SUP_ARGV_MAX     16
+#define SUP_RESTART_MAX  5      /* default restart limit */
+
+typedef struct {
+	char            name[64];
+	pid_t           pid;
+	int             active;          /* slot in use */
+	child_source_t  source;
+	char            argv_store[SUP_ARGV_STORE]; /* packed NUL-separated */
+	const char     *argv[SUP_ARGV_MAX];         /* pointers into store  */
+	int             restart_count;
+	int             restart_max;     /* 0 = do not restart */
+	struct timespec started_at;      /* CLOCK_MONOTONIC */
+	/* SRC_CONFIG: DB condition for restart eligibility */
+	char            cfg_type[64];
+	char            cfg_id[64];
+	char            cfg_key[32];
+	char            cfg_val[32];
+} child_entry_t;
+
+static child_entry_t g_children[SUP_MAX_CHILDREN];
+static int           g_nchildren;
 
 /* ── Input validation ───────────────────────────────────────────────────── */
 /* Validators now live in common/sg_validate.c — included via sg_validate.h */
@@ -519,6 +554,341 @@ static void sig_handler(int sig)
 	g_running = 0;
 }
 
+static void sigchld_handler(int sig)
+{
+	(void)sig;
+	g_child_died = 1;
+}
+
+/* ── Supervisor: spawn / start / stop / reap ───────────────────────────── */
+
+static child_entry_t *sup_find(const char *name)
+{
+	for (int i = 0; i < g_nchildren; i++)
+		if (g_children[i].active && strcmp(g_children[i].name, name) == 0)
+			return &g_children[i];
+	return NULL;
+}
+
+static child_entry_t *sup_alloc(const char *name)
+{
+	/* Reuse existing slot */
+	child_entry_t *e = sup_find(name);
+	if (e) return e;
+	/* Find free slot */
+	for (int i = 0; i < SUP_MAX_CHILDREN; i++) {
+		if (!g_children[i].active) {
+			memset(&g_children[i], 0, sizeof(g_children[i]));
+			g_children[i].active = 1;
+			snprintf(g_children[i].name, sizeof(g_children[i].name),
+				 "%s", name);
+			if (i >= g_nchildren)
+				g_nchildren = i + 1;
+			return &g_children[i];
+		}
+	}
+	return NULL;
+}
+
+static void sup_unregister(child_entry_t *e)
+{
+	e->active = 0;
+	e->pid = 0;
+	/* Shrink g_nchildren if this was the last slot */
+	while (g_nchildren > 0 && !g_children[g_nchildren - 1].active)
+		g_nchildren--;
+}
+
+/*
+ * Deep-copy argv into entry's argv_store (packed NUL-separated strings).
+ * Sets entry->argv[] pointers into the store.
+ */
+static int sup_copy_argv(child_entry_t *e, const char *const argv[])
+{
+	size_t off = 0;
+	int argc = 0;
+	for (int i = 0; argv[i] && i < SUP_ARGV_MAX - 1; i++) {
+		size_t len = strlen(argv[i]) + 1;
+		if (off + len > SUP_ARGV_STORE)
+			return -1;
+		memcpy(e->argv_store + off, argv[i], len);
+		e->argv[argc++] = e->argv_store + off;
+		off += len;
+	}
+	e->argv[argc] = NULL;
+	return 0;
+}
+
+/*
+ * Fork+exec a supervised child. Child: close all fds >= 3, reset signals
+ * to SIG_DFL, setsid, redirect stdio to /dev/null.
+ */
+static int spawn_child(child_entry_t *e)
+{
+	pid_t pid = fork();
+	if (pid < 0) {
+		mgmt_log("ERROR", "supervisor: fork failed for %s: %s",
+			 e->name, strerror(errno));
+		return -1;
+	}
+	if (pid == 0) {
+		/* Child process */
+		/* Close all inherited fds (db, sockets, etc.) */
+		long maxfd = sysconf(_SC_OPEN_MAX);
+		if (maxfd < 0) maxfd = 1024;
+		for (int fd = 3; fd < (int)maxfd; fd++)
+			close(fd);
+
+		/* Reset signals to default */
+		signal(SIGCHLD, SIG_DFL);
+		signal(SIGINT,  SIG_DFL);
+		signal(SIGTERM, SIG_DFL);
+		signal(SIGPIPE, SIG_DFL);
+
+		/* New session (detach from mgmtd's terminal) */
+		setsid();
+
+		/* Redirect stdio to /dev/null */
+		int devnull = open("/dev/null", O_RDWR);
+		if (devnull >= 0) {
+			dup2(devnull, STDIN_FILENO);
+			dup2(devnull, STDOUT_FILENO);
+			dup2(devnull, STDERR_FILENO);
+			if (devnull > STDERR_FILENO)
+				close(devnull);
+		}
+
+		execvp(e->argv[0], (char *const *)e->argv);
+		_exit(127);
+	}
+
+	e->pid = pid;
+	clock_gettime(CLOCK_MONOTONIC, &e->started_at);
+	mgmt_log("INFO", "supervisor: started %s (pid %d)", e->name, (int)pid);
+	return 0;
+}
+
+int supervisor_start(const char *name, const char *const argv[],
+		     child_source_t source,
+		     const char *cfg_type, const char *cfg_id,
+		     const char *cfg_key, const char *cfg_val)
+{
+	/* If already running, stop it first */
+	child_entry_t *e = sup_find(name);
+	if (e && e->pid > 0) {
+		supervisor_stop(name);
+		e = NULL;
+	}
+
+	e = sup_alloc(name);
+	if (!e) {
+		mgmt_log("ERROR", "supervisor: no free slot for %s", name);
+		return -1;
+	}
+
+	if (sup_copy_argv(e, argv) != 0) {
+		mgmt_log("ERROR", "supervisor: argv too large for %s", name);
+		sup_unregister(e);
+		return -1;
+	}
+
+	e->source = source;
+	e->restart_count = 0;
+	e->restart_max = SUP_RESTART_MAX;
+
+	if (cfg_type) snprintf(e->cfg_type, sizeof(e->cfg_type), "%s", cfg_type);
+	if (cfg_id)   snprintf(e->cfg_id,   sizeof(e->cfg_id),   "%s", cfg_id);
+	if (cfg_key)  snprintf(e->cfg_key,   sizeof(e->cfg_key),  "%s", cfg_key);
+	if (cfg_val)  snprintf(e->cfg_val,   sizeof(e->cfg_val),  "%s", cfg_val);
+
+	return spawn_child(e);
+}
+
+void supervisor_stop(const char *name)
+{
+	child_entry_t *e = sup_find(name);
+	if (!e) return;
+
+	/* Prevent auto-restart */
+	e->restart_max = 0;
+
+	if (e->pid > 0 && kill(e->pid, 0) == 0) {
+		kill(e->pid, SIGTERM);
+		/* Wait up to 3s (100ms polls) for exit */
+		for (int i = 0; i < 30; i++) {
+			usleep(100000);
+			int wstatus;
+			pid_t w = waitpid(e->pid, &wstatus, WNOHANG);
+			if (w > 0 || (w < 0 && errno == ECHILD))
+				goto reaped;
+		}
+		/* Still alive — SIGKILL */
+		mgmt_log("WARN", "supervisor: %s (pid %d) did not exit, "
+			 "sending SIGKILL", e->name, (int)e->pid);
+		kill(e->pid, SIGKILL);
+		waitpid(e->pid, NULL, 0);
+	}
+
+reaped:
+	mgmt_log("INFO", "supervisor: stopped %s", e->name);
+	sup_unregister(e);
+}
+
+pid_t supervisor_get_pid(const char *name)
+{
+	child_entry_t *e = sup_find(name);
+	if (e && e->pid > 0)
+		return e->pid;
+	return 0;
+}
+
+/*
+ * Check if a dead child should be restarted.
+ * For SRC_CONFIG: query DB to see if the config condition still holds.
+ */
+static int should_restart(child_entry_t *e)
+{
+	if (e->restart_max == 0)
+		return 0;
+	if (e->restart_count >= e->restart_max)
+		return 0;
+
+	if (e->source == SRC_CONFIG && e->cfg_type[0]) {
+		char *val = sg_db_get_val(e->cfg_type, e->cfg_id, e->cfg_key);
+		int match = (val && strcmp(val, e->cfg_val) == 0);
+		free(val);
+		if (!match) {
+			mgmt_log("INFO", "supervisor: %s config changed "
+				 "(%s.%s.%s != %s), not restarting",
+				 e->name, e->cfg_type, e->cfg_id,
+				 e->cfg_key, e->cfg_val);
+			return 0;
+		}
+	}
+	return 1;
+}
+
+/*
+ * Reap dead supervised children by iterating the table and calling
+ * waitpid() on each known PID. This avoids stealing safe_exec()'s
+ * children which are reaped by their own waitpid(specific_pid) calls.
+ *
+ * For each dead child: log exit info, check restart eligibility,
+ * apply backoff, and respawn.
+ */
+static void reap_children(void)
+{
+	for (int i = 0; i < g_nchildren; i++) {
+		child_entry_t *e = &g_children[i];
+		if (!e->active || e->pid <= 0)
+			continue;
+
+		int wstatus;
+		pid_t w = waitpid(e->pid, &wstatus, WNOHANG);
+		if (w <= 0)
+			continue;  /* still alive or error */
+
+		/* Log exit reason */
+		if (WIFEXITED(wstatus)) {
+			mgmt_log("WARN", "supervisor: %s (pid %d) exited "
+				 "with code %d",
+				 e->name, (int)e->pid, WEXITSTATUS(wstatus));
+		} else if (WIFSIGNALED(wstatus)) {
+			mgmt_log("WARN", "supervisor: %s (pid %d) killed "
+				 "by signal %d",
+				 e->name, (int)e->pid, WTERMSIG(wstatus));
+		}
+
+		e->pid = 0;
+
+		/* If uptime >= 30s, reset restart counter (stable run) */
+		struct timespec now;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		long uptime = now.tv_sec - e->started_at.tv_sec;
+		if (uptime >= 30)
+			e->restart_count = 0;
+
+		if (!should_restart(e)) {
+			mgmt_log("INFO", "supervisor: %s will not be "
+				 "restarted (count=%d, max=%d)",
+				 e->name, e->restart_count, e->restart_max);
+			sup_unregister(e);
+			continue;
+		}
+
+		e->restart_count++;
+		/* Backoff: sleep min(restart_count, 5) seconds */
+		int delay = e->restart_count;
+		if (delay > 5) delay = 5;
+		mgmt_log("INFO", "supervisor: restarting %s in %ds "
+			 "(attempt %d/%d)",
+			 e->name, delay, e->restart_count, e->restart_max);
+		sleep(delay);
+		spawn_child(e);
+	}
+}
+
+/*
+ * Graceful shutdown of all supervised children.
+ * 1. SIGUSR2 to udhcpc children (triggers DHCP RELEASE)
+ * 2. Sleep 0.5s for RELEASE to be sent
+ * 3. SIGTERM all children with restart_max=0 (prevent restart)
+ * 4. Wait up to 5s for all to exit
+ * 5. SIGKILL any stragglers
+ */
+static void shutdown_children(void)
+{
+	/* Phase 1: SIGUSR2 to udhcpc children for DHCP RELEASE */
+	for (int i = 0; i < g_nchildren; i++) {
+		if (!g_children[i].active || g_children[i].pid <= 0)
+			continue;
+		if (strncmp(g_children[i].name, "udhcpc.", 7) == 0) {
+			kill(g_children[i].pid, SIGUSR2);
+			mgmt_log("INFO", "supervisor: sent SIGUSR2 (DHCP "
+				 "RELEASE) to %s", g_children[i].name);
+		}
+	}
+	usleep(500000);  /* 0.5s for RELEASE */
+
+	/* Phase 2: SIGTERM all, prevent restarts */
+	for (int i = 0; i < g_nchildren; i++) {
+		if (!g_children[i].active || g_children[i].pid <= 0)
+			continue;
+		g_children[i].restart_max = 0;
+		kill(g_children[i].pid, SIGTERM);
+	}
+
+	/* Phase 3: Wait up to 5s, reaping as they die */
+	for (int round = 0; round < 50; round++) {
+		int alive = 0;
+		for (int i = 0; i < g_nchildren; i++) {
+			if (!g_children[i].active || g_children[i].pid <= 0)
+				continue;
+			int wstatus;
+			pid_t w = waitpid(g_children[i].pid, &wstatus, WNOHANG);
+			if (w > 0 || (w < 0 && errno == ECHILD)) {
+				g_children[i].pid = 0;
+				sup_unregister(&g_children[i]);
+			} else {
+				alive++;
+			}
+		}
+		if (alive == 0) break;
+		usleep(100000);
+	}
+
+	/* Phase 4: SIGKILL stragglers */
+	for (int i = 0; i < g_nchildren; i++) {
+		if (!g_children[i].active || g_children[i].pid <= 0)
+			continue;
+		mgmt_log("WARN", "supervisor: SIGKILL %s (pid %d)",
+			 g_children[i].name, (int)g_children[i].pid);
+		kill(g_children[i].pid, SIGKILL);
+		waitpid(g_children[i].pid, NULL, 0);
+		sup_unregister(&g_children[i]);
+	}
+}
+
 /* ── Safe I/O helpers ───────────────────────────────────────────────────── */
 
 static ssize_t safe_read(int fd, void *buf, size_t len)
@@ -726,7 +1096,8 @@ static void mgmtd_signal_fifo(const char *msg)
 {
 	int rfd = open("/run/mgmtd-ready", O_WRONLY);
 	if (rfd >= 0) {
-		write(rfd, msg, strlen(msg));
+		if (write(rfd, msg, strlen(msg)) < 0)
+			(void)0; /* best-effort FIFO signal, ignore error */
 		close(rfd);
 	}
 }
@@ -1450,6 +1821,27 @@ static void mgmtd_init_firewall(void)
 		mgmt_log("INFO", "INPUT chain: policy DROP, lo ACCEPT, "
 			 "ESTABLISHED/RELATED ACCEPT");
 
+	/* FORWARD chain: policy DROP, flush, allow return traffic.
+	 * Firewall policies are replayed on top of this foundation. */
+	{
+		const char *fwd_p[]   = {"iptables", "-P", "FORWARD", "DROP", NULL};
+		const char *fwd_f[]   = {"iptables", "-F", "FORWARD", NULL};
+		const char *fwd_est[] = {"iptables", "-A", "FORWARD",
+					 "-m", "conntrack",
+					 "--ctstate", "ESTABLISHED,RELATED",
+					 "-j", "ACCEPT", NULL};
+		if (ipt_exec(fwd_p) != 0)
+			mgmt_log("ERROR",
+				 "CRITICAL: FORWARD policy DROP failed");
+		ipt_exec(fwd_f);
+		if (ipt_exec(fwd_est) != 0)
+			mgmt_log("ERROR",
+				 "FORWARD ESTABLISHED/RELATED rule failed");
+		else
+			mgmt_log("INFO", "FORWARD chain: policy DROP, "
+				 "ESTABLISHED/RELATED ACCEPT");
+	}
+
 	/* Load conntrack TFTP helper module and assign it explicitly
 	 * via xt_CT in the raw table.  This teaches conntrack about
 	 * TFTP's port-switching so return traffic is marked RELATED
@@ -1532,7 +1924,8 @@ static int scrub_config_entry(const char *type, const char *id,
 		const char *val = eq + 1;
 
 		/* Internal metadata keys — preserve as-is, never scrub */
-		if (strcmp(key, "builtin") == 0) {
+		if (strcmp(key, "builtin") == 0 ||
+		    strcmp(key, "password-hash") == 0) {
 			int n = snprintf(out + pos, outsz - pos,
 					 "%s=%s\n", key, val);
 			if (n > 0 && pos + (size_t)n < outsz)
@@ -1587,10 +1980,13 @@ static void mgmtd_replay_config(void)
 {
 	char result[512];
 
-	/* Single config types (id="0") */
+	/* Single config types (id="0").
+	 * Order: settings first, then services that depend on them. */
 	static const char *single_types[] = {
-		"system_settings",
-		"network_dns",
+		"system_settings",        /* hostname, ip-forward — always first */
+		"system_password-policy", /* load before admin auth checks */
+		"network_dns",            /* write /etc/resolv.conf */
+		"system_ntp",             /* write /etc/ntp.conf */
 		NULL
 	};
 	for (int i = 0; single_types[i]; i++) {
@@ -1614,17 +2010,20 @@ static void mgmtd_replay_config(void)
 		}
 	}
 
-	/* Table config types (multiple entries) */
+	/* Table config types (multiple entries).
+	 * Order: profiles → admins → interfaces → routing/nat → dhcp → firewall */
 	static const char *table_types[] = {
-		"system_admin",
-		"system_interface",
-		"network_route_static",
+		"system_admin-profile",  /* must be before system_admin */
+		"system_admin",          /* depends on profiles */
+		"system_interface",      /* IP + allowaccess INPUT rules */
+		"network_route_static",  /* flush proto static first */
 		"network_nat",
 		"network_dhcp-server",
+		"firewall_policy",       /* FORWARD rules — flush chain first */
 		NULL
 	};
 	for (int i = 0; table_types[i]; i++) {
-		/* Flush NAT chains before replaying to prevent rule accumulation */
+		/* Pre-flush chains before replaying to prevent accumulation */
 		if (strcmp(table_types[i], "network_nat") == 0) {
 			const char *f1[] = {"iptables", "-t", "nat",
 					    "-F", "PREROUTING", NULL};
@@ -1633,6 +2032,23 @@ static void mgmtd_replay_config(void)
 					    "-F", "POSTROUTING", NULL};
 			free(safe_exec(f2));
 			mgmt_log("INFO", "flushed NAT chains before replay");
+		}
+		if (strcmp(table_types[i], "network_route_static") == 0) {
+			const char *fr[] = {"ip", "route", "flush",
+					    "proto", "static", NULL};
+			free(safe_exec(fr));
+			mgmt_log("INFO", "flushed static routes before replay");
+		}
+		if (strcmp(table_types[i], "firewall_policy") == 0) {
+			const char *ff[] = {"iptables", "-F", "FORWARD", NULL};
+			const char *fe[] = {"iptables", "-A", "FORWARD",
+					    "-m", "conntrack",
+					    "--ctstate", "ESTABLISHED,RELATED",
+					    "-j", "ACCEPT", NULL};
+			ipt_exec(ff);
+			ipt_exec(fe);
+			mgmt_log("INFO",
+				 "flushed FORWARD chain before policy replay");
 		}
 
 		char *list = sg_db_list(table_types[i]);
@@ -1829,6 +2245,12 @@ static sg_status_t apply_config(const char *type, const char *id,
 	if (strcmp(type, "network_dhcp-server") == 0)
 		return apply_dhcp(id, data, result, rsize);
 
+	if (strcmp(type, "firewall_policy") == 0)
+		return apply_firewall_policy(id, data, result, rsize);
+
+	if (strcmp(type, "system_ntp") == 0)
+		return apply_ntp(id, data, result, rsize);
+
 	/* ── Inline handlers (tightly coupled to monolith statics) ───── */
 	if (strcmp(type, "system_admin-profile") == 0) {
 		char perms[VALBUFSZ];
@@ -1847,12 +2269,15 @@ static sg_status_t apply_config(const char *type, const char *id,
 
 	if (strcmp(type, "system_admin") == 0) {
 		char profile[VALBUFSZ], password[VALBUFSZ], enforce[VALBUFSZ];
-		char enforce_policy[VALBUFSZ];
+		char enforce_policy[VALBUFSZ], builtin_flag[VALBUFSZ];
+		char pw_hash[SG_PAYLOAD_MAX];
 		extract_val(data, "profile", profile, sizeof(profile));
 		extract_val(data, "password", password, sizeof(password));
 		extract_val(data, "enforce-change-password", enforce, sizeof(enforce));
 		extract_val(data, "enforce-password-policy", enforce_policy,
 			    sizeof(enforce_policy));
+		extract_val(data, "builtin", builtin_flag, sizeof(builtin_flag));
+		extract_val(data, "password-hash", pw_hash, sizeof(pw_hash));
 
 		if (profile[0] == '\0') {
 			snprintf(result, rsize, "'profile' not set.");
@@ -1867,13 +2292,28 @@ static sg_status_t apply_config(const char *type, const char *id,
 		}
 		free(prof_check);
 
-		/* Create Linux user if needed */
-		if (create_system_user(id, "/sbin/stargazer-cli") != 0) {
+		/* Create Linux user if needed.
+		 * Builtin accounts (first-boot admin) get an empty password
+		 * so the first-login flow can require a change.
+		 * Non-builtin accounts are locked until a password is set. */
+		int is_builtin = (strcmp(builtin_flag, "yes") == 0);
+		if (create_system_user(id, "/sbin/stargazer-cli", is_builtin) != 0) {
 			snprintf(result, rsize, "Failed to create user '%s'.", id);
 			return SG_ERR_SYSTEM_FAIL;
 		}
 
-		/* Handle password */
+		/* Replay: restore shadow from DB hash if present.
+		 * This runs on every reboot so the shadow file is always
+		 * consistent with the database. */
+		if (pw_hash[0]) {
+			if (set_shadow_hash(id, pw_hash) != 0)
+				mgmt_log("WARN",
+					 "apply system_admin %s: "
+					 "set_shadow_hash failed", id);
+		}
+
+		/* Handle plaintext password from web UI or CFG_APPLY payload.
+		 * set_password() also persists the hash to DB. */
 		if (password[0]) {
 			/* Validate against password policy */
 			const char *pw_reason = NULL;
@@ -1894,8 +2334,10 @@ static sg_status_t apply_config(const char *type, const char *id,
 			explicit_bzero(password, sizeof(password));
 		}
 
-		/* Ensure admin has a usable password (new or existing) */
-		if (!user_has_password(id)) {
+		/* Ensure admin has a usable password (new or existing).
+		 * Builtins on first boot are exempt — they have empty shadow
+		 * and will be forced to change on first login. */
+		if (!is_builtin && !user_has_password(id)) {
 			snprintf(result, rsize,
 				 "Admin '%s' has no password. Use 'set password'.", id);
 			return SG_ERR_MISSING_ARG;
@@ -1935,6 +2377,10 @@ const char *get_user_permissions(const char *username)
 {
 	static char perms[256];
 	perms[0] = '\0';
+
+	/* Service accounts: __webd gets monitor permission (read config only) */
+	if (strcmp(username, "__webd") == 0)
+		return "monitor";
 
 	/* Get user's profile */
 	char *user_data = sg_db_get("system_admin", username);
@@ -2079,10 +2525,12 @@ sg_status_t validate_cfg_data(const char *type, const char *data,
 			memcpy(val, vstart, vlen);
 			val[vlen] = '\0';
 
-			/* Skip 'builtin' — internal marker managed by
-			 * mgmtd, not a user-settable field.  Handled
-			 * separately in the CFG_SET handler. */
-			if (strcmp(key, "builtin") == 0) {
+			/* Skip internal keys — managed by mgmtd, not
+			 * user-settable fields. */
+			if (strcmp(key, "builtin") == 0 ||
+			    strcmp(key, "password-hash") == 0 ||
+			    strcmp(key, "name") == 0 ||
+			    strcmp(key, "id") == 0) {
 				p += llen;
 				if (eol) p++;
 				continue;
@@ -2128,6 +2576,14 @@ sg_status_t validate_cfg_data(const char *type, const char *data,
 			while (*end && *end != ' ') end++;
 			char saved = *end;
 			*end = '\0';
+
+			/* Entry identity keys validated via entry ID — skip */
+			if (strcmp(tok, "name") == 0 ||
+			    strcmp(tok, "id") == 0) {
+				*end = saved;
+				tok = end;
+				continue;
+			}
 
 			/* search data for "key=" */
 			int found = 0;
@@ -2176,6 +2632,136 @@ static void audit_detail(const char *payload, uint32_t len,
 	out[n] = '\0';
 }
 
+/* ── Supervisor test handler ────────────────────────────────────────────── */
+
+/*
+ * IPC handler for SG_CMD_SUPERVISOR_TEST — used by selftest suite.
+ * Payload format: "op\narg1\narg2\n..."
+ * Ops: start, stop, query, start_config, set_config_val
+ */
+static int handle_supervisor_test(int client_fd, const char *user,
+				  const char *payload,
+				  const sg_request_hdr_t *hdr)
+{
+	(void)hdr;
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "admin")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "Requires 'admin' permission");
+		return 0;
+	}
+
+	if (!payload || !payload[0]) {
+		send_error(client_fd, SG_ERR_MISSING_ARG, "No operation");
+		return 0;
+	}
+
+	/* Parse op and args from newline-separated payload */
+	char buf[1024];
+	snprintf(buf, sizeof(buf), "%s", payload);
+	char *lines[16];
+	int nlines = 0;
+	char *sp = NULL;
+	for (char *tok = strtok_r(buf, "\n", &sp);
+	     tok && nlines < 16;
+	     tok = strtok_r(NULL, "\n", &sp))
+		lines[nlines++] = tok;
+
+	const char *op = lines[0];
+
+	if (strcmp(op, "start") == 0 && nlines >= 2) {
+		/* start\nname\narg0\narg1\n... */
+		const char *name = lines[1];
+		const char *argv[SUP_ARGV_MAX];
+		int argc = 0;
+		for (int i = 2; i < nlines && argc < SUP_ARGV_MAX - 1; i++)
+			argv[argc++] = lines[i];
+		argv[argc] = NULL;
+		if (argc == 0) {
+			send_error(client_fd, SG_ERR_MISSING_ARG,
+				   "No argv for start");
+			return 0;
+		}
+		int rc = supervisor_start(name, argv, SRC_ALWAYS,
+					  NULL, NULL, NULL, NULL);
+		if (rc == 0)
+			send_ok(client_fd, NULL, NULL);
+		else
+			send_error(client_fd, SG_ERR_SYSTEM_FAIL,
+				   "supervisor_start failed");
+		return 0;
+	}
+
+	if (strcmp(op, "start_config") == 0 && nlines >= 3) {
+		/* start_config\nname\narg0[\narg1...]\n---\ncfg_type\ncfg_id\ncfg_key\ncfg_val
+		 * The "---" separator divides argv from config params. */
+		const char *name = lines[1];
+		const char *argv[SUP_ARGV_MAX];
+		int argc = 0;
+		int sep = -1;
+		for (int i = 2; i < nlines; i++) {
+			if (strcmp(lines[i], "---") == 0) {
+				sep = i;
+				break;
+			}
+			if (argc < SUP_ARGV_MAX - 1)
+				argv[argc++] = lines[i];
+		}
+		argv[argc] = NULL;
+		if (argc == 0 || sep < 0 || sep + 4 >= nlines) {
+			send_error(client_fd, SG_ERR_MISSING_ARG,
+				   "Bad start_config format");
+			return 0;
+		}
+		int rc = supervisor_start(name, argv, SRC_CONFIG,
+					  lines[sep + 1], lines[sep + 2],
+					  lines[sep + 3], lines[sep + 4]);
+		if (rc == 0)
+			send_ok(client_fd, NULL, NULL);
+		else
+			send_error(client_fd, SG_ERR_SYSTEM_FAIL,
+				   "supervisor_start failed");
+		return 0;
+	}
+
+	if (strcmp(op, "stop") == 0 && nlines >= 2) {
+		supervisor_stop(lines[1]);
+		send_ok(client_fd, NULL, NULL);
+		return 0;
+	}
+
+	if (strcmp(op, "kill") == 0 && nlines >= 2) {
+		/* Send SIGKILL to a supervised child (for testing) */
+		child_entry_t *e = sup_find(lines[1]);
+		if (!e || e->pid <= 0) {
+			send_error(client_fd, SG_ERR_NOT_FOUND,
+				   "Not in supervisor table");
+			return 0;
+		}
+		kill(e->pid, SIGKILL);
+		send_ok(client_fd, NULL, NULL);
+		return 0;
+	}
+
+	if (strcmp(op, "query") == 0 && nlines >= 2) {
+		/* Return "pid=N\nrestart_count=N\n" or SG_ERR_NOT_FOUND */
+		child_entry_t *e = sup_find(lines[1]);
+		if (!e) {
+			send_error(client_fd, SG_ERR_NOT_FOUND,
+				   "Not in supervisor table");
+			return 0;
+		}
+		char resp[128];
+		snprintf(resp, sizeof(resp), "pid=%d\nrestart_count=%d\n",
+			 (int)e->pid, e->restart_count);
+		send_ok(client_fd, NULL, resp);
+		return 0;
+	}
+
+	send_error(client_fd, SG_ERR_INVALID_ARG, "Unknown test op");
+	return 0;
+}
+
 /* ── Request handler ────────────────────────────────────────────────────── */
 
 static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
@@ -2212,7 +2798,8 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 	    cmd != SG_CMD_HISTORY_SAVE &&
 	    cmd != SG_CMD_AUTH_LOGIN &&
 	    cmd != SG_CMD_AUTH_CHANGE_PW &&
-	    cmd != SG_CMD_AUTH_LOGIN_OK) {
+	    cmd != SG_CMD_AUTH_LOGIN_OK &&
+	    strcmp(user, "__webd") != 0) {
 		if (!session_tag_validate(user, hdr->session_tag)) {
 			send_error(client_fd, SG_ERR_SESSION_EXPIRED,
 				   "Session invalid or expired");
@@ -2263,7 +2850,33 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 
 		char *data = sg_db_get(db_type, db_id);
 		if (data) {
-			send_ok(client_fd, NULL, data);
+			/* Strip password-hash from system_admin responses —
+			 * hashes must never leave mgmtd over the IPC socket. */
+			if (strcmp(db_type, "system_admin") == 0) {
+				char filtered[SG_PAYLOAD_MAX];
+				size_t fpos = 0;
+				const char *p = data;
+				while (*p) {
+					if (*p == '\n') { p++; continue; }
+					const char *eol = strchr(p, '\n');
+					size_t llen = eol ? (size_t)(eol - p)
+							  : strlen(p);
+					if (!(llen >= 14 &&
+					      memcmp(p, "password-hash=", 14) == 0)) {
+						if (fpos + llen + 1 < sizeof(filtered)) {
+							memcpy(filtered + fpos, p, llen);
+							fpos += llen;
+							filtered[fpos++] = '\n';
+						}
+					}
+					p += llen;
+					if (eol) p++;
+				}
+				filtered[fpos] = '\0';
+				send_ok(client_fd, NULL, filtered);
+			} else {
+				send_ok(client_fd, NULL, data);
+			}
 			free(data);
 		} else {
 			send_error(client_fd, SG_ERR_ENTRY_NOT_FOUND, section);
@@ -2395,23 +3008,27 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			return 0;
 		}
 
-		/* Preserve builtin status: clients cannot grant or
-		 * revoke the builtin flag — it is set only by mgmtd
-		 * seed logic.  Read the existing entry's builtin value
-		 * and re-apply it after the write.  Any builtin= line
-		 * in the incoming data is stripped by building a clean
-		 * payload that omits it, then appending the original. */
+		/* Preserve internal-only fields that clients cannot set:
+		 *  - builtin: mgmtd seed flag, never client-controllable
+		 *  - password-hash: managed by set_password(), never plaintext
+		 * Also strip password= — plaintext passwords are only accepted
+		 * by CFG_APPLY (which calls set_password and stores the hash);
+		 * they must never be written as plaintext to the DB. */
 		char *existing = sg_db_get(db_type, db_id);
 		int was_builtin = 0;
+		char saved_pw_hash[SG_PAYLOAD_MAX];
+		saved_pw_hash[0] = '\0';
 		if (existing) {
 			char bi[VALBUFSZ];
 			extract_val(existing, "builtin", bi, sizeof(bi));
 			if (strcmp(bi, "yes") == 0)
 				was_builtin = 1;
+			extract_val(existing, "password-hash",
+				    saved_pw_hash, sizeof(saved_pw_hash));
 			free(existing);
 		}
 
-		/* Build clean data: strip any client-sent builtin= */
+		/* Build clean data: strip builtin=, password=, password-hash= */
 		char clean[SG_PAYLOAD_MAX];
 		size_t cpos = 0;
 		const char *dp = data;
@@ -2419,7 +3036,9 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			if (*dp == '\n') { dp++; continue; }
 			const char *el = strchr(dp, '\n');
 			size_t ll = el ? (size_t)(el - dp) : strlen(dp);
-			if (ll >= 8 && memcmp(dp, "builtin=", 8) == 0) {
+			if ((ll >=  8 && memcmp(dp, "builtin=",       8) == 0) ||
+			    (ll >=  9 && memcmp(dp, "password=",      9) == 0) ||
+			    (ll >= 14 && memcmp(dp, "password-hash=", 14) == 0)) {
 				dp += ll;
 				if (el) dp++;
 				continue;
@@ -2435,7 +3054,7 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			dp += ll;
 			if (el) dp++;
 		}
-		/* Re-append original builtin status */
+		/* Re-append preserved internal fields */
 		if (was_builtin) {
 			const char *tag = "builtin=yes\n";
 			size_t tlen = strlen(tag);
@@ -2454,6 +3073,12 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			send_error(client_fd, SG_ERR_IO_FAIL, "Failed to write config");
 			return 0;
 		}
+
+		/* Restore password-hash after the overwrite — sg_db_set()
+		 * replaces all values so it would clear the hash. */
+		if (saved_pw_hash[0])
+			sg_db_set_val(db_type, db_id, "password-hash",
+				      saved_pw_hash);
 
 		/* Invalidate sessions for admin/profile/policy config changes.
 		 * All affected admins are purged so they re-authenticate,
@@ -2678,6 +3303,12 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			/* Stop udhcpd daemon, remove firewall rule and
 			 * runtime files for this DHCP pool. */
 			unapply_dhcp(db_id);
+		} else if (strcmp(db_type, "firewall_policy") == 0) {
+			char *data = sg_db_get(db_type, db_id);
+			if (data) {
+				unapply_firewall_policy(db_id, data);
+				free(data);
+			}
 		}
 
 		if (sg_db_del(db_type, db_id) != 0) {
@@ -2747,6 +3378,19 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		}
 
 		const char *data = nl2 + 1;
+
+		/* Validate data format BEFORE applying — same checks as
+		 * CFG_SET uses.  Without this, apply handlers accept
+		 * values that CFG_SET would reject, causing runtime/DB
+		 * divergence when the web UI does APPLY-then-SET. */
+		char val_err[256];
+		sg_status_t val_st = validate_cfg_data(type_str, data,
+						       val_err, sizeof(val_err));
+		if (val_st != SG_OK) {
+			send_error(client_fd, val_st, val_err);
+			return 0;
+		}
+
 		char result[512];
 		sg_status_t st = apply_config(type_str, id_str, data,
 					      result, sizeof(result));
@@ -3225,6 +3869,9 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 	case SG_CMD_UPGRADE_TEST_SETUP:
 		return handle_upgrade_test_setup(client_fd, user, payload, hdr);
 
+	case SG_CMD_SUPERVISOR_TEST:
+		return handle_supervisor_test(client_fd, user, payload, hdr);
+
 	case SG_CMD_DEBUG_FETCH: {
 		const char *perms = get_user_permissions(user);
 		if (!has_permission(perms, "admin")) {
@@ -3295,7 +3942,16 @@ int main(void)
 	signal(SIGINT,  sig_handler);
 	signal(SIGTERM, sig_handler);
 	signal(SIGPIPE, SIG_IGN);
-	signal(SIGCHLD, SIG_IGN);  /* auto-reap forked children (fw upgrade) */
+
+	/* SIGCHLD: set flag for main loop reaping (SA_NOCLDSTOP skips
+	 * stopped-child signals which we don't care about) */
+	{
+		struct sigaction sa;
+		memset(&sa, 0, sizeof(sa));
+		sa.sa_handler = sigchld_handler;
+		sa.sa_flags = SA_NOCLDSTOP;
+		sigaction(SIGCHLD, &sa, NULL);
+	}
 
 	/* Remove stale socket */
 	unlink(SG_MGMTD_SOCK);
@@ -3346,11 +4002,16 @@ int main(void)
 	/* Set INPUT policy DROP, allow loopback + return traffic */
 	mgmtd_init_firewall();
 
-	/* Apply saved configuration to running system */
+	/* Apply saved configuration to running system BEFORE accepting
+	 * any connections.  Clients must see a fully-applied state —
+	 * iptables rules, routes, interfaces all consistent with the DB.
+	 * This may take several seconds on large configs. */
 	mgmtd_replay_config();
 
-	/* Create socket AFTER init is complete — socket file appearance means
-	 * mgmtd is truly ready to accept connections (no backlog delay). */
+	mgmt_log("INFO", "config replay complete");
+
+	/* Create socket AFTER replay — socket appearance means mgmtd is
+	 * truly ready to accept connections with consistent state. */
 	int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (sfd < 0) {
 		perror("socket");
@@ -3384,16 +4045,41 @@ int main(void)
 		return 1;
 	}
 
-	/* Signal readiness to init via FIFO */
+	/* Start webd under supervision — unconditional (SRC_ALWAYS).
+	 * Must start AFTER socket listen() so webd's bind_listeners()
+	 * can connect to mgmtd and query interface allowaccess config. */
+	{
+		const char *webd_argv[] = {"/sbin/stargazer-webd", NULL};
+		supervisor_start("webd", webd_argv, SRC_ALWAYS,
+				 NULL, NULL, NULL, NULL);
+	}
+
+	/* Signal readiness to init — config is fully applied, socket is
+	 * listening, webd is started.  Init can now start the login loop. */
 	mgmtd_signal_fifo("ready");
 
-	mgmt_log("INFO", "stargazer-mgmtd started, listening on %s", SG_MGMTD_SOCK);
+	mgmt_log("INFO", "stargazer-mgmtd ready, listening on %s", SG_MGMTD_SOCK);
 
 	/* Store listen fd for forked children to close */
 	g_listen_fd = sfd;
 
-	/* Main accept loop */
+	/* Main accept loop — poll() so SIGCHLD wakes us for reaping */
 	while (g_running) {
+		/* Reap any dead supervised children */
+		if (g_child_died) {
+			g_child_died = 0;
+			reap_children();
+		}
+
+		struct pollfd pfd = { .fd = sfd, .events = POLLIN };
+		int pr = poll(&pfd, 1, 5000);
+		if (pr < 0) {
+			if (errno == EINTR) continue;
+			mgmt_log("ERROR", "poll: %s", strerror(errno));
+			continue;
+		}
+		if (pr == 0) continue;  /* timeout, loop back for reap */
+
 		int cfd = accept(sfd, NULL, NULL);
 		if (cfd < 0) {
 			if (errno == EINTR) continue;
@@ -3468,13 +4154,20 @@ int main(void)
 				 * Otherwise fall back to getpwuid().
 				 */
 				int verified = 0;
-				if (hdr.username[0] != '\0') {
+				/* Trusted proxy: webd (UID 900) forwards
+				 * web user identities via IPC. Trust the
+				 * claimed username — webd authenticates
+				 * users itself before proxying requests.
+				 * Scoped: only UID 900, and webd is
+				 * seccomp-sandboxed (no fork/exec). */
+				if (cred.uid == WEBD_SERVICE_UID) {
+					verified = 1;
+				} else if (hdr.username[0] != '\0') {
 					struct passwd *claimed =
 						getpwnam(hdr.username);
 					if (claimed &&
 					    claimed->pw_uid == cred.uid) {
 						verified = 1;
-						/* username already correct */
 					}
 				}
 				if (!verified) {
@@ -3511,6 +4204,9 @@ int main(void)
 		if (!owned)
 			close(cfd);
 	}
+
+	/* Gracefully stop all supervised children */
+	shutdown_children();
 
 	close(sfd);
 	unlink(SG_MGMTD_SOCK);

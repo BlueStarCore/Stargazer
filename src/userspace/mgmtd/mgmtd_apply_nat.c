@@ -51,8 +51,8 @@ sg_status_t apply_nat(const char *id, const char *data,
 		const char *chk[] = {"iptables", "-t", "nat", "-C", "POSTROUTING",
 				     "-o", srcintf, "-j", "MASQUERADE", NULL};
 		char *out = safe_exec(chk);
-		int exists = (out && strstr(out, "iptables") == NULL);
-		/* -C returns 0 (empty output) if exists, error text if not */
+		int exists = 0;
+		/* -C returns empty output when rule exists, error text when not */
 		if (out && out[0] == '\0') exists = 1;
 		free(out);
 

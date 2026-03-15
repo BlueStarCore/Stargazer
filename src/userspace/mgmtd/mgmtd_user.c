@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -28,6 +29,15 @@
 
 #include "mgmtd_internal.h"
 #include "mgmtd_apply.h"
+#include "sg_db.h"
+
+/* ── Auth lockout constants ───────────────────────────────────────────────
+ * Matches the policy previously in stargazer-login shell script.
+ * Escalating lockout: 2min → 4min → 8min ... capped at 1hr.
+ */
+#define AUTH_MAX_FAILS   5
+#define AUTH_LOCK_BASE   120   /* seconds */
+#define AUTH_LOCK_MAX    3600  /* seconds */
 
 /* ── Password / Shadow helpers ──────────────────────────────────────────── */
 
@@ -70,6 +80,11 @@ int set_password(const char *username, const char *password)
 	char *hash = crypt(password, salt);
 	if (!hash) return -1;
 
+	/* Capture hash before any further crypt() call invalidates the
+	 * static buffer.  We persist it to DB after the shadow write. */
+	char hash_copy[256];
+	snprintf(hash_copy, sizeof(hash_copy), "%s", hash);
+
 	/* Acquire advisory lock for shadow file manipulation */
 	int lockfd = open("/etc/shadow.lock", O_CREAT | O_RDWR, SHADOW_LOCK_MODE);
 	if (lockfd < 0) return -1;
@@ -79,6 +94,76 @@ int set_password(const char *username, const char *password)
 	}
 
 	/* Update shadow atomically */
+	FILE *fp = fopen("/etc/shadow", "r");
+	if (!fp) { flock(lockfd, LOCK_UN); close(lockfd); return -1; }
+
+	char tmppath[64];
+	snprintf(tmppath, sizeof(tmppath), "/etc/shadow.XXXXXX");
+	int tfd = mkstemp(tmppath);
+	if (tfd < 0) { fclose(fp); flock(lockfd, LOCK_UN); close(lockfd); return -1; }
+	fchmod(tfd, SHADOW_FILE_MODE);
+	FILE *out = fdopen(tfd, "w");
+	if (!out) { close(tfd); unlink(tmppath); fclose(fp); flock(lockfd, LOCK_UN); close(lockfd); return -1; }
+
+	char line[MAX_LINE];
+	size_t ulen = strlen(username);
+	int found = 0;
+
+	while (fgets(line, sizeof(line), fp)) {
+		if (strncmp(line, username, ulen) == 0 && line[ulen] == ':') {
+			char *rest = strchr(line + ulen + 1, ':');
+			if (rest)
+				fprintf(out, "%s:%s%s", username, hash, rest);
+			else
+				fprintf(out, "%s:%s:" SHADOW_LAST_CHANGED ":0:" SHADOW_MAX_DAYS ":" SHADOW_WARN_DAYS ":::\n", username, hash);
+			found = 1;
+		} else {
+			fputs(line, out);
+		}
+	}
+	fclose(fp);
+	fclose(out);
+
+	if (!found) {
+		unlink(tmppath);
+		flock(lockfd, LOCK_UN);
+		close(lockfd);
+		return -1;
+	}
+
+	if (rename(tmppath, "/etc/shadow") != 0) {
+		unlink(tmppath);
+		flock(lockfd, LOCK_UN);
+		close(lockfd);
+		return -1;
+	}
+	flock(lockfd, LOCK_UN);
+	close(lockfd);
+
+	/* Persist hash to DB so it survives reboot (replay path) */
+	sg_db_set_val("system_admin", username, "password-hash", hash_copy);
+
+	return 0;
+}
+
+/*
+ * Write a pre-computed hash directly to /etc/shadow for a user.
+ * Used during config replay to restore the saved password hash
+ * without needing the original plaintext.
+ */
+int set_shadow_hash(const char *username, const char *hash)
+{
+#ifdef STARGAZER_TEST_MODE
+	(void)username; (void)hash;
+	return 0;
+#endif
+	int lockfd = open("/etc/shadow.lock", O_CREAT | O_RDWR, SHADOW_LOCK_MODE);
+	if (lockfd < 0) return -1;
+	if (flock(lockfd, LOCK_EX) != 0) {
+		close(lockfd);
+		return -1;
+	}
+
 	FILE *fp = fopen("/etc/shadow", "r");
 	if (!fp) { flock(lockfd, LOCK_UN); close(lockfd); return -1; }
 
@@ -298,10 +383,11 @@ static void add_user_to_group(const char *username, const char *groupname)
 	rename(tmppath, "/etc/group");
 }
 
-int create_system_user(const char *username, const char *shell)
+int create_system_user(const char *username, const char *shell,
+		       int allow_empty_pw)
 {
 #ifdef STARGAZER_TEST_MODE
-	(void)username; (void)shell;
+	(void)username; (void)shell; (void)allow_empty_pw;
 	return 0;
 #endif
 	/* Check if already exists */
@@ -355,10 +441,15 @@ int create_system_user(const char *username, const char *shell)
 		username, uid, uid, username, shell);
 	fclose(fp);
 
-	/* Append to /etc/shadow */
+	/* Append to /etc/shadow.
+	 * Built-in accounts (allow_empty_pw=1) get an empty password
+	 * field — first-login flow will require a password change.
+	 * All other accounts are locked ('!') until a password is set. */
 	fp = fopen("/etc/shadow", "a");
 	if (fp) {
-		fprintf(fp, "%s::" SHADOW_LAST_CHANGED ":0:" SHADOW_MAX_DAYS ":" SHADOW_WARN_DAYS ":::\n", username);
+		const char *pw_field = allow_empty_pw ? "" : "!";
+		fprintf(fp, "%s:%s:" SHADOW_LAST_CHANGED ":0:" SHADOW_MAX_DAYS ":" SHADOW_WARN_DAYS ":::\n",
+			username, pw_field);
 		fclose(fp);
 	}
 
@@ -553,8 +644,8 @@ int handle_admin_create(int client_fd, const char *user,
 		return 0;
 	}
 
-	/* Create Linux user */
-	if (create_system_user(newuser, "/sbin/stargazer-cli") != 0) {
+	/* Create Linux user — non-builtin, so lock shadow until password set */
+	if (create_system_user(newuser, "/sbin/stargazer-cli", 0) != 0) {
 		send_error(client_fd, SG_ERR_SYSTEM_FAIL, "create user failed");
 		return 0;
 	}
@@ -910,10 +1001,11 @@ int handle_auth_login(int client_fd, const char *user,
 {
 	(void)hdr;
 
-	/* Only root (logind) can call auth commands */
-	if (strcmp(user, "root") != 0) {
+	/* Only privileged daemons can call auth commands:
+	 * root (logind) and __webd (web login proxy). */
+	if (strcmp(user, "root") != 0 && strcmp(user, "__webd") != 0) {
 		send_error(client_fd, SG_ERR_PERM_DENIED,
-			   "Auth commands require root caller");
+			   "Auth commands require privileged caller");
 		return 0;
 	}
 
@@ -957,13 +1049,41 @@ int handle_auth_login(int client_fd, const char *user,
 	}
 
 	/*
-	 * Constant-time defense (BUG-AUTH-01): always call crypt() even if
-	 * user not found, so response latency doesn't leak username validity.
+	 * Constant-time defense (BUG-AUTH-01): dummy hash for crypt() when
+	 * user not found or account locked — ensures response latency
+	 * doesn't leak username validity or lockout state.
 	 */
 	static const char dummy_hash[] =
 		"$6$dummy.salt.value$"
 		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+	/*
+	 * Lockout check (before real crypt — avoids wasting CPU on locked
+	 * accounts).  Like OpenSSH/PAM pam_faillock: lockout is checked
+	 * and enforced inside the auth handler, not by the caller.
+	 * The same "Invalid credentials" message is returned for locked
+	 * accounts to avoid leaking lockout state to an attacker.
+	 */
+	int lockout_fail_count = 0;
+	long lockout_until = 0;
+	sg_db_lockout_get(target, &lockout_fail_count, &lockout_until);
+	time_t now = time(NULL);
+	if (lockout_until > 0 && now < lockout_until) {
+		/* Account locked — run crypt on dummy for timing defense */
+		(void)crypt(password, dummy_hash);
+		explicit_bzero(password, sizeof(password));
+		mgmt_log("INFO", "auth: login rejected for %s "
+			 "(locked until %ld, now %ld)", target,
+			 lockout_until, (long)now);
+		send_error(client_fd, SG_ERR_AUTH_FAIL, "Invalid credentials");
+		return 0;
+	}
+	/* If lockout has expired, reset the counter */
+	if (lockout_until > 0 && now >= lockout_until) {
+		lockout_fail_count = 0;
+		lockout_until = 0;
+	}
 
 	struct spwd *sp = getspnam(target);
 	const char *hash = sp ? sp->sp_pwdp : dummy_hash;
@@ -975,7 +1095,7 @@ int handle_auth_login(int client_fd, const char *user,
 	if (!sp) {
 		/* User not found — fail after crypt (timing constant) */
 	} else if (sp->sp_pwdp[0] == '!' || sp->sp_pwdp[0] == '*') {
-		/* Locked account */
+		/* Locked account (shadow-level lock, e.g. passwd -l) */
 		explicit_bzero(password, sizeof(password));
 		send_error(client_fd, SG_ERR_LOCKED, "Account is locked");
 		return 0;
@@ -988,8 +1108,49 @@ int handle_auth_login(int client_fd, const char *user,
 
 	if (!auth_ok) {
 		explicit_bzero(password, sizeof(password));
+		/* Lockout accounting: increment fail count, set lockout
+		 * time if threshold reached. Escalating backoff like
+		 * pam_faillock: 2min → 4min → 8min ... max 1hr. */
+		lockout_fail_count++;
+		if (lockout_fail_count >= AUTH_MAX_FAILS) {
+			int rounds = (lockout_fail_count - AUTH_MAX_FAILS)
+				     / AUTH_MAX_FAILS;
+			long duration = AUTH_LOCK_BASE;
+			for (int i = 0; i < rounds && duration < AUTH_LOCK_MAX;
+			     i++)
+				duration *= 2;
+			if (duration > AUTH_LOCK_MAX)
+				duration = AUTH_LOCK_MAX;
+			lockout_until = (long)now + duration;
+			mgmt_log("WARN", "auth: locking %s for %lds "
+				 "(fail_count=%d)", target, duration,
+				 lockout_fail_count);
+		}
+		sg_db_lockout_set(target, lockout_fail_count, lockout_until);
 		send_error(client_fd, SG_ERR_AUTH_FAIL, "Invalid credentials");
 		return 0;
+	}
+
+	/* Auth succeeded — clear lockout state */
+	if (lockout_fail_count > 0)
+		sg_db_lockout_clear(target);
+
+	/*
+	 * Ghost account check (BUG-AUTH-2): shadow entry exists but no DB
+	 * record means the account was never created through mgmtd.  Reject
+	 * it so that manually injected shadow entries have no effect.
+	 */
+	{
+		char *admin_cfg = sg_db_get("system_admin", target);
+		if (!admin_cfg) {
+			explicit_bzero(password, sizeof(password));
+			mgmt_log("WARN", "auth: ghost account rejected: %s "
+				 "(shadow entry exists but no DB record)", target);
+			send_error(client_fd, SG_ERR_AUTH_FAIL,
+				   "Invalid credentials");
+			return 0;
+		}
+		free(admin_cfg);
 	}
 
 	/*
@@ -1043,9 +1204,9 @@ int handle_auth_change_pw(int client_fd, const char *user,
 {
 	(void)hdr;
 
-	if (strcmp(user, "root") != 0) {
+	if (strcmp(user, "root") != 0 && strcmp(user, "__webd") != 0) {
 		send_error(client_fd, SG_ERR_PERM_DENIED,
-			   "Auth commands require root caller");
+			   "Auth commands require privileged caller");
 		return 0;
 	}
 
@@ -1142,9 +1303,9 @@ int handle_auth_login_ok(int client_fd, const char *user,
 {
 	(void)hdr;
 
-	if (strcmp(user, "root") != 0) {
+	if (strcmp(user, "root") != 0 && strcmp(user, "__webd") != 0) {
 		send_error(client_fd, SG_ERR_PERM_DENIED,
-			   "Auth commands require root caller");
+			   "Auth commands require privileged caller");
 		return 0;
 	}
 

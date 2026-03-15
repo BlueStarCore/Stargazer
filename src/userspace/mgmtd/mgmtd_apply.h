@@ -16,10 +16,45 @@
 #include "sg_validate.h"
 
 #include <stddef.h>
+#include <sys/types.h>
 
 /* ── Shared constants ───────────────────────────────────────────────────── */
 
 #define VALBUFSZ 128
+
+/* ── Supervisor API ────────────────────────────────────────────────────── */
+
+/*
+ * Child source: why this process was started.
+ * SRC_ALWAYS — unconditional (e.g. webd), always restart on crash.
+ * SRC_CONFIG — config-driven (e.g. udhcpc.wan), only restart if the
+ *              relevant DB key still matches the expected value.
+ */
+typedef enum { SRC_ALWAYS, SRC_CONFIG } child_source_t;
+
+/*
+ * Start a supervised child process. If an entry with the same name
+ * already exists and is running, it is stopped first.
+ *
+ * argv is deep-copied into internal storage (survives caller stack).
+ * For SRC_CONFIG children, cfg_type/cfg_id/cfg_key/cfg_val define
+ * the DB condition checked before auto-restart.
+ */
+int  supervisor_start(const char *name, const char *const argv[],
+		      child_source_t source,
+		      const char *cfg_type, const char *cfg_id,
+		      const char *cfg_key, const char *cfg_val);
+
+/*
+ * Stop a supervised child. Sets restart_max=0 (prevents auto-restart),
+ * sends SIGTERM, waits up to 3s, then SIGKILL. Unregisters entry.
+ */
+void supervisor_stop(const char *name);
+
+/*
+ * Return the PID of a supervised child, or 0 if not found / not running.
+ */
+pid_t supervisor_get_pid(const char *name);
 
 /* ── Helpers (defined in stargazer-mgmtd.c) ─────────────────────────────── */
 
@@ -58,5 +93,13 @@ sg_status_t apply_dhcp(const char *id, const char *data,
 		       char *result, size_t rsize);
 
 void unapply_dhcp(const char *id);
+
+sg_status_t apply_firewall_policy(const char *id, const char *data,
+				   char *result, size_t rsize);
+
+void unapply_firewall_policy(const char *id, const char *data);
+
+sg_status_t apply_ntp(const char *id, const char *data,
+		      char *result, size_t rsize);
 
 #endif /* MGMTD_APPLY_H */
