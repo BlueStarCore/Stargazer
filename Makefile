@@ -74,6 +74,9 @@ MGMTD_DIR      := $(PROJECT_ROOT)/src/userspace/mgmtd
 # CLI (C binary replacing shell stargazer-cli for interactive mode)
 CLI_DIR        := $(PROJECT_ROOT)/src/userspace/cli
 
+# Web daemon (embedded HTTP server — Mongoose + REST API)
+WEBD_DIR       := $(PROJECT_ROOT)/src/userspace/webd
+
 # Musl cross toolchain (for clean static linking — no glibc NSS issues)
 # Auto-downloaded from musl.cc on first build
 MUSL_CROSS_URL := https://musl.cc/aarch64-linux-musl-cross.tgz
@@ -448,7 +451,21 @@ $(BUILD_DIR)/cli/stargazer-cli: $(MUSL_CC) $(SRC_WATCH)
 	@echo "[3g/5] CLI binary ready."
 
 # =============================================================================
-# 3h. Tools (sg-partinit — first-boot partition creator)
+# 3h. Web daemon — embedded HTTP server (cross-compile with musl)
+# =============================================================================
+
+webd: $(BUILD_DIR)/webd/stargazer-webd
+
+$(BUILD_DIR)/webd/stargazer-webd: $(MUSL_CC) $(SRC_WATCH)
+	@echo "[3h/5] Building web daemon (musl static)..."
+	@mkdir -p $(BUILD_DIR)/webd
+	$(MAKE) -C $(WEBD_DIR) \
+		CROSS_COMPILE=$(MUSL_CROSS) \
+		BUILD_DIR=$(BUILD_DIR)/webd
+	@echo "[3h/5] Web daemon ready."
+
+# =============================================================================
+# 3i. Tools (sg-partinit — first-boot partition creator)
 # =============================================================================
 
 TOOLS_DIR := $(PROJECT_ROOT)/src/userspace/tools
@@ -546,7 +563,7 @@ $(ATF_MTK_DIR)/.stamp:
 
 rootfs: $(ROOTFS_DIR)/.stamp
 
-$(ROOTFS_DIR)/.stamp: modules busybox dash iptables logind mgmtd cli tools
+$(ROOTFS_DIR)/.stamp: modules busybox dash iptables logind mgmtd cli webd tools
 	@echo "[4/5] Creating rootfs..."
 	@rm -rf $(ROOTFS_DIR)
 	@mkdir -p $(ROOTFS_DIR)
@@ -595,6 +612,12 @@ $(ROOTFS_DIR)/.stamp: modules busybox dash iptables logind mgmtd cli tools
 	cp $(BUILD_DIR)/cli/stargazer-cli $(ROOTFS_DIR)/sbin/stargazer-cli
 	@chmod +x $(ROOTFS_DIR)/sbin/stargazer-cli
 
+	# Install web daemon + static web UI files
+	cp $(BUILD_DIR)/webd/stargazer-webd $(ROOTFS_DIR)/sbin/stargazer-webd
+	@chmod +x $(ROOTFS_DIR)/sbin/stargazer-webd
+	@mkdir -p $(ROOTFS_DIR)/usr/share/stargazer/www
+	cp -r $(PROJECT_ROOT)/src/userspace/webui/www/* $(ROOTFS_DIR)/usr/share/stargazer/www/
+
 	# Install tools (sg-partinit — first-boot partition creator)
 	cp $(BUILD_DIR)/tools/sg-partinit $(ROOTFS_DIR)/sbin/sg-partinit
 	@chmod +x $(ROOTFS_DIR)/sbin/sg-partinit
@@ -606,8 +629,10 @@ $(ROOTFS_DIR)/.stamp: modules busybox dash iptables logind mgmtd cli tools
 	# Create minimal /etc files (no Alpine branding)
 	@echo 'root:x:0:0:root:/root:/sbin/nologin' > $(ROOTFS_DIR)/etc/passwd
 	@echo 'nobody:x:65534:65534:nobody:/:/bin/false' >> $(ROOTFS_DIR)/etc/passwd
+	@echo '__webd:x:900:900:webd service:/:/bin/false' >> $(ROOTFS_DIR)/etc/passwd
 	@echo 'root:x:0:root' > $(ROOTFS_DIR)/etc/group
 	@echo 'nobody:x:65534:' >> $(ROOTFS_DIR)/etc/group
+	@echo 'stargazer:x:900:' >> $(ROOTFS_DIR)/etc/group
 	@echo 'root:*:19700:0:99999:7:::' > $(ROOTFS_DIR)/etc/shadow
 	@echo 'nobody:*:19700:0:99999:7:::' >> $(ROOTFS_DIR)/etc/shadow
 	@chmod 640 $(ROOTFS_DIR)/etc/shadow
@@ -957,7 +982,7 @@ firmware: rootfs
 # Test in QEMU
 # =============================================================================
 
-test-build: modules busybox dash iptables logind mgmtd cli tools uboot
+test-build: modules busybox dash iptables logind mgmtd cli webd tools uboot
 	@echo "Building test initramfs..."
 	@mkdir -p $(BUILD_DIR)/test
 
@@ -1003,6 +1028,12 @@ test-build: modules busybox dash iptables logind mgmtd cli tools uboot
 	cp $(BUILD_DIR)/cli/stargazer-cli $(BUILD_DIR)/test/initramfs/sbin/stargazer-cli
 	@chmod +x $(BUILD_DIR)/test/initramfs/sbin/stargazer-cli
 
+	# Install web daemon + static web UI files
+	cp $(BUILD_DIR)/webd/stargazer-webd $(BUILD_DIR)/test/initramfs/sbin/stargazer-webd
+	@chmod +x $(BUILD_DIR)/test/initramfs/sbin/stargazer-webd
+	@mkdir -p $(BUILD_DIR)/test/initramfs/usr/share/stargazer/www
+	cp -r $(PROJECT_ROOT)/src/userspace/webui/www/* $(BUILD_DIR)/test/initramfs/usr/share/stargazer/www/
+
 	# Install tools (sg-partinit — first-boot partition creator)
 	cp $(BUILD_DIR)/tools/sg-partinit $(BUILD_DIR)/test/initramfs/sbin/sg-partinit
 	@chmod +x $(BUILD_DIR)/test/initramfs/sbin/sg-partinit
@@ -1021,8 +1052,10 @@ test-build: modules busybox dash iptables logind mgmtd cli tools uboot
 	# Create minimal /etc files
 	@echo 'root:x:0:0:root:/root:/sbin/nologin' > $(BUILD_DIR)/test/initramfs/etc/passwd
 	@echo 'nobody:x:65534:65534:nobody:/:/bin/false' >> $(BUILD_DIR)/test/initramfs/etc/passwd
+	@echo '__webd:x:900:900:webd service:/:/bin/false' >> $(BUILD_DIR)/test/initramfs/etc/passwd
 	@echo 'root:x:0:root' > $(BUILD_DIR)/test/initramfs/etc/group
 	@echo 'nobody:x:65534:' >> $(BUILD_DIR)/test/initramfs/etc/group
+	@echo 'stargazer:x:900:' >> $(BUILD_DIR)/test/initramfs/etc/group
 	@echo 'root:*:19700:0:99999:7:::' > $(BUILD_DIR)/test/initramfs/etc/shadow
 	@echo 'nobody:*:19700:0:99999:7:::' >> $(BUILD_DIR)/test/initramfs/etc/shadow
 	@chmod 640 $(BUILD_DIR)/test/initramfs/etc/shadow
@@ -1188,14 +1221,15 @@ clean:
 	$(MAKE) -C $(LOGIND_DIR) clean BUILD_DIR=$(BUILD_DIR)/logind 2>/dev/null || true
 	$(MAKE) -C $(MGMTD_DIR) clean BUILD_DIR=$(BUILD_DIR)/mgmtd 2>/dev/null || true
 	$(MAKE) -C $(CLI_DIR) clean BUILD_DIR=$(BUILD_DIR)/cli 2>/dev/null || true
+	$(MAKE) -C $(WEBD_DIR) clean BUILD_DIR=$(BUILD_DIR)/webd 2>/dev/null || true
 	$(MAKE) -C $(TOOLS_DIR) clean BUILD_DIR=$(BUILD_DIR)/tools 2>/dev/null || true
 	@# Remove build subdirectories but keep kernel.img
 	rm -rf $(BUILD_DIR)/busybox $(BUILD_DIR)/cli $(BUILD_DIR)/dash \
 	       $(BUILD_DIR)/image $(BUILD_DIR)/iptables $(BUILD_DIR)/logind \
 	       $(BUILD_DIR)/mgmtd $(BUILD_DIR)/modules $(BUILD_DIR)/rootfs \
-	       $(BUILD_DIR)/test $(BUILD_DIR)/tools $(BUILD_DIR)/u-boot \
-	       $(BUILD_DIR)/bpi-r4 $(BUILD_DIR)/bl2_emmc.img \
-	       $(BUILD_DIR)/firmware
+	       $(BUILD_DIR)/test $(BUILD_DIR)/tools $(BUILD_DIR)/webd \
+	       $(BUILD_DIR)/u-boot $(BUILD_DIR)/bpi-r4 \
+	       $(BUILD_DIR)/bl2_emmc.img $(BUILD_DIR)/firmware
 	@echo "Clean complete (kernel + source caches preserved)"
 
 help:

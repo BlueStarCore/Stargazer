@@ -18,6 +18,7 @@ BUILD_DIR="$PROJECT_ROOT/build"
 UBOOT_BIN="$BUILD_DIR/u-boot/u-boot.bin"
 BOOT_IMG="$BUILD_DIR/test/boot.img"
 DATA_IMG="$BUILD_DIR/test/data.img"
+LOGS_IMG="$BUILD_DIR/test/logs.img"
 
 # Pre-flight checks
 fail=0
@@ -41,12 +42,20 @@ if [[ ! -f "$DATA_IMG" ]]; then
     echo "Created data disk: $DATA_IMG"
 fi
 
+# Create persistent logs disk if missing
+if [[ ! -f "$LOGS_IMG" ]]; then
+    mke2fs -t ext2 -L sglogs "$LOGS_IMG" 64M 2>/dev/null
+    echo "Created logs disk: $LOGS_IMG"
+fi
+
 # U-Boot boots from boot.img (virtio0), then loads kernel+initramfs from disk
+# vda=boot, vdb=sgdata (config), vdc=sglogs (logs)
 exec qemu-system-aarch64 \
     -machine virt -cpu cortex-a72 -smp 4 -m 2G \
     -bios "$UBOOT_BIN" \
     -drive file="$BOOT_IMG",format=raw,if=virtio \
     -drive file="$DATA_IMG",format=raw,if=virtio \
+    -drive file="$LOGS_IMG",format=raw,if=virtio \
     -nographic \
     -netdev tap,id=wan,ifname=tap-sg-wan,script=no,downscript=no \
     -device virtio-net-pci,netdev=wan,mac=52:54:00:12:01:02 \

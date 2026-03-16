@@ -16,6 +16,7 @@ import signal
 PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BOOT_IMG = os.path.join(PROJECT, "build/test/boot.img")
 DATA_IMG = os.path.join(PROJECT, "build/test/data.img")
+LOGS_IMG = os.path.join(PROJECT, "build/test/logs.img")
 UBOOT_BIN = os.path.join(PROJECT, "build/u-boot/u-boot.bin")
 TIMEOUT = 300  # 5 minutes max
 
@@ -54,18 +55,24 @@ def main():
         print(f"ERROR: {BOOT_IMG} not found. Run 'make test-build' first.")
         sys.exit(1)
 
-    # Create fresh data image
+    # Create fresh data and logs images
     subprocess.run(
         ["dd", "if=/dev/zero", f"of={DATA_IMG}", "bs=1M", "count=32"],
         capture_output=True,
     )
+    subprocess.run(
+        ["dd", "if=/dev/zero", f"of={LOGS_IMG}", "bs=1M", "count=32"],
+        capture_output=True,
+    )
 
+    # vda=boot (snapshot), vdb=sgdata (config), vdc=sglogs (logs)
     qemu_cmd = [
         "qemu-system-aarch64",
         "-M", "virt", "-cpu", "cortex-a57", "-m", "2G", "-nographic",
         "-bios", UBOOT_BIN,
         "-drive", f"file={BOOT_IMG},format=raw,if=virtio,snapshot=on",
         "-drive", f"file={DATA_IMG},format=raw,if=virtio",
+        "-drive", f"file={LOGS_IMG},format=raw,if=virtio",
         "-net", "none",
     ]
 
@@ -107,9 +114,9 @@ def main():
                 send(proc, "Admin@1234\n")
                 read_until(proc, r"[$#>]", timeout=10)
 
-        # Run selftest
-        print("\n\n=== Running selftest ===\n")
-        send(proc, "execute diagnose selftest\n", delay=1)
+        # Run selftest (full mode — includes IPC-dependent suites)
+        print("\n\n=== Running selftest full ===\n")
+        send(proc, "execute diagnose selftest full\n", delay=1)
 
         # Collect selftest output (takes a while)
         buf = read_until(proc, r"tests passed|tests failed|SUMMARY", timeout=180)
