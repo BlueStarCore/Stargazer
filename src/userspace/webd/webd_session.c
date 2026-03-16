@@ -133,7 +133,8 @@ void session_expire_check(void)
 
 	for (int i = 0; i < WEBD_MAX_SESSIONS; i++) {
 		if (sessions[i].token[0] &&
-		    now - sessions[i].created > WEBD_SESSION_TTL) {
+		    (now - sessions[i].created > WEBD_SESSION_TTL ||
+		     now - sessions[i].last_used > WEBD_IDLE_TIMEOUT)) {
 			memset(&sessions[i], 0, sizeof(sessions[i]));
 		}
 	}

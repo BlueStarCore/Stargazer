@@ -34,6 +34,7 @@
 #define FLOW_RES_RAM        13
 #define FLOW_RES_DISK       14
 #define FLOW_RES_PROCTOP    15
+#define FLOW_ADMIN_CREATE   16
 
 typedef struct {
 	unsigned long   conn_id;        /* Mongoose connection ID */

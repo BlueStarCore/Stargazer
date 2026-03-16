@@ -97,7 +97,7 @@ static int ipc_status_to_http(uint32_t st)
 	if (st == SG_ERR_POLICY_FAIL)     return 400;
 	if (st == SG_ERR_PERM_DENIED)     return 403;
 	if (st == SG_ERR_AUTH_FAIL)       return 401;
-	if (st == SG_ERR_LOCKED)          return 403;
+	if (st == SG_ERR_LOCKED)          return 401;
 	if (st == SG_ERR_SESSION_EXPIRED) return 401;
 	if (st == SG_ERR_PROFILE_DENY)    return 403;
 	if (st == SG_ERR_NOT_FOUND)       return 404;
@@ -146,6 +146,7 @@ static void send_ipc_error(unsigned long conn_id, uint32_t status,
 	const char *msg = (extra && extra[0]) ? extra
 					      : sg_status_str((sg_status_t)status);
 	char *json = json_error(msg, &http);
+	if (!json) json = strdup("{\"error\":\"Internal error\"}");
 	size_t len = json ? strlen(json) : 0;
 	send_result(conn_id, http, json, len);
 }
@@ -339,9 +340,9 @@ static void flow_login(work_item_t *item)
 
 static void flow_change_pw(work_item_t *item)
 {
-	/* item->payload = "username\nnew_password\n" */
+	/* item->payload = "username\nnew_password\nadmin-flag\n" */
 	webd_ipc_response_t resp;
-	if (webd_ipc_send(SG_CMD_AUTH_CHANGE_PW, item->username,
+	if (webd_ipc_send(SG_CMD_AUTH_CHANGE_PW, "__webd",
 			  item->session_tag, item->payload, &resp) != 0) {
 		char *json = json_error("Backend unavailable", NULL);
 		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
@@ -354,6 +355,96 @@ static void flow_change_pw(work_item_t *item)
 		return;
 	}
 	webd_ipc_resp_free(&resp);
+
+	char *json = strdup("{\"ok\":true}");
+	send_result(item->conn_id, 200, json, json ? strlen(json) : 0);
+}
+
+static void flow_admin_create(work_item_t *item)
+{
+	/* item->payload = "username\nprofile\npassword\n"
+	 * Step 1: ADMIN_CREATE (username\nprofile\n)
+	 * Step 2: ADMIN_SET_PW (username\nnew_password\n) */
+
+	/* Parse fields */
+	const char *p = item->payload;
+	if (!p) {
+		char *json = json_error("Missing payload", NULL);
+		send_result(item->conn_id, 400, json, json ? strlen(json) : 0);
+		return;
+	}
+	const char *nl1 = strchr(p, '\n');
+	if (!nl1) {
+		char *json = json_error("Bad format", NULL);
+		send_result(item->conn_id, 400, json, json ? strlen(json) : 0);
+		return;
+	}
+	char username[128] = {0};
+	size_t ulen = (size_t)(nl1 - p);
+	if (ulen >= sizeof(username)) ulen = sizeof(username) - 1;
+	memcpy(username, p, ulen);
+
+	const char *p2 = nl1 + 1;
+	const char *nl2 = strchr(p2, '\n');
+	char profile[128] = {0};
+	size_t plen = nl2 ? (size_t)(nl2 - p2) : strlen(p2);
+	if (plen >= sizeof(profile)) plen = sizeof(profile) - 1;
+	memcpy(profile, p2, plen);
+
+	char password[256] = {0};
+	if (nl2) {
+		const char *p3 = nl2 + 1;
+		const char *nl3 = strchr(p3, '\n');
+		size_t pwlen = nl3 ? (size_t)(nl3 - p3) : strlen(p3);
+		if (pwlen >= sizeof(password)) pwlen = sizeof(password) - 1;
+		memcpy(password, p3, pwlen);
+	}
+
+	/* Step 1: Create admin (as __webd — privileged proxy) */
+	char create_payload[512];
+	snprintf(create_payload, sizeof(create_payload),
+		 "%s\n%s\n", username, profile);
+
+	webd_ipc_response_t resp;
+	if (webd_ipc_send(SG_CMD_ADMIN_CREATE, item->username,
+			  item->session_tag, create_payload, &resp) != 0) {
+		char *json = json_error("Backend unavailable", NULL);
+		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
+		return;
+	}
+	if (resp.status != SG_OK) {
+		send_ipc_error(item->conn_id, resp.status, resp.extra);
+		webd_ipc_resp_free(&resp);
+		return;
+	}
+	webd_ipc_resp_free(&resp);
+
+	/* Step 2: Set password if provided */
+	if (password[0]) {
+		char pw_payload[512];
+		snprintf(pw_payload, sizeof(pw_payload),
+			 "%s\n%s\n", username, password);
+
+		webd_ipc_response_t resp2;
+		if (webd_ipc_send(SG_CMD_ADMIN_SET_PW, item->username,
+				  item->session_tag, pw_payload,
+				  &resp2) != 0) {
+			/* Admin created but password not set — still report success
+			 * since the admin exists (enforce-change-password is on) */
+			char *json = strdup("{\"ok\":true}");
+			send_result(item->conn_id, 200, json,
+				    json ? strlen(json) : 0);
+			return;
+		}
+		if (resp2.status != SG_OK) {
+			/* Admin created but password failed policy — report the
+			 * policy error so the user knows */
+			send_ipc_error(item->conn_id, resp2.status, resp2.extra);
+			webd_ipc_resp_free(&resp2);
+			return;
+		}
+		webd_ipc_resp_free(&resp2);
+	}
 
 	char *json = strdup("{\"ok\":true}");
 	send_result(item->conn_id, 200, json, json ? strlen(json) : 0);
@@ -501,9 +592,15 @@ static void flow_config_list(work_item_t *item)
 			continue;
 		}
 
-		/* Apply search filter if present */
-		if (search && search[0] && entry_resp.payload) {
-			if (!strcasestr(entry_resp.payload, search)) {
+		/* Apply search filter — check both entry ID and kv data */
+		if (search && search[0]) {
+			int match = 0;
+			if (strcasestr(ids[i], search))
+				match = 1;
+			if (entry_resp.payload &&
+			    strcasestr(entry_resp.payload, search))
+				match = 1;
+			if (!match) {
 				webd_ipc_resp_free(&entry_resp);
 				continue;
 			}
@@ -551,7 +648,7 @@ static void flow_config_create(work_item_t *item)
 			set_payload = item->payload + alen + 1;
 	}
 
-	/* Step 1: APPLY first */
+	/* Step 1: APPLY first (test run) */
 	webd_ipc_response_t resp;
 	if (webd_ipc_send(SG_CMD_CFG_APPLY, item->username,
 			  item->session_tag, apply_payload, &resp) != 0) {
@@ -567,7 +664,7 @@ static void flow_config_create(work_item_t *item)
 	}
 	webd_ipc_resp_free(&resp);
 
-	/* Step 2: SET to persist */
+	/* Step 2: SET to persist (validates + applies + persists) */
 	if (set_payload) {
 		webd_ipc_response_t resp2;
 		if (webd_ipc_send(SG_CMD_CFG_SET, item->username,
@@ -616,11 +713,18 @@ static void flow_config_update(work_item_t *item)
 	}
 
 	/* Step 2: Merge — existing kv + new kv (new overrides existing) */
-	/* Parse existing into key-value pairs */
-	char merged[4096];
+	size_t merge_cap = 4096;
+	char *merged = malloc(merge_cap);
+	if (!merged) {
+		webd_ipc_resp_free(&get_resp);
+		char *j = json_error("Out of memory", NULL);
+		if (!j) j = strdup("{\"error\":\"Internal error\"}");
+		send_result(item->conn_id, 500, j, j ? strlen(j) : 0);
+		return;
+	}
 	size_t mlen = 0;
 
-	/* First, collect new keys from item->payload */
+	/* Collect new keys from item->payload */
 	char new_keys[64][64];
 	int nk = 0;
 	if (item->payload) {
@@ -662,7 +766,20 @@ static void flow_config_update(work_item_t *item)
 						}
 					}
 				}
-				if (!skip && mlen + ll + 1 < sizeof(merged)) {
+				if (!skip) {
+					while (mlen + ll + 1 >= merge_cap) {
+						merge_cap *= 2;
+						char *tmp = realloc(merged, merge_cap);
+						if (!tmp) {
+							free(merged);
+							webd_ipc_resp_free(&get_resp);
+							char *j = json_error("Out of memory", NULL);
+							if (!j) j = strdup("{\"error\":\"Internal error\"}");
+							send_result(item->conn_id, 500, j, j ? strlen(j) : 0);
+							return;
+						}
+						merged = tmp;
+					}
 					memcpy(merged + mlen, p, ll);
 					mlen += ll;
 					merged[mlen++] = '\n';
@@ -673,12 +790,35 @@ static void flow_config_update(work_item_t *item)
 	}
 	webd_ipc_resp_free(&get_resp);
 
-	/* Append new kv */
+	/* Append new kv, skipping name= and id= routing keys */
 	if (item->payload) {
-		size_t plen = strlen(item->payload);
-		if (mlen + plen < sizeof(merged)) {
-			memcpy(merged + mlen, item->payload, plen);
-			mlen += plen;
+		const char *p = item->payload;
+		while (*p) {
+			const char *nl = strchr(p, '\n');
+			size_t ll = nl ? (size_t)(nl - p) : strlen(p);
+			if (ll > 0) {
+				int is_routing =
+					(ll > 5 && strncmp(p, "name=", 5) == 0) ||
+					(ll > 3 && strncmp(p, "id=",   3) == 0);
+				if (!is_routing) {
+					while (mlen + ll + 1 >= merge_cap) {
+						merge_cap *= 2;
+						char *tmp = realloc(merged, merge_cap);
+						if (!tmp) {
+							free(merged);
+							char *j = json_error("Out of memory", NULL);
+							if (!j) j = strdup("{\"error\":\"Internal error\"}");
+							send_result(item->conn_id, 500, j, j ? strlen(j) : 0);
+							return;
+						}
+						merged = tmp;
+					}
+					memcpy(merged + mlen, p, ll);
+					mlen += ll;
+					merged[mlen++] = '\n';
+				}
+			}
+			p = nl ? nl + 1 : p + ll;
 		}
 	}
 	merged[mlen] = '\0';
@@ -697,40 +837,50 @@ static void flow_config_update(work_item_t *item)
 	}
 
 	/* Step 3: APPLY merged config */
-	char apply_payload[4096];
-	int n = snprintf(apply_payload, sizeof(apply_payload),
-			 "%s\n%s\n%s", type, id, merged);
-	if (n < 0 || (size_t)n >= sizeof(apply_payload)) {
-		char *json = json_error("Payload too large", NULL);
-		send_result(item->conn_id, 400, json, json ? strlen(json) : 0);
+	size_t ap_sz = strlen(type) + 1 + strlen(id) + 1 + mlen + 1;
+	char *apply_payload = malloc(ap_sz);
+	if (!apply_payload) {
+		free(merged);
+		char *j = json_error("Out of memory", NULL);
+		if (!j) j = strdup("{\"error\":\"Internal error\"}");
+		send_result(item->conn_id, 500, j, j ? strlen(j) : 0);
 		return;
 	}
+	snprintf(apply_payload, ap_sz, "%s\n%s\n%s", type, id, merged);
 
 	webd_ipc_response_t apply_resp;
 	if (webd_ipc_send(SG_CMD_CFG_APPLY, item->username,
 			  item->session_tag, apply_payload,
 			  &apply_resp) != 0) {
+		free(apply_payload);
+		free(merged);
 		char *json = json_error("Backend unavailable", NULL);
 		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
 		return;
 	}
 	if (apply_resp.status != SG_OK) {
+		free(apply_payload);
+		free(merged);
 		send_ipc_error(item->conn_id, apply_resp.status,
 			       apply_resp.extra);
 		webd_ipc_resp_free(&apply_resp);
 		return;
 	}
+	free(apply_payload);
 	webd_ipc_resp_free(&apply_resp);
 
 	/* Step 4: SET full merged config */
 	size_t sp_sz = strlen(section) + 1 + mlen + 1;
 	char *set_payload = malloc(sp_sz);
 	if (!set_payload) {
+		free(merged);
 		char *j = json_error("Out of memory", NULL);
+		if (!j) j = strdup("{\"error\":\"Internal error\"}");
 		send_result(item->conn_id, 500, j, j ? strlen(j) : 0);
 		return;
 	}
 	snprintf(set_payload, sp_sz, "%s\n%s", section, merged);
+	free(merged);
 
 	webd_ipc_response_t set_resp;
 	if (webd_ipc_send(SG_CMD_CFG_SET, item->username,
@@ -1364,6 +1514,7 @@ static void *worker_fn(void *arg)
 		case FLOW_RES_RAM:      flow_res_ram(&item);         break;
 		case FLOW_RES_DISK:     flow_res_disk(&item);        break;
 		case FLOW_RES_PROCTOP:  flow_res_proctop(&item);     break;
+		case FLOW_ADMIN_CREATE: flow_admin_create(&item);    break;
 		default:                 flow_simple(&item);          break;
 		}
 

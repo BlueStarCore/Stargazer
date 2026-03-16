@@ -341,9 +341,14 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 			/* Build IPC payload: "username\npassword\n" */
 			size_t plen = strlen(username) + strlen(password) + 3;
 			char *payload = malloc(plen);
-			if (payload)
-				snprintf(payload, plen, "%s\n%s\n",
-					 username, password);
+			if (!payload) {
+				free(username);
+				free(password);
+				reply_json(c, 503,
+					   "{\"error\":\"Internal error\"}");
+				return -1;
+			}
+			snprintf(payload, plen, "%s\n%s\n", username, password);
 
 			work_item_t item;
 			memset(&item, 0, sizeof(item));
@@ -352,7 +357,7 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 			snprintf(item.username, sizeof(item.username),
 				 "%s", username);
 			item.payload = payload;
-			item.payload_len = payload ? strlen(payload) : 0;
+			item.payload_len = strlen(payload);
 
 			free(username);
 			free(password);
@@ -415,12 +420,18 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 				return -1;
 			}
 
-			/* Build payload: "username\nnew_password\n" */
-			size_t plen = strlen(sess.username) + strlen(password) + 3;
+			/* Build payload: "username\nnew_password\nsource\n" */
+			size_t plen = strlen(sess.username) + strlen(password) +
+				      3 + 11; /* +11 for "admin-flag\n" */
 			char *payload = malloc(plen);
-			if (payload)
-				snprintf(payload, plen, "%s\n%s\n",
-					 sess.username, password);
+			if (!payload) {
+				free(password);
+				reply_json(c, 503,
+					   "{\"error\":\"Internal error\"}");
+				return -1;
+			}
+			snprintf(payload, plen, "%s\n%s\nadmin-flag\n",
+				 sess.username, password);
 			free(password);
 
 			work_item_t item;
@@ -431,7 +442,7 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 				 "%s", sess.username);
 			item.session_tag = sess.ipc_session_tag;
 			item.payload = payload;
-			item.payload_len = payload ? strlen(payload) : 0;
+			item.payload_len = strlen(payload);
 
 			if (webd_pool_enqueue(&item) != 0) {
 				free(payload);
@@ -471,6 +482,65 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 	if (!token || session_lookup(token, &sess) != 0) {
 		reply_json(c, 401, "{\"error\":\"Unauthorized\"}");
 		return -1;
+	}
+
+	/* ── /api/admin/create ───────────────────────────────────────── */
+	if (strcmp(segs[0], "admin") == 0 && nseg >= 2 &&
+	    strcmp(segs[1], "create") == 0 &&
+	    mg_str_eq(hm->method, "POST")) {
+		char *username = json_str(hm->body, "$.username");
+		char *profile = json_str(hm->body, "$.profile");
+		char *password = json_str(hm->body, "$.password");
+
+		if (!username || !profile) {
+			free(username);
+			free(profile);
+			free(password);
+			reply_json(c, 400,
+				   "{\"error\":\"Missing username or profile\"}");
+			return -1;
+		}
+
+		/* Build payload: "username\nprofile\npassword\n" */
+		size_t plen = strlen(username) + strlen(profile) +
+			      (password ? strlen(password) : 0) + 4;
+		char *payload = malloc(plen);
+		if (!payload) {
+			free(username);
+			free(profile);
+			free(password);
+			reply_json(c, 503,
+				   "{\"error\":\"Internal error\"}");
+			return -1;
+		}
+		if (password)
+			snprintf(payload, plen, "%s\n%s\n%s\n",
+				 username, profile, password);
+		else
+			snprintf(payload, plen, "%s\n%s\n",
+				 username, profile);
+
+		free(username);
+		free(profile);
+		free(password);
+
+		work_item_t item;
+		memset(&item, 0, sizeof(item));
+		item.conn_id = c->id;
+		item.flow_type = FLOW_ADMIN_CREATE;
+		snprintf(item.username, sizeof(item.username),
+			 "%s", sess.username);
+		item.session_tag = sess.ipc_session_tag;
+		item.payload = payload;
+		item.payload_len = strlen(payload);
+
+		if (webd_pool_enqueue(&item) != 0) {
+			free(payload);
+			reply_json(c, 503,
+				   "{\"error\":\"Server busy\"}");
+			return -1;
+		}
+		return 0;
 	}
 
 	/* ── /api/config/... ─────────────────────────────────────────── */
@@ -517,7 +587,12 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 				 "%s", sess.username);
 			item.session_tag = sess.ipc_session_tag;
 			item.payload = strdup(section);
-			item.payload_len = strlen(section);
+			if (!item.payload) {
+				reply_json(c, 500,
+					   "{\"error\":\"Internal error\"}");
+				return -1;
+			}
+			item.payload_len = strlen(item.payload);
 
 			if (webd_pool_enqueue(&item) != 0) {
 				free(item.payload);
@@ -543,11 +618,11 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 			const char *entry_id = name ? name : id_field;
 			if (!entry_id) entry_id = "new";
 
-			/* Strip routing keys — 'name' and 'id' are entry
-			 * identifiers, not config fields.  Sending them in
-			 * the payload causes "Unknown key" errors for types
-			 * that don't have a 'name' field (e.g. system_admin). */
-			static const char *const strip_keys[] = {"name", "id", NULL};
+			/* Strip 'id' key — it's the entry identifier, not a
+			 * config field.  Keep 'name' — some types (e.g.
+			 * firewall_address, firewall_service) have 'name'
+			 * as a real config key in their schema. */
+			static const char *const strip_keys[] = {"id", NULL};
 			char *kv = strip_kv_keys(kv_raw, strip_keys);
 			free(kv_raw);
 			if (!kv) {
@@ -562,32 +637,47 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 			size_t ap_sz = strlen(type) + strlen(entry_id) +
 				       strlen(kv) + 4;
 			char *apply_payload = malloc(ap_sz);
-			if (apply_payload)
-				snprintf(apply_payload, ap_sz, "%s\n%s\n%s",
-					 type, entry_id, kv);
 
 			/* Build set payload: "type:id\nkey=val\n..." */
 			size_t sp_sz = strlen(type) + strlen(entry_id) +
 				       strlen(kv) + 4;
 			char *set_payload = malloc(sp_sz);
-			if (set_payload)
-				snprintf(set_payload, sp_sz, "%s:%s\n%s",
-					 type, entry_id, kv);
+
+			if (!apply_payload || !set_payload) {
+				free(apply_payload);
+				free(set_payload);
+				free(kv);
+				free(name);
+				free(id_field);
+				reply_json(c, 500,
+					   "{\"error\":\"Internal error\"}");
+				return -1;
+			}
+			snprintf(apply_payload, ap_sz, "%s\n%s\n%s",
+				 type, entry_id, kv);
+			snprintf(set_payload, sp_sz, "%s:%s\n%s",
+				 type, entry_id, kv);
 
 			/* Pack both payloads with NUL separator */
-			size_t total = (apply_payload ? strlen(apply_payload) : 0) +
-				       1 +
-				       (set_payload ? strlen(set_payload) : 0) +
-				       1;
+			size_t total = strlen(apply_payload) + 1 +
+				       strlen(set_payload) + 1;
 			char *combined = malloc(total);
-			if (combined && apply_payload && set_payload) {
-				size_t alen = strlen(apply_payload);
-				memcpy(combined, apply_payload, alen);
-				combined[alen] = '\0';
-				size_t slen = strlen(set_payload);
-				memcpy(combined + alen + 1, set_payload, slen);
-				combined[alen + 1 + slen] = '\0';
+			if (!combined) {
+				free(apply_payload);
+				free(set_payload);
+				free(kv);
+				free(name);
+				free(id_field);
+				reply_json(c, 500,
+					   "{\"error\":\"Internal error\"}");
+				return -1;
 			}
+			size_t alen = strlen(apply_payload);
+			memcpy(combined, apply_payload, alen);
+			combined[alen] = '\0';
+			size_t slen = strlen(set_payload);
+			memcpy(combined + alen + 1, set_payload, slen);
+			combined[alen + 1 + slen] = '\0';
 
 			free(kv);
 			free(name);
@@ -617,10 +707,18 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 
 		/* PUT /api/config/{type}/{id} — update entry */
 		if (nseg >= 3 && mg_str_eq(hm->method, "PUT")) {
-			char *kv = json_body_to_kv(hm->body);
-			if (!kv) {
+			char *kv_raw = json_body_to_kv(hm->body);
+			if (!kv_raw) {
 				reply_json(c, 400,
 					   "{\"error\":\"Invalid body\"}");
+				return -1;
+			}
+			static const char *const strip_keys[] = {"id", NULL};
+			char *kv = strip_kv_keys(kv_raw, strip_keys);
+			free(kv_raw);
+			if (!kv) {
+				reply_json(c, 500,
+					   "{\"error\":\"Internal error\"}");
 				return -1;
 			}
 
@@ -660,7 +758,12 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 				 "%s", sess.username);
 			item.session_tag = sess.ipc_session_tag;
 			item.payload = strdup(payload);
-			item.payload_len = strlen(payload);
+			if (!item.payload) {
+				reply_json(c, 500,
+					   "{\"error\":\"Internal error\"}");
+				return -1;
+			}
+			item.payload_len = strlen(item.payload);
 
 			if (webd_pool_enqueue(&item) != 0) {
 				free(item.payload);
@@ -832,15 +935,20 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 
 		size_t plen = strlen(target) + (iface ? strlen(iface) : 0) + 32;
 		char *payload = malloc(plen);
-		if (payload) {
-			if (iface)
-				snprintf(payload, plen,
-					 "target=%s\niface=%s\n",
-					 target, iface);
-			else
-				snprintf(payload, plen,
-					 "target=%s\n", target);
+		if (!payload) {
+			free(target);
+			free(iface);
+			reply_json(c, 503,
+				   "{\"error\":\"Internal error\"}");
+			return -1;
 		}
+		if (iface)
+			snprintf(payload, plen,
+				 "target=%s\niface=%s\n",
+				 target, iface);
+		else
+			snprintf(payload, plen,
+				 "target=%s\n", target);
 		free(target);
 		free(iface);
 
@@ -853,7 +961,7 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 			 "%s", sess.username);
 		item.session_tag = sess.ipc_session_tag;
 		item.payload = payload;
-		item.payload_len = payload ? strlen(payload) : 0;
+		item.payload_len = strlen(payload);
 
 		if (webd_pool_enqueue(&item) != 0) {
 			free(payload);
