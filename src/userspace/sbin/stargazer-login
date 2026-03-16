@@ -88,119 +88,9 @@ ensure_admin_account() {
 # ----------------------------------------------------------------------------
 ensure_admin_account
 
-# ----------------------------------------------------------------------------
-# Phase B auth hardening: username pre-check + lockout/backoff + audit
-# ----------------------------------------------------------------------------
-
-AUTH_STATE_FILE="/tmp/stargazer-auth.state"
-AUTH_MAX_FAILS=5
-AUTH_LOCK_BASE=120
-AUTH_LOCK_MAX=3600
-
-auth_get_state() {
-	_ag_user="$1"
-	_ag_count=0
-	_ag_until=0
-	if _db_ready; then
-		_ag_uq=$(_db_escape "$_ag_user")
-		_ag_row=$(sqlite3 "$STARGAZER_DB_PATH" "SELECT fail_count, locked_until FROM auth_lockouts WHERE username='${_ag_uq}' LIMIT 1;" 2>/dev/null)
-		if [ -n "$_ag_row" ]; then
-			_ag_count="${_ag_row%%|*}"
-			_ag_until="${_ag_row#*|}"
-		fi
-		echo "${_ag_count:-0}:${_ag_until:-0}"
-		return
-	fi
-	[ -f "$AUTH_STATE_FILE" ] || {
-		echo "$_ag_count:$_ag_until"
-		return
-	}
-	while IFS=: read -r _u _c _t || [ -n "$_u" ]; do
-		[ "$_u" = "$_ag_user" ] || continue
-		_ag_count="${_c:-0}"
-		_ag_until="${_t:-0}"
-		break
-	done < "$AUTH_STATE_FILE"
-	echo "$_ag_count:$_ag_until"
-}
-
-auth_set_state() {
-	_as_user="$1"
-	_as_count="$2"
-	_as_until="$3"
-	if _db_ready; then
-		_as_uq=$(_db_escape "$_as_user")
-		sqlite3 "$STARGAZER_DB_PATH" "INSERT INTO auth_lockouts(username, fail_count, locked_until, updated_at)
-		VALUES('${_as_uq}', ${_as_count}, ${_as_until}, datetime('now'))
-		ON CONFLICT(username) DO UPDATE SET
-		fail_count=excluded.fail_count,
-		locked_until=excluded.locked_until,
-		updated_at=datetime('now');" >/dev/null 2>&1 || true
-		return
-	fi
-	_as_tmp="${AUTH_STATE_FILE}.tmp.$$"
-	> "$_as_tmp"
-	if [ -f "$AUTH_STATE_FILE" ]; then
-		while IFS=: read -r _u _c _t || [ -n "$_u" ]; do
-			[ -z "$_u" ] && continue
-			[ "$_u" = "$_as_user" ] && continue
-			echo "${_u}:${_c}:${_t}" >> "$_as_tmp"
-		done < "$AUTH_STATE_FILE"
-	fi
-	echo "${_as_user}:${_as_count}:${_as_until}" >> "$_as_tmp"
-	mv "$_as_tmp" "$AUTH_STATE_FILE"
-}
-
-auth_clear_state() {
-	_ac_user="$1"
-	if _db_ready; then
-		_ac_uq=$(_db_escape "$_ac_user")
-		sqlite3 "$STARGAZER_DB_PATH" "DELETE FROM auth_lockouts WHERE username='${_ac_uq}';" >/dev/null 2>&1 || true
-		return 0
-	fi
-	_ac_tmp="${AUTH_STATE_FILE}.tmp.$$"
-	[ -f "$AUTH_STATE_FILE" ] || return 0
-	> "$_ac_tmp"
-	while IFS=: read -r _u _c _t || [ -n "$_u" ]; do
-		[ -z "$_u" ] && continue
-		[ "$_u" = "$_ac_user" ] && continue
-		echo "${_u}:${_c}:${_t}" >> "$_ac_tmp"
-	done < "$AUTH_STATE_FILE"
-	mv "$_ac_tmp" "$AUTH_STATE_FILE"
-}
-
-auth_note_fail() {
-	_af_user="$1"
-	_af_now=$(date +%s 2>/dev/null || echo 0)
-	_af_state=$(auth_get_state "$_af_user")
-	_af_count=${_af_state%%:*}
-	_af_until=${_af_state#*:}
-	[ "$_af_now" -ge "${_af_until:-0}" ] && _af_count=0
-	_af_count=$((_af_count + 1))
-	if [ "$_af_count" -ge "$AUTH_MAX_FAILS" ]; then
-		# Escalating lockout: 2min → 4min → 8min ... max 1hr (BUG-AUTH-07)
-		_af_rounds=$(( (_af_count - AUTH_MAX_FAILS) / AUTH_MAX_FAILS ))
-		_af_duration=$AUTH_LOCK_BASE
-		_af_i=0
-		while [ "$_af_i" -lt "$_af_rounds" ] && [ "$_af_duration" -lt "$AUTH_LOCK_MAX" ]; do
-			_af_duration=$((_af_duration * 2))
-			_af_i=$((_af_i + 1))
-		done
-		[ "$_af_duration" -gt "$AUTH_LOCK_MAX" ] && _af_duration=$AUTH_LOCK_MAX
-		_af_until=$((_af_now + _af_duration))
-	else
-		_af_until=0
-	fi
-	auth_set_state "$_af_user" "$_af_count" "$_af_until"
-}
-
-auth_is_locked() {
-	_al_user="$1"
-	_al_now=$(date +%s 2>/dev/null || echo 0)
-	_al_state=$(auth_get_state "$_al_user")
-	_al_until=${_al_state#*:}
-	[ "$_al_now" -lt "${_al_until:-0}" ]
-}
+# Auth lockout is handled inside mgmtd's AUTH_LOGIN handler.
+# No shell-side lockout checks needed — eliminates sqlite3 process
+# spawns from the login hot path (OpenSSH/PAM model).
 
 # ── Ctrl+C resets to fresh login prompt (no process restart) ──
 _login_interrupted=0
@@ -217,6 +107,12 @@ while true; do
 	unset STARGAZER_USER
 	unset LOGIN
 	_login_user=""
+
+	# ── Restore terminal sanity after CLI exit ──
+	# CLI uses raw mode (no echo, no canonical) for readline.
+	# After CLI exits, terminal may still be in that state.
+	# Force echo + canonical mode so the login prompt works.
+	stty sane 2>/dev/null
 
 	printf "login: "
 	read -r _login_user
@@ -243,24 +139,8 @@ while true; do
 	export LOGIN="$_login_user"
 	auth_debug "login_attempt attempt_user=${_login_user} env_STARGAZER_LOGIN_USER=${STARGAZER_LOGIN_USER} env_LOGIN=${LOGIN}"
 
-	# ── Check lockout BEFORE authentication (BUG-AUTH-08) ──
-	if _is_safe_id "$_login_user" \
-		&& admin_exists_in_config "$_login_user" \
-		&& grep -q "^${_login_user}:" /etc/passwd 2>/dev/null; then
-		if auth_is_locked "$_login_user"; then
-			audit_log "login_reject" "user=${_login_user} reason=locked"
-			echo "Account temporarily locked. Try again later."
-			sleep 1
-			# ── Ctrl+C during lockout wait → reset ──
-			if [ "$_login_interrupted" -eq 1 ]; then echo ""; continue; fi
-			# Cleanup context
-			unset STARGAZER_LOGIN_USER
-			unset STARGAZER_USER
-			unset LOGIN
-			continue
-		fi
-	fi
-
+	# Lockout is checked inside mgmtd's AUTH_LOGIN handler —
+	# no shell-side pre-check needed (instant password prompt).
 	/sbin/stargazer-logind "$_login_user"
 	_logind_rc=$?
 
@@ -272,13 +152,13 @@ while true; do
 	fi
 
 	if [ "$_logind_rc" -eq 0 ]; then
-		auth_clear_state "$_login_user"
 		audit_log "login_success" "user=${_login_user}"
-		# Cleanup before exit
+		# CLI exited normally — loop back to login prompt immediately
+		# (no init respawn needed, avoids delay + terminal state issues)
 		unset STARGAZER_LOGIN_USER
 		unset STARGAZER_USER
 		unset LOGIN
-		exit 0
+		continue
 	fi
 
 	# ── Cleanup ALL login context after failed attempt ──
@@ -286,15 +166,8 @@ while true; do
 	unset STARGAZER_USER
 	unset LOGIN
 
-	# Apply lockout accounting only for syntactically-safe existing users
-	if _is_safe_id "$_login_user" \
-		&& admin_exists_in_config "$_login_user" \
-		&& grep -q "^${_login_user}:" /etc/passwd 2>/dev/null; then
-		auth_note_fail "$_login_user"
-		audit_log "login_reject" "user=${_login_user} reason=bad-password"
-	else
-		audit_log "login_reject" "user=${_login_user} reason=invalid-credential"
-	fi
+	# Lockout accounting is handled inside mgmtd — just audit here.
+	audit_log "login_reject" "user=${_login_user}"
 	sleep 1
 	# ── Ctrl+C during failure delay → reset ──
 	if [ "$_login_interrupted" -eq 1 ]; then echo ""; continue; fi

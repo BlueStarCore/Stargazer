@@ -271,12 +271,16 @@ echo "@VERSION@" > /tmp/stargazer-fw-version
 
 # Ensure stargazer system group exists (used for socket + config file ACL)
 if ! grep -q '^stargazer:' /etc/group 2>/dev/null; then
-	# Find a free GID in system range
 	_sg_gid=900
 	while grep -q "^[^:]*:[^:]*:${_sg_gid}:" /etc/group 2>/dev/null; do
 		_sg_gid=$((_sg_gid + 1))
 	done
 	echo "stargazer:x:${_sg_gid}:" >> /etc/group
+fi
+
+# Ensure __webd service account exists (webd drops to this UID for SO_PEERCRED)
+if ! grep -q '^__webd:' /etc/passwd 2>/dev/null; then
+	echo '__webd:x:900:900:webd service:/:/bin/false' >> /etc/passwd
 fi
 
 # Lock down INPUT before any interface comes up — prevents a window
@@ -291,11 +295,17 @@ iptables -P INPUT DROP 2>/dev/null
 # started during mgmtd_replay_config() on boot.
 
 # Start management daemon (privilege separation)
+# mgmtd now supervises webd, udhcpc, udhcpd — wrapping in a restart
+# loop so init can recover from mgmtd crashes without a full reboot.
 if [ -x /sbin/stargazer-mgmtd ]; then
 	echo "[stargazer] Starting management daemon..."
 	_ready=/run/mgmtd-ready
 	mkfifo "$_ready" 2>/dev/null
-	/sbin/stargazer-mgmtd &
+	(while true; do
+		/sbin/stargazer-mgmtd
+		[ -f /tmp/stargazer-shutdown ] && break
+		sleep 2
+	done) &
 	# Block until mgmtd signals readiness via FIFO (zero-CPU wait).
 	# Config replay applies iptables/ip rules for every interface —
 	# can take 10-20s on large configs.  30s timeout covers worst case.
@@ -319,27 +329,7 @@ if [ -x /sbin/stargazer-mgmtd ]; then
 			;;
 	esac
 fi
-
-# Start web daemon (HTTP API — binds to interface IPs per allowaccess config)
-if [ -x /sbin/stargazer-webd ]; then
-	echo "[stargazer] Starting web daemon..."
-	_webd_ready=/run/webd-ready
-	mkfifo "$_webd_ready" 2>/dev/null
-	# Binds to interface IPs based on allowaccess config (http→:80, https→:443).
-	# To enable HTTPS, add TLS cert/key and set allowaccess=https on interfaces:
-	#   --tls-cert /etc/stargazer/tls/cert.pem --tls-key /etc/stargazer/tls/key.pem
-	/sbin/stargazer-webd &
-	(sleep 10; echo timeout > "$_webd_ready" 2>/dev/null) &
-	_wto=$!
-	read _wsig < "$_webd_ready"
-	kill "$_wto" 2>/dev/null; wait "$_wto" 2>/dev/null
-	rm -f "$_webd_ready"
-	case "$_wsig" in
-		ready) echo "[stargazer] Web UI ready." ;;
-		*)     echo "[stargazer] WARNING: Web daemon did not start."
-		       _init_errors="${_init_errors}webd " ;;
-	esac
-fi
+# webd is now started by mgmtd's supervisor — no init block needed.
 
 # Create commands (remove busybox symlinks first to avoid "Text file busy")
 rm -f /sbin/service /sbin/poweroff /sbin/reboot /sbin/halt /sbin/shutdown
@@ -349,8 +339,18 @@ cat > /sbin/service << 'SVC'
 [ -x "/etc/init.d/$1" ] && "/etc/init.d/$1" "$2" || echo "Usage: service <name> <action>"
 SVC
 
-cat > /sbin/poweroff << 'PWR'
+# Shared shutdown helper — exec'd by /sbin/poweroff and /sbin/reboot.
+# Argument: "halt" or "reboot".
+cat > /usr/libexec/stargazer/shutdown.sh << 'SHUTDOWN'
 #!/bin/sh
+_action="${1:-halt}"
+
+# Ignore SIGTERM so the broadkill in phase 2 cannot kill this script.
+# kill(-1, sig) excludes the calling process on Linux, but if kill is
+# an external command (not a shell builtin), the forked child calls
+# kill() and the PARENT (this script) would receive the signal.
+trap '' TERM
+
 # Reopen stdout/stderr to console (safe_exec redirects them to a pipe)
 exec >/dev/console 2>&1 </dev/console
 # Reset terminal from raw mode (CLI readline leaves it raw)
@@ -359,8 +359,16 @@ stty sane 2>/dev/null
 echo 1 > /proc/sys/kernel/printk 2>/dev/null
 # Signal init to not restart login
 touch /tmp/stargazer-shutdown
+
 echo ""
-echo "[stargazer] Shutting down..."
+if [ "$_action" = "reboot" ]; then
+	echo "[stargazer] Rebooting..."
+else
+	echo "[stargazer] Shutting down..."
+fi
+
+# ── Phase 1: Graceful stop (SIGTERM) ────────────────────────────────────
+
 # Kill entire login process group at once — login shell + CLI die
 # simultaneously, so no parent shell survives to print "Terminated".
 # setsid -c makes the login shell PID = PGID.
@@ -373,85 +381,89 @@ sleep 0.3
 # Safety net: kill any stragglers individually
 killall stargazer-cli 2>/dev/null
 killall stargazer-logind 2>/dev/null
-echo "[stargazer] Stopping web daemon..."
-killall stargazer-webd 2>/dev/null
-echo "[stargazer] Stopping management daemon..."
+
+# SIGTERM mgmtd — its shutdown_children() handles webd, udhcpc, udhcpd
+# (SIGUSR2 for DHCP RELEASE, SIGTERM, then SIGKILL for stragglers).
+echo "[stargazer] Stopping management daemon (+ supervised services)..."
 killall stargazer-mgmtd 2>/dev/null
-echo "[stargazer] Stopping DHCP services..."
-killall udhcpd 2>/dev/null
-# SIGUSR2 triggers DHCP RELEASE before exit (BusyBox udhcpc)
-killall -USR2 udhcpc 2>/dev/null
-sleep 0.5
-killall udhcpc 2>/dev/null
+sleep 1
+
 echo "[stargazer] Stopping init services..."
 for s in /etc/init.d/*; do [ -x "$s" ] && "$s" stop 2>/dev/null; done
+
+# ── Phase 2: Kill remaining processes ───────────────────────────────────
+
+# SIGTERM everything except PID 1 (this script runs as a child of mgmtd,
+# which is already SIGTERM'd above — safe to broadkill here).
 echo "[stargazer] Killing remaining processes..."
+kill -TERM -1 2>/dev/null
 sleep 1
+# Force-kill anything that ignored SIGTERM (stuck I/O, hung daemons).
+# Without this, open files can prevent umount.
+kill -KILL -1 2>/dev/null
+sleep 0.5
+
+# ── Phase 3: Save persistent state ─────────────────────────────────────
+
 echo "[stargazer] Saving auth files..."
 if mountpoint -q /etc/stargazer 2>/dev/null; then
 	cp /etc/shadow /etc/stargazer/shadow 2>/dev/null
 	cp /etc/passwd /etc/stargazer/passwd 2>/dev/null
 	cp /etc/group /etc/stargazer/group 2>/dev/null
 fi
+
+# ── Phase 4: Unmount with fallback ──────────────────────────────────────
+
+# Try clean umount → lazy umount → remount read-only.
+# ext2 has no journal — dirty unmount risks filesystem corruption.
+_sg_umount() {
+	_mp="$1"
+	mountpoint -q "$_mp" 2>/dev/null || return 0
+	if umount "$_mp" 2>/dev/null; then
+		return 0
+	fi
+	echo "[stargazer] WARNING: umount $_mp failed, trying lazy unmount..."
+	if umount -l "$_mp" 2>/dev/null; then
+		return 0
+	fi
+	echo "[stargazer] WARNING: lazy umount $_mp failed, remounting read-only..."
+	mount -o remount,ro "$_mp" 2>/dev/null
+}
+
 echo "[stargazer] Unmounting logs partition..."
-mountpoint -q /etc/stargazer/logs 2>/dev/null && umount /etc/stargazer/logs 2>/dev/null
+_sg_umount /etc/stargazer/logs
+
 echo "[stargazer] Unmounting data partition..."
-mountpoint -q /etc/stargazer 2>/dev/null && umount /etc/stargazer 2>/dev/null
+_sg_umount /etc/stargazer
+
 echo "[stargazer] Syncing disks..."
 sync
-# MT7988A ATF lacks PSCI SYSTEM_OFF — 'poweroff' triggers an unsupported error.
-# 'halt -f' cleanly stops the CPU without PSCI; user can safely remove power.
-echo "[stargazer] System halted. You may remove power."
-/bin/busybox halt -f
+
+# ── Phase 5: Final action ──────────────────────────────────────────────
+
+if [ "$_action" = "reboot" ]; then
+	echo "[stargazer] System rebooting now..."
+	sleep 1
+	/bin/busybox reboot -f
+else
+	# MT7988A ATF lacks PSCI SYSTEM_OFF — 'poweroff' triggers an
+	# unsupported error. 'halt -f' stops the CPU without PSCI.
+	echo "[stargazer] System halted. You may remove power."
+	/bin/busybox halt -f
+fi
+SHUTDOWN
+
+cat > /sbin/poweroff << 'PWR'
+#!/bin/sh
+exec /bin/sh /usr/libexec/stargazer/shutdown.sh halt
 PWR
 
 cat > /sbin/reboot << 'RBT'
 #!/bin/sh
-exec >/dev/console 2>&1 </dev/console
-stty sane 2>/dev/null
-echo 1 > /proc/sys/kernel/printk 2>/dev/null
-touch /tmp/stargazer-shutdown
-echo ""
-echo "[stargazer] Rebooting..."
-echo "[stargazer] Stopping login session..."
-if [ -f /tmp/stargazer-login.pid ]; then
-	_lpid=$(cat /tmp/stargazer-login.pid 2>/dev/null)
-	[ -n "$_lpid" ] && kill -- -"$_lpid" 2>/dev/null
-fi
-sleep 0.3
-killall stargazer-cli 2>/dev/null
-killall stargazer-logind 2>/dev/null
-echo "[stargazer] Stopping web daemon..."
-killall stargazer-webd 2>/dev/null
-echo "[stargazer] Stopping management daemon..."
-killall stargazer-mgmtd 2>/dev/null
-echo "[stargazer] Stopping DHCP services..."
-killall udhcpd 2>/dev/null
-# SIGUSR2 triggers DHCP RELEASE before exit (BusyBox udhcpc)
-killall -USR2 udhcpc 2>/dev/null
-sleep 0.5
-killall udhcpc 2>/dev/null
-echo "[stargazer] Stopping init services..."
-for s in /etc/init.d/*; do [ -x "$s" ] && "$s" stop 2>/dev/null; done
-echo "[stargazer] Killing remaining processes..."
-sleep 1
-echo "[stargazer] Saving auth files..."
-if mountpoint -q /etc/stargazer 2>/dev/null; then
-	cp /etc/shadow /etc/stargazer/shadow 2>/dev/null
-	cp /etc/passwd /etc/stargazer/passwd 2>/dev/null
-	cp /etc/group /etc/stargazer/group 2>/dev/null
-fi
-echo "[stargazer] Unmounting logs partition..."
-mountpoint -q /etc/stargazer/logs 2>/dev/null && umount /etc/stargazer/logs 2>/dev/null
-echo "[stargazer] Unmounting data partition..."
-mountpoint -q /etc/stargazer 2>/dev/null && umount /etc/stargazer 2>/dev/null
-echo "[stargazer] Syncing disks..."
-sync
-echo "[stargazer] System rebooting now..."
-sleep 1; /bin/busybox reboot -f
+exec /bin/sh /usr/libexec/stargazer/shutdown.sh reboot
 RBT
 
-chmod +x /sbin/service /sbin/poweroff /sbin/reboot
+chmod +x /sbin/service /sbin/poweroff /sbin/reboot /usr/libexec/stargazer/shutdown.sh
 cp /sbin/poweroff /sbin/halt
 cp /sbin/poweroff /sbin/shutdown
 
@@ -470,7 +482,6 @@ else
 fi
 while true; do
 	setsid -c /sbin/stargazer-login </dev/console >/dev/console 2>&1
-	wait 2>/dev/null
 	# If shutdown/reboot is in progress, stop restarting login
 	[ -f /tmp/stargazer-shutdown ] && break
 	sleep 2
