@@ -1332,7 +1332,8 @@ static void test_ipc_apply(void)
 	conn = ipc_send_str(SG_CMD_CFG_APPLY,
 			    "system_settings\n0\n"
 			    "hostname=stargazer\n"
-			    "ip-forward=enable\n",
+			    "ip-forward=enable\n"
+			    "timezone=UTC\n",
 			    &resp);
 	if (conn == 0 && resp.status == SG_OK) {
 		tc_pass++;
@@ -1353,7 +1354,9 @@ static void test_ipc_apply(void)
 	tc_total++;
 	conn = ipc_send_str(SG_CMD_CFG_APPLY,
 			    "network_dns\n0\n"
-			    "primary=8.8.8.8\n",
+			    "primary=8.8.8.8\n"
+			    "secondary=8.8.4.4\n"
+			    "status=enable\n",
 			    &resp);
 	if (conn == 0 && resp.status == SG_OK) {
 		tc_pass++;

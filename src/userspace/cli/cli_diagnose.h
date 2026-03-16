@@ -97,4 +97,20 @@ int cli_diagnose_test_disk(int mode, diag_result_t *out);
  */
 int cli_diagnose_test_dhcp(int mode, diag_result_t *out);
 
+/*
+ * Run supervisor diagnostics (process start/stop/restart/crash-loop).
+ *   mode=0: no local-only tests (all checks need IPC)
+ *   mode=1: full test (IPC round-trips via SG_CMD_SUPERVISOR_TEST)
+ * Returns 0 on all-pass, 1 on any failure.
+ */
+int cli_diagnose_test_supervisor(int mode, diag_result_t *out);
+
+/*
+ * Run webd backend IPC diagnostics.
+ *   mode=0: no local-only tests (all checks need IPC)
+ *   mode=1: full test (session tags, WHOAMI, error codes, CRUD, diag)
+ * Returns 0 on all-pass, 1 on any failure.
+ */
+int cli_diagnose_test_webd(int mode, diag_result_t *out);
+
 #endif /* CLI_DIAGNOSE_H */
