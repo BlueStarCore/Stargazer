@@ -2,9 +2,9 @@
 /*
  * mgmtd_apply_dhcp.c — Apply handler for network_dhcp-server
  *
- * Manages BusyBox udhcpd lifecycle: generates config, starts/stops daemon.
- * Each DHCP pool gets its own udhcpd instance with a dedicated config,
- * pidfile, and lease file under /var/run/.
+ * Manages BusyBox udhcpd lifecycle: generates config, starts/stops daemon
+ * via the mgmtd supervisor. Each DHCP pool gets its own udhcpd instance
+ * with a dedicated config and lease file under /var/run/.
  *
  * Firewall: inserts an INPUT rule to allow UDP/67 (BOOTP server) on the
  * pool's interface.  Without this, the default DROP policy blocks all
@@ -17,12 +17,9 @@
 
 #include <dirent.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 /* ── IP helpers ────────────────────────────────────────────────────────── */
@@ -46,12 +43,6 @@ static void
 dhcpd_conf_path(const char *id, char *buf, size_t sz)
 {
 	snprintf(buf, sz, "/var/run/udhcpd-%s.conf", id);
-}
-
-static void
-dhcpd_pid_path(const char *id, char *buf, size_t sz)
-{
-	snprintf(buf, sz, "/var/run/udhcpd-%s.pid", id);
 }
 
 static void
@@ -96,31 +87,6 @@ dhcpd_fw_del(const char *iface)
 	free(safe_exec(argv));
 }
 
-/* ── Process identity helper ───────────────────────────────────────────── */
-
-/*
- * Verify that pid belongs to a process named 'expected_name'.
- * Reads /proc/<pid>/comm to prevent killing a recycled PID.
- */
-static int
-pid_is_process(pid_t pid, const char *expected_name)
-{
-	char path[64];
-	snprintf(path, sizeof(path), "/proc/%d/comm", (int)pid);
-	FILE *fp = fopen(path, "r");
-	if (!fp)
-		return 0;
-	char comm[64];
-	if (!fgets(comm, sizeof(comm), fp)) {
-		fclose(fp);
-		return 0;
-	}
-	fclose(fp);
-	char *nl = strchr(comm, '\n');
-	if (nl) *nl = '\0';
-	return strcmp(comm, expected_name) == 0;
-}
-
 /* ── Daemon lifecycle ─────────────────────────────────────────────────── */
 
 /*
@@ -159,46 +125,17 @@ dhcpd_read_conf_iface(const char *conf_path, char *out, size_t outsz)
 }
 
 /*
- * Stop any running udhcpd for this pool.
+ * Stop any running udhcpd for this pool via the supervisor.
  * Reads the old conf to find the interface and remove its firewall rule.
- * Cleans up config, pidfile, and lease files.
+ * Cleans up config and lease files.
  */
 static void
 dhcpd_stop(const char *id)
 {
-	char pf[128];
-	dhcpd_pid_path(id, pf, sizeof(pf));
-
-	FILE *fp = fopen(pf, "r");
-	if (fp) {
-		char line[32];
-		if (fgets(line, sizeof(line), fp)) {
-			pid_t pid = (pid_t)atoi(line);
-			if (pid > 1 && pid_is_process(pid, "udhcpd")) {
-				kill(pid, SIGTERM);
-				/* Wait up to 3s for exit to avoid
-				 * EADDRINUSE on immediate restart */
-				for (int i = 0; i < 30; i++) {
-					if (kill(pid, 0) != 0)
-						break;
-					usleep(100000);
-				}
-				if (kill(pid, 0) == 0) {
-					mgmt_log("WARN",
-						 "dhcpd: pid %d did not exit,"
-						 " sending SIGKILL",
-						 (int)pid);
-					kill(pid, SIGKILL);
-				}
-			} else if (pid > 1) {
-				mgmt_log("WARN",
-					 "dhcpd: pid %d is not udhcpd,"
-					 " not killing", (int)pid);
-			}
-		}
-		fclose(fp);
-		unlink(pf);
-	}
+	/* Stop via supervisor (handles SIGTERM/SIGKILL/reap) */
+	char name[80];
+	snprintf(name, sizeof(name), "udhcpd.%s", id);
+	supervisor_stop(name);
 
 	/* Read interface from conf before deleting — needed to remove
 	 * the firewall rule that was added when this pool started. */
@@ -270,7 +207,9 @@ dhcpd_iface_conflict(const char *id, const char *iface)
 }
 
 /*
- * Generate /var/run/udhcpd-<id>.conf and start udhcpd.
+ * Generate /var/run/udhcpd-<id>.conf and start udhcpd via supervisor.
+ * Uses -f (foreground) so mgmtd is the direct parent — SIGCHLD gives
+ * instant crash detection and automatic restart.
  * Returns 0 on success, -1 on failure.
  */
 static int
@@ -280,9 +219,8 @@ dhcpd_start(const char *id,
 	    const char *gateway, const char *dns,
 	    const char *domain, const char *lease_time)
 {
-	char cf[128], pf[128], lf[128];
+	char cf[128], lf[128];
 	dhcpd_conf_path(id, cf, sizeof(cf));
-	dhcpd_pid_path(id, pf, sizeof(pf));
 	dhcpd_lease_path(id, lf, sizeof(lf));
 
 	FILE *fp = fopen(cf, "w");
@@ -303,8 +241,8 @@ dhcpd_start(const char *id,
 	if (domain[0])
 		fprintf(fp, "opt\tdomain\t%s\n", domain);
 	fprintf(fp, "opt\tlease\t%s\n", lease_time);
-	fprintf(fp, "pidfile\t%s\n", pf);
 	fprintf(fp, "lease_file\t%s\n", lf);
+	/* No pidfile line — supervisor tracks PID directly */
 
 	fclose(fp);
 
@@ -313,42 +251,13 @@ dhcpd_start(const char *id,
 	if (fp)
 		fclose(fp);
 
-	/* Start udhcpd via fork+exec with fd safety.
-	 * Close ALL inherited fds to prevent leaking database/socket
-	 * to udhcpd, which listens on untrusted network ports.
-	 * udhcpd daemonizes immediately (parent exits fast). */
-	pid_t dpid = fork();
-	if (dpid < 0) {
-		mgmt_log("ERROR", "dhcpd: fork failed for pool %s: %s",
-			 id, strerror(errno));
-		unlink(cf);
-		unlink(lf);
-		return -1;
-	}
-	if (dpid == 0) {
-		/* Child: close ALL inherited fds */
-		long maxfd = sysconf(_SC_OPEN_MAX);
-		if (maxfd < 0) maxfd = 1024;
-		for (int fd = 3; fd < (int)maxfd; fd++)
-			close(fd);
-		int devnull = open("/dev/null", O_RDWR);
-		if (devnull >= 0) {
-			dup2(devnull, STDOUT_FILENO);
-			dup2(devnull, STDERR_FILENO);
-			if (devnull > STDERR_FILENO)
-				close(devnull);
-		}
-		execl("/usr/sbin/udhcpd", "udhcpd", cf, (char *)NULL);
-		_exit(127);
-	}
-	/* Parent: wait for udhcpd parent to exit (it double-forks).
-	 * This blocks briefly but udhcpd daemonizes immediately,
-	 * unlike udhcpc which waits for a lease first. */
-	int wstatus;
-	waitpid(dpid, &wstatus, 0);
-	if (!WIFEXITED(wstatus) || WEXITSTATUS(wstatus) != 0) {
-		mgmt_log("ERROR", "dhcpd: udhcpd failed for pool %s (exit %d)",
-			 id, WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1);
+	/* Start via supervisor — foreground mode, mgmtd is direct parent */
+	char name[80];
+	snprintf(name, sizeof(name), "udhcpd.%s", id);
+	const char *argv[] = {"/usr/sbin/udhcpd", "-f", cf, NULL};
+	if (supervisor_start(name, argv, SRC_CONFIG,
+			     "network_dhcp-server", id,
+			     "status", "enable") != 0) {
 		unlink(cf);
 		unlink(lf);
 		return -1;

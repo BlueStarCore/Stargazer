@@ -72,6 +72,22 @@ void read_iface_mtu_limits(const char *name, int *out_min, int *out_max);
 void mgmt_log(const char *level, const char *fmt, ...)
 	__attribute__((format(printf, 2, 3)));
 
+/* ── Pre-replay flush functions ─────────────────────────────────────────── *
+ *
+ * Called once before replaying each config type.  Each function cleans
+ * the runtime state so replay starts from a known baseline.
+ *
+ * Rules:
+ *   - Only remove state owned by this config type.
+ *   - Never destroy state owned by other types (e.g. connected routes
+ *     belong to interfaces, not static routes).
+ *   - BusyBox caveats: "ip route flush proto X" ignores the proto
+ *     filter — must delete individually.
+ */
+void flush_static_routes(void);
+void flush_nat_rules(void);
+void flush_forward_chain(void);
+
 /* ── Per-feature apply handlers ─────────────────────────────────────────── */
 
 sg_status_t apply_route_static(const char *id, const char *data,

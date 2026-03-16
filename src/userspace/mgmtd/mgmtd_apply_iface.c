@@ -10,7 +10,6 @@
 #include "sg_db.h"
 
 #include <errno.h>
-#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -150,126 +149,35 @@ static int apply_allowaccess(const char *iface, const char *services)
 	return errors == 0 ? 0 : -1;
 }
 
-/* ── udhcpc lifecycle ───────────────────────────────────────────────── */
+/* ── udhcpc lifecycle (via supervisor) ──────────────────────────────── */
 
-/* ── Process identity helper ───────────────────────────────────────────── */
-
-static int
-pid_is_process(pid_t pid, const char *expected_name)
-{
-	char path[64];
-	snprintf(path, sizeof(path), "/proc/%d/comm", (int)pid);
-	FILE *fp = fopen(path, "r");
-	if (!fp)
-		return 0;
-	char comm[64];
-	if (!fgets(comm, sizeof(comm), fp)) {
-		fclose(fp);
-		return 0;
-	}
-	fclose(fp);
-	char *nl = strchr(comm, '\n');
-	if (nl) *nl = '\0';
-	return strcmp(comm, expected_name) == 0;
-}
-
-/* Per-interface pidfile: /var/run/udhcpc.<iface>.pid */
-static void dhcpc_pidfile(const char *iface, char *buf, size_t sz)
-{
-	snprintf(buf, sz, "/var/run/udhcpc.%s.pid", iface);
-}
-
-/* Kill any running udhcpc for this interface via its pidfile */
+/* Stop udhcpc for this interface via the supervisor */
 static void dhcpc_stop(const char *iface)
 {
-	char pf[128];
-	dhcpc_pidfile(iface, pf, sizeof(pf));
-
-	FILE *fp = fopen(pf, "r");
-	if (!fp)
-		return;
-	char line[32];
-	if (fgets(line, sizeof(line), fp)) {
-		pid_t pid = (pid_t)atoi(line);
-		if (pid > 1 && pid_is_process(pid, "udhcpc")) {
-			kill(pid, SIGTERM);
-			for (int i = 0; i < 30; i++) {
-				if (kill(pid, 0) != 0)
-					break;
-				usleep(100000);
-			}
-			if (kill(pid, 0) == 0) {
-				mgmt_log("WARN",
-					 "dhcpc: pid %d did not exit,"
-					 " sending SIGKILL", (int)pid);
-				kill(pid, SIGKILL);
-			}
-		} else if (pid > 1) {
-			mgmt_log("WARN",
-				 "dhcpc: pid %d is not udhcpc,"
-				 " not killing", (int)pid);
-		}
-	}
-	fclose(fp);
-	unlink(pf);
-	mgmt_log("INFO", "dhcpc: stopped on %s", iface);
+	char name[80];
+	snprintf(name, sizeof(name), "udhcpc.%s", iface);
+	supervisor_stop(name);
 }
 
 /*
- * Start a persistent udhcpc for this interface.
+ * Start a supervised udhcpc for this interface.
  *
- * Uses fork()+exec() instead of safe_exec() so mgmtd is NOT blocked
- * waiting for the first DHCP lease attempt.  udhcpc -b will try once,
- * then double-fork to daemonize and write the daemon PID to the pidfile.
- *
- * Safety: the child closes ALL inherited fds (database, listen socket,
- * client connections) before exec to prevent fd leaks to udhcpc, which
- * processes untrusted network data from DHCP servers.
+ * Uses -f (foreground) instead of -b: mgmtd is the direct parent,
+ * SIGCHLD gives instant crash detection + automatic restart.
+ * The supervisor handles fd safety, signal reset, and setsid.
  */
 static void dhcpc_start(const char *iface)
 {
-	char pf[128];
-	dhcpc_pidfile(iface, pf, sizeof(pf));
-
-	pid_t pid = fork();
-	if (pid < 0) {
-		mgmt_log("ERROR", "dhcpc: fork failed for %s: %s",
-			 iface, strerror(errno));
-		return;
-	}
-
-	if (pid == 0) {
-		/* Child: close ALL inherited fds (db, sockets, etc.)
-		 * to prevent leaking privileged resources to udhcpc. */
-		long maxfd = sysconf(_SC_OPEN_MAX);
-		if (maxfd < 0)
-			maxfd = 1024;
-		for (int fd = 3; fd < (int)maxfd; fd++)
-			close(fd);
-
-		/* Redirect stdout/stderr to /dev/null */
-		int devnull = open("/dev/null", O_RDWR);
-		if (devnull >= 0) {
-			dup2(devnull, STDOUT_FILENO);
-			dup2(devnull, STDERR_FILENO);
-			if (devnull > STDERR_FILENO)
-				close(devnull);
-		}
-
-		execl("/sbin/udhcpc", "udhcpc",
-		      "-i", iface,
-		      "-p", pf,
-		      "-s", "/usr/share/udhcpc/default.script",
-		      "-b",   /* background after first lease attempt */
-		      (char *)NULL);
-		_exit(127);
-	}
-
-	/* Parent returns immediately — SIGCHLD is SIG_IGN so the
-	 * intermediate process is auto-reaped.  udhcpc -b double-forks
-	 * and writes the daemon PID to the pidfile. */
-	mgmt_log("INFO", "dhcpc: started on %s (pid %d, pidfile %s)",
-		 iface, (int)pid, pf);
+	char name[80];
+	snprintf(name, sizeof(name), "udhcpc.%s", iface);
+	const char *argv[] = {
+		"/sbin/udhcpc", "-i", iface,
+		"-f",   /* foreground — mgmtd is direct parent */
+		"-s", "/usr/share/udhcpc/default.script",
+		NULL
+	};
+	supervisor_start(name, argv, SRC_CONFIG,
+			 "system_interface", iface, "mode", "dhcp");
 }
 
 /*
@@ -344,6 +252,11 @@ sg_status_t apply_interface(const char *id, const char *data,
 			 "Interface '%s' not present, skipping.", id);
 		return SG_ERR_NOT_FOUND;
 	}
+	/* 0.0.0.0/0 is the sentinel "no IP assigned" for static interfaces.
+	 * Normalise it to empty so the ip addr add step is skipped below. */
+	if (strcmp(ip, "0.0.0.0/0") == 0)
+		ip[0] = '\0';
+
 	if (strcmp(mode, "static") == 0 && ip[0] && !sg_is_cidr(ip)) {
 		snprintf(result, rsize, "Invalid IP '%s'.", ip);
 		return SG_ERR_INVALID_VAL;
@@ -378,7 +291,10 @@ sg_status_t apply_interface(const char *id, const char *data,
 	/* Link state */
 	if (strcmp(status, "up") == 0) {
 		const char *a[] = {"ip", "link", "set", id, "up", NULL};
-		free(safe_exec(a));
+		char *out = safe_exec(a);
+		if (out && out[0])
+			mgmt_log("ERROR", "ip link set %s up: %s", id, out);
+		free(out);
 	} else if (strcmp(status, "down") == 0) {
 		const char *a[] = {"ip", "link", "set", id, "down", NULL};
 		free(safe_exec(a));
@@ -387,7 +303,14 @@ sg_status_t apply_interface(const char *id, const char *data,
 	/* MTU */
 	if (mtu[0]) {
 		const char *a[] = {"ip", "link", "set", id, "mtu", mtu, NULL};
-		free(safe_exec(a));
+		char *out = safe_exec(a);
+		if (out && out[0]) {
+			snprintf(result, rsize,
+				 "MTU %s failed on %s: %s", mtu, id, out);
+			free(out);
+			return SG_ERR_SYSTEM_FAIL;
+		}
+		free(out);
 	}
 
 	/* Address: DHCP or static */
@@ -406,28 +329,31 @@ sg_status_t apply_interface(const char *id, const char *data,
 			free(safe_exec(a1));
 			const char *a2[] = {"ip", "addr", "add", ip, "dev",
 					    id, NULL};
-			free(safe_exec(a2));
+			char *out = safe_exec(a2);
+			if (out && out[0]) {
+				snprintf(result, rsize,
+					 "IP %s failed on %s: %s",
+					 ip, id, out);
+				free(out);
+				return SG_ERR_SYSTEM_FAIL;
+			}
+			free(out);
 		}
 	}
 
 	/* Apply allowaccess iptables rules */
 	if (apply_allowaccess(id, allowaccess) != 0) {
 		snprintf(result, rsize,
-			 "Interface %s configured, but some firewall rules failed.",
-			 id);
-		return SG_OK;  /* non-fatal: interface is configured */
+			 "Firewall access rules failed for %s.", id);
+		return SG_ERR_SYSTEM_FAIL;
 	}
 
 	/* Signal webd to rebind listeners (allowaccess may have changed).
 	 * Best-effort: if webd isn't running yet (boot), this is a no-op. */
 	{
-		FILE *fp = fopen("/run/stargazer-webd.pid", "r");
-		if (fp) {
-			int pid;
-			if (fscanf(fp, "%d", &pid) == 1 && pid > 1)
-				kill(pid, SIGHUP);
-			fclose(fp);
-		}
+		pid_t wpid = supervisor_get_pid("webd");
+		if (wpid > 0)
+			kill(wpid, SIGHUP);
 	}
 
 	snprintf(result, rsize, "Interface %s configured (%s).", id, mode);

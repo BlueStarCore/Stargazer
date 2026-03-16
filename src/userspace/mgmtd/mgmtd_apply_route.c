@@ -46,9 +46,19 @@ sg_status_t apply_route_static(const char *id, const char *data,
 	}
 
 	if (strcmp(status, "disable") == 0) {
+		/* Remove this specific route if it exists.
+		 * Check ip route output first to avoid deleting a
+		 * connected route with the same dst (BusyBox ip route
+		 * del ignores proto filter). */
 		if (dst[0]) {
-			const char *argv[] = {"ip", "route", "del", dst, NULL};
-			free(safe_exec(argv));
+			const char *ls[] = {"ip", "route", "show", dst, NULL};
+			char *cur = safe_exec(ls);
+			if (cur && strstr(cur, "proto static")) {
+				const char *del[] = {"ip", "route", "del",
+						     dst, NULL};
+				free(safe_exec(del));
+			}
+			free(cur);
 		}
 		snprintf(result, rsize, "Route %s disabled.", id);
 		return SG_OK;
@@ -60,19 +70,33 @@ sg_status_t apply_route_static(const char *id, const char *data,
 
 	/*
 	 * Build argv for ip route replace.
-	 * "ip route replace DST [via GW] [dev DEV] [metric DIST]"
+	 * "ip route replace DST proto static [via GW] [dev DEV] [metric DIST]"
+	 * proto static: marks route as user-managed so flush proto static
+	 * correctly removes it before replay.
 	 */
-	const char *argv[14];
+	const char *argv[16];
 	int argc = 0;
 	argv[argc++] = "ip";
 	argv[argc++] = "route";
 	argv[argc++] = "replace";
 	argv[argc++] = dst;
+	argv[argc++] = "proto";
+	argv[argc++] = "static";
 	if (gw[0])  { argv[argc++] = "via";    argv[argc++] = gw;   }
 	if (dev[0]) { argv[argc++] = "dev";    argv[argc++] = dev;  }
 	if (dist[0]){ argv[argc++] = "metric"; argv[argc++] = dist; }
 	argv[argc] = NULL;
-	free(safe_exec(argv));
+	char *out = safe_exec(argv);
+	if (out && out[0]) {
+		/* Trim trailing newline for cleaner error messages */
+		size_t olen = strlen(out);
+		while (olen > 0 && (out[olen-1] == '\n' || out[olen-1] == '\r'))
+			out[--olen] = '\0';
+		snprintf(result, rsize, "Route %s failed: %s", id, out);
+		free(out);
+		return SG_ERR_SYSTEM_FAIL;
+	}
+	free(out);
 
 	snprintf(result, rsize, "Route %s applied: %s", id, dst);
 	return SG_OK;
