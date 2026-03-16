@@ -146,10 +146,14 @@ typedef enum {
 	/* DNS/DHCP — Member A (7xx): SG_CMD_DNS_* 700-749, SG_CMD_DHCP_* 750-799 */
 	/* NAT — Member B (8xx): SG_CMD_NAT_* 800-849 */
 
+	/* Firmware upload via IPC (webd → mgmtd) */
+	SG_CMD_UPGRADE_UPLOAD    = 680,  /* Receive firmware data via IPC   */
+
 	/* Keepalive / ping (9xx) */
 	SG_CMD_PING          = 900,
 	SG_CMD_DEBUG_FETCH   = 901,   /* Fetch buffered debug traces    */
 	SG_CMD_UPGRADE_TEST_SETUP = 902, /* Test: write/clean/query fw state */
+	SG_CMD_SUPERVISOR_TEST = 903, /* Test: start/stop/query supervised children */
 } sg_cmd_t;
 
 /* ── Message header ─────────────────────────────────────────────────────── */
@@ -259,6 +263,7 @@ static inline int sg_cmd_audit_skip(sg_cmd_t cmd)
 	case SG_CMD_DISK_LIST:
 	case SG_CMD_DISK_INFO:
 	case SG_CMD_DISK_SMART:
+	case SG_CMD_SUPERVISOR_TEST:
 		return 1;
 	default:
 		return 0;

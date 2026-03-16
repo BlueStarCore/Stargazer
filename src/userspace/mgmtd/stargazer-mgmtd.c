@@ -258,6 +258,78 @@ static int ipt_available(void)
 	return 1;
 }
 
+/* ── Pre-replay flush functions ─────────────────────────────────────────
+ *
+ * Each function removes runtime state for one config type so that
+ * replay starts from a clean baseline.  Called once per type before
+ * iterating entries.
+ *
+ * IMPORTANT: BusyBox "ip route flush proto X" ignores the proto
+ * filter (protocol matching is commented out in iproute.c).  We
+ * must list routes and delete matching lines individually.
+ * ────────────────────────────────────────────────────────────────────── */
+
+void flush_static_routes(void)
+{
+	/* List all routes, delete only "proto static" lines.
+	 * Preserves proto kernel connected routes.
+	 *
+	 * BusyBox "ip route flush proto static" ignores the proto
+	 * filter (iproute.c has protocol matching commented out),
+	 * so we parse output and delete individually.
+	 *
+	 * "ip route del" needs just the destination (first word),
+	 * not the full display line. */
+	const char *ls[] = {"ip", "route", "show", NULL};
+	char *routes = safe_exec(ls);
+	if (routes && routes[0]) {
+		char *copy = strdup(routes);
+		if (copy) {
+			char *saveptr = NULL;
+			for (char *line = strtok_r(copy, "\n", &saveptr);
+			     line;
+			     line = strtok_r(NULL, "\n", &saveptr)) {
+				if (!strstr(line, "proto static"))
+					continue;
+				/* Extract destination (first token) */
+				char dst[128];
+				if (sscanf(line, "%127s", dst) != 1)
+					continue;
+				const char *del[] = {"ip", "route", "del",
+						     dst, "proto", "static",
+						     NULL};
+				free(safe_exec(del));
+			}
+			free(copy);
+		}
+	}
+	free(routes);
+	fprintf(stderr, "[mgmtd] flush: static routes\n");
+}
+
+void flush_nat_rules(void)
+{
+	const char *f1[] = {"iptables", "-t", "nat",
+			    "-F", "PREROUTING", NULL};
+	free(safe_exec(f1));
+	const char *f2[] = {"iptables", "-t", "nat",
+			    "-F", "POSTROUTING", NULL};
+	free(safe_exec(f2));
+	fprintf(stderr, "[mgmtd] flush: NAT chains\n");
+}
+
+void flush_forward_chain(void)
+{
+	const char *ff[] = {"iptables", "-F", "FORWARD", NULL};
+	const char *fe[] = {"iptables", "-A", "FORWARD",
+			    "-m", "conntrack",
+			    "--ctstate", "ESTABLISHED,RELATED",
+			    "-j", "ACCEPT", NULL};
+	ipt_exec(ff);
+	ipt_exec(fe);
+	fprintf(stderr, "[mgmtd] flush: FORWARD chain\n");
+}
+
 /* ── Debug state ───────────────────────────────────────────────────────── */
 
 static int debug_state_get_bool(const char *key, int defval)
@@ -1227,7 +1299,15 @@ static int mgmtd_seed_defaults(void)
 		      "status=enable\n"
 		      "comment=Default deny all traffic\n") != 0) goto fail;
 
-	/* Interfaces and routes are handled by mgmtd_sync_interfaces() */
+	/* ── Default interfaces ──────────────────────────────────────── */
+	/* lan3: LAN management interface — allow ping, http, https by default.
+	 * apply_interface() skips gracefully if the interface is not yet present. */
+	if (sg_db_set("system_interface", "lan3",
+		      "mode=static\n"
+		      "ip=" MGMT_DEFAULT_IP "\n"
+		      "status=up\n"
+		      "mtu=1500\n"
+		      "allowaccess=ping http https\n") != 0) goto fail;
 
 	/* Verify critical tables populated before stamping flag */
 	for (size_t i = 0; i < N_CRITICAL; i++) {
@@ -1378,7 +1458,7 @@ static void mgmtd_reconcile_config(void)
 					/* Skip internal meta type */
 					if (strcmp(tp, "system_meta") != 0 &&
 					    sg_reg_type_mode(tp) == -1) {
-						mgmt_log("INFO", "reconcile: purging stale type '%s'", tp);
+						fprintf(stderr, "[mgmtd] reconcile: PURGING stale type '%s'\n", tp);
 						sg_db_purge_type(tp);
 						changes++;
 					}
@@ -1478,7 +1558,7 @@ void read_iface_mtu_limits(const char *name,
  * - Marks existing NICs as builtin=yes (protects from deletion)
  * - Clears builtin flag from DB entries whose hardware was removed
  */
-static void mgmtd_sync_interfaces(void)
+static void mgmtd_sync_interfaces(int is_first_boot)
 {
 #define MAX_NICS 16
 	char *nics[MAX_NICS];
@@ -1518,15 +1598,12 @@ static void mgmtd_sync_interfaces(void)
 		nics[j + 1] = key;
 	}
 
-	/* 3. Detect first boot: no interface entries in DB yet */
-	int first_boot = (sg_db_count("system_interface") == 0);
-
 	/* On first boot, pick management and WAN NICs:
 	 * - "lan3" gets static management IP (fallback: first NIC)
 	 * - "wan" gets DHCP mode for upstream connectivity */
 	int mgmt_idx = 0;
 	int wan_idx = -1;
-	if (first_boot) {
+	if (is_first_boot) {
 		for (int i = 0; i < nic_count; i++) {
 			if (strcmp(nics[i], "lan3") == 0)
 				mgmt_idx = i;
@@ -1546,7 +1623,7 @@ static void mgmtd_sync_interfaces(void)
 				cur_mtu = 1500;
 
 			char seed[256];
-			if (first_boot && i == mgmt_idx) {
+			if (is_first_boot && i == mgmt_idx) {
 				snprintf(seed, sizeof(seed),
 					 "mode=static\n"
 					 "ip=" MGMT_DEFAULT_IP "\n"
@@ -1558,7 +1635,7 @@ static void mgmtd_sync_interfaces(void)
 				mgmt_log("INFO",
 					 "interface %s: created (management IP " MGMT_DEFAULT_IP ", mtu %d)",
 					 nics[i], cur_mtu);
-			} else if (first_boot && i == wan_idx) {
+			} else if (is_first_boot && i == wan_idx) {
 				snprintf(seed, sizeof(seed),
 					 "mode=dhcp\n"
 					 "allowaccess=ping\n"
@@ -1570,13 +1647,19 @@ static void mgmtd_sync_interfaces(void)
 					 "interface %s: created (dhcp, mtu %d)",
 					 nics[i], cur_mtu);
 			} else {
+				/* Normal boot new NIC, or first-boot non-wan/non-mgmt NIC.
+				 * Seed with static + sentinel 0.0.0.0/0 so the entry has
+				 * a valid mode and ip immediately without waiting for
+				 * reconcile to backfill defaults on the next boot. */
 				snprintf(seed, sizeof(seed),
+					 "mode=static\n"
+					 "ip=0.0.0.0/0\n"
 					 "allowaccess=ping\n"
 					 "status=up\n"
 					 "mtu=%d\n"
 					 "builtin=yes\n", cur_mtu);
 				sg_db_set("system_interface", nics[i], seed);
-				mgmt_log("INFO", "interface %s: created (mtu %d)",
+				mgmt_log("INFO", "interface %s: created (static, mtu %d)",
 					 nics[i], cur_mtu);
 			}
 		} else {
@@ -2004,8 +2087,12 @@ static void mgmtd_replay_config(void)
 			sg_status_t rc = apply_config(single_types[i], "0",
 						      use,
 						      result, sizeof(result));
-			mgmt_log(rc == SG_OK ? "INFO" : "WARN",
-				 "replay %s: %s", single_types[i], result);
+			if (rc == SG_OK)
+				fprintf(stderr, "[mgmtd] replay %s: %s\n",
+					single_types[i], result);
+			else
+				fprintf(stderr, "[mgmtd] replay FAIL %s: %s\n",
+					single_types[i], result);
 			free(data);
 		}
 	}
@@ -2023,37 +2110,33 @@ static void mgmtd_replay_config(void)
 		NULL
 	};
 	for (int i = 0; table_types[i]; i++) {
-		/* Pre-flush chains before replaying to prevent accumulation */
-		if (strcmp(table_types[i], "network_nat") == 0) {
-			const char *f1[] = {"iptables", "-t", "nat",
-					    "-F", "PREROUTING", NULL};
-			free(safe_exec(f1));
-			const char *f2[] = {"iptables", "-t", "nat",
-					    "-F", "POSTROUTING", NULL};
-			free(safe_exec(f2));
-			mgmt_log("INFO", "flushed NAT chains before replay");
-		}
-		if (strcmp(table_types[i], "network_route_static") == 0) {
-			const char *fr[] = {"ip", "route", "flush",
-					    "proto", "static", NULL};
-			free(safe_exec(fr));
-			mgmt_log("INFO", "flushed static routes before replay");
-		}
-		if (strcmp(table_types[i], "firewall_policy") == 0) {
-			const char *ff[] = {"iptables", "-F", "FORWARD", NULL};
-			const char *fe[] = {"iptables", "-A", "FORWARD",
-					    "-m", "conntrack",
-					    "--ctstate", "ESTABLISHED,RELATED",
-					    "-j", "ACCEPT", NULL};
-			ipt_exec(ff);
-			ipt_exec(fe);
-			mgmt_log("INFO",
-				 "flushed FORWARD chain before policy replay");
-		}
+		/* Pre-flush: clean runtime state before replaying each type.
+		 * Centralized flush functions in mgmtd_apply.h — each one
+		 * only removes state owned by its config type. */
+		if (strcmp(table_types[i], "network_route_static") == 0)
+			flush_static_routes();
+		else if (strcmp(table_types[i], "network_nat") == 0)
+			flush_nat_rules();
+		else if (strcmp(table_types[i], "firewall_policy") == 0)
+			flush_forward_chain();
 
 		char *list = sg_db_list(table_types[i]);
-		if (!list)
+		if (!list) {
+			fprintf(stderr, "[mgmtd] replay %s: no entries in DB\n",
+				table_types[i]);
 			continue;
+		}
+		/* Log entry count for diagnostics */
+		{
+			int cnt = 0;
+			const char *cp = list;
+			while (*cp) {
+				if (*cp == '\n') cnt++;
+				cp++;
+			}
+			fprintf(stderr, "[mgmtd] replay %s: found %d entries\n",
+				table_types[i], cnt);
+		}
 
 		const char *p = list;
 		while (*p) {
@@ -2080,9 +2163,15 @@ static void mgmtd_replay_config(void)
 				sg_status_t rc = apply_config(
 					table_types[i], id, use,
 					result, sizeof(result));
-				mgmt_log(rc == SG_OK ? "INFO" : "WARN",
-					 "replay %s:%s: %s",
-					 table_types[i], id, result);
+				/* Always log replay results — boot failures
+				 * must be visible without debug mode.
+				 * "ERROR" bypasses the debug-only filter. */
+				if (rc == SG_OK)
+					fprintf(stderr, "[mgmtd] replay %s:%s: %s\n",
+						table_types[i], id, result);
+				else
+					fprintf(stderr, "[mgmtd] replay FAIL %s:%s: %s\n",
+						table_types[i], id, result);
 				free(data);
 			}
 
@@ -2489,12 +2578,20 @@ int check_references(const char *type, const char *id,
  * Returns SG_OK on success, or an error status with a human-readable
  * message written to errbuf.
  */
-sg_status_t validate_cfg_data(const char *type, const char *data,
-			      char *errbuf, size_t errsz)
+/*
+ * validate_cfg_fields — Validate each key=value line in the payload.
+ *
+ * Checks key names are registered, value formats match the schema.
+ * Does NOT check that all required keys are present — use
+ * validate_cfg_data() for that (full payload only).
+ *
+ * Safe for partial payloads (e.g. CFG_APPLY with only changed fields).
+ */
+static sg_status_t validate_cfg_fields(const char *type, const char *data,
+				       char *errbuf, size_t errsz)
 {
 	errbuf[0] = '\0';
 
-	/* --- check each key=value line -------------------------------- */
 	const char *p = data;
 	while (*p) {
 		if (*p == '\n') { p++; continue; }
@@ -2506,8 +2603,7 @@ sg_status_t validate_cfg_data(const char *type, const char *data,
 		if (eq) {
 			size_t klen = (size_t)(eq - p);
 			if (klen >= 64) {
-				snprintf(errbuf, errsz,
-					 "Key name too long");
+				snprintf(errbuf, errsz, "Key name too long");
 				return SG_ERR_INVALID_ARG;
 			}
 			char key[64];
@@ -2525,25 +2621,31 @@ sg_status_t validate_cfg_data(const char *type, const char *data,
 			memcpy(val, vstart, vlen);
 			val[vlen] = '\0';
 
-			/* Skip internal keys — managed by mgmtd, not
-			 * user-settable fields. */
+			/* Skip internal/storage-only keys that are never
+			 * user-settable and have no entry in field_table.
+			 * Note: "name" is NOT skipped here — for types like
+			 * firewall_address it IS a registered safe-id field
+			 * and must be validated like any other. */
 			if (strcmp(key, "builtin") == 0 ||
 			    strcmp(key, "password-hash") == 0 ||
-			    strcmp(key, "name") == 0 ||
 			    strcmp(key, "id") == 0) {
 				p += llen;
 				if (eol) p++;
 				continue;
 			}
 
-			/* 1. reject unknown keys */
 			if (!sg_reg_is_valid_key(type, key)) {
 				snprintf(errbuf, errsz,
 					 "Unknown key '%s'", key);
 				return SG_ERR_INVALID_ARG;
 			}
 
-			/* 2. validate value format */
+			/* Skip validation for optional fields with empty
+			 * values — empty means "not set" / "clear field".
+			 * e.g. interface ip= is valid when mode=dhcp. */
+			if (val[0] == '\0' && sg_reg_is_optional(type, key))
+				goto next_line;
+
 			if (!sg_reg_validate_value(type, key, val)) {
 				const char *rule =
 					sg_reg_value_rule(type, key);
@@ -2557,11 +2659,28 @@ sg_status_t validate_cfg_data(const char *type, const char *data,
 			}
 		}
 
+	next_line:
 		p += llen;
 		if (eol) p++;
 	}
 
-	/* --- check required keys are present -------------------------- */
+	return SG_OK;
+}
+
+/*
+ * validate_cfg_data — Full validation: field formats + required keys.
+ *
+ * Only use for full payloads (CFG_SET) where all required keys must
+ * be present.  For partial payloads (CFG_APPLY), use validate_cfg_fields().
+ */
+sg_status_t validate_cfg_data(const char *type, const char *data,
+			      char *errbuf, size_t errsz)
+{
+	/* Part 1: validate each field */
+	sg_status_t st = validate_cfg_fields(type, data, errbuf, errsz);
+	if (st != SG_OK) return st;
+
+	/* Part 2: check required keys are present */
 	const char *req = sg_reg_required_keys(type);
 	if (req && *req) {
 		char reqbuf[512];
@@ -3068,6 +3187,63 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		}
 		clean[cpos] = '\0';
 
+		/* Backfill missing keys that have registry defaults.
+		 * Ensures entries always have keys like status, mode, mtu
+		 * even if the caller didn't send them.  Optional keys
+		 * without defaults (ip, description, allowaccess) are
+		 * NOT backfilled — they're genuinely absent until set. */
+		{
+			const char *defs = sg_reg_default_values(db_type);
+			if (defs && *defs) {
+				char defcopy[1024];
+				snprintf(defcopy, sizeof(defcopy), "%s", defs);
+				char *dk = defcopy;
+				while (*dk) {
+					char *dnl = strchr(dk, '\n');
+					if (dnl) *dnl = '\0';
+					char *deq = strchr(dk, '=');
+					if (deq) {
+						*deq = '\0';
+						if (!sg_kv_has_key(clean, dk)) {
+							*deq = '=';
+							size_t dlen = strlen(dk);
+							if (cpos + dlen + 1 <
+							    sizeof(clean)) {
+								memcpy(clean + cpos,
+								       dk, dlen);
+								cpos += dlen;
+								clean[cpos++] = '\n';
+								clean[cpos] = '\0';
+							}
+						}
+					}
+					if (!dnl) break;
+					dk = dnl + 1;
+				}
+			}
+		}
+
+		/* Apply before persist — never trust the client.
+		 *
+		 * CFG_APPLY is a "test run" — clients call it to check
+		 * if a config change would succeed.  CFG_SET is the real
+		 * operation: validate → apply → persist.
+		 *
+		 * Apply handlers are idempotent, so the double-apply
+		 * (client's test run + our real run) is safe.  If the
+		 * apply fails here, the config never reaches the DB —
+		 * preventing broken configs that fail on reboot replay. */
+		{
+			char apply_result[512];
+			sg_status_t apply_st = apply_config(
+				db_type, db_id, clean,
+				apply_result, sizeof(apply_result));
+			if (apply_st != SG_OK) {
+				send_error(client_fd, apply_st, apply_result);
+				return 0;
+			}
+		}
+
 		if (sg_db_set(db_type, db_id, clean) != 0) {
 			mgmt_log("ERROR", "sg_db_set failed for %s", section);
 			send_error(client_fd, SG_ERR_IO_FAIL, "Failed to write config");
@@ -3196,9 +3372,14 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			return 0;
 		}
 
-		/* Check builtin flag */
+		/* Check entry exists */
 		char *existing = sg_db_get(db_type, db_id);
-		if (existing) {
+		if (!existing) {
+			send_error(client_fd, SG_ERR_ENTRY_NOT_FOUND, db_id);
+			return 0;
+		}
+		/* Check builtin flag */
+		{
 			char bi[VALBUFSZ];
 			extract_val(existing, "builtin", bi, sizeof(bi));
 			if (strcmp(bi, "yes") == 0) {
@@ -3206,8 +3387,8 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 				send_error(client_fd, SG_ERR_BUILTIN, section);
 				return 0;
 			}
-			free(existing);
 		}
+		free(existing);
 
 		/* Check referential integrity */
 		char ref_err[SG_EXTRA_MAX];
@@ -3379,16 +3560,34 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 
 		const char *data = nl2 + 1;
 
-		/* Validate data format BEFORE applying — same checks as
-		 * CFG_SET uses.  Without this, apply handlers accept
-		 * values that CFG_SET would reject, causing runtime/DB
-		 * divergence when the web UI does APPLY-then-SET. */
+		/* Validate field formats AND required-key completeness.
+		 * CFG_APPLY always receives full payloads — CLI loads
+		 * all keys via CFG_GET before editing, webd merges
+		 * before applying.  Partial payloads are a test artifact. */
 		char val_err[256];
 		sg_status_t val_st = validate_cfg_data(type_str, data,
-						       val_err, sizeof(val_err));
+						       val_err,
+						       sizeof(val_err));
 		if (val_st != SG_OK) {
 			send_error(client_fd, val_st, val_err);
 			return 0;
+		}
+
+		/* Cross-field check: system_interface in static mode must have
+		 * an explicit IP.  0.0.0.0/0 is accepted as sentinel (means
+		 * "no address yet"), but a completely absent ip is rejected
+		 * so the user must make an explicit choice. */
+		if (strcmp(type_str, "system_interface") == 0) {
+			char chk_mode[VALBUFSZ], chk_ip[VALBUFSZ];
+			extract_val(data, "mode", chk_mode, sizeof(chk_mode));
+			extract_val(data, "ip",   chk_ip,   sizeof(chk_ip));
+			if (strcmp(chk_mode, "static") == 0 &&
+			    chk_ip[0] == '\0') {
+				send_error(client_fd, SG_ERR_MISSING_ARG,
+					   "Static mode requires 'ip' "
+					   "(e.g. 192.168.1.1/24 or 0.0.0.0/0).");
+				return 0;
+			}
 		}
 
 		char result[512];
@@ -3551,7 +3750,8 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 	case SG_CMD_SHOW_ROUTES: {
 		const char *argv[] = {"ip", "route", NULL};
 		char *out = safe_exec(argv);
-		send_ok(client_fd, NULL, out ? out : "");
+		send_ok(client_fd, NULL,
+			(out && out[0]) ? out : "  (no routes)\n");
 		free(out);
 		return 0;
 	}
@@ -3649,7 +3849,8 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 
 		char result[512];
 		snprintf(result, sizeof(result),
-			 "profile=%s\npermissions=%s\n", prof, perm);
+			 "username=%s\nprofile=%s\npermissions=%s\n",
+			 user, prof, perm);
 		send_ok(client_fd, NULL, result);
 		return 0;
 	}
@@ -3997,7 +4198,7 @@ int main(void)
 	mgmtd_reconcile_config();
 
 	/* Discover NICs, create/protect interface entries */
-	mgmtd_sync_interfaces();
+	mgmtd_sync_interfaces(boot == BOOT_FIRST);
 
 	/* Set INPUT policy DROP, allow loopback + return traffic */
 	mgmtd_init_firewall();
