@@ -165,6 +165,12 @@ void dbg_reset(void)
 
 int dbg_enabled(void)
 {
+	/* Defer debug state load until session tag is acquired.
+	 * ipc_send() calls dbg_enabled() before connect — if we
+	 * trigger mem_load_once() before the tag exists, the inner
+	 * DEBUG_STATE_GET IPC is rejected (no tag). */
+	if (!mem_loaded && !ipc_has_tag())
+		return 0;
 	mem_load_once();
 	const char *v = mem_get("enabled");
 	return v && strcmp(v, "1") == 0;

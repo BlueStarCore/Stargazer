@@ -144,7 +144,24 @@ int main(void)
 
 	/* ── Everything below runs inside the sandbox ────────────── */
 
-	/* 5. Get profile and permissions via IPC (WHOAMI) */
+	/* 5. Acquire session tag from mgmtd (before any tag-gated IPC) */
+	{
+		struct ipc_response tresp;
+		uint64_t tag = 0;
+		if (ipc_send_str(SG_CMD_SESSION_TAG_NEW, "", &tresp) == 0 &&
+		    tresp.status == SG_OK && tresp.payload) {
+			tag = strtoull(tresp.payload, NULL, 10);
+		}
+		ipc_resp_free(&tresp);
+		if (tag == 0) {
+			fprintf(stderr, "Error: failed to acquire session\n");
+			cli_term_cleanup();
+			return 1;
+		}
+		ipc_set_session_tag(tag);
+	}
+
+	/* 6. Get profile and permissions via IPC (WHOAMI) */
 	char profile[128]    = "read-only";
 	char permissions[256] = "monitor";
 	for (int attempt = 0; attempt < 5; attempt++) {
@@ -166,37 +183,17 @@ int main(void)
 	setenv("STARGAZER_PERMISSIONS", permissions, 1);
 	setenv("STARGAZER_USER", user, 1);
 
-	/* 6. Register commands based on permissions */
+	/* 7. Register commands based on permissions */
 	cmd_register_all(permissions);
 
-	/* 7. Load history via IPC (inside sandbox) */
+	/* 8. Load history via IPC (inside sandbox) */
 	cli_hist_load_ipc();
 
-	/* 8. Print banner */
+	/* 9. Print banner */
 	printf("\n  Stargazer NGFW %s\n", VERSION);
 	printf("  User: %s | Profile: %s | Perms: %s\n",
 	       user, profile, permissions);
 	printf("  Type 'help' or '?' for available commands.\n\n");
-
-	/* 9. Acquire session tag from mgmtd */
-	{
-		struct ipc_response tresp;
-		uint64_t tag = 0;
-		if (ipc_send_str(SG_CMD_SESSION_TAG_NEW, "", &tresp) == 0 &&
-		    tresp.status == SG_OK && tresp.payload) {
-			tag = strtoull(tresp.payload, NULL, 10);
-		}
-		ipc_resp_free(&tresp);
-		if (tag == 0) {
-			fprintf(stderr, "Error: failed to acquire session\n");
-			cli_term_cleanup();
-			return 1;
-		}
-		ipc_set_session_tag(tag);
-		/* Clear any stale expired flag from pre-tag IPC calls
-		 * (e.g. HISTORY_LOAD runs before tag acquisition). */
-		ipc_clear_session_expired();
-	}
 
 	/* 10. Idle permission polling — detects profile changes while idle */
 	g_permissions = permissions;

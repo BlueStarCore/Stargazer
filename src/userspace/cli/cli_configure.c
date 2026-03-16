@@ -451,9 +451,7 @@ static void register_value_completions(const char *key, const char *kind)
 
 	/* ── permissions-csv — register known permission values ───────── */
 	if (strcmp(kind, "permissions-csv") == 0) {
-		static const char *perms[] = {
-			"monitor", "configure", "admin", NULL
-		};
+		const char * const *perms = sg_permissions_opts();
 		for (int i = 0; perms[i]; i++) {
 			snprintf(regpath, sizeof(regpath),
 				 "set %s %s", key, perms[i]);
@@ -464,7 +462,47 @@ static void register_value_completions(const char *key, const char *kind)
 		return;
 	}
 
-	/* Other kinds (cidr, ipv4, uint, safe-id, etc.) — no value completions */
+	/* ── access-services — space-separated management service tokens ─ */
+	if (strcmp(kind, "access-services") == 0) {
+		const char * const *svcs = sg_access_services_opts();
+		for (int i = 0; svcs[i]; i++) {
+			snprintf(regpath, sizeof(regpath),
+				 "set %s %s", key, svcs[i]);
+			snprintf(regdesc, sizeof(regdesc),
+				 "%s management service", svcs[i]);
+			cli_register(regpath, regdesc);
+		}
+		return;
+	}
+
+	/* ── iface — fetch configured interface names via IPC ──────────── */
+	if (strcmp(kind, "iface") == 0) {
+		struct ipc_response resp;
+		if (ipc_send_str(SG_CMD_CFG_LIST, "system_interface", &resp) == 0 &&
+		    resp.payload && resp.payload_len > 0) {
+			const char *p = resp.payload;
+			while (*p) {
+				const char *eol = strchr(p, '\n');
+				size_t len = eol ? (size_t)(eol - p) : strlen(p);
+				if (len == 0) { p++; continue; }
+				char id[256];
+				if (len >= sizeof(id)) len = sizeof(id) - 1;
+				memcpy(id, p, len);
+				id[len] = '\0';
+				snprintf(regpath, sizeof(regpath),
+					 "set %s %s", key, id);
+				snprintf(regdesc, sizeof(regdesc),
+					 "%s (interface)", id);
+				cli_register(regpath, regdesc);
+				p += len;
+				if (eol) p++;
+			}
+		}
+		ipc_resp_free(&resp);
+		return;
+	}
+
+	/* Other kinds (cidr, ipv4, uint, safe-id, tz-token, etc.) — no value completions */
 }
 
 /* Register set commands for a config type */

@@ -402,6 +402,15 @@ static void redraw_at(const char *prompt, const char *buf, int cursor)
 		o += blen;
 	}
 
+	/* Force deferred wrap: if content ends at exact column boundary,
+	 * the terminal holds cursor at rightmost col (pending wrap).
+	 * Emit \n\r to resolve it so row tracking stays correct. */
+	int end_abs_chk = plen + blen;
+	if (cols > 0 && end_abs_chk > 0 && end_abs_chk % cols == 0) {
+		out[o++] = '\n';
+		out[o++] = '\r';
+	}
+
 	/* Step 4: position cursor at the requested offset.
 	 * After writing, cursor is at char position (plen + blen).
 	 * We want it at (plen + cursor). */
@@ -460,6 +469,13 @@ static void redraw_buf(const char *prompt, const char *buf, int cursor)
 	if (blen > 0) {
 		memcpy(out + o, buf, (size_t)blen);
 		o += blen;
+	}
+
+	/* Force deferred wrap at exact column boundary */
+	int end_abs_chk = plen + blen;
+	if (cols > 0 && end_abs_chk > 0 && end_abs_chk % cols == 0) {
+		out[o++] = '\n';
+		out[o++] = '\r';
 	}
 
 	/* Position cursor */
@@ -527,6 +543,13 @@ static void redraw_from(const char *prompt, const char *buf,
 	if (tail > 0) {
 		memcpy(out + o, buf + from, (size_t)tail);
 		o += tail;
+	}
+
+	/* Force deferred wrap at exact column boundary */
+	int end_abs_chk = plen + blen;
+	if (cols > 0 && end_abs_chk > 0 && end_abs_chk % cols == 0) {
+		out[o++] = '\n';
+		out[o++] = '\r';
 	}
 
 	/* Step 4: position cursor at 'cursor' */
@@ -1151,8 +1174,11 @@ const char *cli_readline(const char *prompt)
 	if (pos > 0) {
 		tty_write(tty_fd, buf, (size_t)pos);
 		int cols = get_term_cols();
-		rl_cursor_row = cols > 0
-		    ? ((int)strlen(prompt) + pos) / cols : 0;
+		int seed_abs = (int)strlen(prompt) + pos;
+		/* Force deferred wrap at exact column boundary */
+		if (cols > 0 && seed_abs > 0 && seed_abs % cols == 0)
+			tty_write(tty_fd, "\n\r", 2);
+		rl_cursor_row = cols > 0 ? seed_abs / cols : 0;
 	}
 
 	while (1) {
@@ -1594,8 +1620,16 @@ const char *cli_readline(const char *prompt)
 							    strlen(prompt);
 							int cols =
 							    get_term_cols();
+							int abs_pos =
+							    plen + cursor;
+							/* Force deferred wrap */
+							if (cols > 0 &&
+							    abs_pos > 0 &&
+							    abs_pos % cols == 0)
+								tty_write(tty_fd,
+									  "\n\r", 2);
 							rl_cursor_row = cols > 0
-							    ? (plen + cursor) / cols
+							    ? abs_pos / cols
 							    : 0;
 						} else {
 							redraw_from(prompt, buf,

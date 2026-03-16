@@ -97,6 +97,70 @@ static int value_needs_quote(const char *type, const char *key)
 	return strcmp(kind, "string") == 0;
 }
 
+/*
+ * Print ALL registered keys for an entry type.
+ * Walks sg_reg_all_keys_defaults() to get every key, then looks up the
+ * actual value from the DB payload (kv "key=val\n" string).
+ * Keys not in the DB get the registry default (or empty).
+ * Skips internal keys (builtin, password-hash).
+ */
+static void show_entry_keys(const char *type, const char *payload,
+			    const char *indent)
+{
+	const char *all = sg_reg_all_keys_defaults(type);
+	if (!all || !all[0]) return;
+
+	/* Copy static buffer — sg_reg_all_keys_defaults uses static */
+	char allcopy[2048];
+	snprintf(allcopy, sizeof(allcopy), "%s", all);
+
+	char *kp = allcopy;
+	while (*kp) {
+		char *knl = strchr(kp, '\n');
+		if (knl) *knl = '\0';
+		char *keq = strchr(kp, '=');
+		if (!keq) { if (!knl) break; kp = knl + 1; continue; }
+
+		*keq = '\0';
+		/* Bounded key copy — field keys are short (< 64 chars) */
+		char key[64];
+		size_t kplen = strlen(kp);
+		if (kplen >= sizeof(key)) kplen = sizeof(key) - 1;
+		memcpy(key, kp, kplen);
+		key[kplen] = '\0';
+		const char *defval = keq + 1;
+
+		/* Skip internal keys */
+		if (strcmp(key, "builtin") == 0 ||
+		    strcmp(key, "password-hash") == 0) {
+			if (!knl) break;
+			kp = knl + 1;
+			continue;
+		}
+
+		/* Look up actual value from DB payload */
+		char val[SG_PAYLOAD_MAX];
+		sg_kv_get(payload, key, val, sizeof(val));
+
+		/* Use default if not in DB */
+		if (!val[0] && defval[0])
+			snprintf(val, sizeof(val), "%s", defval);
+
+		/* Mask passwords */
+		if (strcmp(key, "password") == 0) {
+			if (val[0])
+				printf("%sset %s ********\n", indent, key);
+		} else if (value_needs_quote(type, key) && val[0]) {
+			printf("%sset %s \"%s\"\n", indent, key, val);
+		} else {
+			printf("%sset %s %s\n", indent, key, val);
+		}
+
+		if (!knl) break;
+		kp = knl + 1;
+	}
+}
+
 /* ── show configure (FortiGate-style dump) ────────────────────────────── */
 
 /*
@@ -147,45 +211,7 @@ void show_configure(void)
 				if (ipc_send_str(SG_CMD_CFG_GET, section,
 						 &dresp) == 0 &&
 				    dresp.status == SG_OK && dresp.payload) {
-					/* Parse key=value lines */
-					const char *p = dresp.payload;
-					while (*p) {
-						const char *eol = strchr(p, '\n');
-						size_t llen = eol ? (size_t)(eol - p) : strlen(p);
-						if (llen > 0) {
-							const char *eq = memchr(p, '=', llen);
-							if (eq) {
-								size_t klen = (size_t)(eq - p);
-								/* Skip builtin marker */
-								if (klen == 7 && strncmp(p, "builtin", 7) == 0) {
-									p += llen;
-									if (eol) p++;
-									continue;
-								}
-								/* Mask passwords */
-								if (klen == 8 && strncmp(p, "password", 8) == 0) {
-									printf("    set password ********\n");
-								} else {
-									char kbuf[64];
-									size_t kl = klen;
-									if (kl >= sizeof(kbuf))
-										kl = sizeof(kbuf) - 1;
-									memcpy(kbuf, p, kl);
-									kbuf[kl] = '\0';
-									if (value_needs_quote(type, kbuf))
-										printf("    set %.*s \"%.*s\"\n",
-										       (int)klen, p,
-										       (int)(llen - klen - 1), eq + 1);
-									else
-										printf("    set %.*s %.*s\n",
-										       (int)klen, p,
-										       (int)(llen - klen - 1), eq + 1);
-								}
-							}
-						}
-						p += llen;
-						if (eol) p++;
-					}
+					show_entry_keys(type, dresp.payload, "    ");
 				}
 				ipc_resp_free(&dresp);
 
@@ -208,39 +234,7 @@ void show_configure(void)
 			}
 
 			printf("config %s\n", label);
-
-			const char *p = gresp.payload;
-			while (*p) {
-				const char *eol = strchr(p, '\n');
-				size_t llen = eol ? (size_t)(eol - p) : strlen(p);
-				if (llen > 0) {
-					const char *eq = memchr(p, '=', llen);
-					if (eq) {
-						size_t klen = (size_t)(eq - p);
-						if (klen == 7 && strncmp(p, "builtin", 7) == 0) {
-							p += llen;
-							if (eol) p++;
-							continue;
-						}
-						char kbuf[64];
-						size_t kl = klen;
-						if (kl >= sizeof(kbuf))
-							kl = sizeof(kbuf) - 1;
-						memcpy(kbuf, p, kl);
-						kbuf[kl] = '\0';
-						if (value_needs_quote(type, kbuf))
-							printf("  set %.*s \"%.*s\"\n",
-							       (int)klen, p,
-							       (int)(llen - klen - 1), eq + 1);
-						else
-							printf("  set %.*s %.*s\n",
-							       (int)klen, p,
-							       (int)(llen - klen - 1), eq + 1);
-					}
-				}
-				p += llen;
-				if (eol) p++;
-			}
+			show_entry_keys(type, gresp.payload, "  ");
 			printf("end\n\n");
 			ipc_resp_free(&gresp);
 		}

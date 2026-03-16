@@ -26,6 +26,7 @@ int ipc_init(const char *username);
  * Tag is sent in every IPC request header for server-side validation. */
 void     ipc_set_session_tag(uint64_t tag);
 uint64_t ipc_get_session_tag(void);
+int      ipc_has_tag(void);
 int      ipc_session_expired(void);
 void     ipc_clear_session_expired(void);
 

@@ -297,6 +297,11 @@ uint64_t ipc_get_session_tag(void)
 	return ipc_session_tag;
 }
 
+int ipc_has_tag(void)
+{
+	return ipc_session_tag != 0;
+}
+
 int ipc_session_expired(void)
 {
 	return g_session_expired;
