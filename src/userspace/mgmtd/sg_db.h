@@ -42,6 +42,10 @@ char *sg_db_get(const char *type, const char *id);
  * Set (replace) all key=value pairs for a (type, id) entry.
  * 'data' is "key=val\nkey=val\n" format.
  * Deletes existing rows and inserts new ones in a transaction.
+ * Keys are written in field_table registry order; any keys not found in
+ * the registry are appended after, preserving their relative order.
+ * This ensures sg_db_get() always returns keys in a stable, predictable
+ * order regardless of which key was configured first.
  * Returns 0 on success, -1 on error.
  */
 int sg_db_set(const char *type, const char *id, const char *data);
@@ -111,5 +115,28 @@ char *sg_db_list_types(void);
  * Returns 0 on success, -1 on error.
  */
 int sg_db_purge_type(const char *type);
+
+/* ── Auth lockout helpers ────────────────────────────────────────────────── */
+
+/*
+ * Get lockout state for a user.
+ * Sets *fail_count and *locked_until (Unix epoch).
+ * Returns 0 on success, -1 on error.
+ */
+int sg_db_lockout_get(const char *username, int *fail_count,
+		      long *locked_until);
+
+/*
+ * Set lockout state for a user (upsert).
+ * Returns 0 on success, -1 on error.
+ */
+int sg_db_lockout_set(const char *username, int fail_count,
+		      long locked_until);
+
+/*
+ * Clear lockout state for a user (on successful login).
+ * Returns 0 on success, -1 on error.
+ */
+int sg_db_lockout_clear(const char *username);
 
 #endif /* SG_DB_H */

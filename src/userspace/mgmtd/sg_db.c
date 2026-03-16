@@ -10,6 +10,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "sg_db.h"
+#include "sg_validate.h"
 #include "sqlite3.h"
 
 #include <stdint.h>
@@ -277,6 +278,96 @@ char *sg_db_get(const char *type, const char *id)
 	return buf;
 }
 
+/* ── Key-ordered insert helper ───────────────────────────────────────────── */
+
+#define MAX_KV_PAIRS 64
+
+struct kv_entry {
+	const char *key;
+	int         klen;
+	const char *val;
+	int         vlen;
+	int         done;  /* 1 once inserted */
+};
+
+/*
+ * Parse 'data' into kv[], then insert rows via 'ins' in field_table registry
+ * order for 'type'.  Keys absent from the registry are appended afterwards,
+ * preserving their original relative order.
+ * Returns 0 on success, -1 if any sqlite3_step() fails.
+ */
+static int sg_insert_ordered(sqlite3_stmt *ins,
+			     const char *type, const char *id,
+			     const char *data)
+{
+	struct kv_entry kv[MAX_KV_PAIRS];
+	int nkv = 0;
+
+	/* Step 1: parse "key=val\n..." → kv[] */
+	const char *p = data;
+	while (*p && nkv < MAX_KV_PAIRS) {
+		if (*p == '\n') { p++; continue; }
+
+		const char *eol  = strchr(p, '\n');
+		size_t      llen = eol ? (size_t)(eol - p) : strlen(p);
+		const char *eq   = memchr(p, '=', llen);
+		if (eq) {
+			int kl = (int)(eq - p);
+			kv[nkv].key  = p;
+			kv[nkv].klen = kl;
+			kv[nkv].val  = eq + 1;
+			kv[nkv].vlen = (int)(llen - (size_t)kl - 1);
+			kv[nkv].done = 0;
+			nkv++;
+		}
+		p += llen;
+		if (eol) p++;
+	}
+
+	/* Step 2: insert in registry order */
+	const char *rp = sg_reg_valid_keys(type);
+	while (rp && *rp) {
+		while (*rp == ' ') rp++;
+		if (!*rp) break;
+		const char *rend = rp;
+		while (*rend && *rend != ' ') rend++;
+		int rlen = (int)(rend - rp);
+
+		for (int i = 0; i < nkv; i++) {
+			if (kv[i].done || kv[i].klen != rlen)
+				continue;
+			if (memcmp(kv[i].key, rp, (size_t)rlen) != 0)
+				continue;
+			sqlite3_reset(ins);
+			sqlite3_bind_text(ins, 1, type, -1, SQLITE_STATIC);
+			sqlite3_bind_text(ins, 2, id, -1, SQLITE_STATIC);
+			sqlite3_bind_text(ins, 3, kv[i].key, kv[i].klen,
+					  SQLITE_STATIC);
+			sqlite3_bind_text(ins, 4, kv[i].val, kv[i].vlen,
+					  SQLITE_STATIC);
+			if (sqlite3_step(ins) != SQLITE_DONE)
+				return -1;
+			kv[i].done = 1;
+			break;
+		}
+		rp = rend;
+	}
+
+	/* Step 3: append any keys not found in the registry */
+	for (int i = 0; i < nkv; i++) {
+		if (kv[i].done) continue;
+		sqlite3_reset(ins);
+		sqlite3_bind_text(ins, 1, type, -1, SQLITE_STATIC);
+		sqlite3_bind_text(ins, 2, id, -1, SQLITE_STATIC);
+		sqlite3_bind_text(ins, 3, kv[i].key, kv[i].klen, SQLITE_STATIC);
+		sqlite3_bind_text(ins, 4, kv[i].val, kv[i].vlen, SQLITE_STATIC);
+		if (sqlite3_step(ins) != SQLITE_DONE)
+			return -1;
+	}
+
+	return 0;
+}
+
 /* ── sg_db_set ───────────────────────────────────────────────────────────── */
 
 int sg_db_set(const char *type, const char *id, const char *data)
@@ -302,7 +393,7 @@ int sg_db_set(const char *type, const char *id, const char *data)
 	}
 	sqlite3_finalize(del);
 
-	/* Insert new rows from "key=val\nkey=val\n" data */
+	/* Insert new rows in field_table registry order */
 	if (data && data[0]) {
 		sqlite3_stmt *ins;
 		const char *ins_sql =
@@ -313,37 +404,10 @@ int sg_db_set(const char *type, const char *id, const char *data)
 			return -1;
 		}
 
-		const char *p = data;
-		while (*p) {
-			/* Skip blank lines */
-			if (*p == '\n') { p++; continue; }
-
-			const char *eol = strchr(p, '\n');
-			size_t llen = eol ? (size_t)(eol - p) : strlen(p);
-
-			/* Find '=' separator */
-			const char *eq = memchr(p, '=', llen);
-			if (eq) {
-				size_t klen = (size_t)(eq - p);
-				const char *val = eq + 1;
-				size_t vlen = llen - klen - 1;
-
-				sqlite3_reset(ins);
-				sqlite3_bind_text(ins, 1, type, -1, SQLITE_STATIC);
-				sqlite3_bind_text(ins, 2, id, -1, SQLITE_STATIC);
-				sqlite3_bind_text(ins, 3, p, (int)klen, SQLITE_STATIC);
-				sqlite3_bind_text(ins, 4, val, (int)vlen, SQLITE_STATIC);
-
-				if (sqlite3_step(ins) != SQLITE_DONE) {
-					sqlite3_finalize(ins);
-					sqlite3_exec(g_db, "ROLLBACK;",
-						     NULL, NULL, NULL);
-					return -1;
-				}
-			}
-
-			p += llen;
-			if (eol) p++;
+		if (sg_insert_ordered(ins, type, id, data) != 0) {
+			sqlite3_finalize(ins);
+			sqlite3_exec(g_db, "ROLLBACK;", NULL, NULL, NULL);
+			return -1;
 		}
 		sqlite3_finalize(ins);
 	}
@@ -600,4 +664,68 @@ int sg_db_purge_type(const char *type)
 int sg_db_schema_version(void)
 {
 	return sg_db_get_version();
+}
+
+/* ── Auth lockout helpers ────────────────────────────────────────────────── */
+
+int sg_db_lockout_get(const char *username, int *fail_count,
+		      long *locked_until)
+{
+	if (!g_db || !username) return -1;
+	*fail_count = 0;
+	*locked_until = 0;
+
+	sqlite3_stmt *stmt;
+	const char *sql = "SELECT fail_count, locked_until "
+			  "FROM auth_lockouts WHERE username=?1;";
+	if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK)
+		return -1;
+
+	sqlite3_bind_text(stmt, 1, username, -1, SQLITE_STATIC);
+	if (sqlite3_step(stmt) == SQLITE_ROW) {
+		*fail_count = sqlite3_column_int(stmt, 0);
+		*locked_until = (long)sqlite3_column_int64(stmt, 1);
+	}
+	sqlite3_finalize(stmt);
+	return 0;
+}
+
+int sg_db_lockout_set(const char *username, int fail_count,
+		      long locked_until)
+{
+	if (!g_db || !username) return -1;
+
+	sqlite3_stmt *stmt;
+	const char *sql =
+		"INSERT INTO auth_lockouts(username, fail_count, "
+		"locked_until, updated_at) "
+		"VALUES(?1, ?2, ?3, datetime('now')) "
+		"ON CONFLICT(username) DO UPDATE SET "
+		"fail_count=excluded.fail_count, "
+		"locked_until=excluded.locked_until, "
+		"updated_at=datetime('now');";
+	if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK)
+		return -1;
+
+	sqlite3_bind_text(stmt, 1, username, -1, SQLITE_STATIC);
+	sqlite3_bind_int(stmt, 2, fail_count);
+	sqlite3_bind_int64(stmt, 3, locked_until);
+	int rc = sqlite3_step(stmt);
+	sqlite3_finalize(stmt);
+	return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int sg_db_lockout_clear(const char *username)
+{
+	if (!g_db || !username) return -1;
+
+	sqlite3_stmt *stmt;
+	const char *sql = "DELETE FROM auth_lockouts WHERE username=?1;";
+	if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK)
+		return -1;
+
+	sqlite3_bind_text(stmt, 1, username, -1, SQLITE_STATIC);
+	int rc = sqlite3_step(stmt);
+	sqlite3_finalize(stmt);
+	return (rc == SQLITE_DONE) ? 0 : -1;
 }
