@@ -23,6 +23,30 @@ typedef struct {
 /* NULL-terminated array of all config types. */
 const sg_type_info_t *sg_reg_types(void);
 
+/* ── Canonical option lists ───────────────────────────────────────────── */
+
+/* NULL-terminated arrays of valid tokens for multi-token field kinds.
+ * Single source of truth — used by validators, CLI completions, value-rule
+ * descriptions, and any other consumer.  Add a new service/permission here
+ * and every layer picks it up automatically. */
+const char * const *sg_access_services_opts(void);
+const char * const *sg_permissions_opts(void);
+
+/* ── Key=Value utility functions ──────────────────────────────────────── */
+
+/*
+ * Extract a value from "key=val\nkey2=val2\n" format data.
+ * Copies the value for the given key into out (NUL-terminated).
+ * If key is not found, out[0] = '\0'.
+ */
+void sg_kv_get(const char *data, const char *key, char *out, size_t outsz);
+
+/*
+ * Check if a key exists in "key=val\n" format data.
+ * Returns 1 if found at a line start, 0 otherwise.
+ */
+int sg_kv_has_key(const char *data, const char *key);
+
 /* ── Pure validators ──────────────────────────────────────────────────── */
 
 #define SG_SAFE_ID_MAX      64
@@ -56,6 +80,13 @@ const char *sg_reg_valid_keys(const char *type_name);
 
 /* Check if key is valid for type. Returns 1 if valid, 0 if not. */
 int sg_reg_is_valid_key(const char *type_name, const char *key);
+
+/* Check if key is optional. Returns 1 if optional, 0 if required. */
+int sg_reg_is_optional(const char *type_name, const char *key);
+
+/* Get ALL registered keys as "key=default\n" lines.
+ * Keys without defaults get empty values ("key=\n"). */
+const char *sg_reg_all_keys_defaults(const char *type_name);
 
 /* Get space-separated list of required keys. Returns "" if none. */
 const char *sg_reg_required_keys(const char *type_name);

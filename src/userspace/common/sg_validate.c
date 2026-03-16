@@ -71,7 +71,7 @@ static const struct field_entry field_table[] = {
 
 	/* system_interface */
 	{ "system_interface", "mode",        "enum:static,dhcp", 0, "static", "Addressing mode"              },
-	{ "system_interface", "ip",          "cidr",             0, NULL,   "Interface IP address and mask"  },
+	{ "system_interface", "ip",          "cidr",             1, "0.0.0.0/0", "Interface IP address and mask"  },
 	{ "system_interface", "status",      "enum:up,down",     0, "up",   "Administrative state"           },
 	{ "system_interface", "mtu",         "uint:576:65535",   0, "1500", "Maximum transmission unit"      },
 	{ "system_interface", "allowaccess", "access-services",  1, NULL,   "Allowed management services"    },
@@ -103,7 +103,7 @@ static const struct field_entry field_table[] = {
 
 	/* system_ntp */
 	{ "system_ntp", "server", "ipv4",                0, NULL, "NTP server address"          },
-	{ "system_ntp", "status", "enum:enable,disable", 0, NULL, "Enable or disable NTP sync"  },
+	{ "system_ntp", "status", "enum:enable,disable", 0, "enable", "Enable or disable NTP sync"  },
 
 	/* firewall_policy */
 	{ "firewall_policy", "name",     "safe-id",                         0, NULL,     "Policy name"                },
@@ -148,6 +148,68 @@ static const struct field_entry field_table[] = {
 
 	{ NULL, NULL, NULL, 0, NULL, NULL }
 };
+
+/* ── Key=Value utility functions ────────────────────────────────────────── */
+
+void
+sg_kv_get(const char *data, const char *key, char *out, size_t outsz)
+{
+	out[0] = '\0';
+	if (!data || !key || !key[0]) return;
+
+	size_t klen = strlen(key);
+	const char *p = data;
+	while (*p) {
+		const char *eol = strchr(p, '\n');
+		size_t llen = eol ? (size_t)(eol - p) : strlen(p);
+
+		if (llen >= klen + 1 &&
+		    memcmp(p, key, klen) == 0 && p[klen] == '=') {
+			const char *val = p + klen + 1;
+			size_t vlen = llen - klen - 1;
+			if (vlen >= outsz) vlen = outsz - 1;
+			memcpy(out, val, vlen);
+			out[vlen] = '\0';
+			return;
+		}
+		p += llen;
+		if (eol) p++; else break;
+	}
+}
+
+int
+sg_kv_has_key(const char *data, const char *key)
+{
+	if (!data || !key || !key[0]) return 0;
+
+	size_t klen = strlen(key);
+	const char *p = data;
+	while (*p) {
+		const char *eol = strchr(p, '\n');
+		size_t llen = eol ? (size_t)(eol - p) : strlen(p);
+
+		if (llen >= klen + 1 &&
+		    memcmp(p, key, klen) == 0 && p[klen] == '=')
+			return 1;
+
+		p += llen;
+		if (eol) p++; else break;
+	}
+	return 0;
+}
+
+/* ── Canonical option lists ──────────────────────────────────────────────── */
+
+static const char *const s_access_services[] = {
+	"ping", "ssh", "https", "http", "snmp", "telnet", NULL
+};
+
+static const char *const s_permissions[] = {
+	"monitor", "configure", "admin", NULL
+};
+
+const char * const *sg_access_services_opts(void) { return s_access_services; }
+const char * const *sg_permissions_opts(void)      { return s_permissions; }
 
 /* ── Pure validation helpers ─────────────────────────────────────────────── */
 
@@ -319,9 +381,12 @@ sg_is_permissions_csv(const char *s)
 		return 0;
 
 	while (tok) {
-		if (strcmp(tok, "monitor") != 0 &&
-		    strcmp(tok, "configure") != 0 &&
-		    strcmp(tok, "admin") != 0)
+		const char * const *opts = sg_permissions_opts();
+		int found = 0;
+		for (int i = 0; opts[i]; i++) {
+			if (strcmp(tok, opts[i]) == 0) { found = 1; break; }
+		}
+		if (!found)
 			return 0;
 		tok = strtok_r(NULL, ",", &saveptr);
 	}
@@ -349,12 +414,12 @@ sg_is_access_services(const char *s)
 		return 0;
 
 	while (tok) {
-		if (strcmp(tok, "ping") != 0 &&
-		    strcmp(tok, "ssh") != 0 &&
-		    strcmp(tok, "https") != 0 &&
-		    strcmp(tok, "http") != 0 &&
-		    strcmp(tok, "snmp") != 0 &&
-		    strcmp(tok, "telnet") != 0)
+		const char * const *opts = sg_access_services_opts();
+		int found = 0;
+		for (int i = 0; opts[i]; i++) {
+			if (strcmp(tok, opts[i]) == 0) { found = 1; break; }
+		}
+		if (!found)
 			return 0;
 		tok = strtok_r(NULL, " ", &saveptr);
 	}
@@ -545,6 +610,19 @@ sg_reg_is_valid_key(const char *type_name, const char *key)
 	return 0;
 }
 
+int
+sg_reg_is_optional(const char *type_name, const char *key)
+{
+	if (!type_name || !key)
+		return 0;
+	for (const struct field_entry *f = field_table; f->type; f++) {
+		if (strcmp(f->type, type_name) == 0 &&
+		    strcmp(f->key, key) == 0)
+			return f->optional;
+	}
+	return 0;
+}
+
 const char *
 sg_reg_required_keys(const char *type_name)
 {
@@ -589,6 +667,38 @@ sg_reg_default_values(const char *type_name)
 	return buf;
 }
 
+/*
+ * Return ALL registered keys for a type as "key=val\n" lines.
+ * Keys with a default get their default value; keys without a
+ * default get an empty value ("key=\n").  Internal keys (builtin,
+ * password, password-hash) are excluded.
+ */
+const char *
+sg_reg_all_keys_defaults(const char *type_name)
+{
+	static char buf[2048];
+	if (!type_name)
+		return "";
+
+	buf[0] = '\0';
+	size_t pos = 0;
+	for (const struct field_entry *f = field_table; f->type; f++) {
+		if (strcmp(f->type, type_name) != 0)
+			continue;
+		/* Skip internal-only keys */
+		if (strcmp(f->key, "builtin") == 0 ||
+		    strcmp(f->key, "password") == 0 ||
+		    strcmp(f->key, "password-hash") == 0)
+			continue;
+		const char *v = f->defval ? f->defval : "";
+		int n = snprintf(buf + pos, sizeof(buf) - pos,
+				 "%s=%s\n", f->key, v);
+		if (n > 0 && pos + (size_t)n < sizeof(buf))
+			pos += (size_t)n;
+	}
+	return buf;
+}
+
 const char *
 sg_reg_value_kind(const char *type_name, const char *key)
 {
@@ -619,10 +729,36 @@ sg_reg_value_rule(const char *type_name, const char *key)
 		return "safe identifier [A-Za-z0-9_.-]";
 	if (strcmp(kind, "tz-token") == 0)
 		return "timezone token (e.g. Asia/Ho_Chi_Minh)";
-	if (strcmp(kind, "permissions-csv") == 0)
-		return "CSV: monitor,configure,admin";
-	if (strcmp(kind, "access-services") == 0)
-		return "space-separated: ping ssh https http snmp telnet";
+	if (strcmp(kind, "permissions-csv") == 0) {
+		const char * const *opts = sg_permissions_opts();
+		size_t pos = (size_t)snprintf(buf, sizeof(buf), "CSV: ");
+		for (int i = 0; opts[i]; i++) {
+			if (i > 0 && pos < sizeof(buf) - 1)
+				buf[pos++] = ',';
+			size_t olen = strlen(opts[i]);
+			if (pos + olen < sizeof(buf)) {
+				memcpy(buf + pos, opts[i], olen);
+				pos += olen;
+			}
+		}
+		buf[pos] = '\0';
+		return buf;
+	}
+	if (strcmp(kind, "access-services") == 0) {
+		const char * const *opts = sg_access_services_opts();
+		size_t pos = (size_t)snprintf(buf, sizeof(buf), "space-separated: ");
+		for (int i = 0; opts[i]; i++) {
+			if (i > 0 && pos < sizeof(buf) - 1)
+				buf[pos++] = ' ';
+			size_t olen = strlen(opts[i]);
+			if (pos + olen < sizeof(buf)) {
+				memcpy(buf + pos, opts[i], olen);
+				pos += olen;
+			}
+		}
+		buf[pos] = '\0';
+		return buf;
+	}
 	if (strcmp(kind, "port-or-range") == 0)
 		return "port or range (e.g. 80, 1024-65535)";
 	if (strcmp(kind, "password-interactive") == 0)
