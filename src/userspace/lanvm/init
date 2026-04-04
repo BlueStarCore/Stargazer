@@ -20,6 +20,15 @@ mount -t proc     proc     /proc
 mount -t sysfs    sysfs    /sys
 mount -t devtmpfs devtmpfs /dev
 
+# iptables needs /run for lock file
+mkdir -p /run
+
+# Disable firewall — this is a test client, not a firewall.
+# Stargazer kernel has netfilter built-in with default INPUT DROP.
+iptables -P INPUT ACCEPT
+iptables -P FORWARD ACCEPT
+iptables -P OUTPUT ACCEPT
+
 # Configure network
 echo "Configuring network..."
 ip link set lo up

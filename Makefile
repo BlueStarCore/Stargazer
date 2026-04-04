@@ -246,6 +246,9 @@ $(BUSYBOX_BIN):
 	@sed -i 's/# CONFIG_TRACEROUTE is not set/CONFIG_TRACEROUTE=y/' $(BUSYBOX_DIR)/.config
 	@sed -i 's/# CONFIG_NSLOOKUP is not set/CONFIG_NSLOOKUP=y/' $(BUSYBOX_DIR)/.config
 	@sed -i 's/# CONFIG_ARPING is not set/CONFIG_ARPING=y/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/# CONFIG_NTPD is not set/CONFIG_NTPD=y/' $(BUSYBOX_DIR)/.config
+	# --- Fix: disable tc (CBQ removed from kernel headers 6.12+) ---
+	@sed -i 's/CONFIG_TC=y/CONFIG_TC=n/' $(BUSYBOX_DIR)/.config
 	# --- Hardening: disable shell applets (prevent shell escape) ---
 	@sed -i 's/CONFIG_ASH=y/CONFIG_ASH=n/' $(BUSYBOX_DIR)/.config
 	@sed -i 's/CONFIG_HUSH=y/CONFIG_HUSH=n/' $(BUSYBOX_DIR)/.config
@@ -288,6 +291,9 @@ $(BUSYBOX_LINKS):
 	@sed -i 's/# CONFIG_TRACEROUTE is not set/CONFIG_TRACEROUTE=y/' $(BUSYBOX_DIR)/.config
 	@sed -i 's/# CONFIG_NSLOOKUP is not set/CONFIG_NSLOOKUP=y/' $(BUSYBOX_DIR)/.config
 	@sed -i 's/# CONFIG_ARPING is not set/CONFIG_ARPING=y/' $(BUSYBOX_DIR)/.config
+	@sed -i 's/# CONFIG_NTPD is not set/CONFIG_NTPD=y/' $(BUSYBOX_DIR)/.config
+	# --- Fix: disable tc (CBQ removed from kernel headers 6.12+) ---
+	@sed -i 's/CONFIG_TC=y/CONFIG_TC=n/' $(BUSYBOX_DIR)/.config
 	# --- Hardening: disable shell applets (prevent shell escape) ---
 	@sed -i 's/CONFIG_ASH=y/CONFIG_ASH=n/' $(BUSYBOX_DIR)/.config
 	@sed -i 's/CONFIG_HUSH=y/CONFIG_HUSH=n/' $(BUSYBOX_DIR)/.config
@@ -1176,7 +1182,7 @@ test-run:
 # LAN VM (minimal BusyBox client for network testing)
 # =============================================================================
 
-lanvm: busybox dash
+lanvm: busybox dash iptables
 	@echo "Building LAN VM initramfs..."
 	@rm -rf $(BUILD_DIR)/lanvm/initramfs
 	@mkdir -p $(BUILD_DIR)/lanvm/initramfs
@@ -1203,6 +1209,12 @@ lanvm: busybox dash
 	cp $(DASH_BIN) $(BUILD_DIR)/lanvm/initramfs/bin/dash
 	@chmod +x $(BUILD_DIR)/lanvm/initramfs/bin/dash
 	@ln -sf dash $(BUILD_DIR)/lanvm/initramfs/bin/sh
+
+	# Install iptables (needed to set INPUT ACCEPT — kernel has
+	# netfilter built-in with default DROP policy)
+	cp $(IPTABLES_BIN) $(BUILD_DIR)/lanvm/initramfs/sbin/xtables-legacy-multi
+	@ln -sf xtables-legacy-multi $(BUILD_DIR)/lanvm/initramfs/sbin/iptables
+	@ln -sf xtables-legacy-multi $(BUILD_DIR)/lanvm/initramfs/sbin/iptables-restore
 
 	# Install LAN VM init script
 	@cp $(USERSPACE_DIR)/lanvm/init $(BUILD_DIR)/lanvm/initramfs/init

@@ -53,17 +53,18 @@ static void append_addr_match(struct dynbuf *buf,
  * Emit one DNAT rule line for a single protocol.
  * Called once for tcp/udp, twice for tcp+udp.
  */
+/* srcintf = incoming interface for DNAT (PREROUTING -i) */
 static void emit_dnat_rule(struct dynbuf *buf,
 			   const char *srcaddr, const char *dstaddr,
-			   const char *dstintf, const char *proto,
+			   const char *srcintf, const char *proto,
 			   const char *dstport,
 			   const char *mapped_ip, const char *mapped_port)
 {
 	dbuf_printf(buf, "-A PREROUTING");
 	append_addr_match(buf, "-s", srcaddr);
 	append_addr_match(buf, "-d", dstaddr);
-	if (!is_any_or_all(dstintf))
-		dbuf_printf(buf, " -i %s", dstintf);
+	if (!is_any_or_all(srcintf))
+		dbuf_printf(buf, " -i %s", srcintf);
 	if (proto) {
 		dbuf_printf(buf, " -p %s", proto);
 		if (dstport[0])
@@ -130,27 +131,30 @@ sg_status_t rebuild_nat_chains(char *result, size_t rsize)
 				snprintf(protocol, sizeof(protocol), "all");
 
 			/* ── SNAT (overload / MASQUERADE) ───────────── */
+			/* dstintf = outgoing interface → -o (POSTROUTING)
+			 * srcintf not usable in POSTROUTING (-i ignored) */
 			if (strcmp(nattype, "snat") == 0 &&
-			    !is_any_or_all(srcintf)) {
+			    !is_any_or_all(dstintf)) {
 				dbuf_printf(&buf, "-A POSTROUTING");
 				append_addr_match(&buf, "-s", srcaddr);
 				append_addr_match(&buf, "-d", dstaddr);
-				dbuf_printf(&buf, " -o %s", srcintf);
+				dbuf_printf(&buf, " -o %s", dstintf);
 				dbuf_printf(&buf, " -j MASQUERADE\n");
 				snat_count++;
 				continue;
 			}
 
 			/* ── DNAT ───────────────────────────────────── */
+			/* srcintf = incoming interface → -i (PREROUTING) */
 			if (strcmp(nattype, "dnat") == 0 && mapped_ip[0]) {
 				if (strcmp(protocol, "tcp+udp") == 0) {
 					/* Two separate rules (OpenWrt pattern) */
 					emit_dnat_rule(&buf, srcaddr, dstaddr,
-						       dstintf, "tcp",
+						       srcintf, "tcp",
 						       dstport,
 						       mapped_ip, mapped_port);
 					emit_dnat_rule(&buf, srcaddr, dstaddr,
-						       dstintf, "udp",
+						       srcintf, "udp",
 						       dstport,
 						       mapped_ip, mapped_port);
 					dnat_count += 2;
@@ -158,14 +162,14 @@ sg_status_t rebuild_nat_chains(char *result, size_t rsize)
 					/* No -p flag, match all protocols
 					 * (1:1 NAT — dstport ignored) */
 					emit_dnat_rule(&buf, srcaddr, dstaddr,
-						       dstintf, NULL,
+						       srcintf, NULL,
 						       dstport,
 						       mapped_ip, mapped_port);
 					dnat_count++;
 				} else {
 					/* tcp or udp */
 					emit_dnat_rule(&buf, srcaddr, dstaddr,
-						       dstintf, protocol,
+						       srcintf, protocol,
 						       dstport,
 						       mapped_ip, mapped_port);
 					dnat_count++;
@@ -268,9 +272,9 @@ sg_status_t validate_nat(const char *id, const char *data,
 	char nattype[VALBUFSZ];
 	extract_val(data, "type", nattype, sizeof(nattype));
 
-	if (strcmp(nattype, "snat") == 0 && is_any_or_all(srcintf)) {
+	if (strcmp(nattype, "snat") == 0 && is_any_or_all(dstintf)) {
 		snprintf(result, rsize,
-			 "SNAT requires a real outgoing interface (srcintf)");
+			 "SNAT requires a real outgoing interface (dstintf)");
 		return SG_ERR_MISSING_ARG;
 	}
 	if (strcmp(nattype, "dnat") == 0 && !mapped_ip[0]) {
