@@ -28,12 +28,13 @@ $(BUILD_DIR)/sqlite3.o: sqlite3.c sqlite3.h
 
 MGMTD_APPLY_SRCS := mgmtd_apply_route.c mgmtd_apply_iface.c \
                      mgmtd_apply_nat.c mgmtd_apply_dns.c mgmtd_apply_dhcp.c \
-                     mgmtd_apply_firewall.c mgmtd_apply_ntp.c
+                     mgmtd_apply_firewall.c mgmtd_apply_ntp.c \
+                     mgmtd_sequence.c
 
 MGMTD_SRCS := mgmtd_user.c mgmtd_firmware.c mgmtd_network.c mgmtd_diag.c
 
 $(BUILD_DIR)/stargazer-mgmtd: stargazer-mgmtd.c stargazer_ipc.h mgmtd_apply.h \
-                               mgmtd_internal.h \
+                               mgmtd_internal.h mgmtd_sequence.h \
                                $(MGMTD_SRCS) $(MGMTD_APPLY_SRCS) \
                                sg_db.c sg_db.h \
                                $(COMMON_DIR)/password_policy.c $(COMMON_DIR)/password_policy.h \

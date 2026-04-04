@@ -285,6 +285,24 @@ int cli_get_tty_fd(void)
 	return tty_fd;
 }
 
+void cli_term_echo_on(void)
+{
+	if (tty_fd < 0) return;
+	struct termios t;
+	if (tcgetattr(tty_fd, &t) != 0) return;
+	t.c_lflag |= (unsigned)(ECHO | ICANON);
+	tcsetattr(tty_fd, TCSANOW, &t);
+}
+
+void cli_term_echo_off(void)
+{
+	if (tty_fd < 0) return;
+	struct termios t;
+	if (tcgetattr(tty_fd, &t) != 0) return;
+	t.c_lflag &= ~(unsigned)(ECHO | ICANON);
+	tcsetattr(tty_fd, TCSANOW, &t);
+}
+
 /* ── Completion registry ──────────────────────────────────────────────── */
 
 void cli_register(const char *path, const char *desc)

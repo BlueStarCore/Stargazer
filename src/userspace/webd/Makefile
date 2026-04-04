@@ -19,7 +19,7 @@ MG_CFLAGS    := -Wall -Os -static -I. \
                 -DMG_TLS=MG_TLS_BUILTIN
 
 SRCS := stargazer-webd.c webd_api.c webd_ipc.c webd_pool.c \
-        webd_session.c webd_sandbox.c
+        webd_session.c webd_sandbox.c $(COMMON_DIR)/sg_validate.c
 
 HEADERS := webd_api.h webd_ipc.h webd_pool.h webd_session.h \
            webd_sandbox.h mongoose.h $(MGMTD_DIR)/stargazer_ipc.h

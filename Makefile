@@ -23,7 +23,7 @@ CROSS_COMPILE  := aarch64-linux-gnu-
 # Paths
 PROJECT_ROOT   := $(CURDIR)
 BUILD_DIR      := $(PROJECT_ROOT)/build
-KERNEL_DIR     := $(PROJECT_ROOT)/kernel
+KERNEL_DIR     := $(abspath $(PROJECT_ROOT)/../stargazer-kernel)
 MODULE_DIR     := $(PROJECT_ROOT)/src/modules
 USERSPACE_DIR  := $(PROJECT_ROOT)/src/userspace
 ROOTFS_DIR     := $(BUILD_DIR)/rootfs
@@ -143,8 +143,9 @@ $(KERNEL_IMAGE): | kernel-source kernel-config
 
 kernel-source:
 	@if [ ! -d "$(KERNEL_DIR)" ]; then \
-		echo "Cloning kernel source..."; \
-		git clone --depth 1 -b $(KERNEL_BRANCH) $(KERNEL_REPO) $(KERNEL_DIR); \
+		echo "ERROR: Kernel source not found at $(KERNEL_DIR)"; \
+		echo "       Clone it with: git clone -b $(KERNEL_BRANCH) $(KERNEL_REPO) $(KERNEL_DIR)"; \
+		exit 1; \
 	fi
 
 kernel-config:

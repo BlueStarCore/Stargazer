@@ -437,6 +437,144 @@ static void test_system_diag(void)
 	ipc_resp_free(&resp);
 }
 
+/* ── WEB-7: Duplicate entry rejection (CFG_SET for existing) ─────────── */
+/*
+ * This tests the mgmtd-level behavior: CFG_SET silently overwrites.
+ * The 409 Conflict check is in webd's flow_config_create, which is
+ * not reachable via raw IPC. But we CAN verify that CFG_SET overwrites
+ * (which is expected) and that the data is correct after.
+ *
+ * The real duplicate check happens at the HTTP layer in webd.
+ */
+
+#define WDUP_ENTRY "firewall_address:__wdup_test\n"
+#define WDUP_DATA1 "firewall_address:__wdup_test\n" \
+		   "name=__wdup_test\ntype=ipmask\n" \
+		   "subnet=10.0.0.0/24\ncomment=original\n"
+#define WDUP_DATA2 "firewall_address:__wdup_test\n" \
+		   "name=__wdup_test\ntype=ipmask\n" \
+		   "subnet=172.16.0.0/16\ncomment=overwrite\n"
+
+static void test_duplicate_entry(void)
+{
+	struct ipc_response resp;
+
+	printf(C_CYAN "\n  --- WEB-7: Duplicate entry handling ---"
+	       C_NC "\n");
+
+	/* Cleanup */
+	web_ipc(SG_CMD_CFG_DEL, WDUP_ENTRY);
+
+	/* Create entry */
+	web_check("WEB-7a", "create address __wdup_test",
+		  SG_CMD_CFG_SET, WDUP_DATA1, SG_OK);
+
+	/* Verify original data */
+	int conn = ipc_send_str(SG_CMD_CFG_GET, WDUP_ENTRY, &resp);
+	web_total++;
+	if (conn == 0 && resp.status == SG_OK &&
+	    resp.payload && strstr(resp.payload, "comment=original")) {
+		web_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [WEB-7b] original data verified\n");
+	} else {
+		web_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [WEB-7b] original data not found\n");
+	}
+	ipc_resp_free(&resp);
+
+	/* CFG_SET with same ID overwrites (mgmtd design) */
+	web_check("WEB-7c", "CFG_SET same ID overwrites → SG_OK",
+		  SG_CMD_CFG_SET, WDUP_DATA2, SG_OK);
+
+	/* Verify overwritten data */
+	conn = ipc_send_str(SG_CMD_CFG_GET, WDUP_ENTRY, &resp);
+	web_total++;
+	if (conn == 0 && resp.status == SG_OK &&
+	    resp.payload && strstr(resp.payload, "comment=overwrite")) {
+		web_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [WEB-7d] overwritten data verified\n");
+	} else {
+		web_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [WEB-7d] overwritten data not found\n");
+	}
+	ipc_resp_free(&resp);
+
+	/* Cleanup */
+	web_ipc(SG_CMD_CFG_DEL, WDUP_ENTRY);
+}
+
+/* ── WEB-8: CFG_INSERT (move) via IPC ────────────────────────────────── */
+
+#define WMOV_E1  "firewall_policy:9801\n"
+#define WMOV_D1  "firewall_policy:9801\n" \
+		 "name=wmov1\nsrcintf=any\ndstintf=any\n" \
+		 "srcaddr=all\ndstaddr=all\n" \
+		 "action=accept\nstatus=enable\n"
+#define WMOV_E2  "firewall_policy:9802\n"
+#define WMOV_D2  "firewall_policy:9802\n" \
+		 "name=wmov2\nsrcintf=any\ndstintf=any\n" \
+		 "srcaddr=all\ndstaddr=all\n" \
+		 "action=deny\nstatus=enable\n"
+
+static void test_cfg_insert(void)
+{
+	struct ipc_response resp;
+
+	printf(C_CYAN "\n  --- WEB-8: CFG_INSERT (move) ---" C_NC "\n");
+
+	/* Cleanup */
+	web_ipc(SG_CMD_CFG_DEL, WMOV_E1);
+	web_ipc(SG_CMD_CFG_DEL, WMOV_E2);
+
+	/* Create two policies */
+	web_check("WEB-8a", "create policy 9801",
+		  SG_CMD_CFG_SET, WMOV_D1, SG_OK);
+	web_check("WEB-8b", "create policy 9802",
+		  SG_CMD_CFG_SET, WMOV_D2, SG_OK);
+
+	/* Move 9802 to sequence 1 */
+	web_check("WEB-8c", "CFG_INSERT: move 9802 to seq 1",
+		  SG_CMD_CFG_INSERT, "firewall_policy:9802\n1\n", SG_OK);
+
+	/* Verify 9802 now has sequence=1 */
+	int conn = ipc_send_str(SG_CMD_CFG_GET, WMOV_E2, &resp);
+	web_total++;
+	if (conn == 0 && resp.status == SG_OK &&
+	    resp.payload && strstr(resp.payload, "sequence=1")) {
+		web_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [WEB-8d] policy 9802 sequence=1\n");
+	} else {
+		web_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [WEB-8d] policy 9802 sequence!=1\n");
+	}
+	ipc_resp_free(&resp);
+
+	/* CFG_INSERT on non-existent entry → error */
+	web_check("WEB-8e", "CFG_INSERT nonexistent → ENTRY_NOT_FOUND",
+		  SG_CMD_CFG_INSERT, "firewall_policy:9999\n5\n",
+		  SG_ERR_ENTRY_NOT_FOUND);
+
+	/* CFG_INSERT invalid sequence → error */
+	web_check("WEB-8f", "CFG_INSERT seq=-1 → INVALID_VAL",
+		  SG_CMD_CFG_INSERT, "firewall_policy:9801\n-1\n",
+		  SG_ERR_INVALID_VAL);
+
+	/* CFG_INSERT on non-sequence type → error */
+	web_check("WEB-8g", "CFG_INSERT on system_admin → INVALID_ARG",
+		  SG_CMD_CFG_INSERT, "system_admin:admin\n1\n",
+		  SG_ERR_INVALID_ARG);
+
+	/* Cleanup */
+	web_ipc(SG_CMD_CFG_DEL, WMOV_E1);
+	web_ipc(SG_CMD_CFG_DEL, WMOV_E2);
+}
+
 /* ── Public entry point ───────────────────────────────────────────────── */
 
 int cli_diagnose_test_webd(int mode, diag_result_t *out)
@@ -475,6 +613,12 @@ int cli_diagnose_test_webd(int mode, diag_result_t *out)
 	ipc_reacquire_tag();
 
 	test_config_crud();
+	ipc_reacquire_tag();
+
+	test_duplicate_entry();
+	ipc_reacquire_tag();
+
+	test_cfg_insert();
 	ipc_reacquire_tag();
 
 	test_system_diag();

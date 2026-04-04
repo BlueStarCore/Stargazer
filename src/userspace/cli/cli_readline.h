@@ -57,6 +57,14 @@ int cli_resolve_cmd(const char *input, char *output, size_t out_sz);
 int cli_get_tty_fd(void);
 
 /*
+ * Temporarily enable ECHO+ICANON for interactive confirmation prompts.
+ * cli_term_echo_on()  — canonical mode with echo (fgets works normally).
+ * cli_term_echo_off() — back to quiet mode (ECHO off, ICANON off).
+ */
+void cli_term_echo_on(void);
+void cli_term_echo_off(void);
+
+/*
  * Idle callback — called every ~5 seconds while waiting for input.
  * Return 0 to keep waiting, non-zero to abort readline (returns NULL).
  */

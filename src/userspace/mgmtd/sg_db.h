@@ -64,6 +64,14 @@ int sg_db_del(const char *type, const char *id);
 char *sg_db_list(const char *type);
 
 /*
+ * List entry IDs ordered by a numeric key (e.g. "sequence").
+ * Entries without the key sort last (999999).  Tie-break by ID.
+ * Returns heap string "id1\nid2\n" or NULL if none found.
+ * Caller must free().
+ */
+char *sg_db_list_ordered(const char *type, const char *order_key);
+
+/*
  * Get a single value by (type, id, key).
  * Returns heap string or NULL if not found. Caller must free().
  */
@@ -138,5 +146,24 @@ int sg_db_lockout_set(const char *username, int fail_count,
  * Returns 0 on success, -1 on error.
  */
 int sg_db_lockout_clear(const char *username);
+
+/*
+ * Clear all lockout entries (factory reset).
+ * Returns 0 on success, -1 on error.
+ */
+int sg_db_lockout_clear_all(void);
+
+/* ── Transaction helpers ─────────────────────────────────────────────────── */
+
+/*
+ * Explicit transaction control for multi-step atomic operations
+ * (e.g. factory reset purge).  sg_db_set() uses its own internal
+ * transactions, so these are only needed when multiple sg_db_*
+ * calls must be atomic.
+ * Returns 0 on success, -1 on error.
+ */
+int sg_db_begin(void);
+int sg_db_commit(void);
+int sg_db_rollback(void);
 
 #endif /* SG_DB_H */

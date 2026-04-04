@@ -481,6 +481,62 @@ char *sg_db_list(const char *type)
 	return buf;
 }
 
+/* ── sg_db_list_ordered ───────────────────────────────────────────────────── */
+
+char *sg_db_list_ordered(const char *type, const char *order_key)
+{
+	if (!g_db || !type || !order_key) return NULL;
+
+	sqlite3_stmt *stmt;
+	/*
+	 * Left-join: every distinct ID gets a row even if it lacks the
+	 * order_key.  COALESCE puts missing keys at 0 (lowest priority).
+	 * CAST to INTEGER for numeric sort (not lexicographic).
+	 * DESC: higher sequence = higher priority = applied first.
+	 * Boot replay inserts with -I (insert at position), so the
+	 * highest-priority rule must be inserted first to end up at
+	 * the top of the chain.
+	 */
+	const char *sql =
+		"SELECT DISTINCT c.id FROM config c "
+		"LEFT JOIN config seq ON seq.type = c.type "
+		"  AND seq.id = c.id AND seq.key = ?2 "
+		"WHERE c.type = ?1 AND c.id != '0' "
+		"ORDER BY CAST(COALESCE(seq.value, '0') AS INTEGER) DESC, "
+		"         c.id;";
+	if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK)
+		return NULL;
+
+	sqlite3_bind_text(stmt, 1, type, -1, SQLITE_STATIC);
+	sqlite3_bind_text(stmt, 2, order_key, -1, SQLITE_STATIC);
+
+	size_t bufsz = 1024, used = 0;
+	char *buf = malloc(bufsz);
+	if (!buf) { sqlite3_finalize(stmt); return NULL; }
+	buf[0] = '\0';
+
+	while (sqlite3_step(stmt) == SQLITE_ROW) {
+		const char *id = (const char *)sqlite3_column_text(stmt, 0);
+		if (!id) continue;
+
+		size_t ilen = strlen(id);
+		if (buf_append(&buf, &used, &bufsz, id, ilen) < 0 ||
+		    buf_append(&buf, &used, &bufsz, "\n", 1) < 0) {
+			free(buf);
+			sqlite3_finalize(stmt);
+			return NULL;
+		}
+	}
+
+	sqlite3_finalize(stmt);
+
+	if (used == 0) {
+		free(buf);
+		return NULL;
+	}
+	return buf;
+}
+
 /* ── sg_db_get_val ───────────────────────────────────────────────────────── */
 
 char *sg_db_get_val(const char *type, const char *id, const char *key)
@@ -728,4 +784,41 @@ int sg_db_lockout_clear(const char *username)
 	int rc = sqlite3_step(stmt);
 	sqlite3_finalize(stmt);
 	return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int sg_db_lockout_clear_all(void)
+{
+	if (!g_db) return -1;
+
+	sqlite3_stmt *stmt;
+	const char *sql = "DELETE FROM auth_lockouts;";
+	if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK)
+		return -1;
+
+	int rc = sqlite3_step(stmt);
+	sqlite3_finalize(stmt);
+	return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+/* ── Transaction helpers ─────────────────────────────────────────────────── */
+
+int sg_db_begin(void)
+{
+	if (!g_db) return -1;
+	return sqlite3_exec(g_db, "BEGIN;", NULL, NULL, NULL) == SQLITE_OK
+		? 0 : -1;
+}
+
+int sg_db_commit(void)
+{
+	if (!g_db) return -1;
+	return sqlite3_exec(g_db, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK
+		? 0 : -1;
+}
+
+int sg_db_rollback(void)
+{
+	if (!g_db) return -1;
+	return sqlite3_exec(g_db, "ROLLBACK;", NULL, NULL, NULL) == SQLITE_OK
+		? 0 : -1;
 }

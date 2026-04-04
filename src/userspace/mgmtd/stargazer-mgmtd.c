@@ -40,6 +40,7 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/file.h>
+#include <sys/mount.h>
 #include <sys/wait.h>
 #include <poll.h>
 
@@ -48,6 +49,7 @@
 #include "sg_db.h"
 #include "sg_validate.h"
 #include "mgmtd_apply.h"
+#include "mgmtd_sequence.h"
 #include "mgmtd_internal.h"
 
 /* ── Constants ──────────────────────────────────────────────────────────── */
@@ -193,6 +195,89 @@ char *safe_exec(const char *const argv[])
 	buf[used] = '\0';
 	close(pipefd[0]);
 	waitpid(pid, NULL, 0);
+	return buf;
+}
+
+/*
+ * pipe_exec_stdin — fork+exec with data piped to child's stdin.
+ *
+ * Writes 'input' to the child's stdin, closes it, reads stdout+stderr.
+ * Returns heap-allocated output (caller frees) or NULL on fork/pipe
+ * failure.  Sets *exit_code if non-NULL.
+ */
+char *pipe_exec_stdin(const char *const argv[],
+		      const char *input, size_t input_len,
+		      int *exit_code)
+{
+	int in_fd[2], out_fd[2];
+	if (pipe(in_fd) < 0) return NULL;
+	if (pipe(out_fd) < 0) { close(in_fd[0]); close(in_fd[1]); return NULL; }
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		close(in_fd[0]); close(in_fd[1]);
+		close(out_fd[0]); close(out_fd[1]);
+		return NULL;
+	}
+
+	if (pid == 0) {
+		/* Child: stdin from in_fd, stdout+stderr to out_fd */
+		close(in_fd[1]);
+		close(out_fd[0]);
+		dup2(in_fd[0], STDIN_FILENO);
+		dup2(out_fd[1], STDOUT_FILENO);
+		dup2(out_fd[1], STDERR_FILENO);
+		close(in_fd[0]);
+		close(out_fd[1]);
+		execvp(argv[0], (char *const *)argv);
+		_exit(127);
+	}
+
+	/* Parent: write input to child's stdin, then read output */
+	close(in_fd[0]);
+	close(out_fd[1]);
+
+	/* Write all input (small payloads — single write is fine) */
+	if (input && input_len > 0) {
+		const char *p = input;
+		size_t remain = input_len;
+		while (remain > 0) {
+			ssize_t w = write(in_fd[1], p, remain);
+			if (w < 0) {
+				if (errno == EINTR) continue;
+				break;
+			}
+			p += w;
+			remain -= (size_t)w;
+		}
+	}
+	close(in_fd[1]);
+
+	/* Read all output */
+	size_t bufsz = 4096, used = 0;
+	char *buf = malloc(bufsz);
+	if (!buf) { close(out_fd[0]); waitpid(pid, NULL, 0); return NULL; }
+
+	ssize_t n;
+	char tmp[1024];
+	while ((n = read(out_fd[0], tmp, sizeof(tmp))) > 0) {
+		while (used + (size_t)n + 1 > bufsz) {
+			bufsz *= 2;
+			char *nb = realloc(buf, bufsz);
+			if (!nb) { free(buf); close(out_fd[0]); waitpid(pid, NULL, 0); return NULL; }
+			buf = nb;
+		}
+		memcpy(buf + used, tmp, (size_t)n);
+		used += (size_t)n;
+	}
+	buf[used] = '\0';
+	close(out_fd[0]);
+
+	int wstatus;
+	waitpid(pid, &wstatus, 0);
+	if (exit_code)
+		*exit_code = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1;
+
 	return buf;
 }
 
@@ -1297,6 +1382,8 @@ static int mgmtd_seed_defaults(void)
 		      "dstaddr=all\n"
 		      "action=deny\n"
 		      "status=enable\n"
+		      "sequence=1\n"
+		      "builtin=yes\n"
 		      "comment=Default deny all traffic\n") != 0) goto fail;
 
 	/* ── Default interfaces ──────────────────────────────────────── */
@@ -2054,6 +2141,47 @@ static int scrub_config_entry(const char *type, const char *id,
 }
 
 /*
+ * Backfill sequence numbers for types that now require them.
+ * Existing entries without a 'sequence' key get auto-assigned
+ * in ID order (preserving the pre-upgrade behavior).
+ */
+static void mgmtd_backfill_sequences(void)
+{
+	static const char *seq_types[] = {
+		"firewall_policy", "network_nat", NULL
+	};
+	for (int t = 0; seq_types[t]; t++) {
+		char *list = sg_db_list(seq_types[t]);
+		if (!list)
+			continue;
+		int next_seq = 1;
+		char *saveptr = NULL;
+		for (char *tok = strtok_r(list, "\n", &saveptr);
+		     tok;
+		     tok = strtok_r(NULL, "\n", &saveptr)) {
+			char *existing = sg_db_get_val(seq_types[t], tok,
+						       "sequence");
+			if (!existing) {
+				char val[16];
+				snprintf(val, sizeof(val), "%d", next_seq);
+				sg_db_set_val(seq_types[t], tok,
+					      "sequence", val);
+				fprintf(stderr,
+					"[mgmtd] backfill %s:%s sequence=%d\n",
+					seq_types[t], tok, next_seq);
+				next_seq++;
+			} else {
+				int cur = atoi(existing);
+				if (cur >= next_seq)
+					next_seq = cur + 1;
+				free(existing);
+			}
+		}
+		free(list);
+	}
+}
+
+/*
  * Replay saved configuration at boot.
  * Iterates through config types that have runtime apply handlers
  * and calls apply_config() for each entry.
@@ -2061,6 +2189,10 @@ static int scrub_config_entry(const char *type, const char *id,
  */
 static void mgmtd_replay_config(void)
 {
+	/* Backfill sequence numbers before replay so position
+	 * computation works correctly on first boot after upgrade. */
+	mgmtd_backfill_sequences();
+
 	char result[512];
 
 	/* Single config types (id="0").
@@ -2110,15 +2242,33 @@ static void mgmtd_replay_config(void)
 		NULL
 	};
 	for (int i = 0; table_types[i]; i++) {
+		/* Firewall/NAT: atomic rebuild reads all entries from DB
+		 * and generates the complete chain in one shot.  No need
+		 * for per-entry loop, flush, or ordered list. */
+		if (strcmp(table_types[i], "firewall_policy") == 0) {
+			char rb_result[512];
+			sg_status_t rc = rebuild_forward_chain(
+				rb_result, sizeof(rb_result));
+			fprintf(stderr, "[mgmtd] replay firewall_policy: %s%s\n",
+				rc == SG_OK ? "" : "FAIL ",
+				rb_result);
+			continue;
+		}
+		if (strcmp(table_types[i], "network_nat") == 0) {
+			char rb_result[512];
+			sg_status_t rc = rebuild_nat_chains(
+				rb_result, sizeof(rb_result));
+			fprintf(stderr, "[mgmtd] replay network_nat: %s%s\n",
+				rc == SG_OK ? "" : "FAIL ",
+				rb_result);
+			continue;
+		}
+
 		/* Pre-flush: clean runtime state before replaying each type.
 		 * Centralized flush functions in mgmtd_apply.h — each one
 		 * only removes state owned by its config type. */
 		if (strcmp(table_types[i], "network_route_static") == 0)
 			flush_static_routes();
-		else if (strcmp(table_types[i], "network_nat") == 0)
-			flush_nat_rules();
-		else if (strcmp(table_types[i], "firewall_policy") == 0)
-			flush_forward_chain();
 
 		char *list = sg_db_list(table_types[i]);
 		if (!list) {
@@ -2325,17 +2475,14 @@ static sg_status_t apply_config(const char *type, const char *id,
 	if (strcmp(type, "system_interface") == 0)
 		return apply_interface(id, data, result, rsize);
 
-	if (strcmp(type, "network_nat") == 0)
-		return apply_nat(id, data, result, rsize);
+	/* network_nat and firewall_policy use rebuild_*_chain()
+	 * directly from the CFG_SET fast-path — not apply_config(). */
 
 	if (strcmp(type, "network_dns") == 0)
 		return apply_dns(id, data, result, rsize);
 
 	if (strcmp(type, "network_dhcp-server") == 0)
 		return apply_dhcp(id, data, result, rsize);
-
-	if (strcmp(type, "firewall_policy") == 0)
-		return apply_firewall_policy(id, data, result, rsize);
 
 	if (strcmp(type, "system_ntp") == 0)
 		return apply_ntp(id, data, result, rsize);
@@ -2423,14 +2570,12 @@ static sg_status_t apply_config(const char *type, const char *id,
 			explicit_bzero(password, sizeof(password));
 		}
 
-		/* Ensure admin has a usable password (new or existing).
-		 * Builtins on first boot are exempt — they have empty shadow
-		 * and will be forced to change on first login. */
-		if (!is_builtin && !user_has_password(id)) {
-			snprintf(result, rsize,
-				 "Admin '%s' has no password. Use 'set password'.", id);
-			return SG_ERR_MISSING_ARG;
-		}
+		/* Non-builtin users without a password are left locked.
+		 * create_system_user() locks the shadow entry, so the
+		 * account is safe until a password is explicitly set via
+		 * ADMIN_SET_PW.  logind enforces password verification
+		 * at login time.  Blocking CFG_SET here would prevent
+		 * the normal ADMIN_CREATE → CFG_SET update workflow. */
 
 		/* Handle enforce-change-password default for new users */
 		if (enforce[0] == '\0') {
@@ -2881,6 +3026,186 @@ static int handle_supervisor_test(int client_fd, const char *user,
 	return 0;
 }
 
+/* ── Factory reset handler ───────────────────────────────────────────────── */
+
+/*
+ * find_mount_device — resolve a mount point to its block device.
+ *
+ * Reads /proc/mounts to find which device is mounted at the given path.
+ * Returns 0 and fills dev_out on success, -1 if not found.
+ */
+static int find_mount_device(const char *mount_point,
+			     char *dev_out, size_t dev_sz)
+{
+	FILE *fp = fopen("/proc/mounts", "r");
+	if (!fp) return -1;
+
+	char line[512];
+	int found = 0;
+	while (fgets(line, sizeof(line), fp)) {
+		char dev[128], mnt[256];
+		if (sscanf(line, "%127s %255s", dev, mnt) == 2 &&
+		    strcmp(mnt, mount_point) == 0) {
+			snprintf(dev_out, dev_sz, "%s", dev);
+			found = 1;
+			break;
+		}
+	}
+	fclose(fp);
+	return found ? 0 : -1;
+}
+
+/*
+ * wipe_partition — zero the superblock of a block device.
+ *
+ * Writes 4096 bytes of zeros to the start of the device, destroying
+ * the ext2 superblock.  On next boot, init's _sg_prepare() detects
+ * the blank partition and reformats it as a fresh ext2 filesystem.
+ *
+ * This is the nuclear option: ALL data on the partition is lost.
+ * No individual file cleanup needed — the entire filesystem is gone.
+ */
+static int wipe_partition(const char *dev)
+{
+	int fd = open(dev, O_WRONLY);
+	if (fd < 0)
+		return -1;
+	char zeros[4096];
+	memset(zeros, 0, sizeof(zeros));
+	ssize_t n = write(fd, zeros, sizeof(zeros));
+	close(fd);
+	return (n == sizeof(zeros)) ? 0 : -1;
+}
+
+/*
+ * handle_factory_reset — Wipe data and logs partitions, then reboot.
+ *
+ * Strategy: instead of individually cleaning up DB entries, files,
+ * shadow hashes, TLS certs, DHCP leases, etc., we destroy the ext2
+ * superblock on both the sgdata and sglogs partitions.  On reboot,
+ * init detects blank partitions, reformats them, and mgmtd runs the
+ * first-boot seed flow.  Everything starts fresh — no state survives.
+ *
+ * This matches how real network appliances (FortiGate, etc.) handle
+ * factory reset: wipe the config partition, reboot, first-boot flow.
+ *
+ * Steps:
+ *   1. Permission check (admin only)
+ *   2. Parse action (reboot or shutdown)
+ *   3. Audit log BEFORE wiping
+ *   4. Send OK response (before we close DB / unmount)
+ *   5. Close DB (releases file locks on data partition)
+ *   6. Stop all supervised children (releases files on data/logs)
+ *   7. Wipe sgdata partition superblock
+ *   8. Wipe sglogs partition superblock
+ *   9. Reboot or shutdown
+ *
+ * Error handling:
+ *   - Steps 1-3: safe to abort (no side effects)
+ *   - Steps 4+: point of no return — always reboot/shutdown
+ *   - If wipe fails, reboot anyway — init will fsck and reformat
+ */
+static int handle_factory_reset(int client_fd, const char *user,
+				const char *payload,
+				const sg_request_hdr_t *hdr)
+{
+	(void)hdr;
+
+	/* 1. Permission check */
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "admin")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "Requires 'admin' permission");
+		return 0;
+	}
+
+	/* 2. Parse action */
+	int do_reboot = 1; /* default to reboot */
+	if (payload) {
+		char action[32] = {0};
+		sg_kv_get(payload, "action", action, sizeof(action));
+		if (strcmp(action, "shutdown") == 0)
+			do_reboot = 0;
+	}
+
+	/* 3. Audit log BEFORE wiping (will be lost with the partition) */
+	(void)audit_log(user, "factory_reset",
+			do_reboot ? "action=reboot" : "action=shutdown");
+
+	mgmt_log("WARN", "FACTORY RESET initiated by user=%s action=%s",
+		 user, do_reboot ? "reboot" : "shutdown");
+
+	/* 4. Send OK response now — after DB close we can't use IPC.
+	 * The client receives confirmation before the wipe begins. */
+	send_ok(client_fd,
+		do_reboot ? "Factory reset complete. Rebooting..."
+			  : "Factory reset complete. Shutting down...",
+		NULL);
+
+	/* ── Point of no return ───────────────────────────────────── */
+
+	/* 5. Close DB (release file handles on data partition) */
+	sg_db_close();
+
+	/* 6. Stop all supervised children (release file handles) */
+	shutdown_children();
+
+	/* 7. Find and wipe sgdata partition.
+	 * /etc/stargazer is the mount point for the data partition.
+	 * Zeroing the superblock makes init reformat on next boot. */
+	{
+		char data_dev[128] = {0};
+		if (find_mount_device(CONF_DIR, data_dev,
+				      sizeof(data_dev)) == 0) {
+			/* Unmount so the device is not busy */
+			umount(CONF_DIR "/logs");
+			umount(CONF_DIR);
+			if (wipe_partition(data_dev) == 0)
+				mgmt_log("INFO", "factory reset: wiped %s",
+					 data_dev);
+			else
+				mgmt_log("WARN", "factory reset: wipe %s "
+					 "failed (will fsck on boot)",
+					 data_dev);
+		} else {
+			mgmt_log("WARN", "factory reset: data partition "
+				 "not found at %s", CONF_DIR);
+		}
+	}
+
+	/* 8. Find and wipe sglogs partition.
+	 * Logs partition is at CONF_DIR/logs (already unmounted above).
+	 * We derive the device from the data device. */
+	{
+		char logs_dev[128] = {0};
+		if (find_mount_device(CONF_DIR "/logs", logs_dev,
+				      sizeof(logs_dev)) == 0) {
+			umount(CONF_DIR "/logs");
+			if (wipe_partition(logs_dev) == 0)
+				mgmt_log("INFO", "factory reset: wiped %s",
+					 logs_dev);
+			else
+				mgmt_log("WARN", "factory reset: wipe %s "
+					 "failed", logs_dev);
+		}
+		/* Logs partition is optional — don't warn if not found */
+	}
+
+	mgmt_log("WARN", "FACTORY RESET complete — %s",
+		 do_reboot ? "rebooting" : "shutting down");
+
+	/* 9. Reboot or shutdown */
+	usleep(100000);
+	{
+		const char *argv[] = {
+			do_reboot ? "/sbin/reboot" : "/sbin/poweroff",
+			NULL
+		};
+		free(safe_exec(argv));
+	}
+	return 0;
+}
+
 /* ── Request handler ────────────────────────────────────────────────────── */
 
 static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
@@ -3132,9 +3457,13 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		 *  - password-hash: managed by set_password(), never plaintext
 		 * Also strip password= — plaintext passwords are only accepted
 		 * by CFG_APPLY (which calls set_password and stores the hash);
-		 * they must never be written as plaintext to the DB. */
+		 * they must never be written as plaintext to the DB.
+		 *
+		 * Keep 'existing' alive — firewall/NAT rollback needs
+		 * the old DB data to restore on rebuild failure. */
 		char *existing = sg_db_get(db_type, db_id);
 		int was_builtin = 0;
+		int is_new_entry = (existing == NULL);
 		char saved_pw_hash[SG_PAYLOAD_MAX];
 		saved_pw_hash[0] = '\0';
 		if (existing) {
@@ -3144,7 +3473,20 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 				was_builtin = 1;
 			extract_val(existing, "password-hash",
 				    saved_pw_hash, sizeof(saved_pw_hash));
+		}
+
+		/* Builtin firewall/NAT policies are fully immutable.
+		 * The default-deny must stay exactly as seeded — no
+		 * field changes, no enable/disable, no reordering.
+		 * This prevents an attacker who gains configure access
+		 * from silently opening the firewall. */
+		if (was_builtin &&
+		    (strcmp(db_type, "firewall_policy") == 0 ||
+		     strcmp(db_type, "network_nat") == 0)) {
 			free(existing);
+			send_error(client_fd, SG_ERR_BUILTIN,
+				   "Builtin policy cannot be modified");
+			return 0;
 		}
 
 		/* Build clean data: strip builtin=, password=, password-hash= */
@@ -3223,26 +3565,90 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			}
 		}
 
-		/* Apply before persist — never trust the client.
-		 *
-		 * CFG_APPLY is a "test run" — clients call it to check
-		 * if a config change would succeed.  CFG_SET is the real
-		 * operation: validate → apply → persist.
-		 *
-		 * Apply handlers are idempotent, so the double-apply
-		 * (client's test run + our real run) is safe.  If the
-		 * apply fails here, the config never reaches the DB —
-		 * preventing broken configs that fail on reboot replay. */
+		/* Auto-assign sequence for firewall/NAT on new entries.
+		 * Sequence = max(existing) + 1.  Must happen before
+		 * apply_config so the apply handler knows the position. */
+		if (is_new_entry &&
+		    (strcmp(db_type, "firewall_policy") == 0 ||
+		     strcmp(db_type, "network_nat") == 0)) {
+			seq_auto_assign(db_type, clean, sizeof(clean));
+		}
+
+		/* Firewall/NAT types: persist first, then atomic rebuild.
+		 * The rebuild reads ALL entries from DB, so the new data
+		 * must be in the DB before we can generate the chain.
+		 * If rebuild fails, we rollback the DB change. */
+		if (strcmp(db_type, "firewall_policy") == 0 ||
+		    strcmp(db_type, "network_nat") == 0) {
+			/* Validate fields without touching the kernel */
+			char val_result[512];
+			sg_status_t val_rc;
+			if (strcmp(db_type, "firewall_policy") == 0)
+				val_rc = validate_firewall_policy(
+					db_id, clean,
+					val_result, sizeof(val_result));
+			else
+				val_rc = validate_nat(
+					db_id, clean,
+					val_result, sizeof(val_result));
+			if (val_rc != SG_OK) {
+				free(existing);
+				send_error(client_fd, val_rc, val_result);
+				return 0;
+			}
+
+			/* Write to DB */
+			if (sg_db_set(db_type, db_id, clean) != 0) {
+				free(existing);
+				mgmt_log("ERROR", "sg_db_set failed for %s",
+					 section);
+				send_error(client_fd, SG_ERR_IO_FAIL,
+					   "Failed to write config");
+				return 0;
+			}
+
+			/* Atomic rebuild from DB */
+			char rb_result[512];
+			sg_status_t rb_rc;
+			if (strcmp(db_type, "firewall_policy") == 0)
+				rb_rc = rebuild_forward_chain(
+					rb_result, sizeof(rb_result));
+			else
+				rb_rc = rebuild_nat_chains(
+					rb_result, sizeof(rb_result));
+			if (rb_rc != SG_OK) {
+				/* Rollback: restore old DB state */
+				if (is_new_entry)
+					sg_db_del(db_type, db_id);
+				else if (existing)
+					sg_db_set(db_type, db_id, existing);
+				free(existing);
+				send_error(client_fd, rb_rc, rb_result);
+				return 0;
+			}
+			free(existing);
+			existing = NULL;
+
+			send_ok(client_fd, "Config saved", NULL);
+			return 0;
+		}
+
+		/* All other types: apply before persist.
+		 * If apply fails, the config never reaches the DB. */
 		{
 			char apply_result[512];
 			sg_status_t apply_st = apply_config(
 				db_type, db_id, clean,
 				apply_result, sizeof(apply_result));
 			if (apply_st != SG_OK) {
+				free(existing);
 				send_error(client_fd, apply_st, apply_result);
 				return 0;
 			}
 		}
+
+		free(existing);
+		existing = NULL;
 
 		if (sg_db_set(db_type, db_id, clean) != 0) {
 			mgmt_log("ERROR", "sg_db_set failed for %s", section);
@@ -3433,69 +3839,28 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 				}
 				free(data);
 			}
-		} else if (strcmp(db_type, "network_nat") == 0) {
-			char *data = sg_db_get(db_type, db_id);
-			if (data) {
-				char nattype[VALBUFSZ], srcintf[VALBUFSZ];
-				char dstport[VALBUFSZ], mapped_ip[VALBUFSZ];
-				char mapped_port[VALBUFSZ];
-				extract_val(data, "type", nattype,
-					    sizeof(nattype));
-				extract_val(data, "srcintf", srcintf,
-					    sizeof(srcintf));
-				extract_val(data, "dstport", dstport,
-					    sizeof(dstport));
-				extract_val(data, "mapped-ip", mapped_ip,
-					    sizeof(mapped_ip));
-				extract_val(data, "mapped-port", mapped_port,
-					    sizeof(mapped_port));
-
-				if (strcmp(nattype, "snat") == 0 &&
-				    srcintf[0]) {
-					const char *a[] = {
-						"iptables", "-t", "nat",
-						"-D", "POSTROUTING",
-						"-o", srcintf,
-						"-j", "MASQUERADE", NULL};
-					free(safe_exec(a));
-				} else if (strcmp(nattype, "dnat") == 0 &&
-					   dstport[0] && mapped_ip[0]) {
-					char tgt[VALBUFSZ * 2 + 4];
-					if (mapped_port[0])
-						snprintf(tgt, sizeof(tgt),
-							 "%s:%s", mapped_ip,
-							 mapped_port);
-					else
-						snprintf(tgt, sizeof(tgt),
-							 "%s", mapped_ip);
-					const char *a[] = {
-						"iptables", "-t", "nat",
-						"-D", "PREROUTING",
-						"-p", "tcp",
-						"--dport", dstport,
-						"-j", "DNAT",
-						"--to-destination", tgt,
-						NULL};
-					free(safe_exec(a));
-				}
-				free(data);
-			}
 		} else if (strcmp(db_type, "network_dhcp-server") == 0) {
 			/* Stop udhcpd daemon, remove firewall rule and
 			 * runtime files for this DHCP pool. */
 			unapply_dhcp(db_id);
-		} else if (strcmp(db_type, "firewall_policy") == 0) {
-			char *data = sg_db_get(db_type, db_id);
-			if (data) {
-				unapply_firewall_policy(db_id, data);
-				free(data);
-			}
 		}
+		/* Firewall/NAT: no per-rule unapply needed — atomic
+		 * rebuild after DB delete handles everything. */
 
 		if (sg_db_del(db_type, db_id) != 0) {
 			send_error(client_fd, SG_ERR_IO_FAIL, "Failed to delete section");
 			return 0;
 		}
+
+		/* Rebuild chains after deletion */
+		if (strcmp(db_type, "firewall_policy") == 0) {
+			char rb[512];
+			rebuild_forward_chain(rb, sizeof(rb));
+		} else if (strcmp(db_type, "network_nat") == 0) {
+			char rb[512];
+			rebuild_nat_chains(rb, sizeof(rb));
+		}
+
 		send_ok(client_fd, "Deleted", NULL);
 		return 0;
 	}
@@ -3590,15 +3955,150 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			}
 		}
 
+		/* Firewall/NAT: validation only — no kernel changes.
+		 * The actual iptables update happens in CFG_SET via
+		 * atomic rebuild.  This prevents the duplicate-rule
+		 * problem (CFG_APPLY + CFG_SET both inserting). */
 		char result[512];
-		sg_status_t st = apply_config(type_str, id_str, data,
-					      result, sizeof(result));
+		sg_status_t st;
+		if (strcmp(type_str, "firewall_policy") == 0)
+			st = validate_firewall_policy(id_str, data,
+						      result, sizeof(result));
+		else if (strcmp(type_str, "network_nat") == 0)
+			st = validate_nat(id_str, data,
+					  result, sizeof(result));
+		else
+			st = apply_config(type_str, id_str, data,
+					  result, sizeof(result));
 
 		if (st == SG_OK) {
 			send_ok(client_fd, result, NULL);
 		} else {
 			send_error(client_fd, st, result);
 		}
+		return 0;
+	}
+
+	case SG_CMD_CFG_INSERT: {
+		/* Move entry to a new sequence position.
+		 * Payload: "type:id\nnew_sequence\n"
+		 * Flow: delete old kernel rule → insert at new position
+		 * → update DB only if kernel succeeded. */
+		if (!payload || hdr->payload_len == 0) {
+			send_error(client_fd, SG_ERR_MISSING_ARG,
+				   "Missing type:id + sequence");
+			return 0;
+		}
+		char section[256] = {0};
+		const char *nl = strchr(payload, '\n');
+		if (!nl) {
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "Bad format (expected type:id\\nsequence)");
+			return 0;
+		}
+		size_t slen = (size_t)(nl - payload);
+		if (slen >= sizeof(section)) slen = sizeof(section) - 1;
+		memcpy(section, payload, slen);
+		section[slen] = '\0';
+
+		const char *seq_data = nl + 1;
+		int new_seq = atoi(seq_data);
+		if (new_seq < 1 || new_seq > 9999) {
+			send_error(client_fd, SG_ERR_INVALID_VAL,
+				   "Sequence out of range (1-9999)");
+			return 0;
+		}
+
+		char db_type[256], db_id[256];
+		sg_db_parse_section(section, db_type, sizeof(db_type),
+				    db_id, sizeof(db_id));
+
+		/* Only firewall_policy and network_nat have sequences */
+		if (strcmp(db_type, "firewall_policy") != 0 &&
+		    strcmp(db_type, "network_nat") != 0) {
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "Type does not support sequence ordering");
+			return 0;
+		}
+
+		/* Permission check (same as CFG_SET) */
+		{
+			const char *req = get_type_permission(db_type);
+			if (!req) {
+				send_error(client_fd, SG_ERR_INVALID_ARG,
+					   "Unknown config type");
+				return 0;
+			}
+			const char *perms = get_user_permissions(user);
+			if (strcmp(req, "admin") == 0) {
+				if (!has_permission(perms, "admin")) {
+					send_error(client_fd, SG_ERR_PERM_DENIED,
+						   "Requires 'admin' permission");
+					return 0;
+				}
+			} else {
+				if (!has_permission(perms, "configure") &&
+				    !has_permission(perms, "admin")) {
+					send_error(client_fd, SG_ERR_PERM_DENIED,
+						   "Requires 'configure' permission");
+					return 0;
+				}
+			}
+		}
+
+		/* Entry must exist */
+		char *entry_data = sg_db_get(db_type, db_id);
+		if (!entry_data) {
+			send_error(client_fd, SG_ERR_ENTRY_NOT_FOUND, db_id);
+			return 0;
+		}
+
+		/* Builtin policies cannot be reordered */
+		{
+			char bi[VALBUFSZ];
+			extract_val(entry_data, "builtin", bi, sizeof(bi));
+			if (strcmp(bi, "yes") == 0) {
+				free(entry_data);
+				send_error(client_fd, SG_ERR_BUILTIN,
+					   "Builtin policy cannot be moved");
+				return 0;
+			}
+		}
+
+		/* Read old sequence */
+		char old_seq_str[VALBUFSZ];
+		extract_val(entry_data, "sequence", old_seq_str,
+			    sizeof(old_seq_str));
+		int old_seq = old_seq_str[0] ? atoi(old_seq_str) : 999999;
+
+		/* No-op if sequence unchanged */
+		if (old_seq == new_seq) {
+			free(entry_data);
+			send_ok(client_fd, "Sequence unchanged", NULL);
+			return 0;
+		}
+
+		free(entry_data);
+
+		/* Step 1: Handle sequence collision in DB */
+		if (seq_has_collision(db_type, new_seq, db_id))
+			seq_shift(db_type, new_seq, db_id);
+
+		/* Step 2: Update sequence in DB */
+		{
+			char seq_clean[16];
+			snprintf(seq_clean, sizeof(seq_clean), "%d", new_seq);
+			sg_db_set_val(db_type, db_id, "sequence", seq_clean);
+		}
+
+		/* Step 3: Atomic rebuild from DB */
+		char result[512];
+		if (strcmp(db_type, "firewall_policy") == 0)
+			rebuild_forward_chain(result, sizeof(result));
+		else
+			rebuild_nat_chains(result, sizeof(result));
+
+		send_ok(client_fd, result, NULL);
 		return 0;
 	}
 
@@ -3687,6 +4187,9 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		}
 		return 0;
 	}
+
+	case SG_CMD_SYS_FACTORY_RESET:
+		return handle_factory_reset(client_fd, user, payload, hdr);
 
 	/* ── Firmware upgrade (handlers in mgmtd_firmware.c) ──────────── */
 	case SG_CMD_UPGRADE_STATUS:

@@ -237,23 +237,24 @@ static void test_supervisor(void)
 	printf(C_CYAN "\n  --- SEC-SUP-5: Config-gated restart ---"
 	       C_NC "\n");
 
-	/* Create a test interface config entry with mode=dhcp */
+	/* Create a test config entry.  Use firewall_service (no
+	 * apply handler) so CFG_SET always succeeds — we only need
+	 * the DB value for the config-gated restart check. */
 	{
 		struct ipc_response r;
 		ipc_send_str(SG_CMD_CFG_SET,
-			     "system_interface:__sup_test\n"
-			     "mode=dhcp\nstatus=up\nip=127.0.0.1/8\n"
-			     "mtu=1500\n", &r);
+			     "firewall_service:__sup_test\n"
+			     "protocol=tcp\nport-range=8080\n", &r);
 		ipc_resp_free(&r);
 	}
 
-	/* Start config-gated child: only restart if mode=dhcp.
+	/* Start config-gated child: only restart if protocol=tcp.
 	 * Use sleep 300 so it stays alive between kills. */
 	sup_check("SEC-SUP-5a", "start config-gated child",
 		  "start_config\n__test_sup5\n"
 		  "/bin/sleep\n300\n"
 		  "---\n"
-		  "system_interface\n__sup_test\nmode\ndhcp", SG_OK);
+		  "firewall_service\n__sup_test\nprotocol\ntcp", SG_OK);
 	usleep(200000);
 
 	/* Kill it — should restart because mode=dhcp */
@@ -267,24 +268,23 @@ static void test_supervisor(void)
 		if (pid5b > 0 && pid5b != pid5a) {
 			sup_pass++;
 			printf(C_GREEN "  PASS" C_NC
-			       " [SEC-SUP-5b] restarted (mode=dhcp)\n");
+			       " [SEC-SUP-5b] restarted (protocol=tcp)\n");
 		} else {
 			sup_fail++;
 			printf(C_RED "  FAIL" C_NC
 			       " [SEC-SUP-5b] should have restarted\n");
 		}
 
-		/* Change config to mode=static */
+		/* Change config to protocol=udp */
 		{
 			struct ipc_response r;
 			ipc_send_str(SG_CMD_CFG_SET,
-				     "system_interface:__sup_test\n"
-				     "mode=static\nstatus=up\n"
-				     "ip=127.0.0.1/8\nmtu=1500\n", &r);
+				     "firewall_service:__sup_test\n"
+				     "protocol=udp\nport-range=8080\n", &r);
 			ipc_resp_free(&r);
 		}
 
-		/* Kill again — should NOT restart (mode != dhcp) */
+		/* Kill again — should NOT restart (protocol != tcp) */
 		int pid5c = sup_query_pid("__test_sup5");
 		if (pid5c > 0) {
 			sup_kill("__test_sup5");
@@ -296,7 +296,7 @@ static void test_supervisor(void)
 				sup_pass++;
 				printf(C_GREEN "  PASS" C_NC
 				       " [SEC-SUP-5c] not restarted"
-				       " (mode=static)\n");
+				       " (protocol=udp)\n");
 			} else {
 				sup_fail++;
 				printf(C_RED "  FAIL" C_NC
@@ -317,7 +317,7 @@ static void test_supervisor(void)
 	{
 		struct ipc_response r;
 		ipc_send_str(SG_CMD_CFG_DEL,
-			     "system_interface:__sup_test", &r);
+			     "firewall_service:__sup_test", &r);
 		ipc_resp_free(&r);
 	}
 

@@ -420,7 +420,6 @@
                         <span class="rf-col rf-col-status" data-sort="status">STATUS</span>
                         <span class="rf-col rf-col-hits" data-sort="hits">HITS</span>
                         <span class="rf-col rf-col-iface" data-sort="iface">IFACE</span>
-                        <span class="rf-col rf-col-flow">FLOW</span>
                         <span class="rf-col rf-col-dest rf-sort-active" data-sort="dest">DESTINATION &#9650;</span>
                     </div>
                     <div id="route-flow-body"></div>
@@ -554,6 +553,7 @@
                     <div class="form-section"><span class="modal-title-text">NEW NAT RULE</span><span class="modal-close" data-toggle-form="form-nat">&#10005;</span></div>
                     <div class="modal-body">
                         <div class="form-grid">
+                            <div class="form-row"><label class="form-label">Sequence</label><input class="form-input" type="number" min="0" max="9999" placeholder="Auto if empty"></div>
                             <div class="form-row"><label class="form-label">Type</label><select class="form-input"><option value="snat" selected>SNAT (Source)</option><option value="dnat">DNAT (Destination)</option></select></div>
                             <div class="form-row"><label class="form-label">Original Source</label><input class="form-input" type="text" placeholder="192.168.1.0/24 or all"></div>
                             <div class="form-row"><label class="form-label">Original Destination</label><input class="form-input" type="text" placeholder="0.0.0.0/0 or all"></div>
@@ -569,7 +569,7 @@
                 </div>
                 <div class="toolbar"><div class="toolbar-search"><input type="text" placeholder="Filter rules..." class="table-filter" data-target="tbl-nat"><button class="search-btn" type="button">&#9906;</button></div></div>
                 <table class="data-table" data-entity="nat">
-                    <thead><tr><th class="th-checkbox"><input type="checkbox" class="select-all"></th><th>#</th><th>TYPE</th><th>SOURCE</th><th>DESTINATION</th><th>INTERFACE</th><th>STATUS</th></tr></thead>
+                    <thead><tr><th class="th-checkbox"><input type="checkbox" class="select-all"></th><th>#</th><th>SEQ</th><th>TYPE</th><th>SOURCE</th><th>DESTINATION</th><th>INTERFACE</th><th>STATUS</th></tr></thead>
                     <tbody>
                     </tbody>
                 </table>
@@ -586,6 +586,7 @@
                     <div class="modal-body">
                         <div class="form-grid">
                             <div class="form-row"><label class="form-label">Name</label><input class="form-input" type="text" placeholder="e.g. Allow-HTTPS-Out"></div>
+                            <div class="form-row"><label class="form-label">Sequence</label><input class="form-input" type="number" min="0" max="9999" placeholder="Auto if empty"></div>
                             <div class="form-row"><label class="form-label">Status</label><select class="form-input"><option value="enable" selected>Enabled</option><option value="disable">Disabled</option></select></div>
                             <div class="form-row"><label class="form-label">Incoming Interface</label><select class="form-input iface-select"><option>any</option></select></div>
                             <div class="form-row"><label class="form-label">Outgoing Interface</label><select class="form-input iface-select"><option>any</option></select></div>
@@ -601,7 +602,7 @@
                 </div>
                 <div class="toolbar"><div class="toolbar-search"><input type="text" placeholder="Filter policies..." class="table-filter" data-target="tbl-policies"><button class="search-btn" type="button">&#9906;</button></div></div>
                 <table class="data-table" data-entity="policies">
-                    <thead><tr><th class="th-checkbox"><input type="checkbox" class="select-all"></th><th>ID</th><th>NAME</th><th>FROM</th><th>TO</th><th>SOURCE</th><th>DEST</th><th>SERVICE</th><th>ACTION</th><th>STATUS</th></tr></thead>
+                    <thead><tr><th class="th-checkbox"><input type="checkbox" class="select-all"></th><th>ID</th><th>SEQ</th><th>NAME</th><th>FROM</th><th>TO</th><th>SOURCE</th><th>DEST</th><th>SERVICE</th><th>ACTION</th><th>STATUS</th></tr></thead>
                     <tbody>
                     </tbody>
                 </table>

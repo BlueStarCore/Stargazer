@@ -648,6 +648,35 @@ static void flow_config_create(work_item_t *item)
 			set_payload = item->payload + alen + 1;
 	}
 
+	/* Step 0: Check if entry already exists — reject duplicate create.
+	 * Extract "type:id" from the SET payload (first line). */
+	if (set_payload) {
+		char section[512];
+		const char *nl = strchr(set_payload, '\n');
+		size_t slen = nl ? (size_t)(nl - set_payload) : strlen(set_payload);
+		if (slen >= sizeof(section)) slen = sizeof(section) - 1;
+		memcpy(section, set_payload, slen);
+		section[slen] = '\0';
+
+		char get_buf[520];
+		snprintf(get_buf, sizeof(get_buf), "%s\n", section);
+
+		webd_ipc_response_t chk;
+		if (webd_ipc_send(SG_CMD_CFG_GET, item->username,
+				  item->session_tag, get_buf, &chk) == 0) {
+			if (chk.status == SG_OK && chk.payload_len > 0) {
+				/* Entry exists — reject create */
+				webd_ipc_resp_free(&chk);
+				char *json = json_error(
+					"Entry already exists", NULL);
+				send_result(item->conn_id, 409, json,
+					    json ? strlen(json) : 0);
+				return;
+			}
+			webd_ipc_resp_free(&chk);
+		}
+	}
+
 	/* Step 1: APPLY first (test run) */
 	webd_ipc_response_t resp;
 	if (webd_ipc_send(SG_CMD_CFG_APPLY, item->username,
@@ -1515,6 +1544,7 @@ static void *worker_fn(void *arg)
 		case FLOW_RES_DISK:     flow_res_disk(&item);        break;
 		case FLOW_RES_PROCTOP:  flow_res_proctop(&item);     break;
 		case FLOW_ADMIN_CREATE: flow_admin_create(&item);    break;
+		case FLOW_CONFIG_MOVE:  flow_simple(&item);          break;
 		default:                 flow_simple(&item);          break;
 		}
 

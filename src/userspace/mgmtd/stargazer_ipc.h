@@ -68,6 +68,7 @@ typedef enum {
 	SG_CMD_CFG_SET       = 200,   /* Set/update section data         */
 	SG_CMD_CFG_DEL       = 201,   /* Delete a section                */
 	SG_CMD_CFG_APPLY     = 202,   /* Apply config to running system  */
+	SG_CMD_CFG_INSERT    = 203,   /* Move entry to new sequence pos  */
 
 	/* Admin management (3xx) */
 	SG_CMD_ADMIN_CREATE  = 300,   /* Create admin user               */
@@ -107,6 +108,7 @@ typedef enum {
 	SG_CMD_SHOW_ROUTES   = 612,
 	SG_CMD_SHOW_CONFIG   = 613,   /* Reserved: not yet implemented   */
 	SG_CMD_SHOW_STATS    = 614,
+	SG_CMD_SYS_FACTORY_RESET = 615, /* Factory reset to defaults         */
 	SG_CMD_WHOAMI        = 620,   /* Get caller's profile+permissions */
 
 	/* Firewall/routing diagnostics (63x) */

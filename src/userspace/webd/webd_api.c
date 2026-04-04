@@ -12,6 +12,7 @@
 #include "webd_session.h"
 #include "webd_ipc.h"
 #include "stargazer_ipc.h"
+#include "sg_validate.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -616,7 +617,14 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 			char *name = json_str(hm->body, "$.name");
 			char *id_field = json_str(hm->body, "$.id");
 			const char *entry_id = name ? name : id_field;
-			if (!entry_id) entry_id = "new";
+			if (!entry_id || !*entry_id) {
+				free(kv_raw);
+				free(name);
+				free(id_field);
+				reply_json(c, 400,
+					   "{\"error\":\"Missing 'name' or 'id'\"}");
+				return -1;
+			}
 
 			/* Strip 'id' key — it's the entry identifier, not a
 			 * config field.  Keep 'name' — some types (e.g.
@@ -754,6 +762,57 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 			item.conn_id = c->id;
 			item.ipc_cmd = SG_CMD_CFG_DEL;
 			item.flow_type = FLOW_SIMPLE;
+			snprintf(item.username, sizeof(item.username),
+				 "%s", sess.username);
+			item.session_tag = sess.ipc_session_tag;
+			item.payload = strdup(payload);
+			if (!item.payload) {
+				reply_json(c, 500,
+					   "{\"error\":\"Internal error\"}");
+				return -1;
+			}
+			item.payload_len = strlen(item.payload);
+
+			if (webd_pool_enqueue(&item) != 0) {
+				free(item.payload);
+				reply_json(c, 503,
+					   "{\"error\":\"Server busy\"}");
+				return -1;
+			}
+			return 0;
+		}
+
+		/* PATCH /api/config/{type}/{id}/move — reorder entry */
+		if (nseg >= 4 && strcmp(segs[3], "move") == 0 &&
+		    mg_str_eq(hm->method, "PATCH")) {
+			/* Body: {"sequence": N} */
+			char *kv_raw = json_body_to_kv(hm->body);
+			if (!kv_raw) {
+				reply_json(c, 400,
+					   "{\"error\":\"Invalid body\"}");
+				return -1;
+			}
+			/* Extract sequence value from kv */
+			char seq_val[32] = {0};
+			sg_kv_get(kv_raw, "sequence", seq_val, sizeof(seq_val));
+			free(kv_raw);
+
+			if (!seq_val[0]) {
+				reply_json(c, 400,
+					   "{\"error\":\"Missing 'sequence'\"}");
+				return -1;
+			}
+
+			/* Build CFG_INSERT payload: "type:id\nsequence\n" */
+			char payload[512];
+			snprintf(payload, sizeof(payload), "%s:%s\n%s\n",
+				 type, segs[2], seq_val);
+
+			work_item_t item;
+			memset(&item, 0, sizeof(item));
+			item.conn_id = c->id;
+			item.ipc_cmd = SG_CMD_CFG_INSERT;
+			item.flow_type = FLOW_CONFIG_MOVE;
 			snprintf(item.username, sizeof(item.username),
 				 "%s", sess.username);
 			item.session_tag = sess.ipc_session_tag;
