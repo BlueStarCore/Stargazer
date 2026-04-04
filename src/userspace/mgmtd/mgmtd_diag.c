@@ -7,7 +7,7 @@
  * are proxied through these IPC handlers.
  *
  * Permission requirements:
- *   - Diagnostics (640-645, 650-651): "monitor" permission
+ *   - Diagnostics (640-645, 650-652): "monitor" permission
  *   - Debug state (660-662): "admin" permission
  *   - History save (663): any authenticated user
  */
@@ -28,6 +28,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ── Helpers ───────────────────────────────────────────────────────────── */
@@ -1624,5 +1625,52 @@ int handle_history_load(int client_fd, const char *user,
 	}
 
 	send_ok(client_fd, NULL, buf);
+	return 0;
+}
+
+/* ── SG_CMD_DIAG_NTP (652) ────────────────────────────────────────────── */
+
+int handle_diag_ntp(int client_fd, const char *user,
+		    const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)payload; (void)hdr;
+
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "monitor permission required");
+		return 0;
+	}
+
+	char resp[SG_RESPONSE_MAX];
+	size_t pos = 0;
+
+	/* NTP server from config */
+	char *data = sg_db_get("system_ntp", "0");
+	char server[128] = {0};
+	if (data) {
+		extract_val(data, "server", server, sizeof(server));
+		free(data);
+	}
+
+	buf_appendf(resp, sizeof(resp), &pos,
+		    "server=%s\n", server[0] ? server : "(none)");
+
+	/* ntpd process status via supervisor */
+	pid_t pid = supervisor_get_pid("ntpd");
+	buf_appendf(resp, sizeof(resp), &pos,
+		    "status=%s\n", pid > 0 ? "running" : "stopped");
+	buf_appendf(resp, sizeof(resp), &pos,
+		    "pid=%d\n", (int)pid);
+
+	/* Current system time */
+	time_t now = time(NULL);
+	struct tm tm;
+	localtime_r(&now, &tm);
+	char ts[64];
+	strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S%z", &tm);
+	buf_appendf(resp, sizeof(resp), &pos, "time=%s\n", ts);
+
+	send_ok(client_fd, NULL, pos > 0 ? resp : NULL);
 	return 0;
 }

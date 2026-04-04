@@ -1373,6 +1373,15 @@ static int mgmtd_seed_defaults(void)
 		      "hostname=stargazer\n"
 		      "ip-forward=enable\n") != 0) goto fail;
 
+	/* ── DNS (always on) ─────────────────────────────────────── */
+	if (sg_db_set("network_dns", "0",
+		      "primary=1.1.1.1\n"
+		      "secondary=8.8.8.8\n") != 0) goto fail;
+
+	/* ── NTP (always on, default to pool.ntp.org) ────────────── */
+	if (sg_db_set("system_ntp", "0",
+		      "server=pool.ntp.org\n") != 0) goto fail;
+
 	/* ── Default firewall policy (deny all) ─────────────────────── */
 	if (sg_db_set("firewall_policy", "1",
 		      "name=default-deny\n"
@@ -4541,6 +4550,8 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 	case SG_CMD_DISK_SMART:
 		return handle_disk_smart(client_fd, user, payload, hdr);
 
+	case SG_CMD_DIAG_NTP:
+		return handle_diag_ntp(client_fd, user, payload, hdr);
 	case SG_CMD_SHOW_SESSIONS:
 		return handle_show_sessions(client_fd, user, payload, hdr);
 	case SG_CMD_SHOW_BOOT_CONFIG:

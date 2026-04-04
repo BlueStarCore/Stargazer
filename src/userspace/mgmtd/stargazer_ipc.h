@@ -132,6 +132,7 @@ typedef enum {
 	/* Show data (65x) */
 	SG_CMD_SHOW_SESSIONS     = 650,  /* /proc/stargazer/sessions contents  */
 	SG_CMD_SHOW_BOOT_CONFIG  = 651,  /* modules + sysctl config files      */
+	SG_CMD_DIAG_NTP          = 652,  /* NTP status: server, pid, time      */
 
 	/* Debug state (66x) */
 	SG_CMD_DEBUG_STATE_GET   = 660,  /* Read debug conf key=value pairs    */
@@ -266,6 +267,7 @@ static inline int sg_cmd_audit_skip(sg_cmd_t cmd)
 	case SG_CMD_DISK_INFO:
 	case SG_CMD_DISK_SMART:
 	case SG_CMD_SUPERVISOR_TEST:
+	case SG_CMD_DIAG_NTP:
 		return 1;
 	default:
 		return 0;

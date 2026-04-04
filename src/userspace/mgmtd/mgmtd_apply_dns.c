@@ -2,7 +2,7 @@
 /*
  * mgmtd_apply_dns.c — Apply handler for network_dns
  *
- * Writes /etc/resolv.conf from the saved DNS configuration.
+ * DNS is always on.  Writes /etc/resolv.conf from saved configuration.
  */
 
 #include "mgmtd_apply.h"
@@ -15,15 +15,9 @@ sg_status_t apply_dns(const char *id, const char *data,
 {
 	(void)id;
 
-	char primary[VALBUFSZ], secondary[VALBUFSZ], status[VALBUFSZ];
+	char primary[VALBUFSZ], secondary[VALBUFSZ];
 	extract_val(data, "primary",   primary,   sizeof(primary));
 	extract_val(data, "secondary", secondary, sizeof(secondary));
-	extract_val(data, "status",    status,    sizeof(status));
-
-	if (strcmp(status, "disable") == 0) {
-		snprintf(result, rsize, "DNS disabled.");
-		return SG_OK;
-	}
 
 	if (!primary[0] && !secondary[0]) {
 		snprintf(result, rsize, "DNS: no servers configured.");

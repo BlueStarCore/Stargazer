@@ -581,7 +581,69 @@ static int cmd_diag_resources(const char *args, const char *permissions)
 	return 0;
 }
 
-/* ── Disk diagnostic handlers ─────────────────────────────────────────── */
+/* ── NTP diagnostic handler ──────────────���───────────────────────────── */
+
+static int cmd_diag_ntp(const char *args, const char *permissions)
+{
+	(void)args;
+	(void)permissions;
+
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_DIAG_NTP, "", &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+
+	if (resp.status != SG_OK) {
+		print_ipc_error("Error", &resp);
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	/* Parse key=value lines from response */
+	char server[128] = {0}, status[16] = {0};
+	char pid[16] = {0}, timebuf[64] = {0};
+	const char *p = resp.payload;
+	while (p && *p) {
+		const char *eol = strchr(p, '\n');
+		size_t len = eol ? (size_t)(eol - p) : strlen(p);
+		char line[256];
+		if (len >= sizeof(line)) len = sizeof(line) - 1;
+		memcpy(line, p, len);
+		line[len] = '\0';
+
+		char *eq = strchr(line, '=');
+		if (eq) {
+			*eq = '\0';
+			const char *val = eq + 1;
+			if (strcmp(line, "server") == 0)
+				snprintf(server, sizeof(server), "%s", val);
+			else if (strcmp(line, "status") == 0)
+				snprintf(status, sizeof(status), "%s", val);
+			else if (strcmp(line, "pid") == 0)
+				snprintf(pid, sizeof(pid), "%s", val);
+			else if (strcmp(line, "time") == 0)
+				snprintf(timebuf, sizeof(timebuf), "%s", val);
+		}
+
+		if (!eol) break;
+		p = eol + 1;
+	}
+
+	printf("  NTP server : %s\n", server[0] ? server : "(none)");
+	printf("  NTP status : %s", status);
+	if (strcmp(status, "running") == 0 && pid[0] &&
+	    strcmp(pid, "0") != 0)
+		printf(" (pid %s)", pid);
+	printf("\n");
+	printf("  System time: %s\n", timebuf[0] ? timebuf : "(unknown)");
+
+	ipc_resp_free(&resp);
+	return 0;
+}
+
+/* ── Disk diagnostic handlers ──────────────��──────────────────────────── */
 
 static int cmd_diag_disk_list(const char *args, const char *permissions)
 {

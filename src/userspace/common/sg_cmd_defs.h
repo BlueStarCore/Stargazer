@@ -86,6 +86,8 @@ X("execute diagnose disk list",             "List available disks",             
 X("execute diagnose disk info",             "Show disk/partition details",             "admin",           1,  cmd_diag_disk_info)
 X("execute diagnose disk smart",            "Show eMMC wear/health",                   "admin",           0,  cmd_diag_disk_smart)
 
+X("execute diagnose ntp",                   "Show NTP status and system time",         "monitor",         0,  cmd_diag_ntp)
+
 X("execute diagnose selftest",              "Run built-in self-tests",                 "admin",           1,  cmd_diag_selftest)
 X("execute diagnose selftest full",         "All suites, full mode (with IPC)",        "admin",           0,  NULL)
 X("execute diagnose selftest permissions",  "Permission model tests (full)",           "admin",           0,  NULL)

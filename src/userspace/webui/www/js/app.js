@@ -2455,7 +2455,7 @@
     var SETTINGS_MAP = {
         'system': [
             { configType: 'system_settings', fields: { 'hostname': 'Hostname', 'ip-forward': 'IP Forward', 'timezone': 'Timezone' } },
-            { configType: 'system_ntp', fields: { 'status': 'NTP Sync', 'server': 'NTP Server' } },
+            { configType: 'system_ntp', fields: { 'server': 'NTP Server' } },
             { configType: 'network_dns', fields: { 'primary': 'Primary DNS', 'secondary': 'Secondary DNS' } }
         ],
         'password-policy': [

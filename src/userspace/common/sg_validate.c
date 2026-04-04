@@ -84,13 +84,9 @@ static const struct field_entry field_table[] = {
 	{ "system_settings", "ip-forward", "enum:enable,disable", 0, "enable",    "IPv4 packet forwarding" },
 	{ "system_settings", "timezone",   "tz-token",            0, "UTC",       "System timezone"      },
 
-	/* network_dns */
-	{ "network_dns", "primary",    "ipv4",                0, NULL,     "Primary DNS server"       },
-	{ "network_dns", "secondary",  "ipv4",                0, NULL,     "Secondary DNS server"     },
-	{ "network_dns", "listen-on",  "ipv4",                1, NULL,     "Listen address for DNS"   },
-	{ "network_dns", "port",       "uint:1:65535",        1, "53",     "DNS listening port"       },
-	{ "network_dns", "cache-size", "uint:0:100000",       1, "10000",  "DNS cache size (entries)" },
-	{ "network_dns", "status",     "enum:enable,disable", 0, "enable", "Enable or disable DNS"    },
+	/* network_dns — always on, no status field */
+	{ "network_dns", "primary",   "ipv4", 0, "1.1.1.1", "Primary DNS server"   },
+	{ "network_dns", "secondary", "ipv4", 1, "8.8.8.8", "Secondary DNS server" },
 
 	/* network_dhcp-server */
 	{ "network_dhcp-server", "interface",   "ref-iface:system_interface", 0, NULL, "Interface to serve DHCP"     },
@@ -103,9 +99,8 @@ static const struct field_entry field_table[] = {
 	{ "network_dhcp-server", "lease-time",  "uint:60:604800",      0, "86400",  "Lease time in seconds"        },
 	{ "network_dhcp-server", "status",      "enum:enable,disable", 0, "enable", "Enable or disable this pool"  },
 
-	/* system_ntp */
-	{ "system_ntp", "server", "ipv4",                0, NULL, "NTP server address"          },
-	{ "system_ntp", "status", "enum:enable,disable", 0, "enable", "Enable or disable NTP sync"  },
+	/* system_ntp — always on, no status field */
+	{ "system_ntp", "server", "safe-id", 0, "pool.ntp.org", "NTP server address or hostname" },
 
 	/* firewall_policy */
 	{ "firewall_policy", "name",     "safe-id",                         0, NULL,     "Policy name"                },
