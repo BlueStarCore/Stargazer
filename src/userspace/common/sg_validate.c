@@ -53,21 +53,23 @@ static const struct field_entry field_table[] = {
 	/* network_route_static */
 	{ "network_route_static", "dst",      "cidr",                0, NULL,     "Destination network"          },
 	{ "network_route_static", "gateway",  "ipv4",                0, NULL,     "Next-hop gateway address"     },
-	{ "network_route_static", "device",   "iface",               0, NULL,     "Outgoing interface"           },
+	{ "network_route_static", "device",   "ref-iface:system_interface", 0, NULL, "Outgoing interface"          },
 	{ "network_route_static", "distance", "uint:1:255",          0, "10",     "Administrative distance"      },
 	{ "network_route_static", "status",   "enum:enable,disable", 0, "enable", "Enable or disable this route" },
 	{ "network_route_static", "comment",  "string",              1, NULL,     "Optional description"         },
 
 	/* network_nat */
 	{ "network_nat", "type",        "enum:snat,dnat",        0, NULL,     "NAT type"                    },
-	{ "network_nat", "srcintf",     "iface",                 0, NULL,     "Source interface"             },
-	{ "network_nat", "dstintf",     "iface",                 0, NULL,     "Destination interface"        },
+	{ "network_nat", "srcintf",     "ref-iface-or:system_interface:any", 0, NULL, "Source interface"            },
+	{ "network_nat", "dstintf",     "ref-iface-or:system_interface:any", 1, NULL, "Destination interface"       },
+	{ "network_nat", "protocol",    "enum:tcp,udp,tcp+udp,all", 0, "all", "Protocol (tcp, udp, tcp+udp, or all)" },
 	{ "network_nat", "srcaddr",     "cidr-or:any,all",       0, NULL,     "Source address or subnet"     },
 	{ "network_nat", "dstaddr",     "cidr-or:any,all",       0, NULL,     "Destination address or subnet" },
-	{ "network_nat", "dstport",     "uint:1:65535",          0, NULL,     "Destination port"             },
-	{ "network_nat", "mapped-ip",   "ipv4",                  0, NULL,     "Translated IP address"        },
-	{ "network_nat", "mapped-port", "uint:1:65535",          0, NULL,     "Translated port"              },
+	{ "network_nat", "dstport",     "uint:1:65535",          1, NULL,     "Destination port"             },
+	{ "network_nat", "mapped-ip",   "ipv4",                  1, NULL,     "Translated IP address"        },
+	{ "network_nat", "mapped-port", "uint:1:65535",          1, NULL,     "Translated port"              },
 	{ "network_nat", "status",      "enum:enable,disable",   0, "enable", "Enable or disable this rule"  },
+	{ "network_nat", "sequence",    "uint:1:9999",           1, NULL,     "Priority (higher = checked first)" },
 
 	/* system_interface */
 	{ "system_interface", "mode",        "enum:static,dhcp", 0, "static", "Addressing mode"              },
@@ -91,7 +93,7 @@ static const struct field_entry field_table[] = {
 	{ "network_dns", "status",     "enum:enable,disable", 0, "enable", "Enable or disable DNS"    },
 
 	/* network_dhcp-server */
-	{ "network_dhcp-server", "interface",   "iface",               0, NULL,     "Interface to serve DHCP"      },
+	{ "network_dhcp-server", "interface",   "ref-iface:system_interface", 0, NULL, "Interface to serve DHCP"     },
 	{ "network_dhcp-server", "start-ip",    "ipv4",                0, NULL,     "Pool start address"           },
 	{ "network_dhcp-server", "end-ip",      "ipv4",                0, NULL,     "Pool end address"             },
 	{ "network_dhcp-server", "netmask",     "ipv4",                0, NULL,     "Subnet mask for clients"      },
@@ -107,8 +109,8 @@ static const struct field_entry field_table[] = {
 
 	/* firewall_policy */
 	{ "firewall_policy", "name",     "safe-id",                         0, NULL,     "Policy name"                },
-	{ "firewall_policy", "srcintf",  "iface",                           0, "any",    "Source interface"           },
-	{ "firewall_policy", "dstintf",  "iface",                           0, "any",    "Destination interface"      },
+	{ "firewall_policy", "srcintf",  "ref-iface-or:system_interface:any", 0, "any",   "Source interface"           },
+	{ "firewall_policy", "dstintf",  "ref-iface-or:system_interface:any", 0, "any",   "Destination interface"      },
 	{ "firewall_policy", "srcaddr",  "ref-or:firewall_address:all,any", 0, "all",    "Source address object"      },
 	{ "firewall_policy", "dstaddr",  "ref-or:firewall_address:all,any", 0, "all",    "Destination address object" },
 	{ "firewall_policy", "action",   "enum:accept,deny,drop",           0, "deny",   "Matching traffic action"    },
@@ -116,6 +118,7 @@ static const struct field_entry field_table[] = {
 	{ "firewall_policy", "schedule", "safe-id-or:all,any",              0, "all",    "Schedule object"            },
 	{ "firewall_policy", "status",   "enum:enable,disable",             0, "enable", "Enable or disable this policy" },
 	{ "firewall_policy", "comment",  "string",                          1, NULL,     "Optional description"       },
+	{ "firewall_policy", "sequence", "uint:1:9999",                     1, NULL,     "Priority (higher = checked first)" },
 
 	/* firewall_address */
 	{ "firewall_address", "name",    "safe-id",                  0, NULL,     "Address object name"  },
@@ -635,6 +638,11 @@ sg_reg_required_keys(const char *type_name)
 	for (const struct field_entry *f = field_table; f->type; f++) {
 		if (strcmp(f->type, type_name) != 0 || f->optional)
 			continue;
+		/* Fields with defaults are backfilled by CFG_SET after
+		 * validation — only truly mandatory (no default) keys
+		 * need to be present in the user payload. */
+		if (f->defval)
+			continue;
 		if (pos > 0 && pos < sizeof(buf) - 1)
 			buf[pos++] = ' ';
 		size_t klen = strlen(f->key);
@@ -845,6 +853,34 @@ sg_reg_value_rule(const char *type_name, const char *key)
 		return buf;
 	}
 
+	/* ref-iface:TYPE → "existing interface" */
+	if (strncmp(kind, "ref-iface:", 10) == 0) {
+		snprintf(buf, sizeof(buf), "existing interface name");
+		return buf;
+	}
+	/* ref-iface-or:TYPE:a,b → "existing interface or a|b" */
+	if (strncmp(kind, "ref-iface-or:", 13) == 0) {
+		const char *rest = kind + 13;
+		const char *colon = strchr(rest, ':');
+		if (colon) {
+			char alt[64];
+			size_t alen = strlen(colon + 1);
+			if (alen >= sizeof(alt))
+				alen = sizeof(alt) - 1;
+			memcpy(alt, colon + 1, alen);
+			alt[alen] = '\0';
+			for (char *p = alt; *p; p++) {
+				if (*p == ',')
+					*p = '|';
+			}
+			snprintf(buf, sizeof(buf),
+				 "existing interface or %s", alt);
+		} else {
+			snprintf(buf, sizeof(buf), "existing interface name");
+		}
+		return buf;
+	}
+
 	/* safe-id-or:a,b → "safe identifier or a|b" */
 	if (strncmp(kind, "safe-id-or:", 11) == 0) {
 		const char *opts = kind + 11;
@@ -987,6 +1023,18 @@ sg_reg_validate_value(const char *type_name, const char *key, const char *val)
 		return sg_is_safe_id(val);
 	}
 
+	/* ref-iface:TYPE — validate as iface name, register as reference.
+	 * ref-iface-or:TYPE:a,b — iface name OR one of the listed options. */
+	if (strncmp(kind, "ref-iface:", 10) == 0)
+		return sg_is_iface_name(val);
+	if (strncmp(kind, "ref-iface-or:", 13) == 0) {
+		const char *rest = kind + 13;
+		const char *colon = strchr(rest, ':');
+		if (colon && sg_match_csv_option(colon + 1, val))
+			return 1;
+		return sg_is_iface_name(val);
+	}
+
 	/* string — non-empty */
 	return *val != '\0';
 }
@@ -1017,6 +1065,40 @@ sg_parse_ref_kind(const char *kind,
 	/* ref-or:TYPE:opts */
 	if (strncmp(kind, "ref-or:", 7) == 0) {
 		const char *rest = kind + 7;
+		const char *colon = strchr(rest, ':');
+		if (colon) {
+			size_t tlen = (size_t)(colon - rest);
+			if (tlen >= ref_sz) tlen = ref_sz - 1;
+			memcpy(ref_type, rest, tlen);
+			ref_type[tlen] = '\0';
+
+			const char *o = colon + 1;
+			size_t olen = strlen(o);
+			if (olen >= opts_sz) olen = opts_sz - 1;
+			memcpy(opts, o, olen);
+			opts[olen] = '\0';
+		} else {
+			size_t tlen = strlen(rest);
+			if (tlen >= ref_sz) tlen = ref_sz - 1;
+			memcpy(ref_type, rest, tlen);
+			ref_type[tlen] = '\0';
+		}
+		return 1;
+	}
+
+	/* ref-iface:TYPE — same parsing as ref:TYPE */
+	if (strncmp(kind, "ref-iface:", 10) == 0) {
+		const char *t = kind + 10;
+		size_t tlen = strlen(t);
+		if (tlen >= ref_sz) tlen = ref_sz - 1;
+		memcpy(ref_type, t, tlen);
+		ref_type[tlen] = '\0';
+		return 1;
+	}
+
+	/* ref-iface-or:TYPE:opts — same parsing as ref-or:TYPE:opts */
+	if (strncmp(kind, "ref-iface-or:", 13) == 0) {
+		const char *rest = kind + 13;
 		const char *colon = strchr(rest, ':');
 		if (colon) {
 			size_t tlen = (size_t)(colon - rest);

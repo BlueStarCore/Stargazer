@@ -37,6 +37,8 @@ X("execute",                                "Execute commands and operations",  
 X("execute system",                         "System management commands",              "admin",           0,  NULL)
 X("execute system shutdown",                "Shut down the system",                    "admin",           0,  cmd_sys_shutdown)
 X("execute system reboot",                  "Reboot the system",                       "admin",           0,  cmd_sys_reboot)
+X("execute system factory-reboot",         "Factory reset and reboot",                "admin",           0,  cmd_sys_factory_reboot)
+X("execute system factory-shutdown",       "Factory reset and shutdown",              "admin",           0,  cmd_sys_factory_shutdown)
 
 X("execute firmware",                       "Firmware management",                     "admin",           0,  NULL)
 X("execute firmware upgrade",               "Upgrade firmware from URL",               "admin",           1,  cmd_fw_upgrade)
@@ -102,4 +104,8 @@ X("execute diagnose firewall",              "Firewall diagnostics",             
 X("execute diagnose firewall policy",       "Show firewall policy and rules",          "admin",           1,  cmd_diag_fw_policy)
 X("execute diagnose firewall policy nat",   "Show NAT rules",                          "admin",           0,  NULL)
 X("execute diagnose firewall conntrack",    "Show connection tracking entries",         "admin",           0,  cmd_diag_fw_conntrack)
+
+X("execute diagnose nat",                  "NAT diagnostics",                         "admin",           0,  NULL)
+X("execute diagnose nat policy",           "Show kernel NAT table rules",             "admin",           0,  cmd_diag_nat_policy)
+
 X("execute diagnose routes",               "Show routing table",                       "admin",           0,  cmd_diag_routes)

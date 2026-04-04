@@ -456,6 +456,92 @@ static int cmd_sys_reboot(const char *args, const char *permissions)
 	return 0;
 }
 
+/*
+ * Double confirmation for factory reset — requires uppercase Y both times.
+ * Stricter than FortiGate's single y/n prompt, appropriate for a security
+ * appliance where accidental factory reset could be catastrophic.
+ *
+ * cli_term_echo_on() switches to canonical mode with echo so fgets()
+ * works like a normal terminal (user sees what they type, line editing,
+ * Enter submits).  cli_term_echo_off() restores quiet mode afterward.
+ */
+static int confirm_factory_reset(void)
+{
+	char buf[16] = {0};
+	int ok = 0;
+
+	printf("\n  WARNING: This will erase ALL configuration and logs.\n");
+	printf("  The device will return to factory defaults.\n");
+	printf("  You must be the first to login after boot — "
+	       "the default admin has no password.\n\n");
+
+	cli_term_echo_on();
+
+	printf("  This will delete all your saved and running "
+	       "configuration, are you sure? [Y/n] ");
+	fflush(stdout);
+	if (!fgets(buf, sizeof(buf), stdin) || buf[0] != 'Y') {
+		printf("  Aborted.\n");
+		goto out;
+	}
+
+	printf("  Are you really sure? [Y/n] ");
+	fflush(stdout);
+	if (!fgets(buf, sizeof(buf), stdin) || buf[0] != 'Y') {
+		printf("  Aborted.\n");
+		goto out;
+	}
+	ok = 1;
+
+out:
+	cli_term_echo_off();
+	return ok;
+}
+
+static int cmd_sys_factory_reboot(const char *args, const char *permissions)
+{
+	(void)args;
+	(void)permissions;
+	if (!confirm_factory_reset())
+		return 0;
+	printf("  Begin resetting device to factory defaults...\n");
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_SYS_FACTORY_RESET,
+			 "action=reboot\n", &resp) != 0) {
+		printf("  Error: could not contact management daemon.\n");
+	} else if (resp.status == SG_OK) {
+		printf("  Factory reset complete. Rebooting...\n");
+		ipc_resp_free(&resp);
+		for (;;) pause();
+	} else {
+		print_ipc_error("Error", &resp);
+	}
+	ipc_resp_free(&resp);
+	return 0;
+}
+
+static int cmd_sys_factory_shutdown(const char *args, const char *permissions)
+{
+	(void)args;
+	(void)permissions;
+	if (!confirm_factory_reset())
+		return 0;
+	printf("  Begin resetting device to factory defaults...\n");
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_SYS_FACTORY_RESET,
+			 "action=shutdown\n", &resp) != 0) {
+		printf("  Error: could not contact management daemon.\n");
+	} else if (resp.status == SG_OK) {
+		printf("  Factory reset complete. Shutting down...\n");
+		ipc_resp_free(&resp);
+		for (;;) pause();
+	} else {
+		print_ipc_error("Error", &resp);
+	}
+	ipc_resp_free(&resp);
+	return 0;
+}
+
 static int cmd_diag_top(const char *args, const char *permissions)
 {
 	(void)permissions;
@@ -794,6 +880,31 @@ static int cmd_diag_fw_policy(const char *args, const char *permissions)
 
 	struct ipc_response resp;
 	if (ipc_send_str(SG_CMD_DIAG_FW_IPTABLES, payload, &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+
+	if (resp.status != SG_OK) {
+		print_ipc_error("Failed", &resp);
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	if (resp.payload && resp.payload_len > 0)
+		printf("%s", resp.payload);
+
+	ipc_resp_free(&resp);
+	return 0;
+}
+
+static int cmd_diag_nat_policy(const char *args, const char *permissions)
+{
+	(void)args;
+	(void)permissions;
+
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_DIAG_FW_IPTABLES, "table=nat\n", &resp) != 0) {
 		ipc_resp_free(&resp);
 		printf("  Error: could not contact management daemon.\n");
 		return 0;

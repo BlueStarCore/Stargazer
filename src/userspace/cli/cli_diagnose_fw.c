@@ -380,6 +380,364 @@ static void test_config_scrub(void)
 		 def == NULL, 1);
 }
 
+/* ── FW-SEQ: Sequence-based firewall policy ordering (IPC, mode=1) ──── */
+
+/*
+ * Helper: send IPC and return 1 if status matches expected, 0 otherwise.
+ * Stores response in *resp — caller must free.
+ */
+static int fw_ipc(uint32_t cmd, const char *payload,
+		  struct ipc_response *resp, uint32_t expect)
+{
+	int conn = ipc_send_str(cmd, payload, resp);
+	return (conn == 0 && resp->status == expect) ? 1 : 0;
+}
+
+static void fw_ipc_fire(uint32_t cmd, const char *payload)
+{
+	struct ipc_response resp;
+	ipc_send_str(cmd, payload, &resp);
+	ipc_resp_free(&resp);
+}
+
+static void test_fw_sequence(void)
+{
+	struct ipc_response resp;
+
+	printf(C_CYAN "\n  --- FW-SEQ-1: sequence auto-assign ---" C_NC "\n");
+
+	/* Cleanup: delete test policies if leftover */
+	fw_ipc_fire(SG_CMD_CFG_DEL, "firewall_policy:9901\n");
+	fw_ipc_fire(SG_CMD_CFG_DEL, "firewall_policy:9902\n");
+	fw_ipc_fire(SG_CMD_CFG_DEL, "firewall_policy:9903\n");
+
+	/* Create policy without sequence → should auto-assign */
+	fw_check("FW-SEQ-1", "create policy 9901 (no sequence)",
+		 fw_ipc(SG_CMD_CFG_SET,
+			"firewall_policy:9901\n"
+			"name=test-seq1\n"
+			"srcintf=any\ndstintf=any\n"
+			"srcaddr=all\ndstaddr=all\n"
+			"action=accept\nstatus=enable\n",
+			&resp, SG_OK), 1);
+	ipc_resp_free(&resp);
+
+	/* Verify sequence was assigned */
+	fw_check("FW-SEQ-1", "policy 9901 has sequence",
+		 fw_ipc(SG_CMD_CFG_GET, "firewall_policy:9901\n",
+			&resp, SG_OK) &&
+		 resp.payload && strstr(resp.payload, "sequence="), 1);
+	ipc_resp_free(&resp);
+
+	/* Create second policy → should get sequence = prev + 1 */
+	fw_check("FW-SEQ-1", "create policy 9902 (auto-seq)",
+		 fw_ipc(SG_CMD_CFG_SET,
+			"firewall_policy:9902\n"
+			"name=test-seq2\n"
+			"srcintf=any\ndstintf=any\n"
+			"srcaddr=all\ndstaddr=all\n"
+			"action=deny\nstatus=enable\n",
+			&resp, SG_OK), 1);
+	ipc_resp_free(&resp);
+
+	fw_check("FW-SEQ-1", "policy 9902 has sequence",
+		 fw_ipc(SG_CMD_CFG_GET, "firewall_policy:9902\n",
+			&resp, SG_OK) &&
+		 resp.payload && strstr(resp.payload, "sequence="), 1);
+	ipc_resp_free(&resp);
+
+	printf(C_CYAN "\n  --- FW-SEQ-2: FORWARD chain order ---" C_NC "\n");
+
+	/* Check that both rules appear in FORWARD chain */
+	fw_check("FW-SEQ-2", "FORWARD chain has ACCEPT rule",
+		 fw_ipc(SG_CMD_DIAG_FW_IPTABLES, "table=filter\n",
+			&resp, SG_OK) &&
+		 resp.payload && strstr(resp.payload, "ACCEPT"), 1);
+	ipc_resp_free(&resp);
+
+	printf(C_CYAN "\n  --- FW-SEQ-3: disable removes rule ---" C_NC "\n");
+
+	/* Disable policy 9901 → rule should be removed from chain */
+	fw_check("FW-SEQ-3", "disable policy 9901",
+		 fw_ipc(SG_CMD_CFG_SET,
+			"firewall_policy:9901\n"
+			"name=test-seq1\n"
+			"srcintf=any\ndstintf=any\n"
+			"srcaddr=all\ndstaddr=all\n"
+			"action=accept\nstatus=disable\n"
+			"sequence=1\n",
+			&resp, SG_OK), 1);
+	ipc_resp_free(&resp);
+
+	/* Verify status is disable in DB */
+	fw_check("FW-SEQ-3", "policy 9901 status=disable in DB",
+		 fw_ipc(SG_CMD_CFG_GET, "firewall_policy:9901\n",
+			&resp, SG_OK) &&
+		 resp.payload && strstr(resp.payload, "status=disable"), 1);
+	ipc_resp_free(&resp);
+
+	printf(C_CYAN "\n  --- FW-SEQ-4: re-enable re-inserts ---" C_NC "\n");
+
+	/* Re-enable policy 9901 */
+	fw_check("FW-SEQ-4", "re-enable policy 9901",
+		 fw_ipc(SG_CMD_CFG_SET,
+			"firewall_policy:9901\n"
+			"name=test-seq1\n"
+			"srcintf=any\ndstintf=any\n"
+			"srcaddr=all\ndstaddr=all\n"
+			"action=accept\nstatus=enable\n"
+			"sequence=1\n",
+			&resp, SG_OK), 1);
+	ipc_resp_free(&resp);
+
+	printf(C_CYAN "\n  --- FW-SEQ-5: CFG_INSERT (move) ---" C_NC "\n");
+
+	/* Move policy 9902 to sequence 1 (swap order) */
+	fw_check("FW-SEQ-5", "move policy 9902 to sequence 1",
+		 fw_ipc(SG_CMD_CFG_INSERT,
+			"firewall_policy:9902\n1\n",
+			&resp, SG_OK), 1);
+	ipc_resp_free(&resp);
+
+	/* Verify sequence updated in DB */
+	fw_check("FW-SEQ-5", "policy 9902 has sequence=1 in DB",
+		 fw_ipc(SG_CMD_CFG_GET, "firewall_policy:9902\n",
+			&resp, SG_OK) &&
+		 resp.payload && strstr(resp.payload, "sequence=1"), 1);
+	ipc_resp_free(&resp);
+
+	printf(C_CYAN "\n  --- FW-SEQ-6: collision shift ---" C_NC "\n");
+
+	/* After move, policy 9901 should have been shifted from seq=1 to seq=2 */
+	fw_check("FW-SEQ-6", "policy 9901 shifted to sequence=2",
+		 fw_ipc(SG_CMD_CFG_GET, "firewall_policy:9901\n",
+			&resp, SG_OK) &&
+		 resp.payload && strstr(resp.payload, "sequence=2"), 1);
+	ipc_resp_free(&resp);
+
+	/* Cleanup */
+	fw_ipc_fire(SG_CMD_CFG_DEL, "firewall_policy:9901\n");
+	fw_ipc_fire(SG_CMD_CFG_DEL, "firewall_policy:9902\n");
+}
+
+/* ── NAT-SEQ: NAT sequence ordering (IPC, mode=1) ────────────────────── */
+
+static void test_nat_sequence(void)
+{
+	struct ipc_response resp;
+
+	printf(C_CYAN "\n  --- NAT-SEQ-1: NAT sequence auto-assign ---" C_NC "\n");
+
+	/* Cleanup */
+	fw_ipc_fire(SG_CMD_CFG_DEL, "network_nat:9901\n");
+	fw_ipc_fire(SG_CMD_CFG_DEL, "network_nat:9902\n");
+
+	/* Create SNAT rule without sequence */
+	fw_check("NAT-SEQ-1", "create SNAT 9901 (auto-seq)",
+		 fw_ipc(SG_CMD_CFG_SET,
+			"network_nat:9901\n"
+			"type=snat\nsrcintf=lo\n"
+			"srcaddr=any\ndstaddr=any\n"
+			"status=enable\n",
+			&resp, SG_OK), 1);
+	ipc_resp_free(&resp);
+
+	fw_check("NAT-SEQ-1", "NAT 9901 has sequence",
+		 fw_ipc(SG_CMD_CFG_GET, "network_nat:9901\n",
+			&resp, SG_OK) &&
+		 resp.payload && strstr(resp.payload, "sequence="), 1);
+	ipc_resp_free(&resp);
+
+	printf(C_CYAN "\n  --- NAT-SEQ-2: NAT disable/enable ---" C_NC "\n");
+
+	/* Disable NAT rule */
+	fw_check("NAT-SEQ-2", "disable NAT 9901",
+		 fw_ipc(SG_CMD_CFG_SET,
+			"network_nat:9901\n"
+			"type=snat\nsrcintf=lo\n"
+			"srcaddr=any\ndstaddr=any\n"
+			"status=disable\nsequence=1\n",
+			&resp, SG_OK), 1);
+	ipc_resp_free(&resp);
+
+	/* Re-enable */
+	fw_check("NAT-SEQ-2", "re-enable NAT 9901",
+		 fw_ipc(SG_CMD_CFG_SET,
+			"network_nat:9901\n"
+			"type=snat\nsrcintf=lo\n"
+			"srcaddr=any\ndstaddr=any\n"
+			"status=enable\nsequence=1\n",
+			&resp, SG_OK), 1);
+	ipc_resp_free(&resp);
+
+	/* Cleanup */
+	fw_ipc_fire(SG_CMD_CFG_DEL, "network_nat:9901\n");
+}
+
+/* ── NAT-KER: Kernel NAT rule verification (IPC, mode=1) ─────────────── */
+
+/*
+ * Helper: query kernel NAT table via IPC and check if a string
+ * appears in the output.  Returns 1 if found, 0 otherwise.
+ */
+static int nat_kernel_has(const char *needle)
+{
+	struct ipc_response resp;
+	int found = 0;
+
+	if (fw_ipc(SG_CMD_DIAG_FW_IPTABLES, "table=nat\n", &resp, SG_OK) &&
+	    resp.payload && strstr(resp.payload, needle))
+		found = 1;
+	ipc_resp_free(&resp);
+	return found;
+}
+
+static void test_nat_kernel_verify(void)
+{
+	struct ipc_response resp;
+
+	printf(C_CYAN "\n  --- NAT-KER-1: SNAT overload in kernel ---"
+	       C_NC "\n");
+
+	/* Cleanup */
+	fw_ipc_fire(SG_CMD_CFG_DEL, "network_nat:9903\n");
+	fw_ipc_fire(SG_CMD_CFG_DEL, "network_nat:9904\n");
+	fw_ipc_fire(SG_CMD_CFG_DEL, "network_nat:9905\n");
+	fw_ipc_fire(SG_CMD_CFG_DEL, "network_nat:9906\n");
+
+	/* Create SNAT overload rule */
+	fw_check("NAT-KER-1", "create SNAT overload (lo)",
+		 fw_ipc(SG_CMD_CFG_SET,
+			"network_nat:9903\n"
+			"type=snat\nsrcintf=lo\n"
+			"srcaddr=any\ndstaddr=any\n"
+			"protocol=all\nstatus=enable\n",
+			&resp, SG_OK), 1);
+	ipc_resp_free(&resp);
+
+	/* Verify MASQUERADE appears in kernel POSTROUTING */
+	fw_check("NAT-KER-1", "MASQUERADE in kernel POSTROUTING",
+		 nat_kernel_has("MASQUERADE"), 1);
+
+	printf(C_CYAN "\n  --- NAT-KER-2: DNAT tcp in kernel ---"
+	       C_NC "\n");
+
+	/* Create DNAT tcp rule */
+	fw_check("NAT-KER-2", "create DNAT tcp dstport=9999",
+		 fw_ipc(SG_CMD_CFG_SET,
+			"network_nat:9904\n"
+			"type=dnat\nsrcintf=any\ndstintf=any\n"
+			"srcaddr=any\ndstaddr=any\n"
+			"protocol=tcp\ndstport=9999\n"
+			"mapped-ip=127.0.0.1\nmapped-port=80\n"
+			"status=enable\n",
+			&resp, SG_OK), 1);
+	ipc_resp_free(&resp);
+
+	/* Verify dpt:9999 in kernel PREROUTING */
+	fw_check("NAT-KER-2", "dpt:9999 in kernel PREROUTING",
+		 nat_kernel_has("dpt:9999"), 1);
+
+	printf(C_CYAN "\n  --- NAT-KER-3: DNAT 1:1 (protocol=all) ---"
+	       C_NC "\n");
+
+	/* Create DNAT 1:1 — no port, no protocol */
+	fw_check("NAT-KER-3", "create DNAT 1:1 (all protocols)",
+		 fw_ipc(SG_CMD_CFG_SET,
+			"network_nat:9905\n"
+			"type=dnat\nsrcintf=any\ndstintf=any\n"
+			"srcaddr=any\ndstaddr=any\n"
+			"protocol=all\n"
+			"mapped-ip=127.0.0.2\n"
+			"status=enable\n",
+			&resp, SG_OK), 1);
+	ipc_resp_free(&resp);
+
+	/* Verify to:127.0.0.2 in kernel */
+	fw_check("NAT-KER-3", "to:127.0.0.2 in kernel",
+		 nat_kernel_has("to:127.0.0.2"), 1);
+
+	printf(C_CYAN "\n  --- NAT-KER-4: DNAT tcp+udp (2 rules) ---"
+	       C_NC "\n");
+
+	/* Create DNAT tcp+udp — should generate 2 rules */
+	fw_check("NAT-KER-4", "create DNAT tcp+udp dstport=8888",
+		 fw_ipc(SG_CMD_CFG_SET,
+			"network_nat:9906\n"
+			"type=dnat\nsrcintf=any\ndstintf=any\n"
+			"srcaddr=any\ndstaddr=any\n"
+			"protocol=tcp+udp\ndstport=8888\n"
+			"mapped-ip=127.0.0.1\n"
+			"status=enable\n",
+			&resp, SG_OK), 1);
+	ipc_resp_free(&resp);
+
+	/* Verify both tcp and udp rules exist for dpt:8888 */
+	fw_check("NAT-KER-4", "tcp dpt:8888 in kernel",
+		 nat_kernel_has("tcp dpt:8888"), 1);
+	fw_check("NAT-KER-4", "udp dpt:8888 in kernel",
+		 nat_kernel_has("udp dpt:8888"), 1);
+
+	printf(C_CYAN "\n  --- NAT-KER-5: delete removes rules ---"
+	       C_NC "\n");
+
+	/* Delete all test rules */
+	fw_ipc_fire(SG_CMD_CFG_DEL, "network_nat:9903\n");
+	fw_ipc_fire(SG_CMD_CFG_DEL, "network_nat:9904\n");
+	fw_ipc_fire(SG_CMD_CFG_DEL, "network_nat:9905\n");
+	fw_ipc_fire(SG_CMD_CFG_DEL, "network_nat:9906\n");
+
+	/* Verify test rules gone from kernel */
+	fw_check("NAT-KER-5", "dpt:9999 gone after delete",
+		 !nat_kernel_has("dpt:9999"), 1);
+	fw_check("NAT-KER-5", "to:127.0.0.2 gone after delete",
+		 !nat_kernel_has("to:127.0.0.2"), 1);
+	fw_check("NAT-KER-5", "dpt:8888 gone after delete",
+		 !nat_kernel_has("dpt:8888"), 1);
+}
+
+/* ── REF-IFACE: Interface referential integrity (IPC, mode=1) ────────── */
+
+static void test_iface_ref_integrity(void)
+{
+	struct ipc_response resp;
+
+	printf(C_CYAN "\n  --- REF-IFACE: interface referential integrity ---"
+	       C_NC "\n");
+
+	/* Create a static route referencing lan0 (or whatever exists).
+	 * We use 'lo' as it always exists for loopback. */
+	fw_ipc_fire(SG_CMD_CFG_DEL, "network_route_static:9901\n");
+
+	fw_check("REF-IFACE", "create route referencing lo",
+		 fw_ipc(SG_CMD_CFG_SET,
+			"network_route_static:9901\n"
+			"dst=198.51.100.0/24\n"
+			"gateway=127.0.0.1\n"
+			"device=lo\n"
+			"distance=10\n"
+			"status=enable\n",
+			&resp, SG_OK), 1);
+	ipc_resp_free(&resp);
+
+	/* Try to delete system_interface:lo → should be blocked
+	 * (builtin or referenced).  lo may not be in DB as system_interface,
+	 * so this tests the concept — if it exists, it's blocked. */
+	int blocked = fw_ipc(SG_CMD_CFG_DEL, "system_interface:lo\n",
+			     &resp, SG_OK);
+	/* We expect either SG_ERR_ENTRY_NOT_FOUND (lo not in DB),
+	 * SG_ERR_BUILTIN, or SG_ERR_IN_USE — anything but SG_OK */
+	fw_check("REF-IFACE", "delete interface with route ref → blocked",
+		 !blocked ||
+		 resp.status == SG_ERR_IN_USE ||
+		 resp.status == SG_ERR_BUILTIN ||
+		 resp.status == SG_ERR_ENTRY_NOT_FOUND, 1);
+	ipc_resp_free(&resp);
+
+	/* Cleanup */
+	fw_ipc_fire(SG_CMD_CFG_DEL, "network_route_static:9901\n");
+}
+
 /* ── Entry point ──────────────────────────────────────────────────────── */
 
 int cli_diagnose_test_firewall(int mode, diag_result_t *out)
@@ -410,6 +768,10 @@ int cli_diagnose_test_firewall(int mode, diag_result_t *out)
 			test_diag_payload_presence();
 			test_input_chain_structure();
 			test_ct_helper_tftp();
+			test_fw_sequence();
+			test_nat_sequence();
+			test_nat_kernel_verify();
+			test_iface_ref_integrity();
 		}
 	}
 

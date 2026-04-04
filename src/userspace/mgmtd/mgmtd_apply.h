@@ -88,6 +88,21 @@ void flush_static_routes(void);
 void flush_nat_rules(void);
 void flush_forward_chain(void);
 
+/* ── Pipe data to child stdin, read stdout ─────────────────────────────── */
+char *pipe_exec_stdin(const char *const argv[],
+		      const char *input, size_t input_len,
+		      int *exit_code);
+
+/* ── Atomic chain rebuild (firewall + NAT) ─────────────────────────────── */
+sg_status_t rebuild_forward_chain(char *result, size_t rsize);
+sg_status_t rebuild_nat_chains(char *result, size_t rsize);
+
+/* Validation-only for CFG_APPLY (no kernel changes) */
+sg_status_t validate_firewall_policy(const char *id, const char *data,
+				     char *result, size_t rsize);
+sg_status_t validate_nat(const char *id, const char *data,
+			 char *result, size_t rsize);
+
 /* ── Per-feature apply handlers ─────────────────────────────────────────── */
 
 sg_status_t apply_route_static(const char *id, const char *data,
@@ -99,9 +114,6 @@ sg_status_t apply_settings(const char *id, const char *data,
 sg_status_t apply_interface(const char *id, const char *data,
 			    char *result, size_t rsize);
 
-sg_status_t apply_nat(const char *id, const char *data,
-		      char *result, size_t rsize);
-
 sg_status_t apply_dns(const char *id, const char *data,
 		      char *result, size_t rsize);
 
@@ -109,11 +121,6 @@ sg_status_t apply_dhcp(const char *id, const char *data,
 		       char *result, size_t rsize);
 
 void unapply_dhcp(const char *id);
-
-sg_status_t apply_firewall_policy(const char *id, const char *data,
-				   char *result, size_t rsize);
-
-void unapply_firewall_policy(const char *id, const char *data);
 
 sg_status_t apply_ntp(const char *id, const char *data,
 		      char *result, size_t rsize);

@@ -687,7 +687,11 @@
         for (var i = 0; i < pageRoutes.length; i++) {
             html += routeRowHTML(pageRoutes[i]);
         }
-        body.innerHTML = html;
+        if (total === 0) {
+            body.innerHTML = '<div style="text-align:center;color:#999;padding:24px 0">No routes configured</div>';
+        } else {
+            body.innerHTML = html;
+        }
 
         /* Pager info */
         info.textContent = total === 0 ? 'No routes' : 'Showing ' + (start + 1) + '-' + end + ' of ' + total;
@@ -696,12 +700,13 @@
         nextBtn.disabled = rfState.page >= totalPages - 1;
 
         /* Update header sort indicators */
+        var rfLabels = { type: 'TYPE', status: 'STATUS', hits: 'HITS', iface: 'IFACE', dest: 'DESTINATION' };
         var cols = document.querySelectorAll('#route-flow-widget .rf-col[data-sort]');
         cols.forEach(function (col) {
             var key = col.dataset.sort;
             col.classList.toggle('rf-sort-active', key === rfState.sortKey);
             /* Show arrow only on active sort column */
-            var label = col.dataset.sort.toUpperCase();
+            var label = rfLabels[key] || key.toUpperCase();
             if (key === rfState.sortKey) {
                 col.textContent = label + ' ' + (rfState.sortAsc ? '\u25B2' : '\u25BC');
             } else {
@@ -1044,6 +1049,30 @@
         if (!activeModal) return;
         var form = activeModal;
         backdrop.classList.remove('visible');
+
+        /* Reset edit state so next open starts clean */
+        form.dataset.editMode = 'false';
+        form.dataset.editRowId = '';
+
+        /* Restore create-only fields hidden during edit */
+        form.querySelectorAll('.admin-create-only').forEach(function (el) {
+            el.style.display = '';
+        });
+
+        /* Reset form inputs to defaults */
+        form.querySelectorAll('.form-input').forEach(function (inp) {
+            if (inp.tagName === 'SELECT') {
+                inp.selectedIndex = 0;
+            } else if (inp.type === 'checkbox') {
+                inp.checked = false;
+            } else {
+                inp.value = inp.defaultValue || '';
+            }
+        });
+        form.querySelectorAll('.form-row-full input[type="checkbox"]').forEach(function (cb) {
+            cb.checked = false;
+        });
+
         if (instant) {
             form.classList.remove('visible', 'closing');
             activeModal = null;
@@ -1064,6 +1093,19 @@
             if (form && form.classList.contains('visible')) {
                 closeModal(false);
             } else {
+                /* Reset to create mode — closeModal already resets
+                 * editMode/editRowId, but also restore the title. */
+                if (form) {
+                    var entity = null;
+                    for (var k in ENTITIES) {
+                        if (ENTITIES[k].formId === id) { entity = k; break; }
+                    }
+                    if (entity) {
+                        var titleSpan = form.querySelector('.modal-title-text');
+                        if (titleSpan)
+                            titleSpan.textContent = ENTITIES[entity].createTitle;
+                    }
+                }
                 /* Refresh all dynamic selects when opening a create form */
                 populateIfaceSelects();
                 populateProfileSelect();
@@ -1096,6 +1138,8 @@
             configType: 'system_interface',
             createTitle: 'NEW INTERFACE',
             editTitle: 'EDIT INTERFACE',
+            noCreate: true,   /* hardware-backed, mgmtd auto-detects */
+            allBuiltin: true, /* all entries are builtin, no delete */
             hasStatus: true,
             statusLabels: { on: 'UP', off: 'DOWN', dotOn: 'up', dotOff: 'down' },
             fields: [
@@ -1153,15 +1197,16 @@
             statusLabels: { on: 'Enabled', off: 'Disabled', dotOn: 'up', dotOff: 'disabled' },
             fields: [
                 { label: '#',                    key: 'id',           col: 0, bulkEditable: false, editDisabled: true },
-                { label: 'Type',                 key: 'type',         col: 1, bulkEditable: false },
-                { label: 'Original Source',      key: 'srcaddr',      col: 2, bulkEditable: false },
-                { label: 'Original Destination', key: 'dstaddr',      col: 3, bulkEditable: false },
+                { label: 'Sequence',             key: 'sequence',     col: 1, bulkEditable: false },
+                { label: 'Type',                 key: 'type',         col: 2, bulkEditable: false },
+                { label: 'Original Source',      key: 'srcaddr',      col: 3, bulkEditable: false },
+                { label: 'Original Destination', key: 'dstaddr',      col: 4, bulkEditable: false },
                 { label: 'Destination Port',     key: 'dstport',      col: -1, bulkEditable: false },
                 { label: 'Translated Address',   key: 'mapped-ip',    col: -1, bulkEditable: false },
                 { label: 'Translated Port',      key: 'mapped-port',  col: -1, bulkEditable: false },
-                { label: 'Source Interface',      key: 'srcintf',      col: 4, bulkEditable: false },
+                { label: 'Source Interface',      key: 'srcintf',      col: 5, bulkEditable: false },
                 { label: 'Destination Interface', key: 'dstintf',      col: -1, bulkEditable: false },
-                { label: 'Status',               key: 'status',       col: 5, bulkEditable: true }
+                { label: 'Status',               key: 'status',       col: 6, bulkEditable: true }
             ]
         },
         policies: {
@@ -1173,14 +1218,15 @@
             statusLabels: { on: 'Enabled', off: 'Disabled', dotOn: 'up', dotOff: 'disabled' },
             fields: [
                 { label: 'ID',                  key: 'id',       col: 0, bulkEditable: false, editDisabled: true },
-                { label: 'Name',                key: 'name',     col: 1, bulkEditable: false },
-                { label: 'Incoming Interface',  key: 'srcintf',  col: 2, bulkEditable: false },
-                { label: 'Outgoing Interface',  key: 'dstintf',  col: 3, bulkEditable: false },
-                { label: 'Source',              key: 'srcaddr',  col: 4, bulkEditable: false },
-                { label: 'Destination',         key: 'dstaddr',  col: 5, bulkEditable: false },
-                { label: 'Service',             key: 'service',  col: 6, bulkEditable: false },
-                { label: 'Action',              key: 'action',   col: 7, bulkEditable: true },
-                { label: 'Status',              key: 'status',   col: 8, bulkEditable: true },
+                { label: 'Sequence',            key: 'sequence', col: 1, bulkEditable: false },
+                { label: 'Name',                key: 'name',     col: 2, bulkEditable: false },
+                { label: 'Incoming Interface',  key: 'srcintf',  col: 3, bulkEditable: false },
+                { label: 'Outgoing Interface',  key: 'dstintf',  col: 4, bulkEditable: false },
+                { label: 'Source',              key: 'srcaddr',  col: 5, bulkEditable: false },
+                { label: 'Destination',         key: 'dstaddr',  col: 6, bulkEditable: false },
+                { label: 'Service',             key: 'service',  col: 7, bulkEditable: false },
+                { label: 'Action',              key: 'action',   col: 8, bulkEditable: true },
+                { label: 'Status',              key: 'status',   col: 9, bulkEditable: true },
                 { label: 'Schedule',            key: 'schedule', col: -1, bulkEditable: false },
                 { label: 'Comment',             key: 'comment',  col: -1, bulkEditable: false }
             ]
@@ -1230,6 +1276,8 @@
             configType: 'system_admin-profile',
             createTitle: 'NEW ADMIN PROFILE',
             editTitle: 'EDIT ADMIN PROFILE',
+            noCreate: true,   /* only builtin profiles (read-write, read-only) */
+            allBuiltin: true, /* all entries are builtin, no delete */
             hasStatus: false,
             fields: [
                 { label: 'Profile Name', key: 'id',          col: 0, bulkEditable: false },
@@ -1245,6 +1293,17 @@
             if (ENTITIES[k].formId === formId) return k;
         }
         return null;
+    }
+
+    /* Hide Create buttons for entities that don't support creation
+     * (hardware-backed interfaces, builtin admin profiles). */
+    for (var ek in ENTITIES) {
+        if (ENTITIES[ek].noCreate) {
+            var fid = ENTITIES[ek].formId;
+            document.querySelectorAll('.btn-create[data-toggle-form="' + fid + '"]').forEach(function (btn) {
+                btn.style.display = 'none';
+            });
+        }
     }
 
     /* ================================================================
@@ -1272,6 +1331,7 @@
         },
 
         toggle: function (entity, rowId, row) {
+            if (!rowId) return; /* ignore placeholder rows */
             if (this.entity && this.entity !== entity) this.clear();
             this.entity = entity;
             if (this.ids[rowId]) {
@@ -1297,7 +1357,7 @@
         var total = 0, checked = 0;
         rows.forEach(function (r) {
             var cb = r.querySelector('.row-select');
-            if (cb) { total++; if (cb.checked) checked++; }
+            if (cb && !cb.disabled) { total++; if (cb.checked) checked++; }
         });
         sa.checked = total > 0 && checked === total;
         sa.indeterminate = checked > 0 && checked < total;
@@ -1315,7 +1375,7 @@
             selection.entity = entity;
             table.querySelectorAll('tbody tr[data-row-id]').forEach(function (row) {
                 var cb = row.querySelector('.row-select');
-                if (!cb) return;
+                if (!cb || cb.disabled) return; /* skip builtin rows */
                 cb.checked = true;
                 row.classList.add('row-selected');
                 selection.ids[row.dataset.rowId] = true;
@@ -1349,8 +1409,10 @@
         bulkCount.textContent = selection.count + ' selected';
         bulkActions.innerHTML = '';
 
-        /* Delete always available */
-        addBulkBtn('Delete', 'delete', 'btn-danger');
+        /* Delete — hidden for all-builtin entities (no deletable rows) */
+        if (!config.allBuiltin) {
+            addBulkBtn('Delete', 'delete', 'btn-danger');
+        }
 
         /* Enable/Disable for entities with status */
         if (config.hasStatus) {
@@ -1428,6 +1490,7 @@
         if (!row || row.classList.contains('group-header')) return;
         if (row.closest('thead')) return; /* ignore header row dblclick */
         if (e.target.closest('.td-checkbox')) return; /* ignore checkbox dblclick */
+        if (!row.dataset.rowId) return; /* ignore placeholder rows (No results) */
         var table = row.closest('table[data-entity]');
         if (!table) return;
 
@@ -1644,6 +1707,7 @@
     document.addEventListener('contextmenu', function (e) {
         var row = e.target.closest('tr');
         if (!row || row.classList.contains('group-header')) { hideCtx(); return; }
+        if (!row.dataset.rowId) { hideCtx(); return; } /* no-data placeholder */
         var table = row.closest('table[data-entity]');
         if (!table) { hideCtx(); return; }
 
@@ -1656,10 +1720,13 @@
         ctxEntity = entity;
 
         var isEditable = !config.editableFilter || config.editableFilter(row);
+        var isBuiltin = row.dataset.builtin === 'yes';
         var items = ctxMenu.querySelectorAll('.context-menu-item');
         items.forEach(function (it) {
             var act = it.dataset.action;
-            if (act === 'edit' || act === 'delete') {
+            if (act === 'delete') {
+                it.classList.toggle('ctx-hidden', !isEditable || isBuiltin);
+            } else if (act === 'edit') {
                 it.classList.toggle('ctx-hidden', !isEditable);
             } else if (act === 'enable' || act === 'disable') {
                 it.classList.toggle('ctx-hidden', !config.hasStatus || !isEditable);
@@ -1715,6 +1782,11 @@
         var table = row.closest('table[data-entity]');
         var entity = table ? table.dataset.entity : null;
         var rowId = row.dataset.rowId || '';
+
+        if (row.dataset.builtin === 'yes') {
+            showToast('Cannot delete built-in entry "' + rowId + '"', 'error');
+            return;
+        }
 
         if (!confirm('Delete "' + rowId + '"?')) return;
 
@@ -2059,6 +2131,21 @@
         var tbody = table.querySelector('tbody');
         if (!tbody || !config) return;
 
+        /* Sort by sequence for ordered types (policies, NAT).
+         * Higher sequence = higher priority = checked first in
+         * iptables, so show highest sequence at top (descending).
+         * Entries without sequence sort last. */
+        if (config.configType === 'firewall_policy' ||
+            config.configType === 'network_nat') {
+            rows = rows.slice().sort(function (a, b) {
+                var sa = parseInt(a.sequence, 10);
+                var sb = parseInt(b.sequence, 10);
+                if (isNaN(sa)) sa = -1;
+                if (isNaN(sb)) sb = -1;
+                return sb - sa;
+            });
+        }
+
         if (rows.length === 0) {
             var colCount = table.querySelectorAll('thead th').length;
             tbody.innerHTML = '<tr><td colspan="' + colCount + '" style="text-align:center;color:#999;padding:20px;">No results found</td></tr>';
@@ -2067,9 +2154,12 @@
 
         var html = '';
         rows.forEach(function (row, idx) {
-            html += '<tr data-row-id="' + esc(row.id || row.name || idx) + '">';
-            /* Checkbox column */
-            html += '<td class="td-checkbox"><input type="checkbox" class="row-select"></td>';
+            var isBuiltin = (row.builtin === 'yes') || config.allBuiltin;
+            html += '<tr data-row-id="' + esc(row.id || row.name || idx) + '"'
+                  + (isBuiltin ? ' data-builtin="yes"' : '') + '>';
+            /* Checkbox column — disabled for builtin entries (cannot delete) */
+            html += '<td class="td-checkbox"><input type="checkbox" class="row-select"'
+                  + (isBuiltin ? ' disabled title="Built-in entry"' : '') + '></td>';
             config.fields.forEach(function (f) {
                 if (f.col === -1) return; /* form-only field, skip in table */
                 var val = row[f.key] || '';
@@ -2309,9 +2399,19 @@
         } else {
             method = 'POST';
             url = '/config/' + config.configType;
-            /* Ensure an identifier exists for types without name/id.
-             * Routes and NAT use numeric IDs — generate next available
-             * by counting existing entries + 1. */
+
+            /* Entities that use 'name' as identifier must have it filled.
+             * Addresses and services are identified by name, not numeric ID. */
+            var hasNameField = config.fields.some(function (f) {
+                return f.key === 'name';
+            });
+            if (hasNameField && !payload.name) {
+                showToast('Name is required', 'error');
+                return;
+            }
+
+            /* For types without name (routes, NAT, policies) — auto-generate
+             * a numeric ID by counting existing entries + 1. */
             if (!payload.name && !payload.id) {
                 var pageEl = document.getElementById('page-' + activePage);
                 var table = pageEl ? pageEl.querySelector('table[data-entity]') : null;
@@ -2667,9 +2767,9 @@
 
     function renderNetworkOverview() {
         return Promise.all([
-            fetchIfaceData(),
-            fetchRouteData(),
-            api('/config/network_dhcp-server')
+            fetchIfaceData().catch(function () {}),
+            fetchRouteData().catch(function () {}),
+            api('/config/network_dhcp-server').catch(function () { return null; })
         ]).then(function (results) {
             var dhcpData = results[2];
 
