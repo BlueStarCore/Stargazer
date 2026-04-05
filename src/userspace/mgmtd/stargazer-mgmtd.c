@@ -450,24 +450,40 @@ static int mgmtd_debug_enabled(void)
 
 /* ── Logging ────────────────────────────────────────────────────────────── */
 
+#define MGMTD_LOG    "/etc/stargazer/logs/mgmtd.log"
+#define MGMTD_LOG_FB "/var/log/stargazer-mgmtd.log"
+
 void mgmt_log(const char *level, const char *fmt, ...)
 {
-	if ((strcmp(level, "INFO") == 0 || strcmp(level, "WARN") == 0) &&
-	    !mgmtd_debug_enabled())
-		return;
+	/* INFO/WARN only printed to stderr when debug enabled */
+	int is_debug = (strcmp(level, "INFO") == 0 ||
+			strcmp(level, "WARN") == 0);
 
 	char ts[64];
 	time_t now = time(NULL);
 	struct tm tm;
 	localtime_r(&now, &tm);
-	strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", &tm);
+	strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S%z", &tm);
 
-	fprintf(stderr, "%s [mgmtd] %s: ", ts, level);
+	char msg[1024];
 	va_list ap;
 	va_start(ap, fmt);
-	vfprintf(stderr, fmt, ap);
+	vsnprintf(msg, sizeof(msg), fmt, ap);
 	va_end(ap);
-	fprintf(stderr, "\n");
+
+	/* Always write to log file */
+	const char *path = MGMTD_LOG;
+	if (access("/etc/stargazer/logs", W_OK) != 0)
+		path = MGMTD_LOG_FB;
+	FILE *fp = fopen(path, "a");
+	if (fp) {
+		fprintf(fp, "%s %s: %s\n", ts, level, msg);
+		fclose(fp);
+	}
+
+	/* Also print to stderr (debug-gated for INFO/WARN) */
+	if (!is_debug || mgmtd_debug_enabled())
+		fprintf(stderr, "%s [mgmtd] %s: %s\n", ts, level, msg);
 }
 
 int audit_log(const char *user, const char *event, const char *msg)
@@ -553,6 +569,96 @@ int handle_log_audit(int client_fd, const char *user,
 	}
 
 	/* Build response from circular buffer */
+	size_t bufsz = SG_RESPONSE_MAX;
+	char *buf = malloc(bufsz);
+	if (!buf) {
+		for (int i = 0; i < count; i++)
+			free(lines[i]);
+		free(lines);
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL, "Out of memory");
+		return 0;
+	}
+
+	size_t used = 0;
+	unsigned int ucount = (unsigned int)count;
+	int nlines = total < ucount ? (int)total : count;
+	int start = total < ucount ? 0 : (int)(total % ucount);
+	for (int i = 0; i < nlines && used < bufsz - 1; i++) {
+		int idx = (start + i) % count;
+		if (lines[idx]) {
+			size_t llen = strlen(lines[idx]);
+			if (used + llen >= bufsz - 1)
+				break;
+			memcpy(buf + used, lines[idx], llen);
+			used += llen;
+		}
+	}
+	buf[used] = '\0';
+
+	for (int i = 0; i < count; i++)
+		free(lines[i]);
+	free(lines);
+
+	send_ok(client_fd, NULL, buf);
+	free(buf);
+	return 0;
+}
+
+/*
+ * handle_log_mgmtd — Read last N lines from mgmtd daemon log.
+ * Same pattern as handle_log_audit but reads from mgmtd.log.
+ */
+int handle_log_mgmtd(int client_fd, const char *user,
+		     const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)hdr;
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "Requires 'monitor' permission");
+		return 0;
+	}
+
+	int count = 50;
+	if (payload && payload[0]) {
+		int n = atoi(payload);
+		if (n > 0 && n <= 200)
+			count = n;
+		else if (n > 200)
+			count = 200;
+	}
+
+	FILE *fp = fopen(MGMTD_LOG, "r");
+	if (!fp)
+		fp = fopen(MGMTD_LOG_FB, "r");
+	if (!fp) {
+		send_ok(client_fd, NULL, "  No mgmtd log entries.\n");
+		return 0;
+	}
+
+	char **lines = calloc((size_t)count, sizeof(char *));
+	if (!lines) {
+		fclose(fp);
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL, "Out of memory");
+		return 0;
+	}
+
+	char linebuf[1024];
+	unsigned int total = 0;
+	while (fgets(linebuf, (int)sizeof(linebuf), fp)) {
+		unsigned int idx = total % (unsigned int)count;
+		free(lines[idx]);
+		lines[idx] = strdup(linebuf);
+		total++;
+	}
+	fclose(fp);
+
+	if (total == 0) {
+		free(lines);
+		send_ok(client_fd, NULL, "  No mgmtd log entries.\n");
+		return 0;
+	}
+
 	size_t bufsz = SG_RESPONSE_MAX;
 	char *buf = malloc(bufsz);
 	if (!buf) {
@@ -1957,12 +2063,15 @@ static char *mgmtd_show_interfaces(void)
 }
 
 /*
- * Initialise base INPUT chain policy at boot.
+ * Initialise base INPUT chain rules at boot.
  * Must run BEFORE mgmtd_replay_config() so that per-interface SG_IN_*
  * jump rules are appended after these foundational rules.
  *
+ * INPUT policy DROP is set at kernel level (iptable_filter.c input_drop=1)
+ * so there is no window of ACCEPT policy between kernel boot and mgmtd start.
+ *
  * Result:
- *   INPUT policy DROP
+ *   INPUT policy DROP   (kernel)
  *   1. -i lo -j ACCEPT                 (loopback / self-ping)
  *   2. -m conntrack --ctstate EST,REL   (return traffic)
  *   ... per-interface jumps added later by apply_allowaccess()
@@ -1972,19 +2081,13 @@ static void mgmtd_init_firewall(void)
 	/* Verify iptables is installed before touching any rules */
 	if (!ipt_available()) {
 		mgmt_log("ERROR",
-			 "iptables binary not found — firewall NOT configured! "
-			 "INPUT chain remains at default ACCEPT policy.");
+			 "iptables binary not found — firewall NOT configured!");
 		return;
 	}
 
-	/* Policy DROP first — never leave INPUT in ACCEPT, even briefly */
-	const char *policy[] = {"iptables", "-P", "INPUT", "DROP", NULL};
-	if (ipt_exec(policy) != 0) {
-		mgmt_log("ERROR",
-			 "CRITICAL: failed to set INPUT policy DROP — "
-			 "firewall is NOT active!");
-		return;
-	}
+	/* INPUT policy DROP is set by kernel (iptable_filter input_drop=1).
+	 * No need to set it here — the chain is DROP from the instant the
+	 * filter table is created, before any userspace process runs. */
 
 	/* Flush INPUT — clean slate (safe on restart) */
 	const char *flush[] = {"iptables", "-F", "INPUT", NULL};
@@ -2016,8 +2119,8 @@ static void mgmtd_init_firewall(void)
 		mgmt_log("ERROR",
 			 "failed to add ESTABLISHED/RELATED rule");
 	else
-		mgmt_log("INFO", "INPUT chain: policy DROP, lo ACCEPT, "
-			 "ESTABLISHED/RELATED ACCEPT");
+		mgmt_log("INFO", "INPUT chain: policy DROP (kernel), "
+			 "lo ACCEPT, ESTABLISHED/RELATED ACCEPT");
 
 	/* FORWARD chain: policy DROP, flush, allow return traffic.
 	 * Firewall policies are replayed on top of this foundation. */
@@ -2726,24 +2829,23 @@ const char *get_type_permission(const char *type_name)
  *
  * No separate index needed — DB is the source of truth.
  *
- * Special case: firewall_address / firewall_service changes trigger
- * atomic chain rebuilds instead of per-entry re-apply.
+ * Types that use atomic chain rebuild (firewall_policy, network_nat)
+ * are not re-applied individually — instead, the rebuild is triggered
+ * once at the end if any dependent of that type was found.
+ *
+ * Writes warning message to warn_out if any re-apply fails.
+ * Logs each re-apply to audit log with user="__cascade".
  */
-static void usage_cascade(const char *type, const char *id)
+static void usage_cascade(const char *type, const char *id,
+			  char *warn_out, size_t warn_sz)
 {
-	/* Address/service changes → atomic chain rebuild */
-	if (strcmp(type, "firewall_address") == 0 ||
-	    strcmp(type, "firewall_service") == 0) {
-		char rb[512];
-		rebuild_forward_chain(rb, sizeof(rb));
-		mgmt_log("INFO", "cascade: %s:%s → %s", type, id, rb);
-		rebuild_nat_chains(rb, sizeof(rb));
-		mgmt_log("INFO", "cascade: %s:%s → NAT %s", type, id, rb);
-		return;
-	}
+	if (warn_out && warn_sz > 0)
+		warn_out[0] = '\0';
 
 	sg_ref_entry_t refs[16];
 	int nrefs = sg_reg_find_referencing(type, refs, 16);
+	int need_fw_rebuild = 0;
+	int need_nat_rebuild = 0;
 
 	for (int i = 0; i < nrefs; i++) {
 		char *found = sg_db_find_referencing(refs[i].type,
@@ -2762,11 +2864,17 @@ static void usage_cascade(const char *type, const char *id)
 			sg_db_parse_section(entry, etype, sizeof(etype),
 					    eid, sizeof(eid));
 
-			/* Firewall/NAT use atomic rebuild, skip per-rule */
-			if (strcmp(etype, "firewall_policy") == 0 ||
-			    strcmp(etype, "network_nat") == 0)
+			/* Atomic-rebuild types: mark for rebuild at end */
+			if (strcmp(etype, "firewall_policy") == 0) {
+				need_fw_rebuild = 1;
 				continue;
+			}
+			if (strcmp(etype, "network_nat") == 0) {
+				need_nat_rebuild = 1;
+				continue;
+			}
 
+			/* Per-entry re-apply */
 			char *data = sg_db_get(etype, eid);
 			if (!data)
 				continue;
@@ -2774,12 +2882,48 @@ static void usage_cascade(const char *type, const char *id)
 			char result[512];
 			sg_status_t rc = apply_config(etype, eid, data,
 						      result, sizeof(result));
-			mgmt_log(rc == SG_OK ? "INFO" : "WARN",
-				 "cascade %s:%s → %s",
-				 etype, eid, result);
 			free(data);
+
+			/* Audit log each cascade re-apply */
+			char amsg[512];
+			snprintf(amsg, sizeof(amsg),
+				 "%s %.64s:%.64s (cascade from %.64s:%.64s): %.128s",
+				 rc == SG_OK ? "OK" : "FAILED",
+				 etype, eid, type, id, result);
+			audit_log("__cascade", "200", amsg);
+
+			/* Accumulate warnings for failed re-applies */
+			if (rc != SG_OK && warn_out && warn_sz > 0) {
+				size_t cur = strlen(warn_out);
+				if (cur > 0 && cur + 2 < warn_sz) {
+					warn_out[cur++] = ';';
+					warn_out[cur++] = ' ';
+					warn_out[cur] = '\0';
+				}
+				snprintf(warn_out + cur, warn_sz - cur,
+					 "%.64s:%.64s re-apply failed: %.128s",
+					 etype, eid, result);
+			}
 		}
 		free(found);
+	}
+
+	/* Atomic rebuilds — once at the end if any dependent was found */
+	if (need_fw_rebuild) {
+		char rb[512];
+		rebuild_forward_chain(rb, sizeof(rb));
+		char amsg[512];
+		snprintf(amsg, sizeof(amsg),
+			 "cascade from %.64s:%.64s: %.256s", type, id, rb);
+		audit_log("__cascade", "200", amsg);
+	}
+	if (need_nat_rebuild) {
+		char rb[512];
+		rebuild_nat_chains(rb, sizeof(rb));
+		char amsg[512];
+		snprintf(amsg, sizeof(amsg),
+			 "cascade from %.64s:%.64s: %.256s", type, id, rb);
+		audit_log("__cascade", "200", amsg);
 	}
 }
 
@@ -3911,7 +4055,9 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 
 		/* Cascade: re-apply entries that reference this object.
 		 * Runs after apply + DB persist so cascade reads fresh data. */
-		usage_cascade(db_type, db_id);
+		char cascade_warn[512];
+		usage_cascade(db_type, db_id,
+			      cascade_warn, sizeof(cascade_warn));
 
 		/* Invalidate sessions for admin/profile/policy config changes.
 		 * All affected admins are purged so they re-authenticate,
@@ -3969,7 +4115,14 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			}
 		}
 
-		send_ok(client_fd, "Config saved", NULL);
+		if (cascade_warn[0]) {
+			char msg[768];
+			snprintf(msg, sizeof(msg),
+				 "Config saved. Warning: %s", cascade_warn);
+			send_ok(client_fd, msg, NULL);
+		} else {
+			send_ok(client_fd, "Config saved", NULL);
+		}
 		return 0;
 	}
 
@@ -4836,6 +4989,8 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		return handle_log_audit(client_fd, user, payload, hdr);
 	case SG_CMD_LOG_SYSTEM:
 		return handle_log_system(client_fd, user, payload, hdr);
+	case SG_CMD_LOG_MGMTD:
+		return handle_log_mgmtd(client_fd, user, payload, hdr);
 	case SG_CMD_LOG_CLEAR_AUDIT:
 		return handle_log_clear_audit(client_fd, user, payload, hdr);
 
@@ -4976,7 +5131,7 @@ int main(void)
 	/* Discover NICs, create/protect interface entries */
 	mgmtd_sync_interfaces(boot == BOOT_FIRST);
 
-	/* Set INPUT policy DROP, allow loopback + return traffic */
+	/* INPUT policy DROP set by kernel; add loopback + return traffic rules */
 	mgmtd_init_firewall();
 
 	/* Apply saved configuration to running system BEFORE accepting

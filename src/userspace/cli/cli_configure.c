@@ -1119,6 +1119,11 @@ static int context_entry(const char *type_name, const char *label,
 							printf(" %s",
 							       sresp.extra);
 						printf("\n");
+					} else if (sresp.extra[0] &&
+						   strstr(sresp.extra,
+							  "Warning:")) {
+						printf("  %s\n",
+						       sresp.extra);
 					}
 					if (cfg_dbg())
 						fprintf(stderr,
@@ -1666,6 +1671,11 @@ static int context_single(const char *type_name, const char *label)
 							printf(" %s",
 							       sresp.extra);
 						printf("\n");
+					} else if (sresp.extra[0] &&
+						   strstr(sresp.extra,
+							  "Warning:")) {
+						printf("  %s\n",
+						       sresp.extra);
 					}
 					if (cfg_dbg())
 						fprintf(stderr,

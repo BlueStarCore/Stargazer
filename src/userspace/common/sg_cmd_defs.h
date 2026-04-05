@@ -70,6 +70,7 @@ X("execute debug auth user",                "Debug user authentication",        
 X("execute log",                             "Log management",                          "monitor",         0,  NULL)
 X("execute log audit",                      "Show audit log entries",                  "monitor",         1,  cmd_log_audit)
 X("execute log system",                     "Show system/kernel log",                  "monitor",         1,  cmd_log_system)
+X("execute log mgmtd",                     "Show management daemon log",              "monitor",         1,  cmd_log_mgmtd)
 X("execute log clear",                      "Clear log files",                         "admin",           0,  NULL)
 X("execute log clear audit",                "Clear audit log",                         "admin",           0,  cmd_log_clear_audit)
 

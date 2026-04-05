@@ -1229,6 +1229,33 @@ static int cmd_log_system(const char *args, const char *permissions)
 	return 0;
 }
 
+static int cmd_log_mgmtd(const char *args, const char *permissions)
+{
+	(void)permissions;
+	char payload[32] = "";
+	if (args && *args)
+		snprintf(payload, sizeof(payload), "%s", args);
+
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_LOG_MGMTD, payload, &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+
+	if (resp.status != SG_OK) {
+		print_ipc_error("Error", &resp);
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	if (resp.payload && resp.payload_len > 0)
+		printf("%s", resp.payload);
+
+	ipc_resp_free(&resp);
+	return 0;
+}
+
 static int cmd_log_clear_audit(const char *args, const char *permissions)
 {
 	(void)args;

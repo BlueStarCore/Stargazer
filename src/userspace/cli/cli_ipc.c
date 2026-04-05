@@ -154,6 +154,7 @@ static const char *cmd_name(uint32_t cmd)
 	case SG_CMD_HISTORY_LOAD:      return "HISTORY_LOAD";
 	case SG_CMD_LOG_AUDIT:         return "LOG_AUDIT";
 	case SG_CMD_LOG_SYSTEM:        return "LOG_SYSTEM";
+	case SG_CMD_LOG_MGMTD:         return "LOG_MGMTD";
 	case SG_CMD_LOG_CLEAR_AUDIT:   return "LOG_CLEAR_AUDIT";
 	case SG_CMD_PING:           return "PING";
 	case SG_CMD_DEBUG_FETCH:    return "DEBUG_FETCH";

@@ -145,6 +145,7 @@ typedef enum {
 	SG_CMD_LOG_AUDIT         = 670,  /* Read audit log (tail N lines)      */
 	SG_CMD_LOG_SYSTEM        = 671,  /* Read dmesg output                  */
 	SG_CMD_LOG_CLEAR_AUDIT   = 672,  /* Truncate audit log                 */
+	SG_CMD_LOG_MGMTD        = 673,  /* Read mgmtd daemon log              */
 
 	/* DNS/DHCP — Member A (7xx): SG_CMD_DNS_* 700-749, SG_CMD_DHCP_* 750-799 */
 	/* NAT — Member B (8xx): SG_CMD_NAT_* 800-849 */
@@ -263,6 +264,7 @@ static inline int sg_cmd_audit_skip(sg_cmd_t cmd)
 	case SG_CMD_HISTORY_LOAD:
 	case SG_CMD_LOG_AUDIT:
 	case SG_CMD_LOG_SYSTEM:
+	case SG_CMD_LOG_MGMTD:
 	case SG_CMD_DISK_LIST:
 	case SG_CMD_DISK_INFO:
 	case SG_CMD_DISK_SMART:
