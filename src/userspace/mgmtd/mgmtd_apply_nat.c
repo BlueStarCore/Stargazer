@@ -45,8 +45,11 @@ static void append_addr_match(struct dynbuf *buf,
 			      const char *flag,
 			      const char *addr)
 {
-	if (!is_any_or_all(addr) && sg_is_cidr(addr))
-		dbuf_printf(buf, " %s %s", flag, addr);
+	char resolved[VALBUFSZ];
+	const char *cidr = resolve_address(addr, resolved,
+					   sizeof(resolved));
+	if (cidr && strcmp(cidr, "SKIP") != 0)
+		dbuf_printf(buf, " %s %s", flag, cidr);
 }
 
 /*
@@ -239,12 +242,12 @@ sg_status_t validate_nat(const char *id, const char *data,
 		return SG_ERR_INVALID_VAL;
 	}
 	if (srcaddr[0] && !is_any_or_all(srcaddr) &&
-	    !sg_is_cidr(srcaddr)) {
+	    !sg_is_cidr(srcaddr) && !sg_is_safe_id(srcaddr)) {
 		snprintf(result, rsize, "Invalid srcaddr '%s'", srcaddr);
 		return SG_ERR_INVALID_VAL;
 	}
 	if (dstaddr[0] && !is_any_or_all(dstaddr) &&
-	    !sg_is_cidr(dstaddr)) {
+	    !sg_is_cidr(dstaddr) && !sg_is_safe_id(dstaddr)) {
 		snprintf(result, rsize, "Invalid dstaddr '%s'", dstaddr);
 		return SG_ERR_INVALID_VAL;
 	}

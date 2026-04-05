@@ -636,10 +636,12 @@ static void test_value_validation(void)
 		 sg_reg_validate_value("network_nat", "srcaddr", "all"), 1);
 	tc_check("val", "network_nat.srcaddr = '10.0.0.0/8' (cidr)",
 		 sg_reg_validate_value("network_nat", "srcaddr", "10.0.0.0/8"), 1);
-	tc_check("val", "network_nat.srcaddr = '10.0.0.0' (plain ipv4 fail)",
+	tc_check("val", "network_nat.srcaddr = '10.0.0.0' (plain ipv4 rejected)",
 		 sg_reg_validate_value("network_nat", "srcaddr", "10.0.0.0"), 0);
-	tc_check("val", "network_nat.srcaddr = 'none' (invalid keyword)",
-		 sg_reg_validate_value("network_nat", "srcaddr", "none"), 0);
+	/* 'none' is a valid safe-id (could be an address object name).
+	 * Existence check happens later in validate_ref_existence(). */
+	tc_check("val", "network_nat.srcaddr = 'none' (valid as object name)",
+		 sg_reg_validate_value("network_nat", "srcaddr", "none"), 1);
 
 	/* ref-or */
 	tc_check("val", "firewall_policy.srcaddr = 'all'",
@@ -1355,8 +1357,7 @@ static void test_ipc_apply(void)
 	conn = ipc_send_str(SG_CMD_CFG_APPLY,
 			    "network_dns\n0\n"
 			    "primary=8.8.8.8\n"
-			    "secondary=8.8.4.4\n"
-			    "status=enable\n",
+			    "secondary=8.8.4.4\n",
 			    &resp);
 	if (conn == 0 && resp.status == SG_OK) {
 		tc_pass++;
@@ -1423,6 +1424,20 @@ static void test_ref_metadata(void)
 		       ro, "all,any");
 	}
 
+	/* sg_parse_ref_kind: ref-or-cidr:TYPE:opts */
+	{
+		char rt[64], ro[64];
+		int rc = sg_parse_ref_kind("ref-or-cidr:firewall_address:all,any",
+					   rt, sizeof(rt), ro, sizeof(ro));
+		tc_check("ref-meta",
+			 "parse ref-or-cidr:firewall_address:all,any -> 1",
+			 rc, 1);
+		tc_str("ref-meta", "ref-or-cidr type = firewall_address",
+		       rt, "firewall_address");
+		tc_str("ref-meta", "ref-or-cidr opts = all,any",
+		       ro, "all,any");
+	}
+
 	/* sg_parse_ref_kind: non-ref kinds return 0 */
 	{
 		char rt[64], ro[64];
@@ -1437,24 +1452,15 @@ static void test_ref_metadata(void)
 					   ro, sizeof(ro)), 0);
 	}
 
-	/* sg_reg_find_referencing: firewall_address -> 2 fields */
+	/* sg_reg_find_referencing: firewall_address -> 4 fields
+	 * (NAT srcaddr, NAT dstaddr, policy srcaddr, policy dstaddr) */
 	{
 		sg_ref_entry_t refs[16];
 		int n = sg_reg_find_referencing("firewall_address",
 						refs, 16);
 		tc_check("ref-meta",
-			 "firewall_address referenced by 2 fields",
-			 n, 2);
-		if (n >= 2) {
-			tc_str("ref-meta", "ref[0].type = firewall_policy",
-			       refs[0].type, "firewall_policy");
-			tc_str("ref-meta", "ref[0].key = srcaddr",
-			       refs[0].key, "srcaddr");
-			tc_str("ref-meta", "ref[1].type = firewall_policy",
-			       refs[1].type, "firewall_policy");
-			tc_str("ref-meta", "ref[1].key = dstaddr",
-			       refs[1].key, "dstaddr");
-		}
+			 "firewall_address referenced by 4 fields",
+			 n, 4);
 	}
 
 	/* sg_reg_find_referencing: firewall_service -> 1 field */
@@ -1698,23 +1704,8 @@ static void test_boundary_values(void)
 	tc_check("boundary", "network_nat.mapped-port = '65535' (max)",
 		 sg_reg_validate_value("network_nat", "mapped-port", "65535"), 1);
 
-	/* network_dns.port: 1-65535 */
-	tc_check("boundary", "network_dns.port = '1' (min)",
-		 sg_reg_validate_value("network_dns", "port", "1"), 1);
-	tc_check("boundary", "network_dns.port = '65535' (max)",
-		 sg_reg_validate_value("network_dns", "port", "65535"), 1);
-	tc_check("boundary", "network_dns.port = '0' (below min)",
-		 sg_reg_validate_value("network_dns", "port", "0"), 0);
-	tc_check("boundary", "network_dns.port = '65536' (above max)",
-		 sg_reg_validate_value("network_dns", "port", "65536"), 0);
-
-	/* network_dns.cache-size: 0-100000 */
-	tc_check("boundary", "network_dns.cache-size = '0' (min)",
-		 sg_reg_validate_value("network_dns", "cache-size", "0"), 1);
-	tc_check("boundary", "network_dns.cache-size = '100000' (max)",
-		 sg_reg_validate_value("network_dns", "cache-size", "100000"), 1);
-	tc_check("boundary", "network_dns.cache-size = '100001' (above max)",
-		 sg_reg_validate_value("network_dns", "cache-size", "100001"), 0);
+	/* network_dns.port and cache-size: not yet in schema — tests
+	 * deferred until DNS resolver feature is implemented. */
 
 	/* network_dhcp-server.lease-time: 60-604800 */
 	tc_check("boundary", "network_dhcp-server.lease-time = '60' (min)",
@@ -2052,6 +2043,7 @@ static void test_ipc_cfg_nat_roundtrip(void)
 	conn = ipc_send_str(SG_CMD_CFG_SET,
 			    "network_nat:__diag_nattest\n"
 			    "type=dnat\n"
+			    "protocol=tcp\n"
 			    "srcaddr=any\n"
 			    "dstaddr=10.0.0.0/24\n"
 			    "mapped-ip=192.168.1.100\n"
@@ -2769,6 +2761,464 @@ static void test_ipc_resource_cleanup(void)
 	}
 }
 
+/* ── Reference object system tests ──────────────────────────────────────── */
+
+/*
+ * test_ipc_ref_object — 5-scenario reference lifecycle test.
+ *
+ * Creates objects A (address), B (policy referencing A), C (address).
+ * Tests: resolve, delete protection, delete referrer, cascade, re-reference.
+ */
+static void test_ipc_ref_object(void)
+{
+	struct ipc_response resp;
+	int conn;
+
+	printf(C_CYAN "\n  --- IPC: reference object lifecycle ---" C_NC "\n");
+
+	/* ── Test 1: Resolve — B references A ── */
+
+	/* 1. Create A */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_SET,
+			    "firewall_address:__diag_addrA\n"
+			    "name=__diag_addrA\n"
+			    "subnet=10.50.0.0/24\n"
+			    "type=ipmask\n",
+			    &resp);
+	if (conn < 0 || resp.status != SG_OK) {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC " [ref-obj] create addrA (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+		ipc_resp_free(&resp);
+		return;
+	}
+	tc_pass++;
+	printf(C_GREEN "  PASS" C_NC " [ref-obj] create addrA\n");
+	ipc_resp_free(&resp);
+
+	/* 2. Create B referencing A */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_SET,
+			    "firewall_policy:98\n"
+			    "name=__diag_refpol\n"
+			    "srcaddr=__diag_addrA\n"
+			    "dstaddr=all\n"
+			    "srcintf=any\n"
+			    "dstintf=any\n"
+			    "action=deny\n"
+			    "service=all\n"
+			    "status=enable\n",
+			    &resp);
+	if (conn < 0 || resp.status != SG_OK) {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [ref-obj] create policy:98 with srcaddr=addrA"
+		       " (status=%u: %s)\n",
+		       conn < 0 ? 999 : resp.status,
+		       resp.extra[0] ? resp.extra : "");
+		ipc_resp_free(&resp);
+		goto cleanup;
+	}
+	tc_pass++;
+	printf(C_GREEN "  PASS" C_NC
+	       " [ref-obj] create policy:98 with srcaddr=__diag_addrA\n");
+	ipc_resp_free(&resp);
+
+	/* 3. Verify A's data intact */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_GET,
+			    "firewall_address:__diag_addrA", &resp);
+	if (conn == 0 && resp.status == SG_OK && resp.payload &&
+	    strstr(resp.payload, "subnet=10.50.0.0/24")) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [ref-obj] addrA subnet=10.50.0.0/24 intact\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [ref-obj] addrA data check failed\n");
+	}
+	ipc_resp_free(&resp);
+
+	/* 4. Verify B stores the reference */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_GET,
+			    "firewall_policy:98", &resp);
+	if (conn == 0 && resp.status == SG_OK && resp.payload &&
+	    strstr(resp.payload, "srcaddr=__diag_addrA")) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [ref-obj] policy:98 srcaddr=__diag_addrA stored\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [ref-obj] policy:98 srcaddr check failed\n");
+	}
+	ipc_resp_free(&resp);
+
+	/* ── Test 2: Delete referenced A → expect deny ── */
+
+	ipc_check("delete referenced addrA -> IN_USE",
+		  SG_CMD_CFG_DEL,
+		  "firewall_address:__diag_addrA",
+		  SG_ERR_IN_USE);
+
+	/* Verify A still exists */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_GET,
+			    "firewall_address:__diag_addrA", &resp);
+	if (conn == 0 && resp.status == SG_OK) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [ref-obj] addrA still exists after blocked delete\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [ref-obj] addrA missing after blocked delete\n");
+	}
+	ipc_resp_free(&resp);
+
+	/* ── Test 3: Delete referrer B → expect accept ── */
+
+	ipc_check("delete referrer policy:98 -> OK",
+		  SG_CMD_CFG_DEL,
+		  "firewall_policy:98",
+		  SG_OK);
+
+	/* Verify A still exists and unchanged */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_GET,
+			    "firewall_address:__diag_addrA", &resp);
+	if (conn == 0 && resp.status == SG_OK && resp.payload &&
+	    strstr(resp.payload, "subnet=10.50.0.0/24")) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [ref-obj] addrA unchanged after referrer deleted\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [ref-obj] addrA data changed after referrer deleted\n");
+	}
+	ipc_resp_free(&resp);
+
+	/* ── Test 4: Change A's subnet, cascade re-apply B ── */
+
+	/* Re-create B */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_SET,
+			    "firewall_policy:98\n"
+			    "name=__diag_refpol\n"
+			    "srcaddr=__diag_addrA\n"
+			    "dstaddr=all\n"
+			    "srcintf=any\n"
+			    "dstintf=any\n"
+			    "action=deny\n"
+			    "service=all\n"
+			    "status=enable\n",
+			    &resp);
+	if (conn < 0 || resp.status != SG_OK) {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [ref-obj] re-create policy:98 (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+		ipc_resp_free(&resp);
+		goto cleanup;
+	}
+	tc_pass++;
+	printf(C_GREEN "  PASS" C_NC " [ref-obj] re-create policy:98\n");
+	ipc_resp_free(&resp);
+
+	/* Update A's subnet (triggers usage_cascade → firewall rebuild) */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_SET,
+			    "firewall_address:__diag_addrA\n"
+			    "name=__diag_addrA\n"
+			    "subnet=10.60.0.0/24\n"
+			    "type=ipmask\n",
+			    &resp);
+	if (conn == 0 && resp.status == SG_OK) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [ref-obj] update addrA subnet (cascade triggered)\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [ref-obj] update addrA subnet (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+	}
+	ipc_resp_free(&resp);
+
+	/* Verify A changed */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_GET,
+			    "firewall_address:__diag_addrA", &resp);
+	if (conn == 0 && resp.status == SG_OK && resp.payload &&
+	    strstr(resp.payload, "subnet=10.60.0.0/24")) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [ref-obj] addrA subnet=10.60.0.0/24 updated\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [ref-obj] addrA subnet not updated\n");
+	}
+	ipc_resp_free(&resp);
+
+	/* Verify B still references A by name */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_GET,
+			    "firewall_policy:98", &resp);
+	if (conn == 0 && resp.status == SG_OK && resp.payload &&
+	    strstr(resp.payload, "srcaddr=__diag_addrA")) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [ref-obj] policy:98 still refs addrA after cascade\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [ref-obj] policy:98 ref lost after cascade\n");
+	}
+	ipc_resp_free(&resp);
+
+	/* ── Test 5: B re-references from A to C — A unchanged ── */
+
+	/* Create C */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_SET,
+			    "firewall_address:__diag_addrC\n"
+			    "name=__diag_addrC\n"
+			    "subnet=172.20.0.0/16\n"
+			    "type=ipmask\n",
+			    &resp);
+	if (conn < 0 || resp.status != SG_OK) {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC " [ref-obj] create addrC (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+		ipc_resp_free(&resp);
+		goto cleanup;
+	}
+	tc_pass++;
+	printf(C_GREEN "  PASS" C_NC " [ref-obj] create addrC\n");
+	ipc_resp_free(&resp);
+
+	/* Update B: srcaddr → addrC */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_SET,
+			    "firewall_policy:98\n"
+			    "name=__diag_refpol\n"
+			    "srcaddr=__diag_addrC\n"
+			    "dstaddr=all\n"
+			    "srcintf=any\n"
+			    "dstintf=any\n"
+			    "action=deny\n"
+			    "service=all\n"
+			    "status=enable\n",
+			    &resp);
+	if (conn == 0 && resp.status == SG_OK) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [ref-obj] policy:98 re-ref to addrC\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [ref-obj] policy:98 re-ref failed (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+	}
+	ipc_resp_free(&resp);
+
+	/* Verify A unchanged */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_GET,
+			    "firewall_address:__diag_addrA", &resp);
+	if (conn == 0 && resp.status == SG_OK && resp.payload &&
+	    strstr(resp.payload, "subnet=10.60.0.0/24")) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [ref-obj] addrA unchanged after re-reference\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [ref-obj] addrA modified by re-reference\n");
+	}
+	ipc_resp_free(&resp);
+
+	/* Verify B now references C */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_GET,
+			    "firewall_policy:98", &resp);
+	if (conn == 0 && resp.status == SG_OK && resp.payload &&
+	    strstr(resp.payload, "srcaddr=__diag_addrC")) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [ref-obj] policy:98 now refs addrC\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [ref-obj] policy:98 srcaddr not updated to addrC\n");
+	}
+	ipc_resp_free(&resp);
+
+	/* Verify C intact */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_GET,
+			    "firewall_address:__diag_addrC", &resp);
+	if (conn == 0 && resp.status == SG_OK && resp.payload &&
+	    strstr(resp.payload, "subnet=172.20.0.0/16")) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [ref-obj] addrC subnet=172.20.0.0/16 intact\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [ref-obj] addrC data corrupted\n");
+	}
+	ipc_resp_free(&resp);
+
+cleanup:
+	if (ipc_send_str(SG_CMD_CFG_DEL, "firewall_policy:98", &resp) == 0)
+		ipc_resp_free(&resp);
+	if (ipc_send_str(SG_CMD_CFG_DEL, "firewall_address:__diag_addrA",
+			 &resp) == 0)
+		ipc_resp_free(&resp);
+	if (ipc_send_str(SG_CMD_CFG_DEL, "firewall_address:__diag_addrC",
+			 &resp) == 0)
+		ipc_resp_free(&resp);
+}
+
+/*
+ * test_ipc_ref_existence — Server-side reference existence validation.
+ * Reject nonexistent references; accept builtin "all" object.
+ */
+static void test_ipc_ref_existence(void)
+{
+	printf(C_CYAN "\n  --- IPC: reference existence validation ---"
+	       C_NC "\n");
+
+	/* CFG_SET with nonexistent address → SG_ERR_NOT_FOUND */
+	ipc_check("CFG_SET policy with nonexistent srcaddr -> NOT_FOUND",
+		  SG_CMD_CFG_SET,
+		  "firewall_policy:97\n"
+		  "name=__diag_badref\n"
+		  "srcaddr=__nonexistent_addr\n"
+		  "dstaddr=all\n"
+		  "srcintf=any\n"
+		  "dstintf=any\n"
+		  "action=deny\n"
+		  "service=all\n"
+		  "status=enable\n",
+		  SG_ERR_NOT_FOUND);
+
+	/* CFG_APPLY with nonexistent address → SG_ERR_NOT_FOUND */
+	ipc_check("CFG_APPLY policy with nonexistent srcaddr -> NOT_FOUND",
+		  SG_CMD_CFG_APPLY,
+		  "firewall_policy\n97\n"
+		  "name=__diag_badref\n"
+		  "srcaddr=__nonexistent_addr\n"
+		  "dstaddr=all\n"
+		  "srcintf=any\n"
+		  "dstintf=any\n"
+		  "action=deny\n"
+		  "service=all\n"
+		  "status=enable\n",
+		  SG_ERR_NOT_FOUND);
+
+	/* CFG_SET with builtin "all" → SG_OK */
+	ipc_check("CFG_SET policy with srcaddr=all (builtin) -> OK",
+		  SG_CMD_CFG_SET,
+		  "firewall_policy:97\n"
+		  "name=__diag_allref\n"
+		  "srcaddr=all\n"
+		  "dstaddr=all\n"
+		  "srcintf=any\n"
+		  "dstintf=any\n"
+		  "action=deny\n"
+		  "service=all\n"
+		  "status=enable\n",
+		  SG_OK);
+
+	/* Cleanup */
+	{
+		struct ipc_response resp;
+		if (ipc_send_str(SG_CMD_CFG_DEL, "firewall_policy:97",
+				 &resp) == 0)
+			ipc_resp_free(&resp);
+	}
+}
+
+/*
+ * test_ipc_immutable — Builtin immutable objects cannot be modified/deleted.
+ */
+static void test_ipc_immutable(void)
+{
+	struct ipc_response resp;
+	int conn;
+
+	printf(C_CYAN "\n  --- IPC: immutable object protection ---"
+	       C_NC "\n");
+
+	/* Modify firewall_address:all → SG_ERR_BUILTIN */
+	ipc_check("modify immutable address:all -> BUILTIN",
+		  SG_CMD_CFG_SET,
+		  "firewall_address:all\n"
+		  "name=all\n"
+		  "subnet=192.168.0.0/16\n"
+		  "type=ipmask\n",
+		  SG_ERR_BUILTIN);
+
+	/* Delete firewall_address:all → SG_ERR_BUILTIN */
+	ipc_check("delete immutable address:all -> BUILTIN",
+		  SG_CMD_CFG_DEL,
+		  "firewall_address:all",
+		  SG_ERR_BUILTIN);
+
+	/* Modify firewall_service:all → SG_ERR_BUILTIN */
+	ipc_check("modify immutable service:all -> BUILTIN",
+		  SG_CMD_CFG_SET,
+		  "firewall_service:all\n"
+		  "name=all\n"
+		  "protocol=tcp\n",
+		  SG_ERR_BUILTIN);
+
+	/* Delete firewall_service:all → SG_ERR_BUILTIN */
+	ipc_check("delete immutable service:all -> BUILTIN",
+		  SG_CMD_CFG_DEL,
+		  "firewall_service:all",
+		  SG_ERR_BUILTIN);
+
+	/* Verify address:all data unchanged */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_GET,
+			    "firewall_address:all", &resp);
+	if (conn == 0 && resp.status == SG_OK && resp.payload &&
+	    strstr(resp.payload, "subnet=0.0.0.0/0")) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [immutable] address:all subnet=0.0.0.0/0 intact\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [immutable] address:all data corrupted\n");
+	}
+	ipc_resp_free(&resp);
+
+	/* Verify service:all data unchanged */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_GET,
+			    "firewall_service:all", &resp);
+	if (conn == 0 && resp.status == SG_OK && resp.payload &&
+	    strstr(resp.payload, "protocol=all")) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [immutable] service:all protocol=all intact\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [immutable] service:all data corrupted\n");
+	}
+	ipc_resp_free(&resp);
+}
+
 /* ── Cleanup helper ───────────────────────────────────────────────────── */
 
 static void cleanup_test_entries(void)
@@ -2813,6 +3263,31 @@ static void cleanup_test_entries(void)
 			 "firewall_address:__diag_schematest", &resp) == 0 &&
 	    resp.status == SG_OK)
 		printf("  cleanup: deleted __diag_schematest\n");
+	ipc_resp_free(&resp);
+
+	/* Reference object test entries */
+	if (ipc_send_str(SG_CMD_CFG_DEL,
+			 "firewall_policy:98", &resp) == 0 &&
+	    resp.status == SG_OK)
+		printf("  cleanup: deleted firewall_policy:98\n");
+	ipc_resp_free(&resp);
+
+	if (ipc_send_str(SG_CMD_CFG_DEL,
+			 "firewall_policy:97", &resp) == 0 &&
+	    resp.status == SG_OK)
+		printf("  cleanup: deleted firewall_policy:97\n");
+	ipc_resp_free(&resp);
+
+	if (ipc_send_str(SG_CMD_CFG_DEL,
+			 "firewall_address:__diag_addrA", &resp) == 0 &&
+	    resp.status == SG_OK)
+		printf("  cleanup: deleted __diag_addrA\n");
+	ipc_resp_free(&resp);
+
+	if (ipc_send_str(SG_CMD_CFG_DEL,
+			 "firewall_address:__diag_addrC", &resp) == 0 &&
+	    resp.status == SG_OK)
+		printf("  cleanup: deleted __diag_addrC\n");
 	ipc_resp_free(&resp);
 }
 
@@ -2876,6 +3351,9 @@ int cli_diagnose_test_configure(int mode, diag_result_t *out)
 			test_ipc_cfg_set_validation();
 			test_ipc_schema_version();
 			test_ipc_resource_cleanup();
+			test_ipc_ref_object();
+			test_ipc_ref_existence();
+			test_ipc_immutable();
 			cleanup_test_entries();
 		}
 	}

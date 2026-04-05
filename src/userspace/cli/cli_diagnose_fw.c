@@ -532,11 +532,12 @@ static void test_nat_sequence(void)
 	fw_ipc_fire(SG_CMD_CFG_DEL, "network_nat:9901\n");
 	fw_ipc_fire(SG_CMD_CFG_DEL, "network_nat:9902\n");
 
-	/* Create SNAT rule without sequence */
+	/* Create SNAT rule without sequence.
+	 * Use eth0 as dstintf — lo is not in system_interface DB. */
 	fw_check("NAT-SEQ-1", "create SNAT 9901 (auto-seq)",
 		 fw_ipc(SG_CMD_CFG_SET,
 			"network_nat:9901\n"
-			"type=snat\nsrcintf=lo\n"
+			"type=snat\nsrcintf=any\ndstintf=eth0\n"
 			"srcaddr=any\ndstaddr=any\n"
 			"status=enable\n",
 			&resp, SG_OK), 1);
@@ -554,7 +555,7 @@ static void test_nat_sequence(void)
 	fw_check("NAT-SEQ-2", "disable NAT 9901",
 		 fw_ipc(SG_CMD_CFG_SET,
 			"network_nat:9901\n"
-			"type=snat\nsrcintf=lo\n"
+			"type=snat\nsrcintf=any\ndstintf=eth0\n"
 			"srcaddr=any\ndstaddr=any\n"
 			"status=disable\nsequence=1\n",
 			&resp, SG_OK), 1);
@@ -564,7 +565,7 @@ static void test_nat_sequence(void)
 	fw_check("NAT-SEQ-2", "re-enable NAT 9901",
 		 fw_ipc(SG_CMD_CFG_SET,
 			"network_nat:9901\n"
-			"type=snat\nsrcintf=lo\n"
+			"type=snat\nsrcintf=any\ndstintf=eth0\n"
 			"srcaddr=any\ndstaddr=any\n"
 			"status=enable\nsequence=1\n",
 			&resp, SG_OK), 1);
@@ -605,11 +606,11 @@ static void test_nat_kernel_verify(void)
 	fw_ipc_fire(SG_CMD_CFG_DEL, "network_nat:9905\n");
 	fw_ipc_fire(SG_CMD_CFG_DEL, "network_nat:9906\n");
 
-	/* Create SNAT overload rule */
-	fw_check("NAT-KER-1", "create SNAT overload (lo)",
+	/* Create SNAT overload rule — dstintf is the outgoing interface */
+	fw_check("NAT-KER-1", "create SNAT overload (eth0)",
 		 fw_ipc(SG_CMD_CFG_SET,
 			"network_nat:9903\n"
-			"type=snat\nsrcintf=lo\n"
+			"type=snat\nsrcintf=any\ndstintf=eth0\n"
 			"srcaddr=any\ndstaddr=any\n"
 			"protocol=all\nstatus=enable\n",
 			&resp, SG_OK), 1);
@@ -705,25 +706,24 @@ static void test_iface_ref_integrity(void)
 	printf(C_CYAN "\n  --- REF-IFACE: interface referential integrity ---"
 	       C_NC "\n");
 
-	/* Create a static route referencing lan0 (or whatever exists).
-	 * We use 'lo' as it always exists for loopback. */
+	/* Create a static route referencing eth0 (exists in DB
+	 * after mgmtd_sync_interfaces on QEMU). */
 	fw_ipc_fire(SG_CMD_CFG_DEL, "network_route_static:9901\n");
 
-	fw_check("REF-IFACE", "create route referencing lo",
+	fw_check("REF-IFACE", "create route referencing eth0",
 		 fw_ipc(SG_CMD_CFG_SET,
 			"network_route_static:9901\n"
 			"dst=198.51.100.0/24\n"
-			"gateway=127.0.0.1\n"
-			"device=lo\n"
+			"gateway=10.0.1.1\n"
+			"device=eth0\n"
 			"distance=10\n"
-			"status=enable\n",
+			"status=disable\n",
 			&resp, SG_OK), 1);
 	ipc_resp_free(&resp);
 
-	/* Try to delete system_interface:lo → should be blocked
-	 * (builtin or referenced).  lo may not be in DB as system_interface,
-	 * so this tests the concept — if it exists, it's blocked. */
-	int blocked = fw_ipc(SG_CMD_CFG_DEL, "system_interface:lo\n",
+	/* Try to delete system_interface:eth0 → should be blocked
+	 * because the route references it. */
+	int blocked = fw_ipc(SG_CMD_CFG_DEL, "system_interface:eth0\n",
 			     &resp, SG_OK);
 	/* We expect either SG_ERR_ENTRY_NOT_FOUND (lo not in DB),
 	 * SG_ERR_BUILTIN, or SG_ERR_IN_USE — anything but SG_OK */

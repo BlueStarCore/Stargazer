@@ -1382,6 +1382,23 @@ static int mgmtd_seed_defaults(void)
 	if (sg_db_set("system_ntp", "0",
 		      "server=pool.ntp.org\n") != 0) goto fail;
 
+	/* ── Built-in address object (match all) ────────────────────── */
+	if (sg_db_set("firewall_address", "all",
+		      "name=all\n"
+		      "subnet=0.0.0.0/0\n"
+		      "type=ipmask\n"
+		      "builtin=yes\n"
+		      "immutable=yes\n"
+		      "comment=Match all addresses\n") != 0) goto fail;
+
+	/* ── Built-in service object (match all) ────────────────────── */
+	if (sg_db_set("firewall_service", "all",
+		      "name=all\n"
+		      "protocol=all\n"
+		      "builtin=yes\n"
+		      "immutable=yes\n"
+		      "comment=Match all services\n") != 0) goto fail;
+
 	/* ── Default firewall policy (deny all) ─────────────────────── */
 	if (sg_db_set("firewall_policy", "1",
 		      "name=default-deny\n"
@@ -1390,9 +1407,11 @@ static int mgmtd_seed_defaults(void)
 		      "srcaddr=all\n"
 		      "dstaddr=all\n"
 		      "action=deny\n"
+		      "service=all\n"
 		      "status=enable\n"
 		      "sequence=1\n"
 		      "builtin=yes\n"
+		      "immutable=yes\n"
 		      "comment=Default deny all traffic\n") != 0) goto fail;
 
 	/* ── Default interfaces ──────────────────────────────────────── */
@@ -2104,6 +2123,7 @@ static int scrub_config_entry(const char *type, const char *id,
 
 		/* Internal metadata keys — preserve as-is, never scrub */
 		if (strcmp(key, "builtin") == 0 ||
+		    strcmp(key, "immutable") == 0 ||
 		    strcmp(key, "password-hash") == 0) {
 			int n = snprintf(out + pos, outsz - pos,
 					 "%s=%s\n", key, val);
@@ -2196,6 +2216,8 @@ static void mgmtd_backfill_sequences(void)
  * and calls apply_config() for each entry.
  * Scrubs invalid values before applying — survives version upgrades/downgrades.
  */
+static int g_replaying = 1;
+
 static void mgmtd_replay_config(void)
 {
 	/* Backfill sequence numbers before replay so position
@@ -2245,6 +2267,8 @@ static void mgmtd_replay_config(void)
 		"system_admin",          /* depends on profiles */
 		"system_interface",      /* IP + allowaccess INPUT rules */
 		"network_route_static",  /* flush proto static first */
+		"firewall_address",      /* data-only: before firewall/NAT rebuild */
+		"firewall_service",      /* data-only: before firewall/NAT rebuild */
 		"network_nat",
 		"network_dhcp-server",
 		"firewall_policy",       /* FORWARD rules — flush chain first */
@@ -2339,6 +2363,9 @@ static void mgmtd_replay_config(void)
 		}
 		free(list);
 	}
+
+	/* Enable ref existence checks now that all config is loaded */
+	g_replaying = 0;
 }
 
 /* ── Session tag table ──────────────────────────────────────────────────── */
@@ -2687,6 +2714,95 @@ const char *get_type_permission(const char *type_name)
 	return sg_reg_type_perm(type_name);
 }
 
+/* ── Usage cascade — re-apply entries that reference a changed object ── */
+
+/*
+ * usage_cascade — When object type:id changes, find all config entries
+ * that reference it and re-apply them.
+ *
+ * Uses the same infrastructure as check_references():
+ *   sg_reg_find_referencing() → which fields reference this type
+ *   sg_db_find_referencing()  → which entries have this value
+ *
+ * No separate index needed — DB is the source of truth.
+ *
+ * Special case: firewall_address / firewall_service changes trigger
+ * atomic chain rebuilds instead of per-entry re-apply.
+ */
+static void usage_cascade(const char *type, const char *id)
+{
+	/* Address/service changes → atomic chain rebuild */
+	if (strcmp(type, "firewall_address") == 0 ||
+	    strcmp(type, "firewall_service") == 0) {
+		char rb[512];
+		rebuild_forward_chain(rb, sizeof(rb));
+		mgmt_log("INFO", "cascade: %s:%s → %s", type, id, rb);
+		rebuild_nat_chains(rb, sizeof(rb));
+		mgmt_log("INFO", "cascade: %s:%s → NAT %s", type, id, rb);
+		return;
+	}
+
+	sg_ref_entry_t refs[16];
+	int nrefs = sg_reg_find_referencing(type, refs, 16);
+
+	for (int i = 0; i < nrefs; i++) {
+		char *found = sg_db_find_referencing(refs[i].type,
+						     refs[i].key, id);
+		if (!found)
+			continue;
+
+		/* found = "type:id1\ntype:id2\n..." */
+		char *saveptr = NULL;
+		for (char *entry = strtok_r(found, "\n", &saveptr);
+		     entry;
+		     entry = strtok_r(NULL, "\n", &saveptr)) {
+
+			/* Parse "type:id" */
+			char etype[256], eid[256];
+			sg_db_parse_section(entry, etype, sizeof(etype),
+					    eid, sizeof(eid));
+
+			/* Firewall/NAT use atomic rebuild, skip per-rule */
+			if (strcmp(etype, "firewall_policy") == 0 ||
+			    strcmp(etype, "network_nat") == 0)
+				continue;
+
+			char *data = sg_db_get(etype, eid);
+			if (!data)
+				continue;
+
+			char result[512];
+			sg_status_t rc = apply_config(etype, eid, data,
+						      result, sizeof(result));
+			mgmt_log(rc == SG_OK ? "INFO" : "WARN",
+				 "cascade %s:%s → %s",
+				 etype, eid, result);
+			free(data);
+		}
+		free(found);
+	}
+}
+
+/* ── Immutable check ───────────────────────────────────────────────────── */
+
+/*
+ * is_immutable — Check if a config entry is marked immutable.
+ *
+ * Reads the "immutable" key from the entry's existing DB data.
+ * Immutable entries cannot be modified or deleted.
+ *
+ * 'existing' is the already-fetched DB data (avoids redundant read).
+ * Returns 1 if immutable, 0 if not.
+ */
+static int is_immutable(const char *existing)
+{
+	if (!existing)
+		return 0;
+	char imm[VALBUFSZ];
+	extract_val(existing, "immutable", imm, sizeof(imm));
+	return strcmp(imm, "yes") == 0;
+}
+
 /* ── Referential integrity check ────────────────────────────────────────── */
 
 /*
@@ -2887,6 +3003,99 @@ sg_status_t validate_cfg_data(const char *type, const char *data,
 			*end = saved;
 			tok = end;
 		}
+	}
+
+	return SG_OK;
+}
+
+/* ── Server-side reference existence check ─────────────────────────────── */
+
+/*
+ * validate_ref_existence — Verify that ref field values point to
+ * existing objects in the database.
+ *
+ * For each key=value in data, if the field kind is a reference type
+ * (ref:, ref-or:, ref-iface:, ref-iface-or:, ref-or-cidr:), verify
+ * the referenced entry exists via sg_db_get().  Hardcoded options
+ * (e.g. interface "any") are accepted without lookup.
+ *
+ * This runs inside mgmtd — direct DB access, no IPC needed.
+ *
+ * Returns SG_OK on success, or SG_ERR_NOT_FOUND with message.
+ */
+static sg_status_t validate_ref_existence(const char *type,
+					  const char *data,
+					  char *errbuf, size_t errsz)
+{
+	if (g_replaying)
+		return SG_OK;
+
+	const char *p = data;
+	while (*p) {
+		if (*p == '\n') { p++; continue; }
+
+		const char *eol = strchr(p, '\n');
+		size_t llen = eol ? (size_t)(eol - p) : strlen(p);
+		const char *eq = memchr(p, '=', llen);
+		if (!eq)
+			goto next_ref;
+
+		size_t klen = (size_t)(eq - p);
+		if (klen == 0 || klen >= 64)
+			goto next_ref;
+
+		char key[64];
+		memcpy(key, p, klen);
+		key[klen] = '\0';
+
+		const char *vstart = eq + 1;
+		size_t vlen = llen - klen - 1;
+		if (vlen == 0 || vlen >= VALBUFSZ)
+			goto next_ref;
+
+		char val[VALBUFSZ];
+		memcpy(val, vstart, vlen);
+		val[vlen] = '\0';
+
+		/* Skip internal-only keys */
+		if (strcmp(key, "builtin") == 0 ||
+		    strcmp(key, "immutable") == 0 ||
+		    strcmp(key, "password-hash") == 0 ||
+		    strcmp(key, "id") == 0)
+			goto next_ref;
+
+		/* Get field kind from registry */
+		const char *kind = sg_reg_value_kind(type, key);
+		if (!kind)
+			goto next_ref;
+
+		/* Parse ref kind — skip if not a reference field */
+		char ref_type[64], opts[64];
+		if (!sg_parse_ref_kind(kind, ref_type, sizeof(ref_type),
+				       opts, sizeof(opts)))
+			goto next_ref;
+
+		/* Hardcoded options (e.g. interface "any") are always valid */
+		if (opts[0] && sg_match_csv_option(opts, val))
+			goto next_ref;
+
+		/* For ref-or-cidr: raw CIDR values are valid without lookup */
+		if (strncmp(kind, "ref-or-cidr:", 12) == 0 && sg_is_cidr(val))
+			goto next_ref;
+
+		/* Verify referenced entry exists in DB */
+		char *entry = sg_db_get(ref_type, val);
+		if (!entry) {
+			snprintf(errbuf, errsz,
+				 "'%.32s': %.32s '%.32s' does not exist",
+				 key, ref_type, val);
+			return SG_ERR_NOT_FOUND;
+		}
+		free(entry);
+
+	next_ref:
+		p += llen;
+		if (eol) p++;
 	}
 
 	return SG_OK;
@@ -3461,8 +3670,25 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			return 0;
 		}
 
+		/* Verify referenced objects exist in DB (server-side).
+		 * Closes the web API gap where CLI checks refs via IPC
+		 * but mgmtd itself did not verify. */
+		{
+			sg_status_t ref_st = validate_ref_existence(
+				db_type, data, val_err, sizeof(val_err));
+			if (ref_st != SG_OK) {
+				if (g_debug_flags & SG_DBG_FLAG_MGMTD)
+					debug_buf_push("[MGMTD-DBG] cfg_set "
+						       "ref check: %s\n",
+						       val_err);
+				send_error(client_fd, ref_st, val_err);
+				return 0;
+			}
+		}
+
 		/* Preserve internal-only fields that clients cannot set:
 		 *  - builtin: mgmtd seed flag, never client-controllable
+		 *  - immutable: mgmtd seed flag, never client-controllable
 		 *  - password-hash: managed by set_password(), never plaintext
 		 * Also strip password= — plaintext passwords are only accepted
 		 * by CFG_APPLY (which calls set_password and stores the hash);
@@ -3472,6 +3698,7 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		 * the old DB data to restore on rebuild failure. */
 		char *existing = sg_db_get(db_type, db_id);
 		int was_builtin = 0;
+		int was_immutable = 0;
 		int is_new_entry = (existing == NULL);
 		char saved_pw_hash[SG_PAYLOAD_MAX];
 		saved_pw_hash[0] = '\0';
@@ -3482,19 +3709,18 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 				was_builtin = 1;
 			extract_val(existing, "password-hash",
 				    saved_pw_hash, sizeof(saved_pw_hash));
+			was_immutable = is_immutable(existing);
 		}
 
-		/* Builtin firewall/NAT policies are fully immutable.
-		 * The default-deny must stay exactly as seeded — no
-		 * field changes, no enable/disable, no reordering.
+		/* Immutable entries cannot be modified at all.
+		 * Covers default-deny policy, built-in address/service
+		 * objects, and any future immutable seeds.
 		 * This prevents an attacker who gains configure access
 		 * from silently opening the firewall. */
-		if (was_builtin &&
-		    (strcmp(db_type, "firewall_policy") == 0 ||
-		     strcmp(db_type, "network_nat") == 0)) {
+		if (was_immutable) {
 			free(existing);
 			send_error(client_fd, SG_ERR_BUILTIN,
-				   "Builtin policy cannot be modified");
+				   "Immutable object cannot be modified");
 			return 0;
 		}
 
@@ -3507,6 +3733,7 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			const char *el = strchr(dp, '\n');
 			size_t ll = el ? (size_t)(el - dp) : strlen(dp);
 			if ((ll >=  8 && memcmp(dp, "builtin=",       8) == 0) ||
+			    (ll >= 10 && memcmp(dp, "immutable=",    10) == 0) ||
 			    (ll >=  9 && memcmp(dp, "password=",      9) == 0) ||
 			    (ll >= 14 && memcmp(dp, "password-hash=", 14) == 0)) {
 				dp += ll;
@@ -3527,6 +3754,17 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		/* Re-append preserved internal fields */
 		if (was_builtin) {
 			const char *tag = "builtin=yes\n";
+			size_t tlen = strlen(tag);
+			if (cpos + tlen >= sizeof(clean)) {
+				send_error(client_fd, SG_ERR_INVALID_ARG,
+					   "Config payload too large");
+				return 0;
+			}
+			memcpy(clean + cpos, tag, tlen);
+			cpos += tlen;
+		}
+		if (was_immutable) {
+			const char *tag = "immutable=yes\n";
 			size_t tlen = strlen(tag);
 			if (cpos + tlen >= sizeof(clean)) {
 				send_error(client_fd, SG_ERR_INVALID_ARG,
@@ -3671,6 +3909,10 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			sg_db_set_val(db_type, db_id, "password-hash",
 				      saved_pw_hash);
 
+		/* Cascade: re-apply entries that reference this object.
+		 * Runs after apply + DB persist so cascade reads fresh data. */
+		usage_cascade(db_type, db_id);
+
 		/* Invalidate sessions for admin/profile/policy config changes.
 		 * All affected admins are purged so they re-authenticate,
 		 * including the acting user. */
@@ -3802,6 +4044,15 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 				send_error(client_fd, SG_ERR_BUILTIN, section);
 				return 0;
 			}
+		}
+		/* Check immutable flag (defense-in-depth — immutable
+		 * entries also have builtin=yes, so the above check
+		 * should already catch them) */
+		if (is_immutable(existing)) {
+			free(existing);
+			send_error(client_fd, SG_ERR_BUILTIN,
+				   "Immutable object cannot be deleted");
+			return 0;
 		}
 		free(existing);
 
@@ -3945,6 +4196,17 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		if (val_st != SG_OK) {
 			send_error(client_fd, val_st, val_err);
 			return 0;
+		}
+
+		/* Verify referenced objects exist in DB (server-side) */
+		{
+			char ref_err[SG_EXTRA_MAX];
+			sg_status_t ref_st = validate_ref_existence(
+				type_str, data, ref_err, sizeof(ref_err));
+			if (ref_st != SG_OK) {
+				send_error(client_fd, ref_st, ref_err);
+				return 0;
+			}
 		}
 
 		/* Cross-field check: system_interface in static mode must have

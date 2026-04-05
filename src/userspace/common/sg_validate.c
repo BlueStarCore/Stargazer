@@ -63,8 +63,8 @@ static const struct field_entry field_table[] = {
 	{ "network_nat", "srcintf",     "ref-iface-or:system_interface:any", 0, NULL, "Source interface"            },
 	{ "network_nat", "dstintf",     "ref-iface-or:system_interface:any", 1, NULL, "Destination interface"       },
 	{ "network_nat", "protocol",    "enum:tcp,udp,tcp+udp,all", 0, "all", "Protocol (tcp, udp, tcp+udp, or all)" },
-	{ "network_nat", "srcaddr",     "cidr-or:any,all",       0, NULL,     "Source address or subnet"     },
-	{ "network_nat", "dstaddr",     "cidr-or:any,all",       0, NULL,     "Destination address or subnet" },
+	{ "network_nat", "srcaddr",     "ref-or-cidr:firewall_address:all,any", 0, NULL, "Source address object or subnet" },
+	{ "network_nat", "dstaddr",     "ref-or-cidr:firewall_address:all,any", 0, NULL, "Destination address object or subnet" },
 	{ "network_nat", "dstport",     "uint:1:65535",          1, NULL,     "Destination port"             },
 	{ "network_nat", "mapped-ip",   "ipv4",                  1, NULL,     "Translated IP address"        },
 	{ "network_nat", "mapped-port", "uint:1:65535",          1, NULL,     "Translated port"              },
@@ -106,10 +106,10 @@ static const struct field_entry field_table[] = {
 	{ "firewall_policy", "name",     "safe-id",                         0, NULL,     "Policy name"                },
 	{ "firewall_policy", "srcintf",  "ref-iface-or:system_interface:any", 0, "any",   "Source interface"           },
 	{ "firewall_policy", "dstintf",  "ref-iface-or:system_interface:any", 0, "any",   "Destination interface"      },
-	{ "firewall_policy", "srcaddr",  "ref-or:firewall_address:all,any", 0, "all",    "Source address object"      },
-	{ "firewall_policy", "dstaddr",  "ref-or:firewall_address:all,any", 0, "all",    "Destination address object" },
+	{ "firewall_policy", "srcaddr",  "ref:firewall_address",            0, "all",    "Source address object"      },
+	{ "firewall_policy", "dstaddr",  "ref:firewall_address",            0, "all",    "Destination address object" },
 	{ "firewall_policy", "action",   "enum:accept,deny,drop",           0, "deny",   "Matching traffic action"    },
-	{ "firewall_policy", "service",  "ref-or:firewall_service:all,any", 0, "all",    "Service object"             },
+	{ "firewall_policy", "service",  "ref:firewall_service",            0, "all",    "Service object"             },
 	{ "firewall_policy", "schedule", "safe-id-or:all,any",              0, "all",    "Schedule object"            },
 	{ "firewall_policy", "status",   "enum:enable,disable",             0, "enable", "Enable or disable this policy" },
 	{ "firewall_policy", "comment",  "string",                          1, NULL,     "Optional description"       },
@@ -123,8 +123,8 @@ static const struct field_entry field_table[] = {
 
 	/* firewall_service */
 	{ "firewall_service", "name",       "safe-id",           0, NULL,  "Service object name"  },
-	{ "firewall_service", "protocol",   "enum:tcp,udp,icmp", 0, "tcp", "IP protocol"          },
-	{ "firewall_service", "port-range", "port-or-range",     0, NULL,  "Port or port range"   },
+	{ "firewall_service", "protocol",   "enum:tcp,udp,icmp,all", 0, "tcp", "IP protocol"          },
+	{ "firewall_service", "port-range", "port-or-range",         1, NULL,  "Port or port range"   },
 	{ "firewall_service", "comment",    "string",            1, NULL,  "Optional description" },
 
 	/* system_password-policy */
@@ -1018,6 +1018,23 @@ sg_reg_validate_value(const char *type_name, const char *key, const char *val)
 		return sg_is_safe_id(val);
 	}
 
+	/* ref-or-cidr:TYPE:a,b — CIDR or named ref or hardcoded option.
+	 * Reject plain IPv4 (e.g. "10.0.0.0") — must be CIDR with /prefix.
+	 * Object names that look like IPs (all digits+dots) are also rejected
+	 * to avoid ambiguity. */
+	if (strncmp(kind, "ref-or-cidr:", 12) == 0) {
+		const char *rest = kind + 12;
+		const char *colon = strchr(rest, ':');
+		if (colon && sg_match_csv_option(colon + 1, val))
+			return 1;
+		if (sg_is_cidr(val))
+			return 1;
+		/* Reject if it looks like an IP address (digits+dots only) */
+		if (sg_is_ipv4(val))
+			return 0;
+		return sg_is_safe_id(val);
+	}
+
 	/* ref-iface:TYPE — validate as iface name, register as reference.
 	 * ref-iface-or:TYPE:a,b — iface name OR one of the listed options. */
 	if (strncmp(kind, "ref-iface:", 10) == 0)
@@ -1060,6 +1077,30 @@ sg_parse_ref_kind(const char *kind,
 	/* ref-or:TYPE:opts */
 	if (strncmp(kind, "ref-or:", 7) == 0) {
 		const char *rest = kind + 7;
+		const char *colon = strchr(rest, ':');
+		if (colon) {
+			size_t tlen = (size_t)(colon - rest);
+			if (tlen >= ref_sz) tlen = ref_sz - 1;
+			memcpy(ref_type, rest, tlen);
+			ref_type[tlen] = '\0';
+
+			const char *o = colon + 1;
+			size_t olen = strlen(o);
+			if (olen >= opts_sz) olen = opts_sz - 1;
+			memcpy(opts, o, olen);
+			opts[olen] = '\0';
+		} else {
+			size_t tlen = strlen(rest);
+			if (tlen >= ref_sz) tlen = ref_sz - 1;
+			memcpy(ref_type, rest, tlen);
+			ref_type[tlen] = '\0';
+		}
+		return 1;
+	}
+
+	/* ref-or-cidr:TYPE:opts — same parsing as ref-or:TYPE:opts */
+	if (strncmp(kind, "ref-or-cidr:", 12) == 0) {
+		const char *rest = kind + 12;
 		const char *colon = strchr(rest, ':');
 		if (colon) {
 			size_t tlen = (size_t)(colon - rest);

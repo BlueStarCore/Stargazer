@@ -39,6 +39,94 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* ── Address / Service resolution ───────────────────────────────────────── */
+
+/*
+ * resolve_address — Resolve a policy/NAT address field to a CIDR string.
+ *
+ * Returns:
+ *   pointer to out  — resolved CIDR (caller uses it)
+ *   NULL            — match-all (0.0.0.0/0), omit -s/-d flag
+ *   "SKIP"          — object not found, skip the entire rule (fail-closed)
+ */
+const char *resolve_address(const char *val, char *out, size_t outsz)
+{
+	if (!val || !val[0])
+		return NULL;
+
+	/* Raw CIDR passthrough (backward compat for NAT legacy data) */
+	if (sg_is_cidr(val)) {
+		if (strcmp(val, "0.0.0.0/0") == 0)
+			return NULL;  /* match-all → omit flag */
+		snprintf(out, outsz, "%s", val);
+		return out;
+	}
+
+	/* Look up firewall_address entry */
+	char *data = sg_db_get("firewall_address", val);
+	if (!data) {
+		mgmt_log("ERROR", "resolve_address: '%s' not found", val);
+		return "SKIP";
+	}
+
+	char subnet[VALBUFSZ];
+	extract_val(data, "subnet", subnet, sizeof(subnet));
+	free(data);
+
+	if (!subnet[0] || !sg_is_cidr(subnet)) {
+		mgmt_log("ERROR", "resolve_address: '%s' invalid subnet",
+			 val);
+		return "SKIP";
+	}
+
+	/* 0.0.0.0/0 = match-all → omit flag for cleaner rules */
+	if (strcmp(subnet, "0.0.0.0/0") == 0)
+		return NULL;
+
+	snprintf(out, outsz, "%s", subnet);
+	return out;
+}
+
+/*
+ * resolve_service — Look up a firewall_service entry.
+ *
+ * Returns:
+ *   0  = match-all (no service filter)
+ *   1  = resolved, proto_out and port_out filled
+ *  -1  = not found (dangling ref — skip rule, fail-closed)
+ */
+static int resolve_service(const char *val,
+			   char *proto_out, size_t psz,
+			   char *port_out, size_t ptsz)
+{
+	proto_out[0] = '\0';
+	port_out[0] = '\0';
+
+	if (!val || !val[0])
+		return 0;
+
+	char *data = sg_db_get("firewall_service", val);
+	if (!data) {
+		mgmt_log("ERROR", "resolve_service: '%s' not found", val);
+		return -1;
+	}
+
+	extract_val(data, "protocol", proto_out, psz);
+	extract_val(data, "port-range", port_out, ptsz);
+	free(data);
+
+	if (!proto_out[0]) {
+		mgmt_log("ERROR", "resolve_service: '%s' no protocol", val);
+		return -1;
+	}
+
+	/* protocol=all means no filtering */
+	if (strcmp(proto_out, "all") == 0)
+		return 0;
+
+	return 1;
+}
+
 /* ── Helpers ────────────────────────────────────────────────────────────── */
 
 static const char *action_to_target(const char *action)
@@ -85,13 +173,15 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 			char srcintf[VALBUFSZ], dstintf[VALBUFSZ];
 			char srcaddr[VALBUFSZ], dstaddr[VALBUFSZ];
 			char action[VALBUFSZ], status[VALBUFSZ];
+			char service[VALBUFSZ];
 
-			extract_val(data, "srcintf", srcintf, sizeof(srcintf));
-			extract_val(data, "dstintf", dstintf, sizeof(dstintf));
-			extract_val(data, "srcaddr", srcaddr, sizeof(srcaddr));
-			extract_val(data, "dstaddr", dstaddr, sizeof(dstaddr));
-			extract_val(data, "action",  action,  sizeof(action));
-			extract_val(data, "status",  status,  sizeof(status));
+			extract_val(data, "srcintf",  srcintf,  sizeof(srcintf));
+			extract_val(data, "dstintf",  dstintf,  sizeof(dstintf));
+			extract_val(data, "srcaddr",  srcaddr,  sizeof(srcaddr));
+			extract_val(data, "dstaddr",  dstaddr,  sizeof(dstaddr));
+			extract_val(data, "action",   action,   sizeof(action));
+			extract_val(data, "status",   status,   sizeof(status));
+			extract_val(data, "service",  service,  sizeof(service));
 
 			free(data);
 
@@ -107,19 +197,48 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 				dbuf_printf(&buf, " -i %s", srcintf);
 			if (dstintf[0] && strcmp(dstintf, "any") != 0)
 				dbuf_printf(&buf, " -o %s", dstintf);
-			if (srcaddr[0] &&
-			    strcmp(srcaddr, "all") != 0 &&
-			    strcmp(srcaddr, "any") != 0 &&
-			    sg_is_cidr(srcaddr))
-				dbuf_printf(&buf, " -s %s", srcaddr);
-			if (dstaddr[0] &&
-			    strcmp(dstaddr, "all") != 0 &&
-			    strcmp(dstaddr, "any") != 0 &&
-			    sg_is_cidr(dstaddr))
-				dbuf_printf(&buf, " -d %s", dstaddr);
+			/* Resolve address objects */
+			{
+				char resolved[VALBUFSZ];
+				const char *src = resolve_address(
+					srcaddr, resolved, sizeof(resolved));
+				if (src && strcmp(src, "SKIP") == 0)
+					goto skip_rule;
+				if (src)
+					dbuf_printf(&buf, " -s %s", src);
+			}
+			{
+				char resolved[VALBUFSZ];
+				const char *dst = resolve_address(
+					dstaddr, resolved, sizeof(resolved));
+				if (dst && strcmp(dst, "SKIP") == 0)
+					goto skip_rule;
+				if (dst)
+					dbuf_printf(&buf, " -d %s", dst);
+			}
+
+			/* Resolve service object */
+			{
+				char svc_proto[VALBUFSZ], svc_port[VALBUFSZ];
+				int svc_rc = resolve_service(service,
+					svc_proto, sizeof(svc_proto),
+					svc_port, sizeof(svc_port));
+				if (svc_rc < 0)
+					goto skip_rule;
+				if (svc_rc == 1 && svc_proto[0]) {
+					dbuf_printf(&buf, " -p %s", svc_proto);
+					/* ICMP has no ports */
+					if (svc_port[0] &&
+					    strcmp(svc_proto, "icmp") != 0)
+						dbuf_printf(&buf, " --dport %s",
+							    svc_port);
+				}
+			}
 
 			dbuf_printf(&buf, " -j %s\n", target);
 			rule_count++;
+		skip_rule:
+			;
 		}
 		free(list);
 	}

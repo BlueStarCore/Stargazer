@@ -93,6 +93,12 @@ char *pipe_exec_stdin(const char *const argv[],
 		      const char *input, size_t input_len,
 		      int *exit_code);
 
+/* ── Address resolution (shared by firewall + NAT) ─────────────────────── */
+
+/* Resolve address field value → CIDR.  Returns NULL (match-all),
+ * pointer to out (resolved CIDR), or "SKIP" (fail-closed). */
+const char *resolve_address(const char *val, char *out, size_t outsz);
+
 /* ── Atomic chain rebuild (firewall + NAT) ─────────────────────────────── */
 sg_status_t rebuild_forward_chain(char *result, size_t rsize);
 sg_status_t rebuild_nat_chains(char *result, size_t rsize);
