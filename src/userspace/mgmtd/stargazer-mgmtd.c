@@ -1443,7 +1443,7 @@ static boot_state_t mgmtd_check_boot_integrity(void)
  * Sets the seeded flag LAST — if seeding partially fails, next boot
  * re-tries as FIRST BOOT.
  */
-static int mgmtd_seed_defaults(void)
+static int mgmtd_first_boot_seed(void)
 {
 	mgmt_log("INFO", "first boot — seeding default configuration");
 
@@ -1488,37 +1488,10 @@ static int mgmtd_seed_defaults(void)
 	if (sg_db_set("system_ntp", "0",
 		      "server=pool.ntp.org\n") != 0) goto fail;
 
-	/* ── Built-in address object (match all) ────────────────────── */
-	if (sg_db_set("firewall_address", "all",
-		      "name=all\n"
-		      "subnet=0.0.0.0/0\n"
-		      "type=ipmask\n"
-		      "builtin=yes\n"
-		      "immutable=yes\n"
-		      "comment=Match all addresses\n") != 0) goto fail;
-
-	/* ── Built-in service object (match all) ────────────────────── */
-	if (sg_db_set("firewall_service", "all",
-		      "name=all\n"
-		      "protocol=all\n"
-		      "builtin=yes\n"
-		      "immutable=yes\n"
-		      "comment=Match all services\n") != 0) goto fail;
-
-	/* ── Default firewall policy (deny all) ─────────────────────── */
-	if (sg_db_set("firewall_policy", "1",
-		      "name=default-deny\n"
-		      "srcintf=any\n"
-		      "dstintf=any\n"
-		      "srcaddr=all\n"
-		      "dstaddr=all\n"
-		      "action=deny\n"
-		      "service=all\n"
-		      "status=enable\n"
-		      "sequence=1\n"
-		      "builtin=yes\n"
-		      "immutable=yes\n"
-		      "comment=Default deny all traffic\n") != 0) goto fail;
+	/* Built-in immutable objects (firewall_address:all,
+	 * firewall_service:all, firewall_policy:1) are seeded by
+	 * mgmtd_reconcile_config() Phase 2 — runs every boot,
+	 * idempotent, also handles upgrade migration. */
 
 	/* ── Default interfaces ──────────────────────────────────────── */
 	/* lan3: LAN management interface — allow ping, http, https by default.
@@ -1551,16 +1524,38 @@ fail:
 	return -1;
 }
 
+/* ── Immutable check ───────────────────────────────────────────────────── */
+
+/*
+ * is_immutable — Check if a config entry is marked immutable.
+ *
+ * Reads the "immutable" key from the entry's existing DB data.
+ * Immutable entries cannot be modified or deleted.
+ *
+ * 'existing' is the already-fetched DB data (avoids redundant read).
+ * Returns 1 if immutable, 0 if not.
+ */
+static int is_immutable(const char *existing)
+{
+	if (!existing)
+		return 0;
+	char imm[VALBUFSZ];
+	extract_val(existing, "immutable", imm, sizeof(imm));
+	return strcmp(imm, "yes") == 0;
+}
+
 /* ── Config reconciliation ──────────────────────────────────────────────── */
 
 /*
  * Reconcile database state with the current firmware's config registry.
- * Runs on every boot (both FIRST and NORMAL). Direction-agnostic:
- * handles upgrade, downgrade, and same-version equally.
+ * Runs on every boot.  Idempotent and direction-agnostic — handles
+ * upgrade, downgrade, and same-version equally.
  *
- * Phase 1: Seed missing CFG_SINGLE types (new types added by firmware)
- * Phase 2: Backfill missing keys on existing entries (new fields added)
- * Phase 3: Purge stale types (types removed from registry)
+ * Phase 1: Seed missing CFG_SINGLE types       (new types added)
+ * Phase 2: Seed/repair built-in immutable      (force-overwrite on conflict)
+ * Phase 3: Backfill missing keys               (new fields added)
+ * Phase 4: Backfill sequence numbers           (firewall_policy, network_nat)
+ * Phase 5: Purge stale types                   (types removed from registry)
  */
 static void mgmtd_reconcile_config(void)
 {
@@ -1593,7 +1588,102 @@ static void mgmtd_reconcile_config(void)
 		}
 	}
 
-	/* ── Phase 2: backfill missing keys on existing entries ───── */
+	/* ── Phase 2: seed/repair built-in immutable objects ───────
+	 *
+	 * Idempotent.  For each built-in: if missing → create, if has
+	 * immutable=yes → skip, otherwise force-overwrite (user data lost).
+	 * This is the migration entry point for upgrades from firmware
+	 * that pre-dates the reference object system. */
+	{
+		static const struct {
+			const char *type;
+			const char *id;
+			const char *data;
+		} builtins[] = {
+			{ "firewall_address", "all",
+			  "name=all\n"
+			  "subnet=0.0.0.0/0\n"
+			  "type=ipmask\n"
+			  "builtin=yes\n"
+			  "immutable=yes\n"
+			  "comment=Match all addresses\n" },
+			{ "firewall_service", "all",
+			  "name=all\n"
+			  "protocol=all\n"
+			  "builtin=yes\n"
+			  "immutable=yes\n"
+			  "comment=Match all services\n" },
+			{ "firewall_policy", "1",
+			  "name=default-deny\n"
+			  "srcintf=any\n"
+			  "dstintf=any\n"
+			  "srcaddr=all\n"
+			  "dstaddr=all\n"
+			  "action=deny\n"
+			  "service=all\n"
+			  "status=enable\n"
+			  "sequence=1\n"
+			  "builtin=yes\n"
+			  "immutable=yes\n"
+			  "comment=Default deny all traffic\n" },
+			{ NULL, NULL, NULL }
+		};
+
+		for (int i = 0; builtins[i].type; i++) {
+			const char *btype = builtins[i].type;
+			const char *bid   = builtins[i].id;
+			const char *bdata = builtins[i].data;
+
+			char *existing = sg_db_get(btype, bid);
+
+			if (!existing) {
+				/* Missing → create */
+				if (sg_db_set(btype, bid, bdata) == 0) {
+					mgmt_log("INFO",
+						 "reconcile: created built-in "
+						 "%s:%s", btype, bid);
+					changes++;
+				} else {
+					mgmt_log("ERROR",
+						 "reconcile: failed to create "
+						 "built-in %s:%s", btype, bid);
+				}
+				continue;
+			}
+
+			/* Already immutable → skip */
+			if (is_immutable(existing)) {
+				free(existing);
+				continue;
+			}
+
+			/* Conflict → force-overwrite */
+			mgmt_log("WARN",
+				 "reconcile: CONFLICT %s:%s exists without "
+				 "immutable=yes — overwriting with built-in "
+				 "defaults (user data lost)",
+				 btype, bid);
+			free(existing);
+
+			if (sg_db_set(btype, bid, bdata) == 0) {
+				mgmt_log("INFO",
+					 "reconcile: overwrote %s:%s with "
+					 "built-in defaults", btype, bid);
+				char amsg[256];
+				snprintf(amsg, sizeof(amsg),
+					 "force-overwrite conflict %.64s:%.64s",
+					 btype, bid);
+				audit_log("__migration", "200", amsg);
+				changes++;
+			} else {
+				mgmt_log("ERROR",
+					 "reconcile: failed to overwrite %s:%s",
+					 btype, bid);
+			}
+		}
+	}
+
+	/* ── Phase 3: backfill missing keys on existing entries ───── */
 
 	for (const sg_type_info_t *t = types; t->name; t++) {
 		const char *defs = sg_reg_default_values(t->name);
@@ -1663,7 +1753,50 @@ static void mgmtd_reconcile_config(void)
 		}
 	}
 
-	/* ── Phase 3: purge stale types ───────────────────────────── */
+	/* ── Phase 4: backfill sequence numbers ────────────────────
+	 *
+	 * Folded from former mgmtd_backfill_sequences().  Assigns
+	 * monotonically increasing sequence numbers to firewall_policy
+	 * and network_nat entries that lack one. */
+	{
+		static const char *seq_types[] = {
+			"firewall_policy", "network_nat", NULL
+		};
+		for (int t = 0; seq_types[t]; t++) {
+			char *list = sg_db_list(seq_types[t]);
+			if (!list)
+				continue;
+			int next_seq = 1;
+			char *saveptr = NULL;
+			for (char *tok = strtok_r(list, "\n", &saveptr);
+			     tok;
+			     tok = strtok_r(NULL, "\n", &saveptr)) {
+				char *existing = sg_db_get_val(
+					seq_types[t], tok, "sequence");
+				if (!existing) {
+					char val[16];
+					snprintf(val, sizeof(val), "%d",
+						 next_seq);
+					sg_db_set_val(seq_types[t], tok,
+						      "sequence", val);
+					mgmt_log("INFO",
+						 "reconcile: backfilled "
+						 "%s:%s sequence=%d",
+						 seq_types[t], tok, next_seq);
+					next_seq++;
+					changes++;
+				} else {
+					int cur = atoi(existing);
+					if (cur >= next_seq)
+						next_seq = cur + 1;
+					free(existing);
+				}
+			}
+			free(list);
+		}
+	}
+
+	/* ── Phase 5: purge stale types ───────────────────────────── */
 
 	char *db_types = sg_db_list_types();
 	if (db_types) {
@@ -2273,60 +2406,18 @@ static int scrub_config_entry(const char *type, const char *id,
 }
 
 /*
- * Backfill sequence numbers for types that now require them.
- * Existing entries without a 'sequence' key get auto-assigned
- * in ID order (preserving the pre-upgrade behavior).
- */
-static void mgmtd_backfill_sequences(void)
-{
-	static const char *seq_types[] = {
-		"firewall_policy", "network_nat", NULL
-	};
-	for (int t = 0; seq_types[t]; t++) {
-		char *list = sg_db_list(seq_types[t]);
-		if (!list)
-			continue;
-		int next_seq = 1;
-		char *saveptr = NULL;
-		for (char *tok = strtok_r(list, "\n", &saveptr);
-		     tok;
-		     tok = strtok_r(NULL, "\n", &saveptr)) {
-			char *existing = sg_db_get_val(seq_types[t], tok,
-						       "sequence");
-			if (!existing) {
-				char val[16];
-				snprintf(val, sizeof(val), "%d", next_seq);
-				sg_db_set_val(seq_types[t], tok,
-					      "sequence", val);
-				fprintf(stderr,
-					"[mgmtd] backfill %s:%s sequence=%d\n",
-					seq_types[t], tok, next_seq);
-				next_seq++;
-			} else {
-				int cur = atoi(existing);
-				if (cur >= next_seq)
-					next_seq = cur + 1;
-				free(existing);
-			}
-		}
-		free(list);
-	}
-}
-
-/*
  * Replay saved configuration at boot.
  * Iterates through config types that have runtime apply handlers
  * and calls apply_config() for each entry.
  * Scrubs invalid values before applying — survives version upgrades/downgrades.
+ *
+ * Sequence number backfill is done by mgmtd_reconcile_config()
+ * Phase 4 which runs before this function in main().
  */
 static int g_replaying = 1;
 
 static void mgmtd_replay_config(void)
 {
-	/* Backfill sequence numbers before replay so position
-	 * computation works correctly on first boot after upgrade. */
-	mgmtd_backfill_sequences();
-
 	char result[512];
 
 	/* Single config types (id="0").
@@ -2925,26 +3016,6 @@ static void usage_cascade(const char *type, const char *id,
 			 "cascade from %.64s:%.64s: %.256s", type, id, rb);
 		audit_log("__cascade", "200", amsg);
 	}
-}
-
-/* ── Immutable check ───────────────────────────────────────────────────── */
-
-/*
- * is_immutable — Check if a config entry is marked immutable.
- *
- * Reads the "immutable" key from the entry's existing DB data.
- * Immutable entries cannot be modified or deleted.
- *
- * 'existing' is the already-fetched DB data (avoids redundant read).
- * Returns 1 if immutable, 0 if not.
- */
-static int is_immutable(const char *existing)
-{
-	if (!existing)
-		return 0;
-	char imm[VALBUFSZ];
-	extract_val(existing, "immutable", imm, sizeof(imm));
-	return strcmp(imm, "yes") == 0;
 }
 
 /* ── Referential integrity check ────────────────────────────────────────── */
@@ -5117,7 +5188,7 @@ int main(void)
 		return 1;
 	}
 	if (boot == BOOT_FIRST) {
-		if (mgmtd_seed_defaults() != 0) {
+		if (mgmtd_first_boot_seed() != 0) {
 			mgmt_log("ERROR", "refusing to start — seed failed");
 			mgmtd_signal_fifo("error");
 			sg_db_close();
@@ -5125,7 +5196,9 @@ int main(void)
 		}
 	}
 
-	/* Reconcile config: seed missing types, backfill keys, purge stale */
+	/* Reconcile config: seed/repair built-in immutable objects,
+	 * backfill missing keys and sequences, purge stale types.
+	 * Idempotent — runs every boot, handles upgrade migration. */
 	mgmtd_reconcile_config();
 
 	/* Discover NICs, create/protect interface entries */
