@@ -3137,10 +3137,37 @@ static void test_ipc_ref_existence(void)
 		  "status=enable\n",
 		  SG_OK);
 
+	/* NAT with nonexistent address → SG_ERR_NOT_FOUND */
+	ipc_check("CFG_SET NAT with nonexistent srcaddr -> NOT_FOUND",
+		  SG_CMD_CFG_SET,
+		  "network_nat:__diag_natexist\n"
+		  "type=snat\n"
+		  "srcintf=any\n"
+		  "dstintf=eth0\n"
+		  "srcaddr=__nonexistent_addr\n"
+		  "dstaddr=all\n"
+		  "status=enable\n",
+		  SG_ERR_NOT_FOUND);
+
+	/* NAT with raw CIDR → SG_OK (ref-or-cidr accepts CIDR) */
+	ipc_check("CFG_SET NAT with raw CIDR srcaddr -> OK",
+		  SG_CMD_CFG_SET,
+		  "network_nat:__diag_natcidr\n"
+		  "type=snat\n"
+		  "srcintf=any\n"
+		  "dstintf=eth0\n"
+		  "srcaddr=192.168.1.0/24\n"
+		  "dstaddr=all\n"
+		  "status=enable\n",
+		  SG_OK);
+
 	/* Cleanup */
 	{
 		struct ipc_response resp;
 		if (ipc_send_str(SG_CMD_CFG_DEL, "firewall_policy:97",
+				 &resp) == 0)
+			ipc_resp_free(&resp);
+		if (ipc_send_str(SG_CMD_CFG_DEL, "network_nat:__diag_natcidr",
 				 &resp) == 0)
 			ipc_resp_free(&resp);
 	}
@@ -3219,6 +3246,214 @@ static void test_ipc_immutable(void)
 	ipc_resp_free(&resp);
 }
 
+/*
+ * test_ipc_nat_ref — NAT rule referencing a firewall_address object.
+ * Tests ref-or-cidr kind and cross-type delete protection.
+ */
+static void test_ipc_nat_ref(void)
+{
+	struct ipc_response resp;
+	int conn;
+
+	printf(C_CYAN "\n  --- IPC: NAT address object reference ---"
+	       C_NC "\n");
+
+	/* 1. Create address object */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_SET,
+			    "firewall_address:__diag_nataddr\n"
+			    "name=__diag_nataddr\n"
+			    "subnet=172.30.0.0/16\n"
+			    "type=ipmask\n",
+			    &resp);
+	if (conn < 0 || resp.status != SG_OK) {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [nat-ref] create nataddr (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+		ipc_resp_free(&resp);
+		return;
+	}
+	tc_pass++;
+	printf(C_GREEN "  PASS" C_NC " [nat-ref] create nataddr\n");
+	ipc_resp_free(&resp);
+
+	/* 2. Create NAT rule referencing the address */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_SET,
+			    "network_nat:__diag_natref\n"
+			    "type=snat\n"
+			    "srcintf=any\n"
+			    "dstintf=eth0\n"
+			    "srcaddr=__diag_nataddr\n"
+			    "dstaddr=all\n"
+			    "status=enable\n",
+			    &resp);
+	if (conn < 0 || resp.status != SG_OK) {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [nat-ref] create NAT with srcaddr=nataddr"
+		       " (status=%u: %s)\n",
+		       conn < 0 ? 999 : resp.status,
+		       resp.extra[0] ? resp.extra : "");
+		ipc_resp_free(&resp);
+		goto cleanup;
+	}
+	tc_pass++;
+	printf(C_GREEN "  PASS" C_NC
+	       " [nat-ref] create NAT with srcaddr=__diag_nataddr\n");
+	ipc_resp_free(&resp);
+
+	/* 3. Verify NAT stores the reference */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_GET,
+			    "network_nat:__diag_natref", &resp);
+	if (conn == 0 && resp.status == SG_OK && resp.payload &&
+	    strstr(resp.payload, "srcaddr=__diag_nataddr")) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [nat-ref] NAT srcaddr=__diag_nataddr stored\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [nat-ref] NAT srcaddr not stored\n");
+	}
+	ipc_resp_free(&resp);
+
+	/* 4. Delete address → blocked (NAT refs it) */
+	ipc_check("delete nataddr referenced by NAT -> IN_USE",
+		  SG_CMD_CFG_DEL,
+		  "firewall_address:__diag_nataddr",
+		  SG_ERR_IN_USE);
+
+	/* 5. Delete NAT → OK */
+	ipc_check("delete NAT rule -> OK",
+		  SG_CMD_CFG_DEL,
+		  "network_nat:__diag_natref",
+		  SG_OK);
+
+	/* 6. Delete address → now OK */
+	ipc_check("delete unreferenced nataddr -> OK",
+		  SG_CMD_CFG_DEL,
+		  "firewall_address:__diag_nataddr",
+		  SG_OK);
+
+	return;
+
+cleanup:
+	if (ipc_send_str(SG_CMD_CFG_DEL, "network_nat:__diag_natref",
+			 &resp) == 0)
+		ipc_resp_free(&resp);
+	if (ipc_send_str(SG_CMD_CFG_DEL, "firewall_address:__diag_nataddr",
+			 &resp) == 0)
+		ipc_resp_free(&resp);
+}
+
+/*
+ * test_ipc_service_ref — Service object referenced by firewall policy.
+ * Tests ref:firewall_service kind and cross-type delete protection.
+ */
+static void test_ipc_service_ref(void)
+{
+	struct ipc_response resp;
+	int conn;
+
+	printf(C_CYAN "\n  --- IPC: service object reference ---"
+	       C_NC "\n");
+
+	/* 1. Create service object */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_SET,
+			    "firewall_service:__diag_svc\n"
+			    "name=__diag_svc\n"
+			    "protocol=tcp\n"
+			    "port-range=8080\n",
+			    &resp);
+	if (conn < 0 || resp.status != SG_OK) {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [svc-ref] create service (status=%u)\n",
+		       conn < 0 ? 999 : resp.status);
+		ipc_resp_free(&resp);
+		return;
+	}
+	tc_pass++;
+	printf(C_GREEN "  PASS" C_NC " [svc-ref] create __diag_svc\n");
+	ipc_resp_free(&resp);
+
+	/* 2. Create policy referencing the service */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_SET,
+			    "firewall_policy:96\n"
+			    "name=__diag_svcpol\n"
+			    "srcaddr=all\n"
+			    "dstaddr=all\n"
+			    "srcintf=any\n"
+			    "dstintf=any\n"
+			    "action=deny\n"
+			    "service=__diag_svc\n"
+			    "status=enable\n",
+			    &resp);
+	if (conn < 0 || resp.status != SG_OK) {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [svc-ref] create policy:96 with service=__diag_svc"
+		       " (status=%u: %s)\n",
+		       conn < 0 ? 999 : resp.status,
+		       resp.extra[0] ? resp.extra : "");
+		ipc_resp_free(&resp);
+		goto cleanup;
+	}
+	tc_pass++;
+	printf(C_GREEN "  PASS" C_NC
+	       " [svc-ref] create policy:96 with service=__diag_svc\n");
+	ipc_resp_free(&resp);
+
+	/* 3. Verify policy stores the reference */
+	tc_total++;
+	conn = ipc_send_str(SG_CMD_CFG_GET,
+			    "firewall_policy:96", &resp);
+	if (conn == 0 && resp.status == SG_OK && resp.payload &&
+	    strstr(resp.payload, "service=__diag_svc")) {
+		tc_pass++;
+		printf(C_GREEN "  PASS" C_NC
+		       " [svc-ref] policy:96 service=__diag_svc stored\n");
+	} else {
+		tc_fail++;
+		printf(C_RED "  FAIL" C_NC
+		       " [svc-ref] policy:96 service not stored\n");
+	}
+	ipc_resp_free(&resp);
+
+	/* 4. Delete service → blocked */
+	ipc_check("delete service referenced by policy -> IN_USE",
+		  SG_CMD_CFG_DEL,
+		  "firewall_service:__diag_svc",
+		  SG_ERR_IN_USE);
+
+	/* 5. Delete policy → OK */
+	ipc_check("delete policy:96 -> OK",
+		  SG_CMD_CFG_DEL,
+		  "firewall_policy:96",
+		  SG_OK);
+
+	/* 6. Delete service → now OK */
+	ipc_check("delete unreferenced service -> OK",
+		  SG_CMD_CFG_DEL,
+		  "firewall_service:__diag_svc",
+		  SG_OK);
+
+	return;
+
+cleanup:
+	if (ipc_send_str(SG_CMD_CFG_DEL, "firewall_policy:96",
+			 &resp) == 0)
+		ipc_resp_free(&resp);
+	if (ipc_send_str(SG_CMD_CFG_DEL, "firewall_service:__diag_svc",
+			 &resp) == 0)
+		ipc_resp_free(&resp);
+}
+
 /* ── Cleanup helper ───────────────────────────────────────────────────── */
 
 static void cleanup_test_entries(void)
@@ -3289,6 +3524,36 @@ static void cleanup_test_entries(void)
 	    resp.status == SG_OK)
 		printf("  cleanup: deleted __diag_addrC\n");
 	ipc_resp_free(&resp);
+
+	if (ipc_send_str(SG_CMD_CFG_DEL,
+			 "network_nat:__diag_natref", &resp) == 0 &&
+	    resp.status == SG_OK)
+		printf("  cleanup: deleted __diag_natref\n");
+	ipc_resp_free(&resp);
+
+	if (ipc_send_str(SG_CMD_CFG_DEL,
+			 "network_nat:__diag_natcidr", &resp) == 0 &&
+	    resp.status == SG_OK)
+		printf("  cleanup: deleted __diag_natcidr\n");
+	ipc_resp_free(&resp);
+
+	if (ipc_send_str(SG_CMD_CFG_DEL,
+			 "firewall_address:__diag_nataddr", &resp) == 0 &&
+	    resp.status == SG_OK)
+		printf("  cleanup: deleted __diag_nataddr\n");
+	ipc_resp_free(&resp);
+
+	if (ipc_send_str(SG_CMD_CFG_DEL,
+			 "firewall_service:__diag_svc", &resp) == 0 &&
+	    resp.status == SG_OK)
+		printf("  cleanup: deleted __diag_svc\n");
+	ipc_resp_free(&resp);
+
+	if (ipc_send_str(SG_CMD_CFG_DEL,
+			 "firewall_policy:96", &resp) == 0 &&
+	    resp.status == SG_OK)
+		printf("  cleanup: deleted firewall_policy:96\n");
+	ipc_resp_free(&resp);
 }
 
 /* ── Public entry point ───────────────────────────────────────────────── */
@@ -3354,6 +3619,8 @@ int cli_diagnose_test_configure(int mode, diag_result_t *out)
 			test_ipc_ref_object();
 			test_ipc_ref_existence();
 			test_ipc_immutable();
+			test_ipc_nat_ref();
+			test_ipc_service_ref();
 			cleanup_test_entries();
 		}
 	}

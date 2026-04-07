@@ -100,6 +100,7 @@ X("execute diagnose selftest database",     "Database health tests (full)",     
 X("execute diagnose selftest disk",         "Disk partition health tests (full)",      "admin",           0,  NULL)
 X("execute diagnose selftest dhcp",         "DHCP client/server cross-validation",     "admin",           0,  NULL)
 X("execute diagnose selftest supervisor",  "Supervisor process management tests",      "admin",           0,  NULL)
+X("execute diagnose selftest webd",       "Web API handler tests",                    "admin",           0,  NULL)
 X("execute diagnose pentest",              "Run security penetration tests",          "admin",           1,  cmd_diag_pentest)
 X("execute diagnose pentest full",         "Full pentest with SEC-1..18",             "admin",           0,  NULL)
 
