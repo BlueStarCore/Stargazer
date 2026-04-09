@@ -8,6 +8,73 @@
     'use strict';
 
     /* ================================================================
+     *  SHARED HELPERS
+     * ================================================================ */
+
+    /* Debounce — schedule fn to run after `wait` ms of no calls.
+     * Used to throttle search input handlers and other high-frequency
+     * events that trigger expensive DOM work. */
+    function debounce(fn, wait) {
+        var t = null;
+        return function () {
+            var ctx = this, args = arguments;
+            if (t) clearTimeout(t);
+            t = setTimeout(function () { fn.apply(ctx, args); }, wait);
+        };
+    }
+
+    /* Sort toggle — flip ascending if same key clicked, otherwise
+     * switch to that key with ascending=true.  Uses any state object
+     * exposing { sortKey, sortAsc } (route flow, iface table) or
+     * { col, asc } (generic data table). */
+    function toggleSort(state, key, keyField, ascField) {
+        var kf = keyField || 'sortKey';
+        var af = ascField || 'sortAsc';
+        if (state[kf] === key) {
+            state[af] = !state[af];
+        } else {
+            state[kf] = key;
+            state[af] = true;
+        }
+    }
+
+    /* Status string normalization — backend uses many spellings:
+     * 'enable'/'enabled'/'ACTIVE'/'UP'/'up'/'Enabled'.  This collapses
+     * them into a single boolean check. */
+    var STATUS_ON_VALUES = {
+        'enable': 1, 'enabled': 1, 'Enabled': 1,
+        'up': 1, 'UP': 1, 'ACTIVE': 1, 'active': 1
+    };
+    function isStatusEnabled(val, onLabel) {
+        if (!val) return false;
+        if (onLabel && val === onLabel) return true;
+        return !!STATUS_ON_VALUES[val];
+    }
+
+    /* TTL cache for /config/* fetches.  Modal opens used to refetch
+     * 4 endpoints (interface, profile, address, service) every time;
+     * with a 5s TTL the same modal-open burst hits the IPC layer once. */
+    var apiCache = {};
+    var API_TTL_MS = 5000;
+    function cachedApi(path) {
+        var now = Date.now();
+        var entry = apiCache[path];
+        if (entry && (now - entry.t) < API_TTL_MS) {
+            return Promise.resolve(entry.v);
+        }
+        return api(path).then(function (data) {
+            apiCache[path] = { t: Date.now(), v: data };
+            return data;
+        });
+    }
+    function invalidateApiCache(pathPrefix) {
+        if (!pathPrefix) { apiCache = {}; return; }
+        Object.keys(apiCache).forEach(function (k) {
+            if (k.indexOf(pathPrefix) === 0) delete apiCache[k];
+        });
+    }
+
+    /* ================================================================
      *  SIDEBAR TOGGLE (hamburger menu)
      * ================================================================ */
     var hamburger = document.querySelector('.topbar-hamburger');
@@ -24,15 +91,24 @@
      * ================================================================ */
     var categories = document.querySelectorAll('.nav-category');
 
+    var subItems = document.querySelectorAll('.nav-sub-item');
+
+    /* Forward declarations — selection / hideCtx are defined later
+     * but referenced in nav handlers; check at call time. */
+    function navClearTransient() {
+        if (typeof selection !== 'undefined' && selection && selection.clear)
+            selection.clear();
+        if (typeof hideCtx === 'function')
+            hideCtx();
+    }
+
     categories.forEach(function (cat) {
         var header = cat.querySelector('.nav-category-header');
         if (!header) return;
 
         header.addEventListener('click', function () {
-            var hasArrow = cat.querySelector('.nav-arrow');
-
-            if (hasArrow) {
-                /* Toggle open/close */
+            navClearTransient();
+            if (cat.querySelector('.nav-arrow')) {
                 cat.classList.toggle('open');
             } else {
                 /* Direct page link (e.g. Dashboard) */
@@ -41,87 +117,85 @@
         });
     });
 
-    /* Sub-item clicks */
-    var subItems = document.querySelectorAll('.nav-sub-item');
     subItems.forEach(function (item) {
         item.addEventListener('click', function (e) {
             e.stopPropagation();
+            navClearTransient();
             var parentCat = item.closest('.nav-category');
             setActivePage(item.dataset.page, parentCat, item);
         });
     });
 
-    var contentEl = document.getElementById('content');
+    /* ── setActivePage helpers ──────────────────────────────────── */
 
-    function setActivePage(page, category, subItem) {
-        /* Clear all active states */
+    function clearNavActive() {
         categories.forEach(function (c) { c.classList.remove('active'); });
         subItems.forEach(function (s) { s.classList.remove('active'); });
+    }
 
-        /* Set new active */
+    function hideAllPages() {
+        document.querySelectorAll('.page').forEach(function (p) {
+            p.style.display = 'none';
+        });
+        document.querySelectorAll('.page-cover').forEach(function (el) { el.remove(); });
+    }
+
+    function clearTopbarSearch() {
+        var topSearch = document.querySelector('.topbar-search input');
+        if (topSearch && topSearch.value) topSearch.value = '';
+    }
+
+    /* Show full-page loading cover while data fetches behind it,
+     * then transition to a scan-line reveal animation. */
+    function showLoadingCover(parent) {
+        var cover = document.createElement('div');
+        cover.className = 'page-cover page-cover-loading';
+        var spinner = document.createElement('div');
+        spinner.className = 'page-loading-spinner';
+        spinner.textContent = 'LOADING...';
+        cover.appendChild(spinner);
+        parent.appendChild(cover);
+        return cover;
+    }
+
+    function revealCover(cover) {
+        requestAnimationFrame(function () {
+            requestAnimationFrame(function () {
+                cover.classList.remove('page-cover-loading');
+                cover.classList.add('page-cover-reveal');
+                cover.innerHTML = '';
+                var scanLine = document.createElement('div');
+                scanLine.className = 'page-scan-line';
+                cover.appendChild(scanLine);
+                cover.addEventListener('animationend', function () {
+                    cover.remove();
+                });
+            });
+        });
+    }
+
+    function setActivePage(page, category, subItem) {
+        clearNavActive();
         if (category) category.classList.add('active');
         if (subItem) subItem.classList.add('active');
 
-        /* SPA page routing — show target page, hide all others */
-        var pages = document.querySelectorAll('.page');
-        pages.forEach(function (p) {
-            p.style.display = 'none';
-        });
-
-        /* Remove any lingering covers from interrupted transitions */
-        document.querySelectorAll('.page-cover').forEach(function (el) { el.remove(); });
-
-        /* Track active page for poll manager + persist for refresh */
+        hideAllPages();
         activePage = page;
         sessionStorage.setItem('sg_page', page);
+        clearTopbarSearch();
 
-        /* Clear topbar search on page switch */
-        var topSearch = document.querySelector('.topbar-search input');
-        if (topSearch && topSearch.value) {
-            topSearch.value = '';
-        }
-
+        var loadDone = Promise.resolve();
         var target = document.getElementById('page-' + page);
         if (target) {
             target.style.display = '';
-            var contentEl = document.getElementById('content');
-
-            /* 1) Immediately show opaque cover with loading spinner.
-             *    This blocks the old/empty content while data loads. */
-            var cover = document.createElement('div');
-            cover.className = 'page-cover page-cover-loading';
-
-            var spinner = document.createElement('div');
-            spinner.className = 'page-loading-spinner';
-            spinner.textContent = 'LOADING...';
-            cover.appendChild(spinner);
-
-            contentEl.appendChild(cover);
-
-            /* 2) Fetch data behind the cover */
-            refreshPage(page).then(function () {
-                /* 3) Data loaded — switch to scan-line reveal animation */
-                requestAnimationFrame(function () {
-                    requestAnimationFrame(function () {
-                        cover.classList.remove('page-cover-loading');
-                        cover.classList.add('page-cover-reveal');
-
-                        /* Replace spinner with scan line */
-                        cover.innerHTML = '';
-                        var scanLine = document.createElement('div');
-                        scanLine.className = 'page-scan-line';
-                        cover.appendChild(scanLine);
-
-                        cover.addEventListener('animationend', function () {
-                            cover.remove();
-                        });
-                    });
-                });
+            var cover = showLoadingCover(document.getElementById('content'));
+            loadDone = refreshPage(page).then(function () {
+                revealCover(cover);
             });
         }
 
-        /* Start/stop polling based on new page */
         startPolling();
+        return loadDone;
     }
 
     /**
@@ -196,6 +270,16 @@
             options.body = JSON.stringify(options.body);
         }
 
+        /* Invalidate the read cache on any mutation. /config/<type> is
+         * the populate-selects path; if a CFG_SET / CFG_DEL hits any
+         * /config/* endpoint we drop the entire config slice so the
+         * next modal open re-fetches. */
+        var method = (options.method || 'GET').toUpperCase();
+        if (method !== 'GET' && method !== 'HEAD' &&
+            endpoint.indexOf('/config/') === 0) {
+            invalidateApiCache('/config/');
+        }
+
         return fetch(url, options)
             .then(function (res) {
                 if (res.status === 401) {
@@ -218,7 +302,8 @@
                 return res.json();
             })
             .catch(function (err) {
-                /* Network error or no backend — return null for demo fallback */
+                /* Network error / backend unreachable: return null so
+                 * callers can show placeholder data instead of crashing. */
                 if (!err.status) return null;
                 throw err;
             });
@@ -288,32 +373,59 @@
         }
     }
 
-    /* Escape HTML special chars to prevent XSS when inserting API data */
-    function esc(s) {
-        if (s === null || s === undefined) return '';
-        return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    /* HTML-escape API data before injecting into innerHTML / attributes.
+     * Delegates to SgCommon.escHTML which also escapes single-quote and
+     * is shared with login.js. */
+    var esc = SgCommon.escHTML;
+
+    /* Cache element references by id — getElementById hits DOM
+     * lookup tables; on a 5s poll cycle this is wasted work because
+     * gauge ids are static.  setEl() looks up once and reuses. */
+    var elCache = {};
+    function setEl(id) {
+        var el = elCache[id];
+        if (el && el.isConnected) return el;
+        el = document.getElementById(id);
+        if (el) elCache[id] = el;
+        return el;
     }
 
-    /* Update gauge value text + detail text by element IDs */
+    /* Update a gauge value (with optional unit) and its detail line.
+     * Replaces innerHTML string-concat with DOM API: keeps the
+     * gauge-unit span structure without parsing HTML each call. */
     function setGaugeText(valId, value, unit, detailId, detail) {
-        var valEl = document.getElementById(valId);
-        var detailEl = document.getElementById(detailId);
-        if (valEl) valEl.innerHTML = esc(value) + (unit ? '<span class="gauge-unit">' + esc(unit) + '</span>' : '');
+        var valEl = setEl(valId);
+        var detailEl = setEl(detailId);
+        if (valEl) {
+            valEl.textContent = '';
+            valEl.appendChild(document.createTextNode(String(value)));
+            if (unit) valEl.appendChild(makeSpan('gauge-unit', unit));
+        }
         if (detailEl) detailEl.textContent = detail;
     }
 
-    /* Color thresholds: green → orange → red */
+    /* Threshold colors — duplicate the CSS variables here so canvas
+     * draws and CSS rules stay visually consistent.  If the theme
+     * changes, update both. */
+    var COLOR_OK   = '#4caf50';  /* var(--color-success) */
+    var COLOR_WARN = '#e8956a';  /* var(--color-warning) */
+    var COLOR_BAD  = '#e53935';  /* var(--color-danger)  */
+
+    var GAUGE_WARN_PCT = 60;  /* % usage that flips ok→warn */
+    var GAUGE_BAD_PCT  = 85;  /* % usage that flips warn→bad */
+    var TEMP_WARN_C    = 60;  /* °C that flips ok→warn */
+    var TEMP_BAD_C     = 80;  /* °C that flips warn→bad */
+
     function gaugeColor(percent) {
-        if (percent < 60) return '#4caf50';
-        if (percent < 85) return '#e8956a';
-        return '#e53935';
+        if (percent < GAUGE_WARN_PCT) return COLOR_OK;
+        if (percent < GAUGE_BAD_PCT)  return COLOR_WARN;
+        return COLOR_BAD;
     }
 
-    /* Temperature color: green < 60°C, orange < 80°C, red >= 80°C */
     function tempColor(deg) {
-        if (deg < 60) return '#4caf50';
-        if (deg < 80) return '#e8956a';
-        return '#e53935';
+        if (deg < TEMP_WARN_C) return COLOR_OK;
+        if (deg < TEMP_BAD_C)  return COLOR_WARN;
+        return COLOR_BAD;
     }
 
     /*
@@ -355,8 +467,6 @@
         });
     }
 
-    /* renderGauges() is called via setActivePage → refreshPage on initial load */
-
     /*
      * Fetch and render resource page gauges.
      *
@@ -371,85 +481,94 @@
         return Math.round(kb / 1024) + ' MB';
     }
 
+    /* ── renderResourceDetails helpers ──────────────────────────── */
+
+    /* Set textContent on a cached element by id. */
+    function setText(id, val) {
+        var el = setEl(id);
+        if (el) el.textContent = val;
+    }
+
+    /* Set a usage bar's width and value cell. */
+    function setBar(barId, valId, kb, totalKb) {
+        var bar = setEl(barId);
+        var val = setEl(valId);
+        var pct = totalKb > 0 ? Math.round(kb / totalKb * 100) : 0;
+        if (bar) bar.style.width = pct + '%';
+        if (val) val.textContent = fmtMB(kb);
+    }
+
+    function renderRamDetails(d) {
+        var t = d.total || 0;
+        var pct  = t > 0 ? Math.round(d.used / t * 100) : 0;
+        var aPct = t > 0 ? Math.round(d.available / t * 100) : 0;
+        setText('ram-total',     fmtMB(t));
+        setText('ram-used',      fmtMB(d.used) + ' (' + pct + '%)');
+        setText('ram-free',      fmtMB(d.free));
+        setText('ram-buffers',   fmtMB(d.buffers));
+        setText('ram-cached',    fmtMB(d.cached));
+        setText('ram-available', fmtMB(d.available) + ' (' + aPct + '%)');
+        setText('swap-total',    fmtMB(d.swap_total));
+        setText('swap-used',     fmtMB(d.swap_used));
+        setText('swap-free',     fmtMB(d.swap_total - d.swap_used));
+        setText('ram-slab',      fmtMB(d.slab));
+        setBar('bar-used',  'bar-used-val',  d.used,      t);
+        setBar('bar-buf',   'bar-buf-val',   d.buffers,   t);
+        setBar('bar-cache', 'bar-cache-val', d.cached,    t);
+        setBar('bar-free',  'bar-free-val',  d.free,      t);
+        setBar('bar-swap',  'bar-swap-val',  d.swap_used, t);
+    }
+
+    function renderDiskDetails(d) {
+        setText('disk-emmc-size', d.emmc_mb + ' MB');
+        setText('disk-total',     d.total_mb + ' MB');
+        setText('disk-used',      d.used_mb  + ' MB');
+        setText('disk-free',      d.free_mb  + ' MB');
+    }
+
+    /* Format uptime seconds → "1d 2h 3m 4s" */
+    function fmtUptime(secs) {
+        var days = Math.floor(secs / 86400);
+        var hrs  = Math.floor((secs % 86400) / 3600);
+        var mins = Math.floor((secs % 3600) / 60);
+        var s    = Math.floor(secs % 60);
+        return days + 'd ' + hrs + 'h ' + mins + 'm ' + s + 's';
+    }
+
+    /* Build a process row using DOM API. */
+    function proctopRowEl(p) {
+        var tr = document.createElement('tr');
+        tr.appendChild(makeTd(p.pid));
+        tr.appendChild(makeTd(p.name));
+        tr.appendChild(makeTd(p.cpu_ticks));
+        tr.appendChild(makeTd(Math.round(p.rss_kb / 1024) + ' MB'));
+        tr.appendChild(makeTd(p.state));
+        return tr;
+    }
+
+    function renderProcTop(d) {
+        if (d.uptime) setText('res-uptime', fmtUptime(parseFloat(d.uptime)));
+
+        var tbody = setEl('proctop-tbody');
+        if (!tbody || !d.procs) return;
+
+        var sorted = d.procs.slice().sort(function (a, b) {
+            return b.rss_kb - a.rss_kb;
+        });
+        tbody.innerHTML = '';
+        if (sorted.length === 0) {
+            tbody.appendChild(buildEmptyRow(5));
+            return;
+        }
+        var frag = document.createDocumentFragment();
+        sorted.forEach(function (p) { frag.appendChild(proctopRowEl(p)); });
+        tbody.appendChild(frag);
+    }
+
     function renderResourceDetails() {
-        /* Fetch RAM details */
-        var ramP = api('/system/resources/ram').then(function (d) {
-            if (!d) return;
-            var t = d.total || 0;
-            var setText = function (id, val) {
-                var el = document.getElementById(id);
-                if (el) el.textContent = val;
-            };
-            var pct = t > 0 ? Math.round(d.used / t * 100) : 0;
-            var aPct = t > 0 ? Math.round(d.available / t * 100) : 0;
-            setText('ram-total', fmtMB(t));
-            setText('ram-used', fmtMB(d.used) + ' (' + pct + '%)');
-            setText('ram-free', fmtMB(d.free));
-            setText('ram-buffers', fmtMB(d.buffers));
-            setText('ram-cached', fmtMB(d.cached));
-            setText('ram-available', fmtMB(d.available) + ' (' + aPct + '%)');
-            setText('swap-total', fmtMB(d.swap_total));
-            setText('swap-used', fmtMB(d.swap_used));
-            setText('swap-free', fmtMB(d.swap_total - d.swap_used));
-            setText('ram-slab', fmtMB(d.slab));
-            /* Update bars */
-            function setBar(id, valId, kb) {
-                var bar = document.getElementById(id);
-                var val = document.getElementById(valId);
-                if (bar) bar.style.width = (t > 0 ? Math.round(kb / t * 100) : 0) + '%';
-                if (val) val.textContent = fmtMB(kb);
-            }
-            setBar('bar-used', 'bar-used-val', d.used);
-            setBar('bar-buf', 'bar-buf-val', d.buffers);
-            setBar('bar-cache', 'bar-cache-val', d.cached);
-            setBar('bar-free', 'bar-free-val', d.free);
-            setBar('bar-swap', 'bar-swap-val', d.swap_used);
-        });
-
-        /* Fetch disk details */
-        var diskP = api('/system/resources/disk').then(function (d) {
-            if (!d) return;
-            var setText = function (id, val) {
-                var el = document.getElementById(id);
-                if (el) el.textContent = val;
-            };
-            setText('disk-emmc-size', d.emmc_mb + ' MB');
-            setText('disk-total', d.total_mb + ' MB');
-            setText('disk-used', d.used_mb + ' MB');
-            setText('disk-free', d.free_mb + ' MB');
-        });
-
-        /* Fetch process list */
-        var procP = api('/system/resources/proctop').then(function (d) {
-            if (!d) return;
-            /* Update uptime */
-            if (d.uptime) {
-                var secs = parseFloat(d.uptime);
-                var days = Math.floor(secs / 86400);
-                var hrs = Math.floor((secs % 86400) / 3600);
-                var mins = Math.floor((secs % 3600) / 60);
-                var s = Math.floor(secs % 60);
-                var upEl = document.getElementById('res-uptime');
-                if (upEl) upEl.textContent = days + 'd ' + hrs + 'h ' + mins + 'm ' + s + 's';
-            }
-            /* Render process table */
-            var tbody = document.getElementById('proctop-tbody');
-            if (tbody && d.procs) {
-                /* Sort by RSS descending */
-                var sorted = d.procs.slice().sort(function (a, b) { return b.rss_kb - a.rss_kb; });
-                var html = '';
-                sorted.forEach(function (p) {
-                    html += '<tr><td>' + esc(p.pid) + '</td>' +
-                            '<td>' + esc(p.name) + '</td>' +
-                            '<td>' + esc(p.cpu_ticks) + '</td>' +
-                            '<td>' + esc(Math.round(p.rss_kb / 1024)) + ' MB</td>' +
-                            '<td>' + esc(p.state) + '</td></tr>';
-                });
-                if (html === '') html = '<tr><td colspan="5" style="text-align:center;color:#999;padding:20px">No processes</td></tr>';
-                tbody.innerHTML = html;
-            }
-        });
-
+        var ramP  = api('/system/resources/ram').then(function (d) { if (d) renderRamDetails(d); });
+        var diskP = api('/system/resources/disk').then(function (d) { if (d) renderDiskDetails(d); });
+        var procP = api('/system/resources/proctop').then(function (d) { if (d) renderProcTop(d); });
         return Promise.all([ramP, diskP, procP]);
     }
 
@@ -534,7 +653,8 @@
     /* Status sort priority: ACTIVE first, STANDBY second, DISABLED last */
     var STATUS_ORDER = { ACTIVE: 0, STANDBY: 1, DISABLED: 2 };
 
-    /* Demo route data — 24 routes across all types/statuses */
+    /* Routes loaded from /api/config/network_route_static — populated
+     * by fetchRouteData() and rendered via renderRouteRows(). */
     var routeData = [];
 
     /* Fetch real route data from API → populate routeData */
@@ -612,27 +732,43 @@
         return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
     }
 
-    /* Build HTML for one route row */
-    function routeRowHTML(r) {
+    /* Build a span with class + text content. */
+    function makeSpan(cls, text) {
+        var s = document.createElement('span');
+        s.className = cls;
+        if (text != null) s.textContent = text;
+        return s;
+    }
+
+    /* Build a DOM element for one route row.  Replaces the previous
+     * string-concat builder for XSS safety. */
+    function routeRowEl(r) {
         var typeCls = r.type.toLowerCase();
         var statusCls = r.status === 'ACTIVE' ? 'active' :
                         r.status === 'STANDBY' ? 'standby' : 'route-disabled';
         var dotCls = r.status === 'ACTIVE' ? 'up' :
                      r.status === 'DISABLED' ? 'down' : 'disabled';
 
-        var html = '<div class="route-row">';
-        html += '<span class="route-type ' + esc(typeCls) + '">' + esc(r.type) + '</span>';
-        html += '<span class="route-status ' + esc(statusCls) + '"><span class="status-dot ' + esc(dotCls) + '"></span>' + esc(r.status) + '</span>';
-        html += '<span class="route-hits">' + esc(fmtNum(r.hits)) + '</span>';
-        html += '<span class="route-iface">' + esc(r.iface) + '</span>';
-        html += '<span class="route-arrow">&rarr;</span>';
+        var div = document.createElement('div');
+        div.className = 'route-row';
+
+        div.appendChild(makeSpan('route-type ' + typeCls, r.type));
+
+        var status = makeSpan('route-status ' + statusCls, null);
+        status.appendChild(makeSpan('status-dot ' + dotCls, null));
+        status.appendChild(document.createTextNode(r.status));
+        div.appendChild(status);
+
+        div.appendChild(makeSpan('route-hits', fmtNum(r.hits)));
+        div.appendChild(makeSpan('route-iface', r.iface));
+        div.appendChild(makeSpan('route-arrow', '\u2192'));  /* → */
+
         if (r.gw) {
-            html += '<span class="route-gw">' + esc(r.gw) + '</span>';
-            html += '<span class="route-arrow">&rarr;</span>';
+            div.appendChild(makeSpan('route-gw', r.gw));
+            div.appendChild(makeSpan('route-arrow', '\u2192'));
         }
-        html += '<span class="route-dest">' + esc(r.dest) + '</span>';
-        html += '</div>';
-        return html;
+        div.appendChild(makeSpan('route-dest', r.dest));
+        return div;
     }
 
     /* Render the route flow widget */
@@ -682,15 +818,19 @@
         var end = Math.min(start + rfState.pageSize, total);
         var pageRoutes = sorted.slice(start, end);
 
-        /* Render rows */
-        var html = '';
-        for (var i = 0; i < pageRoutes.length; i++) {
-            html += routeRowHTML(pageRoutes[i]);
-        }
+        /* Render rows via DOM API + DocumentFragment (single attach) */
+        body.innerHTML = '';
         if (total === 0) {
-            body.innerHTML = '<div style="text-align:center;color:#999;padding:24px 0">No routes configured</div>';
+            var empty = document.createElement('div');
+            empty.className = 'rf-empty';
+            empty.textContent = 'No routes configured';
+            body.appendChild(empty);
         } else {
-            body.innerHTML = html;
+            var frag = document.createDocumentFragment();
+            for (var i = 0; i < pageRoutes.length; i++) {
+                frag.appendChild(routeRowEl(pageRoutes[i]));
+            }
+            body.appendChild(frag);
         }
 
         /* Pager info */
@@ -719,13 +859,7 @@
     var rfCols = document.querySelectorAll('#route-flow-widget .rf-col[data-sort]');
     rfCols.forEach(function (col) {
         col.addEventListener('click', function () {
-            var key = col.dataset.sort;
-            if (rfState.sortKey === key) {
-                rfState.sortAsc = !rfState.sortAsc;
-            } else {
-                rfState.sortKey = key;
-                rfState.sortAsc = true;
-            }
+            toggleSort(rfState, col.dataset.sort);
             rfState.page = 0;
             renderRouteRows();
         });
@@ -749,13 +883,13 @@
         renderRouteRows();
     });
 
-    /* Route flow search */
+    /* Route flow search (debounced — full re-render per keystroke) */
     var rfSearchInput = document.getElementById('rf-search');
-    if (rfSearchInput) rfSearchInput.addEventListener('input', function () {
-        rfState.search = this.value;
+    if (rfSearchInput) rfSearchInput.addEventListener('input', debounce(function () {
+        rfState.search = rfSearchInput.value;
         rfState.page = 0;
         renderRouteRows();
-    });
+    }, 150));
 
     /* renderRouteFlows() fetches data + renders; renderRouteRows() re-renders cached data */
 
@@ -773,7 +907,8 @@
         return val;
     }
 
-    /* Demo interface data */
+    /* Interfaces loaded from /api/config/system_interface — populated
+     * by fetchIfaceData() and rendered via renderIfaceRows(). */
     var ifaceData = [];
 
     /* Fetch real interface data from API → populate ifaceData */
@@ -827,21 +962,38 @@
         return asc ? diff : -diff;
     }
 
-    /* Build one table row */
-    function ifaceRowHTML(iface) {
-        var dotCls = iface.status === 'UP' ? 'up' : 'down';
-        var tags = '';
+    /* Build a <td> with text content. */
+    function makeTd(text) {
+        var td = document.createElement('td');
+        if (text != null) td.textContent = text;
+        return td;
+    }
+
+    /* Build a DOM <tr> for one interface row.  Replaces the previous
+     * string-concat builder for XSS safety. */
+    function ifaceRowEl(iface) {
+        var tr = document.createElement('tr');
+
+        /* Name cell with status dot */
+        var nameTd = document.createElement('td');
+        nameTd.appendChild(makeSpan(
+            'status-dot ' + (iface.status === 'UP' ? 'up' : 'down'), null));
+        nameTd.appendChild(document.createTextNode(iface.name));
+        tr.appendChild(nameTd);
+
+        tr.appendChild(makeTd(iface.type));
+        tr.appendChild(makeTd(iface.ip));
+        tr.appendChild(makeTd(iface.status));
+        tr.appendChild(makeTd(iface.speed));
+
+        /* Allowaccess tags */
+        var tagsTd = document.createElement('td');
         for (var i = 0; i < iface.access.length; i++) {
-            tags += '<span class="tag">' + esc(iface.access[i]) + '</span>';
+            tagsTd.appendChild(makeSpan('tag', iface.access[i]));
         }
-        return '<tr>' +
-            '<td><span class="status-dot ' + esc(dotCls) + '"></span>' + esc(iface.name) + '</td>' +
-            '<td>' + esc(iface.type) + '</td>' +
-            '<td>' + esc(iface.ip) + '</td>' +
-            '<td>' + esc(iface.status) + '</td>' +
-            '<td>' + esc(iface.speed) + '</td>' +
-            '<td>' + tags + '</td>' +
-            '</tr>';
+        tr.appendChild(tagsTd);
+
+        return tr;
     }
 
     function renderIfaces() {
@@ -885,25 +1037,34 @@
             groups[t].push(sorted[i]);
         }
 
-        /* Render */
-        var html = '';
-        for (var g = 0; g < groupOrder.length; g++) {
-            var gName = groupOrder[g];
-            var items = groups[gName];
-            html += '<tr class="group-header"><td colspan="6">' +
-                    esc(gName.toUpperCase()) + ' INTERFACES' +
-                    '<span class="group-count">' + esc(items.length) + '</span>' +
-                    '</td></tr>';
-            for (var j = 0; j < items.length; j++) {
-                html += ifaceRowHTML(items[j]);
-            }
-        }
+        /* Render via DOM API + DocumentFragment */
+        tbody.innerHTML = '';
 
         if (sorted.length === 0) {
-            html = '<tr><td colspan="6" style="text-align:center;color:#999;padding:20px;">No matching interfaces</td></tr>';
-        }
+            tbody.appendChild(buildEmptyRow(6));
+        } else {
+            var frag = document.createDocumentFragment();
+            for (var g = 0; g < groupOrder.length; g++) {
+                var gName = groupOrder[g];
+                var items = groups[gName];
 
-        tbody.innerHTML = html;
+                /* Group header row */
+                var hdr = document.createElement('tr');
+                hdr.className = 'group-header';
+                var hdrTd = document.createElement('td');
+                hdrTd.colSpan = 6;
+                hdrTd.appendChild(document.createTextNode(
+                    gName.toUpperCase() + ' INTERFACES'));
+                hdrTd.appendChild(makeSpan('group-count', items.length));
+                hdr.appendChild(hdrTd);
+                frag.appendChild(hdr);
+
+                for (var j = 0; j < items.length; j++) {
+                    frag.appendChild(ifaceRowEl(items[j]));
+                }
+            }
+            tbody.appendChild(frag);
+        }
 
         /* Update sort indicators on headers */
         var ths = document.querySelectorAll('#iface-table thead th[data-sort]');
@@ -911,10 +1072,10 @@
             var key = th.dataset.sort;
             var labels = { name: 'NAME', type: 'TYPE', ip: 'IP / NETMASK', status: 'STATUS', speed: 'SPEED', access: 'ACCESS' };
             th.classList.toggle('th-sort-active', key === ifState.sortKey);
+            th.textContent = labels[key];
             if (key === ifState.sortKey) {
-                th.innerHTML = labels[key] + ' <span class="sort-arrow">' + (ifState.sortAsc ? '&#9650;' : '&#9660;') + '</span>';
-            } else {
-                th.textContent = labels[key];
+                th.appendChild(makeSpan('sort-arrow',
+                    ' ' + (ifState.sortAsc ? '\u25B2' : '\u25BC')));
             }
         });
     }
@@ -923,23 +1084,17 @@
     var ifThs = document.querySelectorAll('#iface-table thead th[data-sort]');
     ifThs.forEach(function (th) {
         th.addEventListener('click', function () {
-            var key = th.dataset.sort;
-            if (ifState.sortKey === key) {
-                ifState.sortAsc = !ifState.sortAsc;
-            } else {
-                ifState.sortKey = key;
-                ifState.sortAsc = true;
-            }
+            toggleSort(ifState, th.dataset.sort);
             renderIfaceRows();
         });
     });
 
-    /* Interface search */
+    /* Interface search (debounced) */
     var ifSearchInput = document.getElementById('iface-search');
-    if (ifSearchInput) ifSearchInput.addEventListener('input', function () {
-        ifState.search = this.value;
+    if (ifSearchInput) ifSearchInput.addEventListener('input', debounce(function () {
+        ifState.search = ifSearchInput.value;
         renderIfaceRows();
-    });
+    }, 150));
 
     /* renderIfaces() fetches data + renders; renderIfaceRows() re-renders cached data */
 
@@ -973,18 +1128,25 @@
         var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr:not(.group-header)'));
         if (rows.length === 0) return;
 
-        rows.sort(function (ra, rb) {
-            var cellA = ra.cells[colIdx], cellB = rb.cells[colIdx];
-            if (!cellA || !cellB) return 0;
-            var ta = cellA.textContent.trim(), tb = cellB.textContent.trim();
-            var cmp = naturalCompare(ta, tb);
+        /* Schwartzian transform — extract sort key once per row instead
+         * of re-parsing cell.textContent on every comparator call
+         * (sort is O(N log N) comparisons). */
+        var keyed = rows.map(function (r) {
+            var cell = r.cells[colIdx];
+            return { row: r, key: cell ? cell.textContent.trim() : '' };
+        });
+        keyed.sort(function (a, b) {
+            var cmp = naturalCompare(a.key, b.key);
             return asc ? cmp : -cmp;
         });
 
         /* Remove group headers — they don't apply after column sort */
         tbody.querySelectorAll('tr.group-header').forEach(function (gh) { gh.remove(); });
-        /* Re-append in sorted order */
-        rows.forEach(function (r) { tbody.appendChild(r); });
+
+        /* Single DOM op via DocumentFragment instead of N appendChild calls */
+        var frag = document.createDocumentFragment();
+        keyed.forEach(function (k) { frag.appendChild(k.row); });
+        tbody.appendChild(frag);
     }
 
     function updateSortIndicators(allThs, activeTh, asc) {
@@ -994,10 +1156,7 @@
             if (arrow) arrow.remove();
         });
         activeTh.classList.add('th-sort-active');
-        var arrowSpan = document.createElement('span');
-        arrowSpan.className = 'sort-arrow';
-        arrowSpan.innerHTML = asc ? '&#9650;' : '&#9660;';
-        activeTh.appendChild(arrowSpan);
+        activeTh.appendChild(makeSpan('sort-arrow', asc ? '\u25B2' : '\u25BC'));
     }
 
     /* Bind sort click on every sortable <th> across all data-tables */
@@ -1016,12 +1175,7 @@
             if (th.classList.contains('th-checkbox')) return;
 
             th.addEventListener('click', function () {
-                if (sortState.col === idx) {
-                    sortState.asc = !sortState.asc;
-                } else {
-                    sortState.col = idx;
-                    sortState.asc = true;
-                }
+                toggleSort(sortState, idx, 'col', 'asc');
                 sortTable(table, idx, sortState.asc);
                 updateSortIndicators(allThs, th, sortState.asc);
             });
@@ -1093,13 +1247,10 @@
             if (form && form.classList.contains('visible')) {
                 closeModal(false);
             } else {
-                /* Reset to create mode — closeModal already resets
-                 * editMode/editRowId, but also restore the title. */
+                /* Reset modal title to "create" mode — closeModal
+                 * already cleared editMode/editRowId. */
                 if (form) {
-                    var entity = null;
-                    for (var k in ENTITIES) {
-                        if (ENTITIES[k].formId === id) { entity = k; break; }
-                    }
+                    var entity = entityForForm(id);
                     if (entity) {
                         var titleSpan = form.querySelector('.modal-title-text');
                         if (titleSpan)
@@ -1199,6 +1350,7 @@
                 { label: '#',                    key: 'id',           col: 0, bulkEditable: false, editDisabled: true },
                 { label: 'Sequence',             key: 'sequence',     col: 1, bulkEditable: false },
                 { label: 'Type',                 key: 'type',         col: 2, bulkEditable: false },
+                { label: 'Protocol',             key: 'protocol',     col: -1, bulkEditable: false },
                 { label: 'Original Source',      key: 'srcaddr',      col: 3, bulkEditable: false },
                 { label: 'Original Destination', key: 'dstaddr',      col: 4, bulkEditable: false },
                 { label: 'Destination Port',     key: 'dstport',      col: -1, bulkEditable: false },
@@ -1217,7 +1369,7 @@
             hasStatus: true,
             statusLabels: { on: 'Enabled', off: 'Disabled', dotOn: 'up', dotOff: 'disabled' },
             fields: [
-                { label: 'ID',                  key: 'id',       col: 0, bulkEditable: false, editDisabled: true },
+                { label: '#',                   key: 'id',       col: 0, bulkEditable: false, editDisabled: true },
                 { label: 'Sequence',            key: 'sequence', col: 1, bulkEditable: false },
                 { label: 'Name',                key: 'name',     col: 2, bulkEditable: false },
                 { label: 'Incoming Interface',  key: 'srcintf',  col: 3, bulkEditable: false },
@@ -1287,12 +1439,16 @@
         }
     };
 
-    /* Look up entity name from a form id */
+    /* Reverse map formId → entity name, built once at startup.
+     * Replaces a linear ENTITIES scan that ran on every modal open
+     * and again inside the toggle-form click handler. */
+    var FORM_ID_TO_ENTITY = {};
+    Object.keys(ENTITIES).forEach(function (k) {
+        if (ENTITIES[k].formId) FORM_ID_TO_ENTITY[ENTITIES[k].formId] = k;
+    });
+
     function entityForForm(formId) {
-        for (var k in ENTITIES) {
-            if (ENTITIES[k].formId === formId) return k;
-        }
-        return null;
+        return FORM_ID_TO_ENTITY[formId] || null;
     }
 
     /* Hide Create buttons for entities that don't support creation
@@ -1447,24 +1603,84 @@
         bulkCloseBtn.addEventListener('click', function () { selection.clear(); });
     }
 
+    /* Inline input prompt — replaces native prompt() for visual
+     * consistency with the rest of the UI.  Returns a Promise that
+     * resolves with the entered string or null on cancel. */
+    function promptInput(title, placeholder) {
+        return new Promise(function (resolve) {
+            var overlay = document.createElement('div');
+            overlay.className = 'inline-prompt-overlay';
+
+            var box = document.createElement('div');
+            box.className = 'inline-prompt';
+
+            var t = document.createElement('div');
+            t.className = 'inline-prompt-title';
+            t.textContent = title;
+            box.appendChild(t);
+
+            var input = document.createElement('input');
+            input.type = 'text';
+            input.className = 'inline-prompt-input form-input';
+            if (placeholder) input.placeholder = placeholder;
+            box.appendChild(input);
+
+            var actions = document.createElement('div');
+            actions.className = 'inline-prompt-actions';
+
+            var ok = document.createElement('button');
+            ok.className = 'btn btn-primary';
+            ok.textContent = 'OK';
+
+            var cancel = document.createElement('button');
+            cancel.className = 'btn';
+            cancel.textContent = 'Cancel';
+
+            actions.appendChild(ok);
+            actions.appendChild(cancel);
+            box.appendChild(actions);
+            overlay.appendChild(box);
+            document.body.appendChild(overlay);
+
+            function close(value) {
+                overlay.remove();
+                resolve(value);
+            }
+            ok.addEventListener('click', function () { close(input.value); });
+            cancel.addEventListener('click', function () { close(null); });
+            input.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter') close(input.value);
+                else if (e.key === 'Escape') close(null);
+            });
+            setTimeout(function () { input.focus(); }, 0);
+        });
+    }
+
     function handleBulkAction(action) {
         if (action === 'delete') {
-            forEachSelected(function (row) { demoDeleteRow(row); });
+            forEachSelected(function (row) { deleteRow(row); });
             selection.clear();
-        } else if (action === 'enable' || action === 'disable') {
+            return;
+        }
+        if (action === 'enable' || action === 'disable') {
             var en = action === 'enable';
-            forEachSelected(function (row) { demoSetStatus(row, en, selection.entity); });
-        } else if (action.indexOf('bulk-') === 0) {
+            forEachSelected(function (row) {
+                setRowStatus(row, en, selection.entity);
+            });
+            return;
+        }
+        if (action.indexOf('bulk-') === 0) {
             var key = action.replace('bulk-', '');
             var config = ENTITIES[selection.entity];
             var field = null;
             config.fields.forEach(function (f) { if (f.key === key) field = f; });
             if (!field) return;
-            var val = prompt('New value for ' + field.label + ':');
-            if (val === null) return;
-            forEachSelected(function (row) {
-                var cell = row.cells[field.col + 1]; /* +1 for checkbox */
-                if (cell) cell.textContent = val;
+            promptInput('New value for ' + field.label, '').then(function (val) {
+                if (val === null) return;
+                forEachSelected(function (row) {
+                    var cell = row.cells[field.col + 1]; /* +1 for checkbox */
+                    if (cell) cell.textContent = val;
+                });
             });
         }
     }
@@ -1473,11 +1689,11 @@
         var table = document.querySelector('table[data-entity="' + selection.entity + '"]');
         if (!table) return;
         for (var id in selection.ids) {
-            /* Use attribute selector with escaped value to prevent selector injection */
-            var rows = table.querySelectorAll('tr[data-row-id]');
-            rows.forEach(function (row) {
-                if (row.dataset.rowId === id) fn(row);
-            });
+            /* Direct lookup — O(1) per id instead of scanning all rows.
+             * CSS.escape guards against selector injection. */
+            var sel = 'tr[data-row-id="' + CSS.escape(id) + '"]';
+            var row = table.querySelector(sel);
+            if (row) fn(row);
         }
     }
 
@@ -1504,35 +1720,49 @@
         openEditModal(entity, row);
     });
 
+    /* ── openEditModal helpers ──────────────────────────────────── */
+
+    function setModalEditMode(form, config, rowId) {
+        var titleSpan = form.querySelector('.modal-title-text');
+        if (titleSpan) {
+            titleSpan.textContent = config.editTitle + (rowId ? ' — ' + rowId : '');
+        }
+        form.dataset.editMode = 'true';
+        form.dataset.editRowId = rowId;
+    }
+
+    /* Hide rows tagged .admin-create-only on edit (e.g. password
+     * fields that should only appear during create). */
+    function hideCreateOnlyFields(form) {
+        form.querySelectorAll('.admin-create-only').forEach(function (el) {
+            el.style.display = 'none';
+        });
+    }
+
+    /* Refresh all dynamic <select> dropdowns in parallel.  All four
+     * are independent fetches so Promise.all batches them. */
+    function refreshAllDynamicSelects() {
+        return Promise.all([
+            populateIfaceSelects(),
+            populateProfileSelect(),
+            populateAddrSelects(),
+            populateSvcSelects()
+        ]);
+    }
+
     function openEditModal(entity, row) {
         var config = ENTITIES[entity];
         var form = document.getElementById(config.formId);
         if (!form) return;
 
-        /* Set title to edit mode — include entry name for context */
-        var titleSpan = form.querySelector('.modal-title-text');
         var rowId = row.dataset.rowId || '';
-        if (titleSpan) titleSpan.textContent = config.editTitle + (rowId ? ' — ' + rowId : '');
-
-        form.dataset.editMode = 'true';
-        form.dataset.editRowId = row.dataset.rowId || '';
-
-        /* Hide create-only fields (e.g. password rows on admin edit) */
-        form.querySelectorAll('.admin-create-only').forEach(function (el) {
-            el.style.display = 'none';
-        });
-
+        setModalEditMode(form, config, rowId);
+        hideCreateOnlyFields(form);
         openModal(config.formId);
 
-        /* Refresh dynamic selects, THEN populate form.
-         * Must wait for selects to be filled before selectOption()
-         * can match values — otherwise the options don't exist yet. */
-        Promise.all([
-            populateIfaceSelects(),
-            populateProfileSelect(),
-            populateAddrSelects(),
-            populateSvcSelects()
-        ]).then(function () {
+        /* Selects must be filled BEFORE populateForm runs, otherwise
+         * selectOption() can't match values to options. */
+        refreshAllDynamicSelects().then(function () {
             fetchEntityData(entity, row, form);
         });
     }
@@ -1559,24 +1789,15 @@
         loader.textContent = 'LOADING...';
         body.appendChild(loader);
 
-        /* Build label→input map from form rows (stable regardless of field order) */
-        var labelMap = {};
-        var formRows = body.querySelectorAll('.form-row');
-        formRows.forEach(function (fr) {
-            var lbl = fr.querySelector('.form-label');
-            var inp = fr.querySelector('.form-input');
-            if (lbl && inp) {
-                labelMap[lbl.textContent.trim().toLowerCase()] = inp;
-            }
-        });
+        /* schema-key → input map (matching consolidated in helper) */
+        var keyMap = buildKeyInputMap(body, config);
 
         var rowId = row.dataset.rowId || '';
 
         /* Try API first, fall back to reading from DOM */
         api('/config/' + cfgType(entity) + '/' + rowId).then(function (data) {
             if (data) {
-                /* Populate from API response */
-                populateForm(config, labelMap, data, body);
+                populateForm(config, keyMap, data, body);
             } else {
                 /* Demo fallback: read from table row cells */
                 var rowData = {};
@@ -1584,7 +1805,7 @@
                     var cell = row.cells[field.col + 1]; /* +1 for checkbox col */
                     if (cell) rowData[field.key] = cellText(cell);
                 });
-                populateForm(config, labelMap, rowData, body);
+                populateForm(config, keyMap, rowData, body);
             }
 
             loader.remove();
@@ -1592,11 +1813,11 @@
         });
     }
 
-    /* Populate form inputs from a data object using label-based matching */
-    function populateForm(config, labelMap, data, formBody) {
+    /* Populate form inputs from a data object via the key→input map. */
+    function populateForm(config, keyMap, data, formBody) {
         config.fields.forEach(function (field) {
             if (field.editDisabled) return;
-            var inp = labelMap[field.label.toLowerCase()];
+            var inp = keyMap[field.key];
             if (!inp) return;
             var val = data[field.key];
             if (val === undefined || val === null) return;
@@ -1607,27 +1828,18 @@
             }
         });
 
-        /* Populate checkbox groups (e.g. Admin Access = "ping http https").
-         * These use .form-row-full with individual checkboxes, not .form-input,
-         * so they're not in labelMap. Match by field label → row label. */
+        /* Populate checkbox groups (e.g. Admin Access = "ping http https",
+         * Permissions = "monitor,admin").  Each .form-row-full carries
+         * data-key matching the schema field; each <input type="checkbox">
+         * carries its own value attribute. */
         if (formBody) {
-            formBody.querySelectorAll('.form-row-full').forEach(function (fr) {
-                var lbl = fr.querySelector('.form-label');
-                if (!lbl) return;
-                var rowLabel = lbl.textContent.trim().toLowerCase();
-                /* Find matching entity field */
-                var field = null;
-                config.fields.forEach(function (f) {
-                    if (f.label.toLowerCase() === rowLabel) field = f;
-                });
-                if (!field) return;
-                var val = data[field.key];
+            formBody.querySelectorAll('.form-row-full[data-key]').forEach(function (fr) {
+                var val = data[fr.dataset.key];
                 if (!val) return;
-                /* val is space-separated (allowaccess) or comma-separated (permissions) */
+                /* Space-separated (allowaccess) or comma-separated (permissions) */
                 var tokens = String(val).toLowerCase().split(/[\s,]+/);
                 fr.querySelectorAll('input[type="checkbox"]').forEach(function (cb) {
-                    var cbLabel = cb.parentElement.textContent.trim().toLowerCase();
-                    cb.checked = tokens.indexOf(cbLabel) !== -1;
+                    cb.checked = tokens.indexOf(cb.value) !== -1;
                 });
             });
         }
@@ -1658,43 +1870,6 @@
             }
         }
     }
-
-    /* Reset modal on close — restore create title and clear fields.
-     * Deferred until AFTER the 150ms close animation so the title
-     * doesn't flash "NEW …" while the modal is still visible. */
-    var _origCloseModal = closeModal;
-    function resetModalFields(modal) {
-        var ent = entityForForm(modal.id);
-        if (ent) {
-            var ts = modal.querySelector('.modal-title-text');
-            if (ts) ts.textContent = ENTITIES[ent].createTitle;
-        }
-        modal.dataset.editMode = '';
-        modal.querySelectorAll('.modal-body .form-input').forEach(function (inp) {
-            if (inp.tagName === 'SELECT') inp.selectedIndex = 0;
-            else if (inp.type === 'checkbox') inp.checked = false;
-            else inp.value = '';
-        });
-        modal.querySelectorAll('.modal-body input[type="checkbox"]').forEach(function (cb) {
-            cb.checked = false;
-        });
-        /* Re-show create-only fields hidden during edit */
-        modal.querySelectorAll('.admin-create-only').forEach(function (el) {
-            el.style.display = '';
-        });
-    }
-    closeModal = function (instant) {
-        if (activeModal) {
-            var modal = activeModal;
-            if (instant) {
-                resetModalFields(modal);
-            } else {
-                /* Reset after the close animation (150ms) */
-                setTimeout(function () { resetModalFields(modal); }, 160);
-            }
-        }
-        _origCloseModal(instant);
-    };
 
     /* ================================================================
      *  RIGHT-CLICK CONTEXT MENU
@@ -1750,8 +1925,20 @@
         if (ctxMenu) ctxMenu.style.display = 'none';
     }
 
+    /* Scroll handler is rAF-throttled to avoid layout writes per
+     * scroll event (capture phase fires for any nested scroller). */
+    var ctxScrollPending = false;
+    function ctxScrollHandler() {
+        if (ctxScrollPending) return;
+        ctxScrollPending = true;
+        requestAnimationFrame(function () {
+            ctxScrollPending = false;
+            hideCtx();
+        });
+    }
+
     document.addEventListener('click', hideCtx);
-    document.addEventListener('scroll', hideCtx, true);
+    document.addEventListener('scroll', ctxScrollHandler, true);
 
     if (ctxMenu) ctxMenu.addEventListener('click', function (e) {
         var item = e.target.closest('.context-menu-item');
@@ -1760,9 +1947,9 @@
         e.stopPropagation(); /* prevent the document click from firing */
 
         if (act === 'edit') openEditModal(ctxEntity, ctxRow);
-        else if (act === 'delete') demoDeleteRow(ctxRow);
-        else if (act === 'enable') demoSetStatus(ctxRow, true, ctxEntity);
-        else if (act === 'disable') demoSetStatus(ctxRow, false, ctxEntity);
+        else if (act === 'delete') deleteRow(ctxRow);
+        else if (act === 'enable') setRowStatus(ctxRow, true, ctxEntity);
+        else if (act === 'disable') setRowStatus(ctxRow, false, ctxEntity);
 
         hideCtx();
     });
@@ -1778,7 +1965,7 @@
      * On success: remove row with fade animation.
      * On failure: alert user, keep row visible.
      */
-    function demoDeleteRow(row) {
+    function deleteRow(row) {
         var table = row.closest('table[data-entity]');
         var entity = table ? table.dataset.entity : null;
         var rowId = row.dataset.rowId || '';
@@ -1820,7 +2007,7 @@
      * On success: update status dot + label text.
      * On failure: alert user, keep original status.
      */
-    function demoSetStatus(row, enable, entity) {
+    function setRowStatus(row, enable, entity) {
         /* Determine the right label + dot class for this entity */
         var cfg = (entity && ENTITIES[entity] && ENTITIES[entity].statusLabels)
             ? ENTITIES[entity].statusLabels
@@ -1871,20 +2058,8 @@
         }
     }
 
-    /* Clear selection on page navigation — hook into existing sub-item clicks */
-    subItems.forEach(function (item) {
-        item.addEventListener('click', function () {
-            selection.clear();
-            hideCtx();
-        });
-    });
-    categories.forEach(function (cat) {
-        var header = cat.querySelector('.nav-category-header');
-        if (header) header.addEventListener('click', function () {
-            selection.clear();
-            hideCtx();
-        });
-    });
+    /* Selection/context cleanup on nav is wired into the original
+     * nav handlers via navClearTransient() — no duplicate listeners. */
 
     /* ================================================================
      *  USER DROPDOWN (topbar admin menu)
@@ -1910,37 +2085,29 @@
             userDrop.classList.remove('open');
 
             if (action === 'logout') {
+                /* Stop keepalive before redirect — avoids one last
+                 * fetch firing against the now-invalid session. */
+                if (window.__sg_stopKeepalive) window.__sg_stopKeepalive();
+                stopPolling();
                 /* POST logout to clear server session + cookie */
                 api('/auth/logout', { method: 'POST' }).catch(function () {});
                 window.location.href = 'login.html';
             } else if (action === 'profile') {
-                /* Navigate to admin page then open edit modal for current user */
+                /* Navigate to admin page then open edit modal for the
+                 * current user — wait for the page's load promise so
+                 * the table row exists, then look it up directly. */
                 var cat = document.querySelector('[data-page="sys-admin"]');
                 var parentCat = cat ? cat.closest('.nav-category') : null;
                 if (parentCat) parentCat.classList.add('open');
-                setActivePage('sys-admin', parentCat, cat);
-                /* Wait for page data to load, then open edit for current user.
-                 * refreshPage returns a promise, so we wait for it. */
                 var nameEl2 = document.querySelector('.user-name');
                 var me = nameEl2 ? nameEl2.textContent : 'admin';
-                /* refreshPage is called by setActivePage — use a polling
-                 * approach that waits for the row to appear (max 5s) */
-                var attempts = 0;
-                var findMyRow = setInterval(function () {
-                    attempts++;
+                setActivePage('sys-admin', parentCat, cat).then(function () {
                     var table = document.querySelector('table[data-entity="admins"]');
-                    if (table) {
-                        var row = null;
-                        table.querySelectorAll('tr[data-row-id]').forEach(function (r) {
-                            if (r.dataset.rowId === me) row = r;
-                        });
-                        if (row) {
-                            clearInterval(findMyRow);
-                            openEditModal('admins', row);
-                        }
-                    }
-                    if (attempts >= 50) clearInterval(findMyRow); /* 5s timeout */
-                }, 100);
+                    if (!table) return;
+                    var row = table.querySelector(
+                        'tr[data-row-id="' + CSS.escape(me) + '"]');
+                    if (row) openEditModal('admins', row);
+                });
             } else if (action === 'password') {
                 /* Open inline password change dialog */
                 showPasswordChangeDialog();
@@ -1952,48 +2119,90 @@
      *  CHANGE PASSWORD DIALOG (topbar dropdown)
      * ================================================================ */
 
+    /* Build a single .form-row with label + input. */
+    function makeFormRow(labelText, input) {
+        var row = document.createElement('div');
+        row.className = 'form-row';
+        var lbl = document.createElement('label');
+        lbl.className = 'form-label';
+        lbl.textContent = labelText;
+        row.appendChild(lbl);
+        row.appendChild(input);
+        return row;
+    }
+
+    function makePasswordInput(idAttr, placeholder) {
+        var inp = document.createElement('input');
+        inp.className = 'form-input';
+        inp.type = 'password';
+        inp.id = idAttr;
+        inp.placeholder = placeholder;
+        return inp;
+    }
+
     function showPasswordChangeDialog() {
-        /* Reuse modal system — create a temporary form */
         var id = 'form-change-pw';
         var existing = document.getElementById(id);
         if (existing) existing.remove();
 
+        /* Header */
+        var titleSpan = makeSpan('modal-title-text', 'CHANGE PASSWORD');
+        var closeX = makeSpan('modal-close', '\u2715');  /* ✕ */
+        closeX.dataset.toggleForm = id;
+        var section = document.createElement('div');
+        section.className = 'form-section';
+        section.appendChild(titleSpan);
+        section.appendChild(closeX);
+
+        /* Body */
+        var newPwInp = makePasswordInput('cp-new', 'New password');
+        var confirmPwInp = makePasswordInput('cp-confirm', 'Confirm new password');
+        var grid = document.createElement('div');
+        grid.className = 'form-grid';
+        grid.appendChild(makeFormRow('New Password', newPwInp));
+        grid.appendChild(makeFormRow('Confirm Password', confirmPwInp));
+        var body = document.createElement('div');
+        body.className = 'modal-body';
+        body.appendChild(grid);
+
+        /* Footer */
+        var saveBtn = document.createElement('button');
+        saveBtn.className = 'btn btn-primary';
+        saveBtn.id = 'cp-save';
+        saveBtn.textContent = 'Change Password';
+        var cancelBtn = document.createElement('button');
+        cancelBtn.className = 'btn';
+        cancelBtn.dataset.toggleForm = id;
+        cancelBtn.textContent = 'Cancel';
+        var footer = document.createElement('div');
+        footer.className = 'modal-footer';
+        footer.appendChild(saveBtn);
+        footer.appendChild(cancelBtn);
+
+        /* Form root */
         var form = document.createElement('div');
         form.className = 'add-form form-card';
         form.id = id;
-        form.innerHTML =
-            '<div class="form-section"><span class="modal-title-text">CHANGE PASSWORD</span>' +
-            '<span class="modal-close" data-toggle-form="' + id + '">&#10005;</span></div>' +
-            '<div class="modal-body"><div class="form-grid">' +
-            '<div class="form-row"><label class="form-label">New Password</label>' +
-            '<input class="form-input" type="password" id="cp-new" placeholder="New password"></div>' +
-            '<div class="form-row"><label class="form-label">Confirm Password</label>' +
-            '<input class="form-input" type="password" id="cp-confirm" placeholder="Confirm new password"></div>' +
-            '</div></div>' +
-            '<div class="modal-footer"><button class="btn btn-primary" id="cp-save">Change Password</button>' +
-            '<button class="btn" data-toggle-form="' + id + '">Cancel</button></div>';
-
+        form.appendChild(section);
+        form.appendChild(body);
+        form.appendChild(footer);
         document.getElementById('content').appendChild(form);
 
-        /* Wire close buttons */
-        form.querySelectorAll('[data-toggle-form]').forEach(function (btn) {
-            btn.addEventListener('click', function () { closeModal(false); form.remove(); });
-        });
+        function closeAndRemove() { closeModal(false); form.remove(); }
+        closeX.addEventListener('click', closeAndRemove);
+        cancelBtn.addEventListener('click', closeAndRemove);
 
-        /* Wire save */
-        document.getElementById('cp-save').addEventListener('click', function () {
-            var newPw = document.getElementById('cp-new').value;
-            var confirm = document.getElementById('cp-confirm').value;
-            if (!newPw) { showToast('Enter a new password', 'error'); return; }
-            if (newPw !== confirm) { showToast('Passwords do not match', 'error'); return; }
+        saveBtn.addEventListener('click', function () {
+            var validationErr = SgCommon.validatePasswordChange(
+                newPwInp.value, confirmPwInp.value);
+            if (validationErr) { showToast(validationErr, 'error'); return; }
 
             api('/auth/change-password', {
                 method: 'POST',
-                body: { password: newPw }
+                body: { password: newPwInp.value }
             }).then(function () {
                 showToast('Password changed', 'success');
-                closeModal(false);
-                form.remove();
+                closeAndRemove();
             }).catch(function (err) {
                 showToast(err.message || 'Password change failed', 'error');
             });
@@ -2011,6 +2220,22 @@
      * Hides non-matching <tr> rows; skips .group-header rows (always visible
      * if at least one child in the group matches).
      */
+    /* Per-row lowercase text cache.  Search inputs fire on every
+     * keystroke and previously called row.textContent on every row,
+     * which allocates the row's full text each call.  WeakMap keys
+     * the cache by row element so it auto-clears when the tbody is
+     * re-rendered (innerHTML reassignment drops the old <tr>s and
+     * GC reaps the WeakMap entries). */
+    var rowTextCache = new WeakMap();
+    function rowText(row) {
+        var t = rowTextCache.get(row);
+        if (t === undefined) {
+            t = row.textContent.toLowerCase();
+            rowTextCache.set(row, t);
+        }
+        return t;
+    }
+
     function filterTable(table, query) {
         if (!table) return;
         var q = query.toLowerCase();
@@ -2033,8 +2258,7 @@
                 return;
             }
 
-            var text = row.textContent.toLowerCase();
-            var match = text.indexOf(q) !== -1;
+            var match = rowText(row).indexOf(q) !== -1;
             row.style.display = match ? '' : 'none';
             if (match) groupHasMatch = true;
         });
@@ -2126,6 +2350,41 @@
      * Render rows returned from backend search into a table.
      * Rebuilds <tbody> from API response data.
      */
+    /* Build a single status cell (status dot + label) using the DOM
+     * API.  Used by renderEntityRows for the per-entity status column. */
+    function buildStatusCell(val, statusLabels) {
+        var td = document.createElement('td');
+        var isOn = isStatusEnabled(val, statusLabels.on);
+        var dot = document.createElement('span');
+        dot.className = 'status-dot ' + (isOn ? statusLabels.dotOn : statusLabels.dotOff);
+        td.appendChild(dot);
+        td.appendChild(document.createTextNode(isOn ? statusLabels.on : statusLabels.off));
+        return td;
+    }
+
+    /* Build the empty-state row shown when an entity has no entries.
+     * Uses a CSS class instead of inline style. */
+    function buildEmptyRow(colCount) {
+        var tr = document.createElement('tr');
+        var td = document.createElement('td');
+        td.colSpan = colCount;
+        td.className = 'table-empty';
+        td.textContent = 'No results found';
+        tr.appendChild(td);
+        return tr;
+    }
+
+    /* Build the loading-state row shown while a fetch is in flight. */
+    function buildLoadingRow(colCount) {
+        var tr = document.createElement('tr');
+        var td = document.createElement('td');
+        td.colSpan = colCount;
+        td.className = 'table-empty';
+        td.textContent = 'Loading...';
+        tr.appendChild(td);
+        return tr;
+    }
+
     function renderEntityRows(table, entity, rows) {
         var config = ENTITIES[entity];
         var tbody = table.querySelector('tbody');
@@ -2146,35 +2405,59 @@
             });
         }
 
+        /* Empty the cached row text before re-rendering — old rows
+         * are about to be GC'd and stale entries would consume
+         * memory until next page nav. */
+        rowTextCache = new WeakMap();
+
         if (rows.length === 0) {
             var colCount = table.querySelectorAll('thead th').length;
-            tbody.innerHTML = '<tr><td colspan="' + colCount + '" style="text-align:center;color:#999;padding:20px;">No results found</td></tr>';
+            tbody.innerHTML = '';
+            tbody.appendChild(buildEmptyRow(colCount));
             return;
         }
 
-        var html = '';
+        /* Build rows via DOM API and append once via DocumentFragment.
+         * No more innerHTML string concatenation — every value reaches
+         * the DOM via textContent (XSS-safe regardless of esc() bugs). */
+        var frag = document.createDocumentFragment();
         rows.forEach(function (row, idx) {
             var isBuiltin = (row.builtin === 'yes') || config.allBuiltin;
-            html += '<tr data-row-id="' + esc(row.id || row.name || idx) + '"'
-                  + (isBuiltin ? ' data-builtin="yes"' : '') + '>';
-            /* Checkbox column — disabled for builtin entries (cannot delete) */
-            html += '<td class="td-checkbox"><input type="checkbox" class="row-select"'
-                  + (isBuiltin ? ' disabled title="Built-in entry"' : '') + '></td>';
+
+            var tr = document.createElement('tr');
+            tr.dataset.rowId = String(row.id || row.name || idx);
+            if (isBuiltin) tr.dataset.builtin = 'yes';
+
+            /* Checkbox column — disabled for builtin entries */
+            var tdCb = document.createElement('td');
+            tdCb.className = 'td-checkbox';
+            var cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.className = 'row-select';
+            if (isBuiltin) {
+                cb.disabled = true;
+                cb.title = 'Built-in entry';
+            }
+            tdCb.appendChild(cb);
+            tr.appendChild(tdCb);
+
             config.fields.forEach(function (f) {
-                if (f.col === -1) return; /* form-only field, skip in table */
+                if (f.col === -1) return;
                 var val = row[f.key] || '';
                 if (f.key === 'status' && config.hasStatus) {
-                    var isOn = (val === config.statusLabels.on || val === 'Enabled' || val === 'UP' || val === 'ACTIVE' || val === 'enable' || val === 'up');
-                    var dotClass = isOn ? config.statusLabels.dotOn : config.statusLabels.dotOff;
-                    var label = isOn ? config.statusLabels.on : config.statusLabels.off;
-                    html += '<td><span class="status-dot ' + esc(dotClass) + '"></span>' + esc(label) + '</td>';
+                    tr.appendChild(buildStatusCell(val, config.statusLabels));
                 } else {
-                    html += '<td>' + esc(val) + '</td>';
+                    var td = document.createElement('td');
+                    td.textContent = val;
+                    tr.appendChild(td);
                 }
             });
-            html += '</tr>';
+
+            frag.appendChild(tr);
         });
-        tbody.innerHTML = html;
+
+        tbody.innerHTML = '';
+        tbody.appendChild(frag);
     }
 
     /**
@@ -2193,10 +2476,10 @@
     document.querySelectorAll('.toolbar-search input, .widget-search input:not(#iface-search):not(#rf-search)').forEach(function (input) {
         var target = findTargetTable(input);
 
-        /* Typing: instant client-side prefill filter */
-        input.addEventListener('input', function () {
-            applyFilter(target, this.value);
-        });
+        /* Typing: client-side prefill filter (debounced) */
+        input.addEventListener('input', debounce(function () {
+            applyFilter(target, input.value);
+        }, 150));
 
         /* Enter: hit backend for real data */
         input.addEventListener('keydown', function (e) {
@@ -2234,10 +2517,10 @@
             });
         }
 
-        /* Typing: client-side prefill */
-        topbarSearchInput.addEventListener('input', function () {
-            filterCurrentPage(this.value);
-        });
+        /* Typing: client-side prefill (debounced) */
+        topbarSearchInput.addEventListener('input', debounce(function () {
+            filterCurrentPage(topbarSearchInput.value);
+        }, 150));
 
         /* Enter: backend search */
         topbarSearchInput.addEventListener('keydown', function (e) {
@@ -2282,116 +2565,146 @@
      *  FORM SAVE — wire modal Save buttons to POST/PUT API calls
      * ================================================================ */
 
-    function formSubmit(entity) {
-        var config = ENTITIES[entity];
-        if (!config) return;
-        var form = document.getElementById(config.formId);
-        if (!form) return;
-        var body = form.querySelector('.modal-body');
-        if (!body) return;
+    /* ── formSubmit helpers ─────────────────────────────────────── */
 
-        /* Build label→input map */
-        var labelMap = {};
+    /* Build a schema-key → input element map for one modal body.
+     *
+     * Preferred path: each .form-row carries a data-key attribute that
+     * matches its schema field key (decouples from label text and is
+     * i18n-friendly).
+     *
+     * Fallback path: rows without data-key are matched by label text
+     * (case-insensitive) against ENTITIES[*].fields[].label, so any
+     * unmigrated form-row keeps working until its data-key lands. */
+    function buildKeyInputMap(body, config) {
+        var keyToInp = {};
+        var unkeyedByLabel = {};
+
         body.querySelectorAll('.form-row').forEach(function (fr) {
-            var lbl = fr.querySelector('.form-label');
             var inp = fr.querySelector('.form-input');
-            if (lbl && inp) {
-                labelMap[lbl.textContent.trim().toLowerCase()] = inp;
+            if (!inp) return;
+            if (fr.dataset.key) {
+                keyToInp[fr.dataset.key] = inp;
+                return;
+            }
+            var lbl = fr.querySelector('.form-label');
+            if (lbl) {
+                unkeyedByLabel[lbl.textContent.trim().toLowerCase()] = inp;
             }
         });
 
-        /* Build payload from fields — only include non-empty values.
-         * Sending empty strings for optional fields would wipe existing
-         * values on edit, or fail validation on create for required fields. */
+        config.fields.forEach(function (f) {
+            if (keyToInp[f.key]) return;
+            var fallback = unkeyedByLabel[f.label.toLowerCase()];
+            if (fallback) keyToInp[f.key] = fallback;
+        });
+
+        return keyToInp;
+    }
+
+    /* Read the form into a payload object keyed by config field keys.
+     * Empty values are dropped — sending empty strings would wipe DB
+     * fields on edit and fail required-key validation on create. */
+    function buildPayloadFromForm(config, body, keyMap) {
         var payload = {};
         config.fields.forEach(function (f) {
-            var inp = labelMap[f.label.toLowerCase()];
+            var inp = keyMap[f.key];
             if (!inp) return;
             /* Skip hidden rows (e.g. password fields hidden during edit) */
             var row = inp.closest('.form-row');
             if (row && row.style.display === 'none') return;
             if (inp.tagName === 'SELECT') {
-                var val = inp.options[inp.selectedIndex].value || inp.options[inp.selectedIndex].text;
+                var opt = inp.options[inp.selectedIndex];
+                var val = opt ? (opt.value || opt.text) : '';
                 if (val) payload[f.key] = val;
             } else if (inp.type === 'checkbox') {
                 payload[f.key] = inp.checked;
-            } else {
-                if (inp.value !== '') payload[f.key] = inp.value;
+            } else if (inp.value !== '') {
+                payload[f.key] = inp.value;
             }
         });
 
-        /* Also capture checkbox groups (e.g. Admin Access) */
-        body.querySelectorAll('.form-row-full').forEach(function (fr) {
-            var lbl = fr.querySelector('.form-label');
-            if (!lbl) return;
+        /* Capture multi-checkbox groups (e.g. Admin Access, Permissions).
+         * Each .form-row-full carries data-key matching the schema field;
+         * each <input type="checkbox"> carries its own value attribute.
+         * Empty groups send empty string to actively clear the backend
+         * field — without this the old value would persist. */
+        body.querySelectorAll('.form-row-full[data-key]').forEach(function (fr) {
+            var fieldKey = fr.dataset.key;
             var cbs = fr.querySelectorAll('input[type="checkbox"]');
             if (cbs.length === 0) return;
             var vals = [];
             cbs.forEach(function (cb) {
-                if (cb.checked) {
-                    var parent = cb.parentElement;
-                    vals.push(parent.textContent.trim().toLowerCase());
-                }
+                if (cb.checked && cb.value) vals.push(cb.value);
             });
-            /* Find matching field by label */
-            var cbKey = lbl.textContent.trim().toLowerCase();
-            config.fields.forEach(function (f) {
-                if (f.label.toLowerCase() === cbKey) {
-                    if (vals.length > 0) {
-                        var sep = (f.key === 'permissions') ? ',' : ' ';
-                        payload[f.key] = vals.join(sep);
-                    } else {
-                        /* All unchecked — send empty to clear the field.
-                         * Without this, the backend keeps the old value. */
-                        payload[f.key] = '';
-                    }
-                }
-            });
+            var sep = (fieldKey === 'permissions') ? ',' : ' ';
+            payload[fieldKey] = vals.length > 0 ? vals.join(sep) : '';
         });
 
-        var isEdit = form.dataset.editMode === 'true';
-        var rowId = form.dataset.editRowId || '';
+        return payload;
+    }
 
-        /* Admin entity uses dedicated API with password handling */
-        if (config.customCreate && !isEdit) {
-            if (!payload.id) {
-                showToast('Username is required', 'error');
-                return;
-            }
-            var adminBody = {
-                username: payload.id || '',
-                profile: payload.profile || ''
-            };
-            /* Include enforce-* fields if present */
-            if (payload['enforce-change-password'])
-                adminBody['enforce-change-password'] = payload['enforce-change-password'];
-            if (payload['enforce-password-policy'])
-                adminBody['enforce-password-policy'] = payload['enforce-password-policy'];
-            /* Read password fields directly from form (not in entity fields) */
-            var pwInp = body.querySelector('input[type="password"]');
-            var cfInp = body.querySelectorAll('input[type="password"]')[1];
-            if (pwInp && pwInp.value) {
-                if (cfInp && cfInp.value !== pwInp.value) {
-                    showToast('Passwords do not match', 'error');
-                    return;
-                }
-                adminBody.password = pwInp.value;
-            } else {
-                showToast('Password is required for new admin', 'error');
-                return;
-            }
-            api('/admin/create', { method: 'POST', body: adminBody })
-                .then(function () {
-                    closeModal(false);
-                    showToast('Administrator created', 'success');
-                    refreshPage(activePage);
-                })
-                .catch(function (err) {
-                    showToast(err.message || 'Create failed', 'error');
-                });
+    /* Auto-assign a numeric id for non-name-as-id types by scanning
+     * the current entity table for the highest existing row id and
+     * returning maxId + 1.  Mirrors webd_api.c:type_uses_name_as_id. */
+    var NAME_AS_ID_TYPES = {
+        'firewall_address': 1,
+        'firewall_service': 1,
+        'system_admin': 1,
+        'system_admin-profile': 1
+    };
+    function nextNumericId() {
+        var pageEl = document.getElementById('page-' + activePage);
+        var table = pageEl ? pageEl.querySelector('table[data-entity]') : null;
+        var rows = table ? table.querySelectorAll('tbody tr[data-row-id]') : [];
+        var maxId = 0;
+        rows.forEach(function (r) {
+            var n = parseInt(r.dataset.rowId, 10);
+            if (!isNaN(n) && n > maxId) maxId = n;
+        });
+        return String(maxId + 1);
+    }
+
+    /* Admin entity has its own create endpoint with password handling. */
+    function submitAdminCreate(body, payload) {
+        if (!payload.id) {
+            showToast('Username is required', 'error');
             return;
         }
+        var adminBody = {
+            username: payload.id,
+            profile: payload.profile || ''
+        };
+        if (payload['enforce-change-password'])
+            adminBody['enforce-change-password'] = payload['enforce-change-password'];
+        if (payload['enforce-password-policy'])
+            adminBody['enforce-password-policy'] = payload['enforce-password-policy'];
 
+        var pwInp = body.querySelector('input[type="password"]');
+        var pwAll = body.querySelectorAll('input[type="password"]');
+        var cfInp = pwAll[1];
+        if (!pwInp || !pwInp.value) {
+            showToast('Password is required for new admin', 'error');
+            return;
+        }
+        if (cfInp && cfInp.value !== pwInp.value) {
+            showToast('Passwords do not match', 'error');
+            return;
+        }
+        adminBody.password = pwInp.value;
+
+        api('/admin/create', { method: 'POST', body: adminBody })
+            .then(function () {
+                closeModal(false);
+                showToast('Administrator created', 'success');
+                refreshPage(activePage);
+            })
+            .catch(function (err) {
+                showToast(err.message || 'Create failed', 'error');
+            });
+    }
+
+    function submitConfigEntry(config, payload, isEdit, rowId) {
         var method, url;
         if (isEdit) {
             method = 'PUT';
@@ -2400,28 +2713,15 @@
             method = 'POST';
             url = '/config/' + config.configType;
 
-            /* Entities that use 'name' as identifier must have it filled.
-             * Addresses and services are identified by name, not numeric ID. */
-            var hasNameField = config.fields.some(function (f) {
-                return f.key === 'name';
-            });
-            if (hasNameField && !payload.name) {
-                showToast('Name is required', 'error');
-                return;
-            }
-
-            /* For types without name (routes, NAT, policies) — auto-generate
-             * a numeric ID by counting existing entries + 1. */
-            if (!payload.name && !payload.id) {
-                var pageEl = document.getElementById('page-' + activePage);
-                var table = pageEl ? pageEl.querySelector('table[data-entity]') : null;
-                var rows = table ? table.querySelectorAll('tbody tr[data-row-id]') : [];
-                var maxId = 0;
-                rows.forEach(function (r) {
-                    var n = parseInt(r.dataset.rowId, 10);
-                    if (!isNaN(n) && n > maxId) maxId = n;
-                });
-                payload.id = String(maxId + 1);
+            if (NAME_AS_ID_TYPES[config.configType]) {
+                if (!payload.name) {
+                    showToast('Name is required', 'error');
+                    return;
+                }
+            } else {
+                /* numeric-id types: name is descriptive only.  Always
+                 * overwrite payload.id with a fresh numeric value. */
+                payload.id = nextNumericId();
             }
         }
 
@@ -2434,6 +2734,26 @@
             .catch(function (err) {
                 showToast(err.message || 'Save failed', 'error');
             });
+    }
+
+    function formSubmit(entity) {
+        var config = ENTITIES[entity];
+        if (!config) return;
+        var form = document.getElementById(config.formId);
+        if (!form) return;
+        var body = form.querySelector('.modal-body');
+        if (!body) return;
+
+        var keyMap = buildKeyInputMap(body, config);
+        var payload = buildPayloadFromForm(config, body, keyMap);
+        var isEdit = form.dataset.editMode === 'true';
+        var rowId = form.dataset.editRowId || '';
+
+        if (config.customCreate && !isEdit) {
+            submitAdminCreate(body, payload);
+            return;
+        }
+        submitConfigEntry(config, payload, isEdit, rowId);
     }
 
     /* Wire all modal Save buttons */
@@ -2452,44 +2772,50 @@
      *  SETTINGS APPLY/RESET — wire settings pages to PUT API calls
      * ================================================================ */
 
+    /* Settings page → list of (configType, fieldKeys) tuples.  Each
+     * card pulls data from one or more backend types (e.g. the
+     * "system" page reads system_settings + system_ntp + network_dns).
+     * Field keys must match data-key attributes on the .form-row. */
     var SETTINGS_MAP = {
         'system': [
-            { configType: 'system_settings', fields: { 'hostname': 'Hostname', 'ip-forward': 'IP Forward', 'timezone': 'Timezone' } },
-            { configType: 'system_ntp', fields: { 'server': 'NTP Server' } },
-            { configType: 'network_dns', fields: { 'primary': 'Primary DNS', 'secondary': 'Secondary DNS' } }
+            { configType: 'system_settings', fields: ['hostname', 'ip-forward', 'timezone'] },
+            { configType: 'system_ntp',      fields: ['server'] },
+            { configType: 'network_dns',     fields: ['primary', 'secondary'] }
         ],
         'password-policy': [
-            { configType: 'system_password-policy', fields: { 'min-length': 'Minimum Length', 'min-uppercase': 'Min Uppercase', 'min-lowercase': 'Min Lowercase', 'min-digit': 'Min Digits', 'min-special': 'Min Special Chars' } }
+            { configType: 'system_password-policy',
+              fields: ['min-length', 'min-uppercase', 'min-lowercase', 'min-digit', 'min-special'] }
         ]
     };
 
-    function settingsLabelMap(card) {
-        var labelMap = {};
-        card.querySelectorAll('.form-row').forEach(function (fr) {
-            var lbl = fr.querySelector('.form-label');
+    /* Build a data-key → input map for settings cards.  Same pattern
+     * as buildKeyInputMap but unscoped to a schema (settings cards
+     * don't have an ENTITIES entry). */
+    function settingsKeyMap(card) {
+        var map = {};
+        card.querySelectorAll('.form-row[data-key]').forEach(function (fr) {
             var inp = fr.querySelector('.form-input');
-            if (lbl && inp) labelMap[lbl.textContent.trim()] = inp;
+            if (inp) map[fr.dataset.key] = inp;
         });
-        return labelMap;
+        return map;
     }
 
     function settingsApply(card, settingsName) {
         var maps = SETTINGS_MAP[settingsName];
         if (!maps) return;
-        var labelMap = settingsLabelMap(card);
+        var keyMap = settingsKeyMap(card);
         var pending = maps.length;
         var hadError = false;
 
         maps.forEach(function (m) {
             var payload = {};
-            for (var key in m.fields) {
-                var inp = labelMap[m.fields[key]];
-                if (inp) {
-                    payload[key] = inp.tagName === 'SELECT'
-                        ? (inp.options[inp.selectedIndex].value || inp.options[inp.selectedIndex].text)
-                        : inp.value;
-                }
-            }
+            m.fields.forEach(function (key) {
+                var inp = keyMap[key];
+                if (!inp) return;
+                payload[key] = inp.tagName === 'SELECT'
+                    ? (inp.options[inp.selectedIndex].value || inp.options[inp.selectedIndex].text)
+                    : inp.value;
+            });
             var isSingle = SINGLE_CONFIGS.indexOf(m.configType) !== -1;
             var url = '/config/' + m.configType + (isSingle ? '/0' : '');
             api(url, { method: 'PUT', body: payload })
@@ -2512,7 +2838,7 @@
     function settingsLoad(card, settingsName) {
         var maps = SETTINGS_MAP[settingsName];
         if (!maps) return Promise.resolve();
-        var labelMap = settingsLabelMap(card);
+        var keyMap = settingsKeyMap(card);
 
         return Promise.all(maps.map(function (m) {
             /* Single-type: GET /api/config/TYPE/0 returns the entry directly.
@@ -2522,13 +2848,12 @@
 
             return api(url).then(function (data) {
                 if (!data) return;
-                for (var key in m.fields) {
-                    var inp = labelMap[m.fields[key]];
-                    if (inp && data[key] !== undefined) {
-                        if (inp.tagName === 'SELECT') selectOption(inp, String(data[key]));
-                        else inp.value = data[key];
-                    }
-                }
+                m.fields.forEach(function (key) {
+                    var inp = keyMap[key];
+                    if (!inp || data[key] === undefined) return;
+                    if (inp.tagName === 'SELECT') selectOption(inp, String(data[key]));
+                    else inp.value = data[key];
+                });
             });
         }));
     }
@@ -2661,18 +2986,36 @@
                         fwInstallBtn.disabled = false;
                         return;
                     }
-                    /* Poll progress */
+                    /* Poll progress.  Capped at 30 minutes (900 ticks
+                     * × 2s) — without a cap a stuck progress endpoint
+                     * leaks the interval until reload.  Errors clear
+                     * the interval too. */
+                    var ticks = 0;
                     var pollId = setInterval(function () {
-                        api('/system/firmware/progress').then(function (prog) {
-                            if (!prog) { clearInterval(pollId); return; }
-                            fwInstallBtn.textContent = 'Installing... ' + (prog.percent || 0) + '%';
-                            if (prog.percent >= 100 || prog.done) {
+                        if (++ticks > 900) {
+                            clearInterval(pollId);
+                            fwInstallBtn.textContent = 'Install Firmware';
+                            fwInstallBtn.disabled = false;
+                            showToast('Firmware install timed out', 'error');
+                            return;
+                        }
+                        api('/system/firmware/progress')
+                            .then(function (prog) {
+                                if (!prog) { clearInterval(pollId); return; }
+                                fwInstallBtn.textContent =
+                                    'Installing... ' + (prog.percent || 0) + '%';
+                                if (prog.percent >= 100 || prog.done) {
+                                    clearInterval(pollId);
+                                    fwInstallBtn.textContent = 'Install Firmware';
+                                    fwInstallBtn.disabled = false;
+                                    showToast('Firmware installed', 'success');
+                                }
+                            })
+                            .catch(function () {
                                 clearInterval(pollId);
                                 fwInstallBtn.textContent = 'Install Firmware';
                                 fwInstallBtn.disabled = false;
-                                showToast('Firmware installed', 'success');
-                            }
-                        });
+                            });
                     }, 2000);
                 })
                 .catch(function (err) {
@@ -2702,10 +3045,12 @@
     function loadEntityPage(entity, table) {
         var config = ENTITIES[entity];
         if (!config) return Promise.resolve();
-        /* Show loading placeholder while fetching */
         var tbody = table.querySelector('tbody');
         var colCount = table.querySelectorAll('thead th').length;
-        if (tbody) tbody.innerHTML = '<tr><td colspan="' + colCount + '" style="text-align:center;color:#999;padding:20px">Loading...</td></tr>';
+        if (tbody) {
+            tbody.innerHTML = '';
+            tbody.appendChild(buildLoadingRow(colCount));
+        }
         return api('/config/' + config.configType).then(function (data) {
             renderEntityRows(table, entity, data && data.entries ? data.entries : []);
         });
@@ -2757,13 +3102,123 @@
             });
     }
 
-    /* Start keepalive — initial check + interval */
+    /* Start keepalive — initial check + interval.
+     * Tracked so we can stop it on logout to prevent stray fetches
+     * after the session is gone. */
+    var keepaliveTimer = null;
     keepaliveCheck();
-    setInterval(keepaliveCheck, KEEPALIVE_INTERVAL);
+    keepaliveTimer = setInterval(keepaliveCheck, KEEPALIVE_INTERVAL);
+    window.__sg_stopKeepalive = function () {
+        if (keepaliveTimer) {
+            clearInterval(keepaliveTimer);
+            keepaliveTimer = null;
+        }
+    };
 
     /* ================================================================
      *  NETWORK OVERVIEW — fetch live stats for summary cards
      * ================================================================ */
+
+    /* ── Network overview helpers ───────────────────────────────── */
+
+    /* Set "<value> / <total>" inside a gauge value cell. */
+    function setGaugeFraction(elId, value, total) {
+        var el = document.getElementById(elId);
+        if (!el) return;
+        el.textContent = '';
+        el.appendChild(document.createTextNode(String(value)));
+        el.appendChild(makeSpan('gauge-unit', ' / ' + total));
+    }
+
+    function renderNetSummary() {
+        var totalIf = ifaceData.length;
+        var upIf = 0;
+        ifaceData.forEach(function (iface) { if (iface.status === 'UP') upIf++; });
+        setGaugeFraction('net-ifaces-up', upIf, totalIf);
+        var det = document.getElementById('net-ifaces-detail');
+        if (det) {
+            var down = totalIf - upIf;
+            det.textContent = down + ' interface' + (down !== 1 ? 's' : '') + ' down';
+        }
+
+        var active = 0, disabled = 0;
+        routeData.forEach(function (r) {
+            if (r.status === 'ACTIVE') active++; else disabled++;
+        });
+        var rel = document.getElementById('net-routes-up');
+        if (rel) rel.textContent = String(active);
+        var rdet = document.getElementById('net-routes-detail');
+        if (rdet) rdet.textContent = disabled + ' disabled';
+
+        /* Throughput / ARP placeholders — backend not yet wired */
+        var tp = document.getElementById('net-throughput');
+        if (tp) {
+            tp.textContent = '--';
+            tp.appendChild(makeSpan('gauge-unit', ' Mbps'));
+        }
+        var tpd = document.getElementById('net-throughput-detail');
+        if (tpd) tpd.textContent = 'not yet available';
+        var arp = document.getElementById('net-arp');
+        if (arp) arp.textContent = '--';
+        var arpd = document.getElementById('net-arp-detail');
+        if (arpd) arpd.textContent = 'not yet available';
+    }
+
+    function renderNetTrafficTable() {
+        var tbody = document.getElementById('net-traffic-tbody');
+        if (!tbody) return;
+        tbody.innerHTML = '';
+        if (ifaceData.length === 0) {
+            tbody.appendChild(buildEmptyRow(4));
+            return;
+        }
+        var frag = document.createDocumentFragment();
+        ifaceData.forEach(function (iface) {
+            var tr = document.createElement('tr');
+            var nameTd = document.createElement('td');
+            nameTd.appendChild(makeSpan(
+                'status-dot ' + (iface.status === 'UP' ? 'up' : 'down'), null));
+            nameTd.appendChild(document.createTextNode(iface.name));
+            tr.appendChild(nameTd);
+            tr.appendChild(makeTd(iface.ip));
+            tr.appendChild(makeTd(iface.speed));
+            tr.appendChild(makeTd(iface.status));
+            frag.appendChild(tr);
+        });
+        tbody.appendChild(frag);
+    }
+
+    function renderNetDhcpTable(dhcpData) {
+        var tbody = document.getElementById('net-dhcp-tbody');
+        if (!tbody) return;
+        tbody.innerHTML = '';
+        var entries = (dhcpData && dhcpData.entries) || [];
+        if (entries.length === 0) {
+            tbody.appendChild(buildEmptyRow(4));
+            return;
+        }
+        var frag = document.createDocumentFragment();
+        entries.forEach(function (pool) {
+            var st = pool.status || 'enable';
+            var enabled = (st === 'enable');
+            var range = (pool['start-ip'] || '') + ' - ' + (pool['end-ip'] || '');
+
+            var tr = document.createElement('tr');
+            tr.appendChild(makeTd(pool.id));
+            tr.appendChild(makeTd(pool['interface'] || ''));
+            tr.appendChild(makeTd(range));
+
+            var statusTd = document.createElement('td');
+            statusTd.appendChild(makeSpan(
+                'status-dot ' + (enabled ? 'up' : 'disabled'), null));
+            statusTd.appendChild(document.createTextNode(
+                enabled ? 'Enabled' : 'Disabled'));
+            tr.appendChild(statusTd);
+
+            frag.appendChild(tr);
+        });
+        tbody.appendChild(frag);
+    }
 
     function renderNetworkOverview() {
         return Promise.all([
@@ -2771,76 +3226,9 @@
             fetchRouteData().catch(function () {}),
             api('/config/network_dhcp-server').catch(function () { return null; })
         ]).then(function (results) {
-            var dhcpData = results[2];
-
-            /* ── Summary cards ── */
-            var up = 0, total = ifaceData.length;
-            ifaceData.forEach(function (iface) {
-                if (iface.status === 'UP') up++;
-            });
-            var el = document.getElementById('net-ifaces-up');
-            if (el) el.innerHTML = esc(up) + '<span class="gauge-unit"> / ' + esc(total) + '</span>';
-            var det = document.getElementById('net-ifaces-detail');
-            if (det) det.textContent = (total - up) + ' interface' + (total - up !== 1 ? 's' : '') + ' down';
-
-            var active = 0, disabled = 0;
-            routeData.forEach(function (r) {
-                if (r.status === 'ACTIVE') active++;
-                else disabled++;
-            });
-            var rel = document.getElementById('net-routes-up');
-            if (rel) rel.textContent = active;
-            var rdet = document.getElementById('net-routes-detail');
-            if (rdet) rdet.textContent = disabled + ' disabled';
-
-            var tp = document.getElementById('net-throughput');
-            if (tp) tp.innerHTML = '--<span class="gauge-unit"> Mbps</span>';
-            var tpd = document.getElementById('net-throughput-detail');
-            if (tpd) tpd.textContent = 'not yet available';
-
-            var arp = document.getElementById('net-arp');
-            if (arp) arp.textContent = '--';
-            var arpd = document.getElementById('net-arp-detail');
-            if (arpd) arpd.textContent = 'not yet available';
-
-            /* ── Interface Traffic table ── */
-            var ttbody = document.getElementById('net-traffic-tbody');
-            if (ttbody) {
-                var html = '';
-                ifaceData.forEach(function (iface) {
-                    var dotCls = iface.status === 'UP' ? 'up' : 'down';
-                    html += '<tr>' +
-                        '<td><span class="status-dot ' + esc(dotCls) + '"></span>' + esc(iface.name) + '</td>' +
-                        '<td>' + esc(iface.ip) + '</td>' +
-                        '<td>' + esc(iface.speed) + '</td>' +
-                        '<td>' + esc(iface.status) + '</td>' +
-                        '</tr>';
-                });
-                ttbody.innerHTML = html || '<tr><td colspan="4" style="text-align:center;color:#999;padding:12px">No interfaces</td></tr>';
-            }
-
-            /* ── DHCP Pools table ── */
-            var dtbody = document.getElementById('net-dhcp-tbody');
-            if (dtbody) {
-                var dhtml = '';
-                if (dhcpData && dhcpData.entries) {
-                    dhcpData.entries.forEach(function (pool) {
-                        var range = (pool['start-ip'] || '') + ' - ' + (pool['end-ip'] || '');
-                        var st = pool.status || 'enable';
-                        var dotCls = st === 'enable' ? 'up' : 'disabled';
-                        var label = st === 'enable' ? 'Enabled' : 'Disabled';
-                        dhtml += '<tr>' +
-                            '<td>' + esc(pool.id) + '</td>' +
-                            '<td>' + esc(pool['interface'] || '') + '</td>' +
-                            '<td>' + esc(range) + '</td>' +
-                            '<td><span class="status-dot ' + esc(dotCls) + '"></span>' + esc(label) + '</td>' +
-                            '</tr>';
-                    });
-                }
-                dtbody.innerHTML = dhtml || '<tr><td colspan="4" style="text-align:center;color:#999;padding:12px">No DHCP pools configured</td></tr>';
-            }
-
-            /* ── Route Flows widget ── */
+            renderNetSummary();
+            renderNetTrafficTable();
+            renderNetDhcpTable(results[2]);
             renderRouteRows();
         });
     }
@@ -2849,79 +3237,59 @@
      *  DYNAMIC SELECT POPULATION — fetch real data for form dropdowns
      * ================================================================ */
 
-    /* Populate all .iface-select dropdowns with real interface names */
+    /* Replace a <select>'s contents with options from API entries.
+     * Preserves a single hardcoded option (e.g. "any" / "all") when
+     * preserveValue is given.  Each entry uses entry.id (or .name) as
+     * both option value and label.  Idempotent — safe to call after
+     * the cached API result returns the same data. */
+    function populateSelectFrom(sel, entries, preserveValue) {
+        if (!sel) return;
+        var preserved = preserveValue
+            ? sel.querySelector('option[value="' + preserveValue + '"]')
+            : null;
+        sel.innerHTML = '';
+        if (preserved) sel.appendChild(preserved);
+        entries.forEach(function (e) {
+            var eid = e.id || e.name || '';
+            var opt = document.createElement('option');
+            opt.value = eid;
+            opt.textContent = eid;
+            sel.appendChild(opt);
+        });
+    }
+
     function populateIfaceSelects() {
-        return api('/config/system_interface').then(function (data) {
+        return cachedApi('/config/system_interface').then(function (data) {
             if (!data || !data.entries) return;
-            var selects = document.querySelectorAll('.iface-select');
-            selects.forEach(function (sel) {
-                /* Preserve 'any' option if present */
-                var hasAny = sel.querySelector('option[value="any"]') ||
-                             (sel.options.length > 0 && sel.options[0].text === 'any');
-                var anyOpt = hasAny ? sel.options[0] : null;
-                sel.innerHTML = '';
-                if (anyOpt) sel.appendChild(anyOpt);
-                data.entries.forEach(function (e) {
-                    var opt = document.createElement('option');
-                    opt.value = e.id || '';
-                    opt.textContent = e.id || '';
-                    sel.appendChild(opt);
-                });
+            document.querySelectorAll('.iface-select').forEach(function (sel) {
+                populateSelectFrom(sel, data.entries, 'any');
             });
         });
     }
 
-    /* Populate admin profile select with real profiles */
     function populateProfileSelect() {
         var sel = document.getElementById('admin-profile-select');
         if (!sel) return Promise.resolve();
-        return api('/config/system_admin-profile').then(function (data) {
+        return cachedApi('/config/system_admin-profile').then(function (data) {
             if (!data || !data.entries) return;
-            sel.innerHTML = '';
-            data.entries.forEach(function (e) {
-                var opt = document.createElement('option');
-                opt.value = e.id || '';
-                opt.textContent = e.id || '';
-                sel.appendChild(opt);
-            });
+            populateSelectFrom(sel, data.entries, null);
         });
     }
 
-    /* Populate address object selects (firewall policy src/dst) */
     function populateAddrSelects() {
-        return api('/config/firewall_address').then(function (data) {
+        return cachedApi('/config/firewall_address').then(function (data) {
             if (!data || !data.entries) return;
             document.querySelectorAll('.addr-select').forEach(function (sel) {
-                /* Keep 'all' option, remove the rest, re-add from API */
-                var allOpt = sel.querySelector('option[value="all"]');
-                sel.innerHTML = '';
-                if (allOpt) sel.appendChild(allOpt);
-                data.entries.forEach(function (e) {
-                    var eid = e.id || e.name || '';
-                    var opt = document.createElement('option');
-                    opt.value = eid;
-                    opt.textContent = eid;
-                    sel.appendChild(opt);
-                });
+                populateSelectFrom(sel, data.entries, 'all');
             });
         });
     }
 
-    /* Populate service selects (firewall policy service) */
     function populateSvcSelects() {
-        return api('/config/firewall_service').then(function (data) {
+        return cachedApi('/config/firewall_service').then(function (data) {
             if (!data || !data.entries) return;
             document.querySelectorAll('.svc-select').forEach(function (sel) {
-                var allOpt = sel.querySelector('option[value="all"]');
-                sel.innerHTML = '';
-                if (allOpt) sel.appendChild(allOpt);
-                data.entries.forEach(function (e) {
-                    var eid = e.id || e.name || '';
-                    var opt = document.createElement('option');
-                    opt.value = eid;
-                    opt.textContent = eid;
-                    sel.appendChild(opt);
-                });
+                populateSelectFrom(sel, data.entries, 'all');
             });
         });
     }

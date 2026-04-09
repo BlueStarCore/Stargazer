@@ -791,6 +791,11 @@ static int st_run_webd(int mode, diag_result_t *out)
 	return cli_diagnose_test_webd(mode, out);
 }
 
+static int st_run_busybox(int mode, diag_result_t *out)
+{
+	return cli_diagnose_test_busybox(mode, out);
+}
+
 static const struct {
 	const char  *name;
 	st_runner_t  run;
@@ -805,6 +810,7 @@ static const struct {
 	{ "dhcp",        st_run_dhcp },
 	{ "supervisor",  st_run_supervisor },
 	{ "webd",        st_run_webd },
+	{ "busybox",     st_run_busybox },
 	{ NULL,          NULL }
 };
 

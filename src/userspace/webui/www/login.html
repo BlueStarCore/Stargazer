@@ -6,9 +6,15 @@
 <title>Stargazer - Login</title>
 <link rel="icon" type="image/png" href="img/icon.png">
 <style>
-/* --- Pixel font (Press Start 2P) embedded via Google Fonts for prototype --- */
-/* Production: embed woff2 as base64 in CSS */
-@import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+/* Self-hosted Press Start 2P (latin subset) — no external CDN.
+ * NGFW must be air-gapped: never fetch resources from the internet. */
+@font-face {
+    font-family: 'Press Start 2P';
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url('fonts/PressStart2P-latin.woff2') format('woff2');
+}
 
 *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -224,6 +230,7 @@ body {
     </div>
 </div>
 
+<script src="js/sg-common.js"></script>
 <script src="js/login.js"></script>
 </body>
 </html>

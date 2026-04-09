@@ -1628,6 +1628,73 @@ int handle_history_load(int client_fd, const char *user,
 	return 0;
 }
 
+/* ── SG_CMD_DIAG_BUSYBOX_LIST (653) ───────────────────────────────────── */
+
+/*
+ * Enumerate every symlink under /bin, /sbin, /usr/bin, /usr/sbin that
+ * resolves to /bin/busybox, and return one path per line. Used by the
+ * BUSYBOX-WHITELIST selftest to detect drift between the committed
+ * configs/busybox.config.fragment and what actually shipped in the rootfs.
+ *
+ * The CLI is sandboxed (no readlinkat/getdents64), so this enumeration
+ * must run in mgmtd.
+ */
+int handle_diag_busybox_list(int client_fd, const char *user,
+			     const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)payload; (void)hdr;
+
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "monitor permission required");
+		return 0;
+	}
+
+	static const char *dirs[] = {
+		"/bin", "/sbin", "/usr/bin", "/usr/sbin", NULL
+	};
+
+	char resp[SG_RESPONSE_MAX];
+	size_t pos = 0;
+	resp[0] = '\0';
+
+	for (int i = 0; dirs[i]; i++) {
+		DIR *d = opendir(dirs[i]);
+		if (!d)
+			continue;
+
+		struct dirent *de;
+		while ((de = readdir(d)) != NULL) {
+			if (de->d_name[0] == '.')
+				continue;
+
+			char path[512];
+			int n = snprintf(path, sizeof(path), "%s/%s",
+					 dirs[i], de->d_name);
+			if (n <= 0 || (size_t)n >= sizeof(path))
+				continue;
+
+			char target[256];
+			ssize_t tlen = readlink(path, target,
+						sizeof(target) - 1);
+			if (tlen <= 0)
+				continue;
+			target[tlen] = '\0';
+
+			/* Only include symlinks resolving to /bin/busybox */
+			if (strcmp(target, "/bin/busybox") != 0)
+				continue;
+
+			buf_appendf(resp, sizeof(resp), &pos, "%s\n", path);
+		}
+		closedir(d);
+	}
+
+	send_ok(client_fd, NULL, resp);
+	return 0;
+}
+
 /* ── SG_CMD_DIAG_NTP (652) ────────────────────────────────────────────── */
 
 int handle_diag_ntp(int client_fd, const char *user,

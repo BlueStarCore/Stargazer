@@ -113,4 +113,14 @@ int cli_diagnose_test_supervisor(int mode, diag_result_t *out);
  */
 int cli_diagnose_test_webd(int mode, diag_result_t *out);
 
+/*
+ * Run BusyBox applet whitelist diagnostics.
+ *   mode=0: same as mode=1 (no local-only checks possible — needs IPC)
+ *   mode=1: enumerate /bin /sbin /usr/bin /usr/sbin via mgmtd, compare
+ *           against the hardcoded whitelist. Fails on unexpected applets
+ *           (drift detection) or missing applets (build broken).
+ * Returns 0 on all-pass, 1 on any failure.
+ */
+int cli_diagnose_test_busybox(int mode, diag_result_t *out);
+
 #endif /* CLI_DIAGNOSE_H */

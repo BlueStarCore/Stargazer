@@ -66,6 +66,8 @@ def main():
     )
 
     # vda=boot (snapshot), vdb=sgdata (config), vdc=sglogs (logs)
+    # virtio-net gives the guest an "eth0" interface so selftests
+    # that need a real interface (NAT, route, DHCP) work in QEMU.
     qemu_cmd = [
         "qemu-system-aarch64",
         "-M", "virt", "-cpu", "cortex-a57", "-m", "2G", "-nographic",
@@ -73,7 +75,8 @@ def main():
         "-drive", f"file={BOOT_IMG},format=raw,if=virtio,snapshot=on",
         "-drive", f"file={DATA_IMG},format=raw,if=virtio",
         "-drive", f"file={LOGS_IMG},format=raw,if=virtio",
-        "-net", "none",
+        "-netdev", "user,id=net0",
+        "-device", "virtio-net-device,netdev=net0",
     ]
 
     print(f"Starting QEMU...")

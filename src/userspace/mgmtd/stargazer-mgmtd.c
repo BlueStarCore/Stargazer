@@ -1494,14 +1494,21 @@ static int mgmtd_first_boot_seed(void)
 	 * idempotent, also handles upgrade migration. */
 
 	/* ── Default interfaces ──────────────────────────────────────── */
-	/* lan3: LAN management interface — allow ping, http, https by default.
-	 * apply_interface() skips gracefully if the interface is not yet present. */
-	if (sg_db_set("system_interface", "lan3",
-		      "mode=static\n"
-		      "ip=" MGMT_DEFAULT_IP "\n"
-		      "status=up\n"
-		      "mtu=1500\n"
-		      "allowaccess=ping http https\n") != 0) goto fail;
+	/* lan3: LAN management interface — only seed if the hardware
+	 * actually exists.  On non-BPI-R4 platforms (e.g. QEMU) lan3
+	 * does not exist and mgmtd_sync_interfaces() will create entries
+	 * for whatever NICs the platform actually has. */
+	if (iface_exists("lan3")) {
+		if (sg_db_set("system_interface", "lan3",
+			      "mode=static\n"
+			      "ip=" MGMT_DEFAULT_IP "\n"
+			      "status=up\n"
+			      "mtu=1500\n"
+			      "allowaccess=ping http https\n") != 0) goto fail;
+	} else {
+		mgmt_log("INFO",
+			 "first-boot: skipping lan3 seed (hardware not present)");
+	}
 
 	/* Verify critical tables populated before stamping flag */
 	for (size_t i = 0; i < N_CRITICAL; i++) {
@@ -1543,6 +1550,10 @@ static int is_immutable(const char *existing)
 	extract_val(existing, "immutable", imm, sizeof(imm));
 	return strcmp(imm, "yes") == 0;
 }
+
+/* Forward declaration — defined further down with the IPC handlers. */
+sg_status_t validate_cfg_data(const char *type, const char *data,
+			      char *errbuf, size_t errsz);
 
 /* ── Config reconciliation ──────────────────────────────────────────────── */
 
@@ -1633,6 +1644,22 @@ static void mgmtd_reconcile_config(void)
 			const char *btype = builtins[i].type;
 			const char *bid   = builtins[i].id;
 			const char *bdata = builtins[i].data;
+
+			/* Sanity check hardcoded data against the registry —
+			 * graceful degradation: log error but still write.
+			 * Catches developer bugs (typo'd field name, invalid
+			 * enum value) without aborting boot. */
+			{
+				char verr[SG_EXTRA_MAX];
+				if (validate_cfg_data(btype, bdata,
+						      verr, sizeof(verr))
+				    != SG_OK) {
+					mgmt_log("ERROR",
+						 "BUG: hardcoded built-in "
+						 "%s:%s fails validation: %s",
+						 btype, bid, verr);
+				}
+			}
 
 			char *existing = sg_db_get(btype, bid);
 
@@ -3112,6 +3139,7 @@ static sg_status_t validate_cfg_fields(const char *type, const char *data,
 			 * firewall_address it IS a registered safe-id field
 			 * and must be validated like any other. */
 			if (strcmp(key, "builtin") == 0 ||
+			    strcmp(key, "immutable") == 0 ||
 			    strcmp(key, "password-hash") == 0 ||
 			    strcmp(key, "id") == 0) {
 				p += llen;
@@ -5038,6 +5066,8 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 
 	case SG_CMD_DIAG_NTP:
 		return handle_diag_ntp(client_fd, user, payload, hdr);
+	case SG_CMD_DIAG_BUSYBOX_LIST:
+		return handle_diag_busybox_list(client_fd, user, payload, hdr);
 	case SG_CMD_SHOW_SESSIONS:
 		return handle_show_sessions(client_fd, user, payload, hdr);
 	case SG_CMD_SHOW_BOOT_CONFIG:

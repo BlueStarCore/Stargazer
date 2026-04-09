@@ -278,12 +278,13 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
 		static char static_hdrs_hsts[512];
 		static int static_hdrs_init = 0;
 		if (!static_hdrs_init) {
+			/* Strict CSP — all resources self-hosted, no external
+			 * CDN. NGFW must be air-gapped. */
 			snprintf(static_hdrs, sizeof(static_hdrs),
 				"X-Content-Type-Options: nosniff\r\n"
 				"X-Frame-Options: DENY\r\n"
 				"Content-Security-Policy: default-src 'self' 'unsafe-inline'; "
-				"style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-				"font-src 'self' https://fonts.gstatic.com\r\n");
+				"font-src 'self'\r\n");
 			snprintf(static_hdrs_hsts, sizeof(static_hdrs_hsts),
 				"%s" WEBD_HSTS_HEADER, static_hdrs);
 			static_hdrs_init = 1;
@@ -293,6 +294,8 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
 			.ssi_pattern = NULL,
 			.extra_headers = g_tls_active ? static_hdrs_hsts
 						      : static_hdrs,
+			/* Mongoose lacks woff2 in builtin MIME table */
+			.mime_types = "woff2=font/woff2",
 		};
 		mg_http_serve_dir(c, hm, &opts);
 

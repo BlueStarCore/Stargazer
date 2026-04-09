@@ -145,6 +145,7 @@ static const char *cmd_name(uint32_t cmd)
 	case SG_CMD_DISK_LIST:         return "DISK_LIST";
 	case SG_CMD_DISK_INFO:         return "DISK_INFO";
 	case SG_CMD_DISK_SMART:        return "DISK_SMART";
+	case SG_CMD_DIAG_BUSYBOX_LIST: return "DIAG_BUSYBOX_LIST";
 	case SG_CMD_SHOW_SESSIONS:     return "SHOW_SESSIONS";
 	case SG_CMD_SHOW_BOOT_CONFIG:  return "SHOW_BOOT_CONFIG";
 	case SG_CMD_DEBUG_STATE_GET:   return "DEBUG_STATE_GET";

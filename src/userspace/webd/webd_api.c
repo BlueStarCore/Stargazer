@@ -38,6 +38,22 @@ static int rate_limit_check(void)
 
 /* ── Helpers ─────────────────────────────────────────────────────────── */
 
+/*
+ * type_uses_name_as_id — true if a config type uses the 'name' field
+ * as the section identifier (rather than a separate numeric/opaque id).
+ *
+ * Examples:
+ *   firewall_address:webservers  → name "webservers" IS the section id
+ *   firewall_policy:1            → numeric id, "name" is descriptive only
+ */
+static int type_uses_name_as_id(const char *type)
+{
+	return strcmp(type, "firewall_address") == 0 ||
+	       strcmp(type, "firewall_service") == 0 ||
+	       strcmp(type, "system_admin") == 0 ||
+	       strcmp(type, "system_admin-profile") == 0;
+}
+
 static void reply_json(struct mg_connection *c, int status, const char *json)
 {
 	mg_http_reply(c, status, webd_sec_headers(), "%s", json);
@@ -613,16 +629,34 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 				return -1;
 			}
 
-			/* Extract id from name or id field */
+			/* Extract entry id.
+			 *
+			 * Two identifier conventions:
+			 *   - "name-as-id" types (firewall_address, firewall_service,
+			 *     system_admin, system_admin-profile): the JSON 'name'
+			 *     IS the section identifier.
+			 *   - All other types (firewall_policy, network_nat,
+			 *     network_route_static, ...): use a separate numeric/
+			 *     opaque 'id' field. The 'name' field, if present, is
+			 *     just a descriptive label stored in the config payload.
+			 *
+			 * The previous code used name-as-id for ALL types, which
+			 * stored firewall_policy entries as e.g. "firewall_policy:
+			 * Allow-HTTPS-Out" — making the section ID and the name
+			 * column always identical and conflicting with the
+			 * numeric-ID convention used by the boot seed.
+			 */
 			char *name = json_str(hm->body, "$.name");
 			char *id_field = json_str(hm->body, "$.id");
-			const char *entry_id = name ? name : id_field;
+			const char *entry_id = type_uses_name_as_id(type)
+				? (name ? name : id_field)
+				: (id_field ? id_field : NULL);
 			if (!entry_id || !*entry_id) {
 				free(kv_raw);
 				free(name);
 				free(id_field);
 				reply_json(c, 400,
-					   "{\"error\":\"Missing 'name' or 'id'\"}");
+					   "{\"error\":\"Missing 'id' field\"}");
 				return -1;
 			}
 

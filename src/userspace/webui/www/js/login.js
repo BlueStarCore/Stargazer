@@ -19,51 +19,61 @@
         return (seed - 1) / 2147483646;
     }
 
+    /* Offscreen caches — sky gradient and nebula puffs are static
+     * after resize.  Pre-rendered once and blitted each frame,
+     * eliminating ~70 gradient allocations per frame (~4200/sec). */
+    var skyCache = document.createElement('canvas');
+    var skyCtx = skyCache.getContext('2d');
+    var nebulaCache = document.createElement('canvas');
+    var nebulaCtx = nebulaCache.getContext('2d');
+
     function resize() {
-        W = window.innerWidth;
-        H = window.innerHeight;
-        canvas.width = W * dpr;
-        canvas.height = H * dpr;
-        canvas.style.width = W + 'px';
-        canvas.style.height = H + 'px';
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        var hi = SgCommon.setupHiDPICanvas(canvas, window.innerWidth, window.innerHeight);
+        W = hi.W; H = hi.H; dpr = hi.dpr;
         seed = 12345; generateStars();
         seed = 54321; generateNebulaPuffs();
+        renderSkyCache();
+        renderNebulaCache();
     }
     window.addEventListener('resize', resize);
 
     /* ================================================================
-     *  SKY GRADIENT — deep dark blue
+     *  SKY GRADIENT — deep dark blue (cached, static)
      * ================================================================ */
-    function drawSky() {
-        /* Base: vertical gradient from deep black-blue top to slightly lighter bottom */
-        var grad = ctx.createLinearGradient(0, 0, 0, H);
-        /* Symmetric: top and bottom mirror each other */
+    function renderSkyCache() {
+        skyCache.width = W * dpr;
+        skyCache.height = H * dpr;
+        skyCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+        /* Base: vertical gradient — symmetric top/bottom */
+        var grad = skyCtx.createLinearGradient(0, 0, 0, H);
         grad.addColorStop(0,    '#020610');
         grad.addColorStop(0.10, '#04091a');
         grad.addColorStop(0.20, '#061230');
         grad.addColorStop(0.30, '#0a1a42');
         grad.addColorStop(0.40, '#0e2458');
-        grad.addColorStop(0.50, '#123068');   /* brightest center */
+        grad.addColorStop(0.50, '#123068');
         grad.addColorStop(0.60, '#0e2458');
         grad.addColorStop(0.70, '#0a1a42');
         grad.addColorStop(0.80, '#061230');
         grad.addColorStop(0.90, '#04091a');
         grad.addColorStop(1.0,  '#020610');
-        ctx.fillStyle = grad;
-        ctx.fillRect(0, 0, W, H);
+        skyCtx.fillStyle = grad;
+        skyCtx.fillRect(0, 0, W, H);
 
-        /* Center glow — brightest area in the middle of the sky */
-        var cx = W * 0.5;
-        var cy = H * 0.45;
-        var cr = H * 0.5;
-        var cglow = ctx.createRadialGradient(cx, cy, 0, cx, cy, cr);
+        /* Center glow */
+        var cx = W * 0.5, cy = H * 0.45, cr = H * 0.5;
+        var cglow = skyCtx.createRadialGradient(cx, cy, 0, cx, cy, cr);
         cglow.addColorStop(0,   'rgba(30, 70, 140, 0.15)');
         cglow.addColorStop(0.5, 'rgba(15, 40, 90, 0.06)');
         cglow.addColorStop(1,   'rgba(0, 0, 0, 0)');
-        ctx.fillStyle = cglow;
-        ctx.fillRect(0, 0, W, H);
+        skyCtx.fillStyle = cglow;
+        skyCtx.fillRect(0, 0, W, H);
+    }
 
+    function drawSky() {
+        /* Blit cached sky — single drawImage instead of 2 gradients/frame */
+        ctx.drawImage(skyCache, 0, 0, W, H);
     }
 
     /* ================================================================
@@ -93,20 +103,31 @@
         }
     }
 
-    function drawNebula(t) {
+    /* Bake all nebula puffs into an offscreen canvas at their base
+     * alpha — no per-frame pulse.  The original ±12% pulse was barely
+     * perceptible against base alpha 0.03-0.09 and is dropped here in
+     * exchange for a static blit (1 drawImage vs 35 gradients/frame). */
+    function renderNebulaCache() {
+        nebulaCache.width = W * dpr;
+        nebulaCache.height = H * dpr;
+        nebulaCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        nebulaCtx.clearRect(0, 0, W, H);
         for (var i = 0; i < nebulaPuffs.length; i++) {
             var p = nebulaPuffs[i];
-            var pulse = 1.0 + Math.sin(t * p.pulseSpeed + p.pulsePhase) * 0.12;
-            var a = p.alpha * pulse;
-            var g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.r * pulse);
-            g.addColorStop(0, 'rgba(' + p.r_col + ',' + p.g_col + ',' + p.b_col + ',' + a + ')');
-            g.addColorStop(0.4, 'rgba(' + p.r_col + ',' + p.g_col + ',' + p.b_col + ',' + (a * 0.5) + ')');
-            g.addColorStop(1, 'rgba(' + p.r_col + ',' + p.g_col + ',' + p.b_col + ',0)');
-            ctx.fillStyle = g;
-            ctx.beginPath();
-            ctx.arc(p.x, p.y, p.r * pulse, 0, Math.PI * 2);
-            ctx.fill();
+            var g = nebulaCtx.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.r);
+            var rgb = p.r_col + ',' + p.g_col + ',' + p.b_col;
+            g.addColorStop(0,   'rgba(' + rgb + ',' + p.alpha + ')');
+            g.addColorStop(0.4, 'rgba(' + rgb + ',' + (p.alpha * 0.5) + ')');
+            g.addColorStop(1,   'rgba(' + rgb + ',0)');
+            nebulaCtx.fillStyle = g;
+            nebulaCtx.beginPath();
+            nebulaCtx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+            nebulaCtx.fill();
         }
+    }
+
+    function drawNebula(_t) {
+        ctx.drawImage(nebulaCache, 0, 0, W, H);
     }
 
     /* ================================================================
@@ -219,7 +240,8 @@
         /* Place named stars at real positions */
         for (var i = 0; i < namedStars.length; i++) {
             var ns = namedStars[i];
-            var type = ns[2] <= 1.5 ? 2 : (ns[2] <= 2.5 ? 1 : 1);
+            /* type=2 → bright (cross sparkle), type=1 → small */
+            var type = ns[2] <= 1.5 ? 2 : 1;
             stars.push({
                 x: (ns[0] + 0.25) * W,  /* shift 25% right */
                 y: ns[1] * H * 0.70,   /* compress sky into upper 70% */
@@ -265,7 +287,16 @@
                 name: ''
             });
         }
+
+        /* Build name → star map for findStar() — avoids the O(N)
+         * scan that ran 4× per frame for constellation lines. */
+        starsByName = {};
+        for (var i = 0; i < stars.length; i++) {
+            if (stars[i].name) starsByName[stars[i].name] = stars[i];
+        }
     }
+
+    var starsByName = {};
 
     function drawStars(t) {
         /* Draw all stars */
@@ -316,14 +347,8 @@
     }
 
     function findStar(name) {
-        for (var i = 0; i < stars.length; i++) {
-            if (stars[i].name === name) return stars[i];
-        }
-        return null;
+        return starsByName[name] || null;
     }
-
-    /* Railing removed — just floor */
-    function drawRailing() {}
 
     /* ================================================================
      *  SHOOTING STARS — bright white-blue trails
@@ -451,7 +476,6 @@
         drawSky();
         drawNebula(t);
         drawStars(t);
-        drawRailing();
         updateShootingStars(dt);
         drawBars();
 
@@ -482,18 +506,10 @@
         btn.textContent = 'CONNECTING...';
         btn.disabled = true;
 
-        fetch('/api/auth/login', {
+        SgCommon.apiCall('/auth/login', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username: user, password: pass })
-        })
-        .then(function (res) {
-            if (!res.ok) {
-                return res.json().catch(function () { return {}; }).then(function (data) {
-                    throw new Error(data.error || 'INVALID CREDENTIALS');
-                });
-            }
-            return res.json();
+            body: { username: user, password: pass },
+            on401: 'throw'
         })
         .then(function (data) {
             /* Session token is now set as HttpOnly cookie by server.
@@ -561,13 +577,9 @@
             var newPw = document.getElementById('cp-new').value;
             var confirmPw = document.getElementById('cp-confirm').value;
 
-            if (!newPw || !confirmPw) {
-                cpErr.textContent = 'ENTER NEW PASSWORD AND CONFIRMATION';
-                cpErr.style.display = 'block';
-                return;
-            }
-            if (newPw !== confirmPw) {
-                cpErr.textContent = 'PASSWORDS DO NOT MATCH';
+            var validationErr = SgCommon.validatePasswordChange(newPw, confirmPw);
+            if (validationErr) {
+                cpErr.textContent = validationErr;
                 cpErr.style.display = 'block';
                 return;
             }
@@ -576,18 +588,10 @@
             cpBtn.disabled = true;
             cpErr.style.display = 'none';
 
-            fetch('/api/auth/change-password', {
+            SgCommon.apiCall('/auth/change-password', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ password: newPw })
-            })
-            .then(function (res) {
-                if (!res.ok) {
-                    return res.json().catch(function () { return {}; }).then(function (data) {
-                        throw new Error(data.error || 'PASSWORD CHANGE FAILED');
-                    });
-                }
-                return res.json();
+                body: { password: newPw },
+                on401: 'throw'
             })
             .then(function () {
                 cpBtn.textContent = 'PASSWORD CHANGED';

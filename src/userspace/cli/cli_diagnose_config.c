@@ -3155,7 +3155,7 @@ static void test_ipc_ref_existence(void)
 		  "network_nat:__diag_natcidr\n"
 		  "type=snat\n"
 		  "srcintf=any\n"
-		  "dstintf=lan3\n"
+		  "dstintf=eth0\n"
 		  "srcaddr=192.168.1.0/24\n"
 		  "dstaddr=all\n"
 		  "status=enable\n",
@@ -3284,7 +3284,7 @@ static void test_ipc_nat_ref(void)
 			    "network_nat:__diag_natref\n"
 			    "type=snat\n"
 			    "srcintf=any\n"
-			    "dstintf=lan3\n"
+			    "dstintf=eth0\n"
 			    "srcaddr=__diag_nataddr\n"
 			    "dstaddr=all\n"
 			    "status=enable\n",

@@ -49,6 +49,7 @@ BUSYBOX_CACHE_DIR := $(PROJECT_ROOT)/.cache
 BUSYBOX_DIR    := $(BUSYBOX_CACHE_DIR)/busybox-src
 BUSYBOX_BIN    := $(BUILD_DIR)/busybox/busybox
 BUSYBOX_LINKS  := $(BUSYBOX_DIR)/busybox.links
+BUSYBOX_CONFIG_FRAGMENT := $(PROJECT_ROOT)/configs/busybox.config.fragment
 
 # Dash shell settings (replaces BusyBox ash as /bin/sh)
 DASH_VERSION   := 0.5.12
@@ -238,38 +239,19 @@ $(BUSYBOX_BIN):
 			git -C $(BUSYBOX_DIR) reset --hard "origin/$(BUSYBOX_TAG)" >/dev/null 2>&1 || true; \
 		fi; \
 	fi
-	$(MAKE) -C $(BUSYBOX_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) defconfig
-	@sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/# CONFIG_TFTP is not set/CONFIG_TFTP=y/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/# CONFIG_FEATURE_TFTP_GET is not set/CONFIG_FEATURE_TFTP_GET=y/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/# CONFIG_FEATURE_TFTP_BLOCKSIZE is not set/CONFIG_FEATURE_TFTP_BLOCKSIZE=y/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/# CONFIG_TRACEROUTE is not set/CONFIG_TRACEROUTE=y/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/# CONFIG_NSLOOKUP is not set/CONFIG_NSLOOKUP=y/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/# CONFIG_ARPING is not set/CONFIG_ARPING=y/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/# CONFIG_NTPD is not set/CONFIG_NTPD=y/' $(BUSYBOX_DIR)/.config
-	# --- Fix: disable tc (CBQ removed from kernel headers 6.12+) ---
-	@sed -i 's/CONFIG_TC=y/CONFIG_TC=n/' $(BUSYBOX_DIR)/.config
-	# --- Hardening: disable shell applets (prevent shell escape) ---
-	@sed -i 's/CONFIG_ASH=y/CONFIG_ASH=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_HUSH=y/CONFIG_HUSH=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_SH_IS_ASH=y/CONFIG_SH_IS_NONE=y/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_BASH_IS_ASH=y/CONFIG_BASH_IS_NONE=y/' $(BUSYBOX_DIR)/.config
-	# --- Hardening: disable dangerous interactive/server applets ---
-	@sed -i 's/CONFIG_VI=y/CONFIG_VI=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_LESS=y/CONFIG_LESS=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_ED=y/CONFIG_ED=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_FTPD=y/CONFIG_FTPD=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_HTTPD=y/CONFIG_HTTPD=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_TELNETD=y/CONFIG_TELNETD=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_TFTPD=y/CONFIG_TFTPD=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_SU=y/CONFIG_SU=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_LOGIN=y/CONFIG_LOGIN=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_PASSWD=y/CONFIG_PASSWD=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_ADDUSER=y/CONFIG_ADDUSER=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_DELUSER=y/CONFIG_DELUSER=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_ADDGROUP=y/CONFIG_ADDGROUP=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_DELGROUP=y/CONFIG_DELGROUP=n/' $(BUSYBOX_DIR)/.config
-	# Resolve Kconfig dependencies after hardening changes
+	# Whitelist build: start from allnoconfig (everything off) and merge the
+	# committed fragment listing only the applets Stargazer actually uses.
+	# See configs/busybox.config.fragment for the full audit-able list.
+	$(MAKE) -C $(BUSYBOX_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) allnoconfig
+	# Drop the "# CONFIG_X is not set" lines that conflict with our enables
+	# (BusyBox 1.36 Kconfig honours the FIRST entry, not the last; without
+	# this step `cat fragment >> .config` is silently ignored).
+	@grep -oE '^CONFIG_[A-Z0-9_]+' $(BUSYBOX_CONFIG_FRAGMENT) | sort -u | \
+		while read sym; do \
+			sed -i "/^# $${sym} is not set\$$/d" $(BUSYBOX_DIR)/.config; \
+		done
+	cat $(BUSYBOX_CONFIG_FRAGMENT) >> $(BUSYBOX_DIR)/.config
+	# Resolve Kconfig dependencies — pulls in required FEATURE_* defaults
 	yes "" | $(MAKE) -C $(BUSYBOX_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) oldconfig
 	$(MAKE) -C $(BUSYBOX_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) -j$$(nproc)
 	$(MAKE) -C $(BUSYBOX_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) busybox.links
@@ -283,38 +265,13 @@ $(BUSYBOX_LINKS):
 		echo "Cloning BusyBox source..."; \
 		git clone --depth 1 -b $(BUSYBOX_TAG) $(BUSYBOX_REPO) $(BUSYBOX_DIR); \
 	fi
-	$(MAKE) -C $(BUSYBOX_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) defconfig
-	@sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/# CONFIG_TFTP is not set/CONFIG_TFTP=y/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/# CONFIG_FEATURE_TFTP_GET is not set/CONFIG_FEATURE_TFTP_GET=y/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/# CONFIG_FEATURE_TFTP_BLOCKSIZE is not set/CONFIG_FEATURE_TFTP_BLOCKSIZE=y/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/# CONFIG_TRACEROUTE is not set/CONFIG_TRACEROUTE=y/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/# CONFIG_NSLOOKUP is not set/CONFIG_NSLOOKUP=y/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/# CONFIG_ARPING is not set/CONFIG_ARPING=y/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/# CONFIG_NTPD is not set/CONFIG_NTPD=y/' $(BUSYBOX_DIR)/.config
-	# --- Fix: disable tc (CBQ removed from kernel headers 6.12+) ---
-	@sed -i 's/CONFIG_TC=y/CONFIG_TC=n/' $(BUSYBOX_DIR)/.config
-	# --- Hardening: disable shell applets (prevent shell escape) ---
-	@sed -i 's/CONFIG_ASH=y/CONFIG_ASH=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_HUSH=y/CONFIG_HUSH=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_SH_IS_ASH=y/CONFIG_SH_IS_NONE=y/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_BASH_IS_ASH=y/CONFIG_BASH_IS_NONE=y/' $(BUSYBOX_DIR)/.config
-	# --- Hardening: disable dangerous interactive/server applets ---
-	@sed -i 's/CONFIG_VI=y/CONFIG_VI=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_LESS=y/CONFIG_LESS=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_ED=y/CONFIG_ED=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_FTPD=y/CONFIG_FTPD=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_HTTPD=y/CONFIG_HTTPD=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_TELNETD=y/CONFIG_TELNETD=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_TFTPD=y/CONFIG_TFTPD=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_SU=y/CONFIG_SU=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_LOGIN=y/CONFIG_LOGIN=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_PASSWD=y/CONFIG_PASSWD=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_ADDUSER=y/CONFIG_ADDUSER=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_DELUSER=y/CONFIG_DELUSER=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_ADDGROUP=y/CONFIG_ADDGROUP=n/' $(BUSYBOX_DIR)/.config
-	@sed -i 's/CONFIG_DELGROUP=y/CONFIG_DELGROUP=n/' $(BUSYBOX_DIR)/.config
-	# Resolve Kconfig dependencies after hardening changes
+	# Whitelist build: see $(BUSYBOX_BIN) rule for full explanation.
+	$(MAKE) -C $(BUSYBOX_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) allnoconfig
+	@grep -oE '^CONFIG_[A-Z0-9_]+' $(BUSYBOX_CONFIG_FRAGMENT) | sort -u | \
+		while read sym; do \
+			sed -i "/^# $${sym} is not set\$$/d" $(BUSYBOX_DIR)/.config; \
+		done
+	cat $(BUSYBOX_CONFIG_FRAGMENT) >> $(BUSYBOX_DIR)/.config
 	yes "" | $(MAKE) -C $(BUSYBOX_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) oldconfig
 	$(MAKE) -C $(BUSYBOX_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) busybox.links
 
