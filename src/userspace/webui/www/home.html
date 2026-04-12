@@ -23,7 +23,7 @@
             <!-- Home -->
             <div class="nav-category active open" data-section="home">
                 <div class="nav-category-header">
-                    <span class="nav-icon" style="font-size:21px">&#8962;</span>
+                    <span class="nav-icon">&#9733;</span>
                     <span class="nav-label">HOME</span>
                     <span class="nav-arrow">&#9656;</span>
                 </div>
@@ -141,6 +141,14 @@
                 <button class="search-btn" type="button">&#9906;</button>
             </div>
             <div class="topbar-spacer"></div>
+            <!-- Connection status pill — auto-managed by ConnStatus
+                 module in app.js.  Hidden when status == ok.
+                 Sits centered between search and the admin menu. -->
+            <div id="conn-banner" class="conn-banner" hidden>
+                <span class="conn-banner-dot"></span>
+                <span class="conn-banner-text"></span>
+            </div>
+            <div class="topbar-spacer"></div>
             <div class="topbar-user" id="topbar-user">
                 <div class="user-avatar">A</div>
                 <span class="user-name">admin</span>
@@ -176,7 +184,7 @@
                             <canvas id="gauge-cpu" width="280" height="280"></canvas>
                             <div class="gauge-value" id="val-cpu">--<span class="gauge-unit">%</span></div>
                         </div>
-                        <div class="gauge-detail" id="detail-cpu">loading...</div>
+                        <div class="gauge-detail loading" id="detail-cpu">loading</div>
                     </div>
 
                     <div class="gauge-card">
@@ -185,7 +193,7 @@
                             <canvas id="gauge-mem" width="280" height="280"></canvas>
                             <div class="gauge-value" id="val-mem">--<span class="gauge-unit">%</span></div>
                         </div>
-                        <div class="gauge-detail" id="detail-mem">loading...</div>
+                        <div class="gauge-detail loading" id="detail-mem">loading</div>
                     </div>
 
                     <div class="gauge-card">
@@ -194,7 +202,7 @@
                             <canvas id="gauge-disk" width="280" height="280"></canvas>
                             <div class="gauge-value" id="val-disk">--<span class="gauge-unit">%</span></div>
                         </div>
-                        <div class="gauge-detail" id="detail-disk">loading...</div>
+                        <div class="gauge-detail loading" id="detail-disk">loading</div>
                     </div>
 
                     <div class="gauge-card">
@@ -203,7 +211,7 @@
                             <canvas id="gauge-sessions" width="280" height="280"></canvas>
                             <div class="gauge-value" id="val-sessions">--</div>
                         </div>
-                        <div class="gauge-detail" id="detail-sessions">loading...</div>
+                        <div class="gauge-detail loading" id="detail-sessions">loading</div>
                     </div>
                 </div>
 
@@ -242,7 +250,7 @@
                             <canvas id="gauge-res-temp" width="280" height="280"></canvas>
                             <div class="gauge-value" id="val-res-temp">--<span class="gauge-unit">&deg;C</span></div>
                         </div>
-                        <div class="gauge-detail" id="detail-res-temp">loading...</div>
+                        <div class="gauge-detail loading" id="detail-res-temp">loading</div>
                     </div>
                     <div class="gauge-card">
                         <div class="gauge-title">CPU LOAD</div>
@@ -250,7 +258,7 @@
                             <canvas id="gauge-res-cpu" width="280" height="280"></canvas>
                             <div class="gauge-value" id="val-res-cpu">--<span class="gauge-unit">%</span></div>
                         </div>
-                        <div class="gauge-detail" id="detail-res-cpu">loading...</div>
+                        <div class="gauge-detail loading" id="detail-res-cpu">loading</div>
                     </div>
                     <div class="gauge-card">
                         <div class="gauge-title">MEMORY</div>
@@ -258,7 +266,7 @@
                             <canvas id="gauge-res-mem" width="280" height="280"></canvas>
                             <div class="gauge-value" id="val-res-mem">--<span class="gauge-unit">%</span></div>
                         </div>
-                        <div class="gauge-detail" id="detail-res-mem">loading...</div>
+                        <div class="gauge-detail loading" id="detail-res-mem">loading</div>
                     </div>
                     <div class="gauge-card">
                         <div class="gauge-title">DISK</div>
@@ -266,7 +274,7 @@
                             <canvas id="gauge-res-disk" width="280" height="280"></canvas>
                             <div class="gauge-value" id="val-res-disk">--<span class="gauge-unit">%</span></div>
                         </div>
-                        <div class="gauge-detail" id="detail-res-disk">loading...</div>
+                        <div class="gauge-detail loading" id="detail-res-disk">loading</div>
                     </div>
                 </div>
 
@@ -281,7 +289,7 @@
                         <div class="form-row"><label class="form-label">Current Governor</label><span class="form-value">performance</span></div>
                         <div class="form-row"><label class="form-label">Crypto Engine</label><span class="form-value">EIP-197 (AES/SHA HW)</span></div>
                         <div class="form-row"><label class="form-label">Network Engine</label><span class="form-value">TOPS (packet offload)</span></div>
-                        <div class="form-row"><label class="form-label">Uptime</label><span class="form-value" id="res-uptime">loading...</span></div>
+                        <div class="form-row"><label class="form-label">Uptime</label><span class="form-value loading" id="res-uptime">loading</span></div>
                     </div>
                     <div class="form-card">
                         <div class="form-section">PER-CORE STATUS</div>
@@ -299,16 +307,16 @@
                     <div class="form-card">
                         <div class="form-section">PHYSICAL RAM</div>
                         <div class="form-row"><label class="form-label">Type</label><span class="form-value">DDR4</span></div>
-                        <div class="form-row"><label class="form-label">Total</label><span class="form-value" id="ram-total">loading...</span></div>
-                        <div class="form-row"><label class="form-label">Used</label><span class="form-value" id="ram-used">loading...</span></div>
-                        <div class="form-row"><label class="form-label">Free</label><span class="form-value" id="ram-free">loading...</span></div>
-                        <div class="form-row"><label class="form-label">Buffers</label><span class="form-value" id="ram-buffers">loading...</span></div>
-                        <div class="form-row"><label class="form-label">Cached</label><span class="form-value" id="ram-cached">loading...</span></div>
-                        <div class="form-row"><label class="form-label">Available</label><span class="form-value" id="ram-available">loading...</span></div>
+                        <div class="form-row"><label class="form-label">Total</label><span class="form-value loading" id="ram-total">loading</span></div>
+                        <div class="form-row"><label class="form-label">Used</label><span class="form-value loading" id="ram-used">loading</span></div>
+                        <div class="form-row"><label class="form-label">Free</label><span class="form-value loading" id="ram-free">loading</span></div>
+                        <div class="form-row"><label class="form-label">Buffers</label><span class="form-value loading" id="ram-buffers">loading</span></div>
+                        <div class="form-row"><label class="form-label">Cached</label><span class="form-value loading" id="ram-cached">loading</span></div>
+                        <div class="form-row"><label class="form-label">Available</label><span class="form-value loading" id="ram-available">loading</span></div>
                         <div class="form-section">SWAP</div>
-                        <div class="form-row"><label class="form-label">Total</label><span class="form-value" id="swap-total">loading...</span></div>
-                        <div class="form-row"><label class="form-label">Used</label><span class="form-value" id="swap-used">loading...</span></div>
-                        <div class="form-row"><label class="form-label">Free</label><span class="form-value" id="swap-free">loading...</span></div>
+                        <div class="form-row"><label class="form-label">Total</label><span class="form-value loading" id="swap-total">loading</span></div>
+                        <div class="form-row"><label class="form-label">Used</label><span class="form-value loading" id="swap-used">loading</span></div>
+                        <div class="form-row"><label class="form-label">Free</label><span class="form-value loading" id="swap-free">loading</span></div>
                     </div>
                     <div class="form-card">
                         <div class="form-section">MEMORY BREAKDOWN</div>
@@ -349,11 +357,11 @@
                 <div class="res-detail-grid">
                     <div class="form-card">
                         <div class="form-section">eMMC &mdash; PRIMARY BOOT</div>
-                        <div class="form-row"><label class="form-label">eMMC Size</label><span class="form-value" id="disk-emmc-size">loading...</span></div>
+                        <div class="form-row"><label class="form-label">eMMC Size</label><span class="form-value loading" id="disk-emmc-size">loading</span></div>
                         <div class="form-section">DATA PARTITION</div>
-                        <div class="form-row"><label class="form-label">Total</label><span class="form-value" id="disk-total">loading...</span></div>
-                        <div class="form-row"><label class="form-label">Used</label><span class="form-value" id="disk-used">loading...</span></div>
-                        <div class="form-row"><label class="form-label">Free</label><span class="form-value" id="disk-free">loading...</span></div>
+                        <div class="form-row"><label class="form-label">Total</label><span class="form-value loading" id="disk-total">loading</span></div>
+                        <div class="form-row"><label class="form-label">Used</label><span class="form-value loading" id="disk-used">loading</span></div>
+                        <div class="form-row"><label class="form-label">Free</label><span class="form-value loading" id="disk-free">loading</span></div>
                     </div>
                 </div>
 
@@ -373,22 +381,22 @@
                     <div class="gauge-card">
                         <div class="gauge-title">INTERFACES UP</div>
                         <div class="gauge-value" style="position:static;transform:none;margin:20px 0" id="net-ifaces-up">--<span class="gauge-unit"> / --</span></div>
-                        <div class="gauge-detail" id="net-ifaces-detail">loading...</div>
+                        <div class="gauge-detail loading" id="net-ifaces-detail">loading</div>
                     </div>
                     <div class="gauge-card">
                         <div class="gauge-title">ACTIVE ROUTES</div>
                         <div class="gauge-value" style="position:static;transform:none;margin:20px 0" id="net-routes-up">--</div>
-                        <div class="gauge-detail" id="net-routes-detail">loading...</div>
+                        <div class="gauge-detail loading" id="net-routes-detail">loading</div>
                     </div>
                     <div class="gauge-card">
                         <div class="gauge-title">THROUGHPUT</div>
                         <div class="gauge-value" style="position:static;transform:none;margin:20px 0" id="net-throughput">--<span class="gauge-unit"> Mbps</span></div>
-                        <div class="gauge-detail" id="net-throughput-detail">loading...</div>
+                        <div class="gauge-detail loading" id="net-throughput-detail">loading</div>
                     </div>
                     <div class="gauge-card">
                         <div class="gauge-title">ARP ENTRIES</div>
                         <div class="gauge-value" style="position:static;transform:none;margin:20px 0" id="net-arp">--</div>
-                        <div class="gauge-detail" id="net-arp-detail">loading...</div>
+                        <div class="gauge-detail loading" id="net-arp-detail">loading</div>
                     </div>
                 </div>
                 <div class="page-header" style="margin-top:8px"><h2 class="page-title">INTERFACE TRAFFIC</h2><div class="widget-search"><input type="text" placeholder="Filter..." class="table-filter" data-target="net-traffic"></div></div>
@@ -666,14 +674,14 @@
                 <div class="page-header"><h1 class="page-title">SYSTEM SETTINGS</h1></div>
                 <div class="form-card" data-settings="system">
                     <div class="form-section">GENERAL</div>
-                    <div class="form-row" data-key="hostname"><label class="form-label">Hostname</label><input class="form-input" type="text" value="STARGAZER-FW01"></div>
-                    <div class="form-row" data-key="ip-forward"><label class="form-label">IP Forward</label><select class="form-input"><option value="enable" selected>Enabled</option><option value="disable">Disabled</option></select></div>
+                    <div class="form-row" data-key="hostname"><label class="form-label">Hostname</label><input class="form-input" type="text" placeholder="e.g. stargazer-fw01"></div>
+                    <div class="form-row" data-key="ip-forward"><label class="form-label">IP Forward</label><select class="form-input"><option value="enable">Enabled</option><option value="disable">Disabled</option></select></div>
                     <div class="form-section">SYSTEM TIME</div>
-                    <div class="form-row" data-key="timezone"><label class="form-label">Timezone</label><select class="form-input"><option value="UTC">UTC</option><option value="Asia/Ho_Chi_Minh" selected>Asia/Ho_Chi_Minh (UTC+7)</option><option value="US/Eastern">US/Eastern</option><option value="US/Pacific">US/Pacific</option><option value="Europe/London">Europe/London</option></select></div>
-                    <div class="form-row" data-key="server"><label class="form-label">NTP Server</label><input class="form-input" type="text" value="pool.ntp.org"></div>
+                    <div class="form-row" data-key="timezone"><label class="form-label">Timezone</label><select class="form-input"><option value="UTC">UTC</option><option value="Asia/Ho_Chi_Minh">Asia/Ho_Chi_Minh (UTC+7)</option><option value="US/Eastern">US/Eastern</option><option value="US/Pacific">US/Pacific</option><option value="Europe/London">Europe/London</option></select></div>
+                    <div class="form-row" data-key="server"><label class="form-label">NTP Server</label><input class="form-input" type="text" placeholder="pool.ntp.org"></div>
                     <div class="form-section">DNS</div>
-                    <div class="form-row" data-key="primary"><label class="form-label">Primary DNS</label><input class="form-input" type="text" value="1.1.1.1"></div>
-                    <div class="form-row" data-key="secondary"><label class="form-label">Secondary DNS</label><input class="form-input" type="text" value="8.8.8.8"></div>
+                    <div class="form-row" data-key="primary"><label class="form-label">Primary DNS</label><input class="form-input" type="text" placeholder="1.1.1.1"></div>
+                    <div class="form-row" data-key="secondary"><label class="form-label">Secondary DNS</label><input class="form-input" type="text" placeholder="8.8.8.8"></div>
                     <div class="form-actions"><button class="btn btn-primary">Apply</button><button class="btn">Reset</button></div>
                 </div>
             </div>
@@ -736,11 +744,11 @@
                 <div class="page-header"><h1 class="page-title">PASSWORD POLICY</h1></div>
                 <div class="form-card" data-settings="password-policy">
                     <div class="form-section">REQUIREMENTS</div>
-                    <div class="form-row" data-key="min-length"><label class="form-label">Minimum Length</label><input class="form-input" type="number" value="12" min="1"></div>
-                    <div class="form-row" data-key="min-uppercase"><label class="form-label">Min Uppercase</label><input class="form-input" type="number" value="1" min="0"></div>
-                    <div class="form-row" data-key="min-lowercase"><label class="form-label">Min Lowercase</label><input class="form-input" type="number" value="1" min="0"></div>
-                    <div class="form-row" data-key="min-digit"><label class="form-label">Min Digits</label><input class="form-input" type="number" value="1" min="0"></div>
-                    <div class="form-row" data-key="min-special"><label class="form-label">Min Special Chars</label><input class="form-input" type="number" value="1" min="0"></div>
+                    <div class="form-row" data-key="min-length"><label class="form-label">Minimum Length</label><input class="form-input" type="number" min="1" placeholder="8"></div>
+                    <div class="form-row" data-key="min-uppercase"><label class="form-label">Min Uppercase</label><input class="form-input" type="number" min="0" placeholder="0"></div>
+                    <div class="form-row" data-key="min-lowercase"><label class="form-label">Min Lowercase</label><input class="form-input" type="number" min="0" placeholder="0"></div>
+                    <div class="form-row" data-key="min-digit"><label class="form-label">Min Digits</label><input class="form-input" type="number" min="0" placeholder="0"></div>
+                    <div class="form-row" data-key="min-special"><label class="form-label">Min Special Chars</label><input class="form-input" type="number" min="0" placeholder="0"></div>
                     <div class="form-actions"><button class="btn btn-primary">Apply</button><button class="btn">Reset</button></div>
                 </div>
             </div>

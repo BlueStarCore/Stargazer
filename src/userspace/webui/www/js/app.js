@@ -108,12 +108,26 @@
 
         header.addEventListener('click', function () {
             navClearTransient();
-            if (cat.querySelector('.nav-arrow')) {
-                cat.classList.toggle('open');
-            } else {
-                /* Direct page link (e.g. Dashboard) */
+
+            /* Direct page link (e.g. Dashboard) — no sub-arrow */
+            if (!cat.querySelector('.nav-arrow')) {
                 setActivePage(cat.dataset.page, cat, null);
+                return;
             }
+
+            /* Sidebar collapsed: sub-items are hidden, so toggling
+             * .open is invisible.  Navigate straight to the category's
+             * first sub-page instead. */
+            if (sidebar && sidebar.classList.contains('collapsed')) {
+                var firstSub = cat.querySelector('.nav-sub-item');
+                if (firstSub) {
+                    setActivePage(firstSub.dataset.page, cat, firstSub);
+                }
+                return;
+            }
+
+            /* Sidebar expanded: toggle the dropdown */
+            cat.classList.toggle('open');
         });
     });
 
@@ -152,7 +166,8 @@
         cover.className = 'page-cover page-cover-loading';
         var spinner = document.createElement('div');
         spinner.className = 'page-loading-spinner';
-        spinner.textContent = 'LOADING...';
+        /* Trailing dots are appended by ::after — animated cycle */
+        spinner.textContent = 'LOADING';
         cover.appendChild(spinner);
         parent.appendChild(cover);
         return cover;
@@ -174,6 +189,11 @@
         });
     }
 
+    /* Hard timeout — cover always reveals after this long even if
+     * the API hangs.  Prevents the page from being permanently
+     * blocked when the backend is unreachable. */
+    var MAX_COVER_MS = 8000;
+
     function setActivePage(page, category, subItem) {
         clearNavActive();
         if (category) category.classList.add('active');
@@ -189,9 +209,43 @@
         if (target) {
             target.style.display = '';
             var cover = showLoadingCover(document.getElementById('content'));
-            loadDone = refreshPage(page).then(function () {
+            var startSuccessCount = apiSuccessCount;
+            var revealed = false;
+
+            /* loadDone resolves when the cover has actually been
+             * revealed — not just when refreshPage's API promise
+             * settled.  Callers (e.g. nav-search smooth-scroll) need
+             * this so they don't scroll under a still-visible cover. */
+            var resolveDone;
+            loadDone = new Promise(function (r) { resolveDone = r; });
+
+            function doReveal() {
+                if (revealed) return;
+                revealed = true;
                 revealCover(cover);
-            });
+                resolveDone();
+            }
+
+            /* Watchdog — reveals the cover if data never arrives. */
+            var watchdog = setTimeout(doReveal, MAX_COVER_MS);
+
+            var pending = refreshPage(page);
+
+            /* Static pages (no API fetches): nothing to wait for —
+             * reveal immediately. */
+            if (!pending.hasFetches) {
+                clearTimeout(watchdog);
+                doReveal();
+            } else {
+                pending.then(function () {
+                    /* Reveal as soon as at least one api() call
+                     * returned non-null data.  Otherwise keep the
+                     * cover up until the watchdog fires. */
+                    if (apiSuccessCount === startSuccessCount) return;
+                    clearTimeout(watchdog);
+                    doReveal();
+                }).catch(function () { /* fall through to watchdog */ });
+            }
         }
 
         startPolling();
@@ -220,8 +274,13 @@
             resetPageFilters(pageEl);
         }
 
-        /* Resolve when all API fetches complete (or immediately for static pages) */
-        return Promise.all(promises).catch(function () { /* ignore errors */ });
+        /* Return both the wait-promise AND a flag telling callers
+         * whether any actual data fetching was scheduled.  Pages with
+         * no fetches (Network Tools, Sessions stub, etc.) shouldn't
+         * have to wait through the cover-watchdog timeout. */
+        var done = Promise.all(promises).catch(function () { /* ignore */ });
+        done.hasFetches = promises.length > 0;
+        return done;
     }
 
     /**
@@ -301,13 +360,121 @@
                 }
                 return res.json();
             })
+            .then(function (data) {
+                /* Bump success counter + clear any banner state. */
+                if (data != null) {
+                    apiSuccessCount++;
+                    ConnStatus.report('ok');
+                }
+                return data;
+            })
             .catch(function (err) {
-                /* Network error / backend unreachable: return null so
-                 * callers can show placeholder data instead of crashing. */
-                if (!err.status) return null;
+                /* Network error / backend unreachable: report and
+                 * return null so callers can show placeholder data
+                 * instead of crashing. */
+                if (!err.status) {
+                    ConnStatus.report('unreachable');
+                    return null;
+                }
+                /* HTTP error response — server reachable but unhappy. */
+                ConnStatus.report('error');
                 throw err;
             });
     }
+
+    /* Counts successful (non-null) api() responses.  setActivePage
+     * snapshots this at navigation and waits until it grows before
+     * revealing the page-cover. */
+    var apiSuccessCount = 0;
+
+    /* ─────────────────────────────────────────────────────────────
+     *  ConnStatus — single source of truth for connection state.
+     *
+     *  Every api() response (success / network error / HTTP error)
+     *  is funneled into ConnStatus.report().  The banner element
+     *  in the topbar reflects the current state automatically; no
+     *  individual call site has to update UI.
+     *
+     *  States:
+     *    'ok'           — banner hidden
+     *    'error'        — last HTTP request returned 4xx/5xx (not auth)
+     *    'unreachable'  — last network call failed entirely
+     *    'reconnect'    — recovered from a bad state, brief flash
+     *  ───────────────────────────────────────────────────────────── */
+    var ConnStatus = (function () {
+        var state = 'ok';
+        var bannerEl = null;
+        var dotEl = null;
+        var textEl = null;
+        var reconnectTimer = null;
+
+        var MESSAGES = {
+            ok:          '',
+            error:       'BACKEND ERROR — last request failed',
+            unreachable: 'BACKEND UNREACHABLE — retrying…',
+            reconnect:   'CONNECTION RESTORED'
+        };
+
+        function ensureRefs() {
+            if (!bannerEl) {
+                bannerEl = document.getElementById('conn-banner');
+                if (bannerEl) {
+                    dotEl  = bannerEl.querySelector('.conn-banner-dot');
+                    textEl = bannerEl.querySelector('.conn-banner-text');
+                }
+            }
+            return bannerEl;
+        }
+
+        function render() {
+            if (!ensureRefs()) return;
+            if (state === 'ok') {
+                bannerEl.hidden = true;
+                bannerEl.removeAttribute('data-state');
+                return;
+            }
+            bannerEl.hidden = false;
+            bannerEl.setAttribute('data-state', state);
+            if (textEl) textEl.textContent = MESSAGES[state] || '';
+        }
+
+        function set(next) {
+            if (state === next) return;
+            var prev = state;
+            state = next;
+            render();
+
+            /* Auto-clear the brief "reconnect" flash after 2.5s */
+            if (next === 'reconnect') {
+                if (reconnectTimer) clearTimeout(reconnectTimer);
+                reconnectTimer = setTimeout(function () {
+                    if (state === 'reconnect') set('ok');
+                }, 2500);
+            }
+            return prev;
+        }
+
+        /* Called by api() on every response.  result is one of:
+         *   'ok'          — got data
+         *   'error'       — HTTP error response (server reachable)
+         *   'unreachable' — network/fetch failure */
+        function report(result) {
+            if (result === 'ok') {
+                /* If we were previously bad, briefly show "restored" */
+                if (state === 'unreachable' || state === 'error') {
+                    set('reconnect');
+                } else if (state === 'reconnect') {
+                    /* keep flash, will auto-clear */
+                } else {
+                    set('ok');
+                }
+                return;
+            }
+            set(result);
+        }
+
+        return { report: report, get: function () { return state; } };
+    })();
 
     /* ================================================================
      *  TOAST NOTIFICATIONS
@@ -400,8 +567,12 @@
             valEl.textContent = '';
             valEl.appendChild(document.createTextNode(String(value)));
             if (unit) valEl.appendChild(makeSpan('gauge-unit', unit));
+            valEl.classList.remove('loading');
         }
-        if (detailEl) detailEl.textContent = detail;
+        if (detailEl) {
+            detailEl.textContent = detail;
+            detailEl.classList.remove('loading');
+        }
     }
 
     /* Threshold colors — duplicate the CSS variables here so canvas
@@ -483,10 +654,14 @@
 
     /* ── renderResourceDetails helpers ──────────────────────────── */
 
-    /* Set textContent on a cached element by id. */
+    /* Set textContent on a cached element by id.  Strips the
+     * `loading` class so the element stops pulsing once real
+     * data has arrived. */
     function setText(id, val) {
         var el = setEl(id);
-        if (el) el.textContent = val;
+        if (!el) return;
+        el.textContent = val;
+        el.classList.remove('loading');
     }
 
     /* Set a usage bar's width and value cell. */
@@ -1199,21 +1374,15 @@
         backdrop.classList.add('visible');
     }
 
-    function closeModal(instant) {
-        if (!activeModal) return;
-        var form = activeModal;
-        backdrop.classList.remove('visible');
-
-        /* Reset edit state so next open starts clean */
+    /* Reset all editable inputs in a modal back to their defaults.
+     * Used by closeModal *after* the slide-out animation completes
+     * so the user doesn't see fields wipe under their cursor. */
+    function resetModalForm(form) {
         form.dataset.editMode = 'false';
         form.dataset.editRowId = '';
-
-        /* Restore create-only fields hidden during edit */
         form.querySelectorAll('.admin-create-only').forEach(function (el) {
             el.style.display = '';
         });
-
-        /* Reset form inputs to defaults */
         form.querySelectorAll('.form-input').forEach(function (inp) {
             if (inp.tagName === 'SELECT') {
                 inp.selectedIndex = 0;
@@ -1226,17 +1395,28 @@
         form.querySelectorAll('.form-row-full input[type="checkbox"]').forEach(function (cb) {
             cb.checked = false;
         });
+    }
+
+    function closeModal(instant) {
+        if (!activeModal) return;
+        var form = activeModal;
+        backdrop.classList.remove('visible');
 
         if (instant) {
             form.classList.remove('visible', 'closing');
             activeModal = null;
-        } else {
-            form.classList.add('closing');
-            setTimeout(function () {
-                form.classList.remove('visible', 'closing');
-                activeModal = null;
-            }, 150);
+            resetModalForm(form);
+            return;
         }
+
+        /* Slide-out animation runs first; reset fields only after it
+         * finishes so the values stay visible while the modal fades. */
+        form.classList.add('closing');
+        setTimeout(function () {
+            form.classList.remove('visible', 'closing');
+            activeModal = null;
+            resetModalForm(form);
+        }, 150);
     }
 
     /* Bind all toggle buttons */
@@ -1786,7 +1966,7 @@
         if (grid) grid.style.display = 'none';
         var loader = document.createElement('div');
         loader.className = 'modal-loading';
-        loader.textContent = 'LOADING...';
+        loader.textContent = 'LOADING';
         body.appendChild(loader);
 
         /* schema-key → input map (matching consolidated in helper) */
@@ -2374,13 +2554,15 @@
         return tr;
     }
 
-    /* Build the loading-state row shown while a fetch is in flight. */
+    /* Build the loading-state row shown while a fetch is in flight.
+     * Trailing dots are appended by the .table-empty.loading ::after
+     * pseudo-element via CSS — keeps the JS plain. */
     function buildLoadingRow(colCount) {
         var tr = document.createElement('tr');
         var td = document.createElement('td');
         td.colSpan = colCount;
-        td.className = 'table-empty';
-        td.textContent = 'Loading...';
+        td.className = 'table-empty loading';
+        td.textContent = 'Loading';
         tr.appendChild(td);
         return tr;
     }
@@ -2498,43 +2680,218 @@
         }
     });
 
-    /* Topbar global search — typing filters client-side, Enter/btn hits backend */
+    /* ─────────────────────────────────────────────────────────────
+     *  Topbar search → nav command palette
+     *
+     *  Typing in the topbar search box filters the sidebar nav and
+     *  shows a dropdown of matching pages.  Enter or click navigates
+     *  to the first/selected match.  Escape closes.
+     *
+     *  Index is built once at startup from the .nav-sub-item nodes
+     *  so renaming labels in HTML automatically updates the index.
+     *  ─────────────────────────────────────────────────────────────
+     */
     var topbarSearchInput = document.querySelector('.topbar-search input');
     if (topbarSearchInput) {
-        function filterCurrentPage(query) {
-            var pageEl = document.getElementById('page-' + activePage);
-            if (!pageEl) return;
-            pageEl.querySelectorAll('table.data-table').forEach(function (tbl) {
-                filterTable(tbl, query);
+        topbarSearchInput.placeholder = 'Search pages, sections...';
+
+        /* Build a 3-level navigation index:
+         *   level 2: .nav-sub-item       → page navigation
+         *   level 3: <h2 class="page-title"> inside each page → scroll target
+         *
+         * Path is shown as "CAT > PAGE > SECTION" so users can see where
+         * a result lives.  Level-2 entries skip the section component. */
+        var navIndex = [];
+
+        /* First pass: index every sub-nav item (level 2) and capture
+         * its page → label so level-3 entries can show the path. */
+        var pageLabels = {};
+        document.querySelectorAll('.nav-sub-item').forEach(function (item) {
+            var label = (item.querySelector('.sub-label') || {}).textContent || '';
+            label = label.trim();
+            var cat = item.closest('.nav-category');
+            var catLabel = cat ? (cat.querySelector('.nav-label') || {}).textContent : '';
+            catLabel = (catLabel || '').trim();
+            var page = item.dataset.page;
+            pageLabels[page] = { catLabel: catLabel, label: label, cat: cat, el: item };
+            navIndex.push({
+                catLabel: catLabel,
+                label: label,
+                section: '',
+                page: page,
+                el: item,
+                cat: cat,
+                anchor: null
             });
+        });
+
+        /* Second pass: index every <h2 class="page-title"> inside a
+         * .page container as a level-3 entry.  The h1 (page title) is
+         * already covered by the level-2 sub-nav scan. */
+        document.querySelectorAll('.page h2.page-title').forEach(function (h2) {
+            var pageEl = h2.closest('.page');
+            if (!pageEl) return;
+            var pageId = pageEl.id.replace(/^page-/, '');
+            var meta = pageLabels[pageId];
+            if (!meta) return;  /* h2 on a page with no nav entry */
+            navIndex.push({
+                catLabel: meta.catLabel,
+                label: meta.label,
+                section: h2.textContent.trim(),
+                page: pageId,
+                el: meta.el,
+                cat: meta.cat,
+                anchor: h2
+            });
+        });
+
+        /* Build (or fetch existing) results dropdown anchored to the
+         * search box.  Lives at body level to escape topbar overflow. */
+        var navResults = document.getElementById('nav-search-results');
+        if (!navResults) {
+            navResults = document.createElement('div');
+            navResults.id = 'nav-search-results';
+            navResults.className = 'nav-search-results';
+            navResults.hidden = true;
+            document.body.appendChild(navResults);
         }
 
-        function searchCurrentPage(query) {
-            var pageEl = document.getElementById('page-' + activePage);
-            if (!pageEl) return;
-            pageEl.querySelectorAll('table.data-table').forEach(function (tbl) {
-                backendSearch(tbl, query);
-            });
+        var matches = [];
+        var activeIdx = -1;
+
+        function positionResults() {
+            var rect = topbarSearchInput.getBoundingClientRect();
+            navResults.style.left = rect.left + 'px';
+            navResults.style.top  = (rect.bottom + 4) + 'px';
+            navResults.style.minWidth = rect.width + 'px';
         }
 
-        /* Typing: client-side prefill (debounced) */
+        function renderResults() {
+            navResults.innerHTML = '';
+            if (matches.length === 0) {
+                navResults.hidden = true;
+                return;
+            }
+            var activeRow = null;
+            matches.forEach(function (m, idx) {
+                var row = document.createElement('div');
+                row.className = 'nav-search-row';
+                if (idx === activeIdx) {
+                    row.classList.add('active');
+                    activeRow = row;
+                }
+
+                /* Path: "CAT › PAGE [› SECTION]" */
+                var path = document.createElement('span');
+                path.className = 'nav-search-path';
+                path.appendChild(makeSpan('nav-search-cat', m.catLabel));
+                path.appendChild(document.createTextNode(' \u203A '));  /* › */
+                path.appendChild(makeSpan('nav-search-label', m.label));
+                if (m.section) {
+                    path.appendChild(document.createTextNode(' \u203A '));
+                    path.appendChild(makeSpan('nav-search-section', m.section));
+                }
+                row.appendChild(path);
+
+                row.addEventListener('mousedown', function (e) {
+                    e.preventDefault();   /* keep focus until we navigate */
+                    navigateTo(m);
+                });
+                navResults.appendChild(row);
+            });
+            positionResults();
+            navResults.hidden = false;
+
+            /* Scroll the highlighted row into view when arrow keys
+             * move past the visible area of the results dropdown. */
+            if (activeRow) {
+                activeRow.scrollIntoView({ block: 'nearest' });
+            }
+        }
+
+        function navigateTo(match) {
+            if (!match) return;
+            if (match.cat) match.cat.classList.add('open');
+            var done = setActivePage(match.page, match.cat, match.el);
+            topbarSearchInput.value = '';
+            matches = [];
+            activeIdx = -1;
+            navResults.hidden = true;
+            topbarSearchInput.blur();
+
+            /* Scroll to the section anchor after the page is loaded
+             * and the cover has revealed.  smooth scroll feels nicer
+             * than a jump cut. */
+            if (match.anchor && done && done.then) {
+                done.then(function () {
+                    setTimeout(function () {
+                        match.anchor.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    }, 50);
+                });
+            }
+        }
+
+        function runSearch(query) {
+            var q = (query || '').trim().toLowerCase();
+            if (!q) {
+                matches = [];
+                activeIdx = -1;
+                navResults.hidden = true;
+                return;
+            }
+            matches = navIndex.filter(function (m) {
+                return m.label.toLowerCase().indexOf(q) !== -1 ||
+                       m.catLabel.toLowerCase().indexOf(q) !== -1 ||
+                       (m.section && m.section.toLowerCase().indexOf(q) !== -1);
+            });
+            activeIdx = matches.length > 0 ? 0 : -1;
+            renderResults();
+        }
+
         topbarSearchInput.addEventListener('input', debounce(function () {
-            filterCurrentPage(topbarSearchInput.value);
-        }, 150));
+            runSearch(topbarSearchInput.value);
+        }, 80));
 
-        /* Enter: backend search */
         topbarSearchInput.addEventListener('keydown', function (e) {
-            if (e.key === 'Enter') {
+            if (e.key === 'Escape') {
+                topbarSearchInput.value = '';
+                matches = [];
+                navResults.hidden = true;
+                topbarSearchInput.blur();
+                return;
+            }
+            if (matches.length === 0) return;
+            if (e.key === 'ArrowDown') {
                 e.preventDefault();
-                searchCurrentPage(this.value);
+                activeIdx = (activeIdx + 1) % matches.length;
+                renderResults();
+            } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                activeIdx = (activeIdx - 1 + matches.length) % matches.length;
+                renderResults();
+            } else if (e.key === 'Enter') {
+                e.preventDefault();
+                navigateTo(matches[activeIdx] || matches[0]);
             }
         });
 
-        /* Topbar search button click: backend search */
+        topbarSearchInput.addEventListener('blur', function () {
+            /* Hide on blur, but mousedown on a row navigates first
+             * because we preventDefault on the row's mousedown. */
+            setTimeout(function () { navResults.hidden = true; }, 120);
+        });
+
+        topbarSearchInput.addEventListener('focus', function () {
+            if (matches.length > 0) {
+                positionResults();
+                navResults.hidden = false;
+            }
+        });
+
         var topbarSearchBtn = document.querySelector('.topbar-search .search-btn');
         if (topbarSearchBtn) {
             topbarSearchBtn.addEventListener('click', function () {
-                searchCurrentPage(topbarSearchInput.value);
+                topbarSearchInput.focus();
             });
         }
     }

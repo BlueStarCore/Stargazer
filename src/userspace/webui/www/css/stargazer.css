@@ -75,6 +75,123 @@
     --white:          #fff;
 }
 
+/* ── CONNECTION STATUS PILL ───────────────────────────────────
+ *
+ * Compact pill that lives inside the topbar between the search
+ * box and the user dropdown.  Hidden via [hidden] when connection
+ * is OK; flips to one of three states via the data-state attribute
+ * set by the ConnStatus module in JS.
+ *
+ *   data-state="unreachable" → red  (network down)
+ *   data-state="error"       → amber (HTTP error)
+ *   data-state="reconnect"   → green flash on recovery
+ */
+.conn-banner {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 16px;
+    padding: 6px 14px;
+    border-radius: 14px;
+    font-family: var(--font-pixel);
+    font-size: 8px;
+    letter-spacing: 1px;
+    color: var(--white);
+    background: var(--conn-bg, var(--color-danger));
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
+    animation: connBannerFadeIn 0.25s ease-out;
+    white-space: nowrap;
+}
+.conn-banner[hidden] {
+    display: none;
+}
+.conn-banner[data-state="unreachable"] {
+    --conn-bg: var(--color-danger);
+}
+.conn-banner[data-state="error"] {
+    --conn-bg: var(--color-warning);
+    color: var(--gray-text);
+}
+.conn-banner[data-state="reconnect"] {
+    --conn-bg: var(--color-success);
+}
+.conn-banner-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: currentColor;
+    box-shadow: 0 0 5px currentColor;
+    animation: connBannerPulse 1.2s ease-in-out infinite;
+    flex-shrink: 0;
+}
+.conn-banner[data-state="reconnect"] .conn-banner-dot {
+    animation: none;
+}
+.conn-banner-text {
+    line-height: 1;
+}
+@keyframes connBannerFadeIn {
+    from { opacity: 0; transform: scale(0.92); }
+    to   { opacity: 1; transform: scale(1); }
+}
+@keyframes connBannerPulse {
+    0%, 100% { opacity: 0.45; }
+    50%      { opacity: 1.0; }
+}
+
+/* ── NAV SEARCH DROPDOWN ──────────────────────────────────────
+ *
+ * Floating results panel anchored under the topbar search input.
+ * Lives at body level (escapes topbar overflow:hidden).  Each
+ * row shows the parent category in muted color + the page label.
+ */
+.nav-search-results {
+    position: fixed;
+    z-index: 200;
+    background: var(--bg-card);
+    border: 1px solid var(--border-light);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+    border-radius: 4px;
+    max-height: 320px;
+    overflow-y: auto;
+    padding: 4px 0;
+}
+.nav-search-results[hidden] { display: none; }
+
+.nav-search-row {
+    display: flex;
+    align-items: baseline;
+    padding: 8px 14px;
+    cursor: pointer;
+    user-select: none;
+    font-size: 13px;
+    color: var(--gray-text);
+}
+.nav-search-row:hover,
+.nav-search-row.active {
+    background: var(--gray-bg-alt);
+}
+.nav-search-path {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 4px;
+    font-family: var(--font-pixel);
+    font-size: 8px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+}
+.nav-search-cat {
+    color: var(--gray-text-dim);
+}
+.nav-search-label {
+    font-size: 9px;
+    color: var(--gray-text);
+}
+.nav-search-section {
+    font-size: 9px;
+    color: var(--dawn-orange);
+}
+
 /* Empty-state cell used by entity tables when there are no rows */
 .table-empty {
     text-align: center;
@@ -154,6 +271,25 @@ html, body {
     flex-direction: column;
     overflow-y: auto;
     overflow-x: hidden;
+    /* Smooth open/close — width animates in step with the labels.
+     * cubic-bezier matches the ease of FortiOS / VSCode sidebars. */
+    transition: width 0.22s cubic-bezier(0.4, 0, 0.2, 1),
+                min-width 0.22s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Labels and sub-rows fade as the sidebar collapses.  Using opacity
+ * + max-width instead of `display:none` lets us animate them.
+ *
+ * Note: NO overflow:hidden in the default state — Press Start 2P
+ * pixel glyphs extend slightly above the line-box, and clipping
+ * here would chop the top off every label.  Overflow is applied
+ * only inside .sidebar.collapsed below. */
+.brand-text,
+.nav-label,
+.nav-arrow,
+.sub-label {
+    transition: opacity 0.18s ease, max-width 0.22s ease;
+    white-space: nowrap;
 }
 
 /* Scrollbar styling */
@@ -681,13 +817,19 @@ html, body {
 .data-table {
     width: 100%;
     border-collapse: collapse;
-    table-layout: auto;
+    /* `auto` lets the browser re-size columns based on cell content,
+     * which causes a visible reflow when the placeholder loading row
+     * (single colspan cell) is replaced with real data rows.  `fixed`
+     * locks column widths to the thead, so reveal animations don't
+     * trigger layout shift on the headers. */
+    table-layout: fixed;
     background: var(--bg-card);
     border: 1px solid var(--border-light);
     border-radius: 4px;
     overflow: hidden;
     box-shadow: var(--card-shadow);
 }
+
 
 .data-table thead th {
     padding: 12px 14px;
@@ -750,6 +892,10 @@ html, body {
     font-size: 14px;
     color: var(--gray-text);
     white-space: nowrap;
+    /* Truncate overflowing values with ellipsis under table-layout:
+     * fixed — without this, oversized cells would visibly clip. */
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 .data-table tbody tr:nth-child(even) {
@@ -1669,16 +1815,22 @@ html, body {
  * visible viewport — works for short pages like Settings/Policies.
  * .content has overflow-x:hidden to clip the cover as it exits right.
  * transform: translateX() is GPU-composited and avoids table reflow. */
-/* Base cover — positioned over content area */
+/* Base cover — pinned to the viewport so it stays put even when
+ * the underlying .content scrolls (e.g. when a search-nav target
+ * triggers a smooth-scroll while data is still loading). */
 .page-cover {
-    position: absolute;
-    top: 0; left: 0;
-    width: 100%;
-    height: 100%;
+    position: fixed;
+    top: var(--topbar-h);
+    left: var(--sidebar-w);
+    right: 0;
+    bottom: 0;
     background: var(--bg-content);
     z-index: 40;
     pointer-events: none;
     will-change: transform;
+}
+.sidebar.collapsed ~ .main-area .page-cover {
+    left: 60px;
 }
 
 /* Loading state — static cover with spinner, blocks page while fetching */
@@ -1689,18 +1841,82 @@ html, body {
     pointer-events: auto;  /* block clicks during load */
 }
 
+/* ── LOADING TEXT ─────────────────────────────────────────────
+ *
+ * Calm opacity heartbeat + cycling trailing dots.  The earlier
+ * flicker / RGB-split glitch effects were too aggressive on the
+ * eye when the cover sits over the page for several seconds.
+ */
 .page-loading-spinner {
-    font-family: var(--font-mono, monospace);
+    font-family: var(--font-pixel);
     font-size: 11px;
-    letter-spacing: 3px;
+    letter-spacing: 4px;
     color: var(--dawn-orange);
-    opacity: 0.7;
-    animation: loadingPulse 1s ease-in-out infinite;
+    text-transform: uppercase;
+    text-shadow: 0 0 6px rgba(232, 149, 106, 0.35);
+    /* Calm heartbeat only — no more flicker / RGB-split glitch.
+     * The earlier multi-layer animation was distracting. */
+    animation: loadingPulse 1.6s ease-in-out infinite;
+}
+
+/* Strip the static "..." and replace with animated cycling dots */
+.page-loading-spinner::after {
+    content: '';
+    display: inline-block;
+    width: 1.2em;
+    text-align: left;
+    margin-left: 0.2em;
+    animation: loadingDots 1.0s steps(4) infinite;
 }
 
 @keyframes loadingPulse {
-    0%, 100% { opacity: 0.3; }
-    50%      { opacity: 0.9; }
+    0%, 100% { opacity: 0.55; }
+    50%      { opacity: 1.0; }
+}
+
+@keyframes loadingDots {
+    0%   { content: ''; }
+    25%  { content: '.'; }
+    50%  { content: '..'; }
+    75%  { content: '...'; }
+    100% { content: ''; }
+}
+
+/* Modal-loading reuses the same look at smaller scale */
+.modal-loading {
+    animation: loadingPulse 1.6s ease-in-out infinite;
+}
+.modal-loading::after {
+    content: '';
+    display: inline-block;
+    width: 1.2em;
+    text-align: left;
+    margin-left: 0.2em;
+    animation: loadingDots 1.0s steps(4) infinite;
+}
+
+/* Table loading row — quieter version (no glitch, just pulse) */
+.table-empty.loading {
+    animation: loadingPulse 1.4s ease-in-out infinite;
+}
+.table-empty.loading::after,
+.gauge-detail.loading::after,
+.form-value.loading::after {
+    content: '';
+    display: inline-block;
+    width: 1.2em;
+    text-align: left;
+    margin-left: 0.1em;
+    animation: loadingDots 1.0s steps(4) infinite;
+}
+
+/* Gauge detail / form value placeholders share the same heartbeat
+ * pulse so all "loading" cells throb in sync.  No glitch on these —
+ * the dashboard already has many gauges and full chromatic split
+ * would be visually noisy. */
+.gauge-detail.loading,
+.form-value.loading {
+    animation: loadingPulse 1.4s ease-in-out infinite;
 }
 
 /* Reveal state — scan-line slides right to uncover loaded content */
@@ -1714,7 +1930,7 @@ html, body {
 }
 
 /* Scan line — child of the cover, rides its left edge automatically.
- * Only needs translateY for the glitch jitter effect. */
+ * Plain steady glow; no jitter or chromatic flash. */
 .page-scan-line {
     position: absolute;
     top: 0;
@@ -1724,31 +1940,12 @@ html, body {
     background: var(--dawn-orange);
     box-shadow: 0 0 12px var(--dawn-orange), 0 0 28px rgba(232, 149, 106, 0.5);
     pointer-events: none;
-    animation: pageScanGlitch 0.3s linear forwards;
+    animation: pageScanFade 0.3s linear forwards;
 }
 
-@keyframes pageScanGlitch {
-    0%   { transform: translateY(0);      box-shadow: 0 0 10px var(--dawn-orange), 0 0 24px rgba(232,149,106,0.5); }
-    9%   { transform: translateY(0); }
-    10%  { transform: translateY(8px);     box-shadow: 0 -5px 0 rgba(255,30,30,0.8), 0 5px 0 rgba(30,120,255,0.8), 0 0 14px var(--dawn-orange); }
-    11%  { transform: translateY(-10px);   box-shadow: 0 -5px 0 rgba(255,30,30,0.8), 0 5px 0 rgba(30,120,255,0.8), 0 0 14px var(--dawn-orange); }
-    12%  { transform: translateY(6px);     box-shadow: 0 -5px 0 rgba(255,30,30,0.8), 0 5px 0 rgba(30,120,255,0.8), 0 0 14px var(--dawn-orange); }
-    14%  { transform: translateY(0);       box-shadow: 0 0 10px var(--dawn-orange), 0 0 24px rgba(232,149,106,0.5); }
-    34%  { transform: translateY(0); }
-    35%  { transform: translateY(-8px);    box-shadow: 0 -5px 0 rgba(255,30,30,0.8), 0 5px 0 rgba(30,120,255,0.8), 0 0 14px var(--dawn-orange); }
-    36%  { transform: translateY(10px);    box-shadow: 0 -5px 0 rgba(255,30,30,0.8), 0 5px 0 rgba(30,120,255,0.8), 0 0 14px var(--dawn-orange); }
-    37%  { transform: translateY(-6px);    box-shadow: 0 -5px 0 rgba(255,30,30,0.8), 0 5px 0 rgba(30,120,255,0.8), 0 0 14px var(--dawn-orange); }
-    39%  { transform: translateY(0);       box-shadow: 0 0 10px var(--dawn-orange), 0 0 24px rgba(232,149,106,0.5); }
-    64%  { transform: translateY(0); }
-    65%  { transform: translateY(7px);     box-shadow: 0 -4px 0 rgba(255,30,30,0.7), 0 4px 0 rgba(30,120,255,0.7), 0 0 14px var(--dawn-orange); }
-    66%  { transform: translateY(-9px);    box-shadow: 0 -4px 0 rgba(255,30,30,0.7), 0 4px 0 rgba(30,120,255,0.7), 0 0 14px var(--dawn-orange); }
-    68%  { transform: translateY(0);       box-shadow: 0 0 10px var(--dawn-orange), 0 0 24px rgba(232,149,106,0.5); }
-    87%  { transform: translateY(0); }
-    88%  { transform: translateY(-6px);    box-shadow: 0 -4px 0 rgba(255,30,30,0.6), 0 4px 0 rgba(30,120,255,0.6), 0 0 12px var(--dawn-orange); }
-    89%  { transform: translateY(7px);     box-shadow: 0 -4px 0 rgba(255,30,30,0.6), 0 4px 0 rgba(30,120,255,0.6), 0 0 12px var(--dawn-orange); }
-    91%  { transform: translateY(0);       box-shadow: 0 0 10px var(--dawn-orange), 0 0 24px rgba(232,149,106,0.5); }
-    97%  { opacity: 1; }
-    100% { opacity: 0; transform: translateY(0); }
+@keyframes pageScanFade {
+    0%, 90% { opacity: 1; }
+    100%    { opacity: 0; }
 }
 
 /* ================================================================
@@ -1759,11 +1956,25 @@ html, body {
     width: 60px;
     min-width: 60px;
 }
-.sidebar.collapsed .brand-text { display: none; }
-.sidebar.collapsed .nav-label { display: none; }
-.sidebar.collapsed .nav-arrow { display: none; }
-.sidebar.collapsed .sub-label { display: none; }
-.sidebar.collapsed .nav-sub { display: none; }
+/* Fade text out via opacity + collapse width to 0.  Overflow
+ * is hidden ONLY here so the truncation is invisible during the
+ * collapsed state, but doesn't clip glyph tops when expanded. */
+.sidebar.collapsed .brand-text,
+.sidebar.collapsed .nav-label,
+.sidebar.collapsed .nav-arrow,
+.sidebar.collapsed .sub-label {
+    opacity: 0;
+    max-width: 0;
+    overflow: hidden;
+    pointer-events: none;
+}
+/* Force-collapse sub menus when sidebar is minimized.  Higher
+ * specificity than `.nav-category.open > .nav-sub` so even an
+ * "open" category collapses while sidebar is shrunk. */
+.sidebar.collapsed .nav-category.open > .nav-sub,
+.sidebar.collapsed .nav-sub {
+    max-height: 0;
+}
 .sidebar.collapsed ~ .main-area .bulk-action-bar { left: 60px; }
 
 @media (max-width: 900px) {

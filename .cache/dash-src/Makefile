@@ -211,7 +211,7 @@ AWK = gawk
 CC = /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc
 CCDEPMODE = depmode=gcc3
 CC_FOR_BUILD = /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc
-CFLAGS = -Os -static
+CFLAGS = -Os -static -no-pie
 CPP = /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc -E
 CPPFLAGS = 
 CYGPATH_W = echo
@@ -228,7 +228,7 @@ INSTALL_DATA = ${INSTALL} -m 644
 INSTALL_PROGRAM = ${INSTALL}
 INSTALL_SCRIPT = ${INSTALL}
 INSTALL_STRIP_PROGRAM = $(install_sh) -c -s
-LDFLAGS = -static
+LDFLAGS = -static -no-pie
 LIBOBJS = 
 LIBS = 
 LTLIBOBJS = 
