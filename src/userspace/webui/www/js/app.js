@@ -3727,19 +3727,6 @@
         });
     }
 
-    /* Reboot to NAND recovery */
-    document.querySelectorAll('#page-sys-firmware .btn').forEach(function (btn) {
-        if (btn.textContent.trim() === 'Reboot to NAND') {
-            btn.addEventListener('click', function () {
-                confirmAction('Reboot to recovery? The system will restart.').then(function (confirmed) {
-                    if (!confirmed) return;
-                    api('/system/reboot', { method: 'POST', body: { device: 'nand' } })
-                        .then(function () { showToast('Rebooting to recovery...', 'success'); })
-                        .catch(function (err) { showToast(err.message || 'Reboot failed', 'error'); });
-                });
-            });
-        }
-    });
 
     /* ================================================================
      *  PAGE-LOAD DATA FETCHING
@@ -4014,7 +4001,7 @@
             if (!data) return;
             var page = document.getElementById('page-sys-firmware');
             if (!page) return;
-            ['version', 'build', 'kernel', 'installed', 'recovery'].forEach(function (key) {
+            ['version', 'build', 'kernel', 'installed'].forEach(function (key) {
                 if (!data[key]) return;
                 var el = page.querySelector('[data-fw="' + key + '"]');
                 if (el) el.textContent = data[key];
