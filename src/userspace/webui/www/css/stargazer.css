@@ -5,15 +5,7 @@
  * Layout: FortiOS 7.6.0 style — left sidebar + top bar + content area
  */
 
-/* Self-hosted Press Start 2P (latin subset) — no external CDN.
- * NGFW must be air-gapped: never fetch resources from the internet. */
-@font-face {
-    font-family: 'Press Start 2P';
-    font-style: normal;
-    font-weight: 400;
-    font-display: swap;
-    src: url('../fonts/PressStart2P-latin.woff2') format('woff2');
-}
+/* Font loaded via css/fonts.css (shared with login.html) */
 
 /* ================================================================
  *  RESET & BASE
@@ -70,6 +62,8 @@
     --gray-bg-alt:    #f8f9fb;
     --gray-bg-alt2:   #f5f6f8;
     --gray-bg-card:   #fafbfc;
+    --gray-bg-muted:  #eef0f4;
+    --gray-bg-tag:    #e8eef4;
     --gray-border:    #c0c6ce;
     --gray-border-h:  #a0a8b4;
     --white:          #fff;
@@ -866,7 +860,7 @@ html, body {
 /* Group header row */
 .data-table .group-header td {
     padding: 12px 14px;
-    background: #eef0f4;
+    background: var(--gray-bg-muted);
     font-family: var(--font-pixel);
     font-size: 10px;
     color: var(--sky-mid);
@@ -928,7 +922,7 @@ html, body {
     display: inline-block;
     padding: 3px 10px;
     margin: 2px 3px;
-    background: #e8eef4;
+    background: var(--gray-bg-tag);
     border-radius: 3px;
     font-size: 13px;
     color: var(--gray-text-mid);
@@ -1123,7 +1117,7 @@ html, body {
 .route-dest {
     display: inline-block;
     padding: 4px 10px;
-    background: #eef0f4;
+    background: var(--gray-bg-muted);
     border: 1px solid var(--border-light);
     border-radius: 3px;
     font-family: var(--font-mono);
@@ -1598,9 +1592,9 @@ html, body {
 }
 
 /* Scrollbar for overflowing modals */
-.add-form { scrollbar-width: thin; scrollbar-color: var(--sky-light) #f5f6f8; }
+.add-form { scrollbar-width: thin; scrollbar-color: var(--sky-light) var(--bg-content); }
 .add-form::-webkit-scrollbar { width: 6px; }
-.add-form::-webkit-scrollbar-track { background: #f5f6f8; }
+.add-form::-webkit-scrollbar-track { background: var(--bg-content); }
 .add-form::-webkit-scrollbar-thumb { background: var(--sky-light); border-radius: 3px; }
 
 /* Checkbox column */
@@ -1748,7 +1742,7 @@ html, body {
 /* Usage bar (inline horizontal) */
 .usage-bar {
     height: 8px;
-    background: #e2e5ea;
+    background: var(--border-light);
     border-radius: 4px;
     overflow: hidden;
     min-width: 80px;
@@ -1810,9 +1804,9 @@ html, body {
     box-shadow: var(--card-shadow);
 }
 
-.scroll-box { scrollbar-width: thin; scrollbar-color: var(--gray-text-soft) #f5f6f8; }
+.scroll-box { scrollbar-width: thin; scrollbar-color: var(--gray-text-soft) var(--bg-content); }
 .scroll-box::-webkit-scrollbar { width: 6px; }
-.scroll-box::-webkit-scrollbar-track { background: #f5f6f8; }
+.scroll-box::-webkit-scrollbar-track { background: var(--bg-content); }
 .scroll-box::-webkit-scrollbar-thumb { background: var(--gray-text-soft); border-radius: 3px; }
 .scroll-box::-webkit-scrollbar-thumb:hover { background: var(--gray-text-faint); }
 

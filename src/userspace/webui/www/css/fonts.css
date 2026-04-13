@@ -1,0 +1,14 @@
+/* fonts.css — Self-hosted fonts for Stargazer NGFW
+ *
+ * Single source of truth for @font-face declarations.
+ * Loaded by both login.html and home.html to avoid duplicate downloads.
+ * NGFW must be air-gapped: never fetch resources from the internet.
+ */
+
+@font-face {
+    font-family: 'Press Start 2P';
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url('../fonts/PressStart2P-latin.woff2') format('woff2');
+}

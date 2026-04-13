@@ -566,7 +566,7 @@
         /* Background track */
         ctx.beginPath();
         ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-        ctx.strokeStyle = '#e2e5ea';
+        ctx.strokeStyle = COLOR_TRACK;
         ctx.lineWidth = lineWidth;
         ctx.lineCap = 'round';
         ctx.stroke();
@@ -623,9 +623,10 @@
     /* Threshold colors — duplicate the CSS variables here so canvas
      * draws and CSS rules stay visually consistent.  If the theme
      * changes, update both. */
-    var COLOR_OK   = '#4caf50';  /* var(--color-success) */
-    var COLOR_WARN = '#e8956a';  /* var(--color-warning) */
-    var COLOR_BAD  = '#e53935';  /* var(--color-danger)  */
+    var COLOR_OK    = '#4caf50';  /* var(--color-success)  */
+    var COLOR_WARN  = '#e8956a';  /* var(--color-warning)  */
+    var COLOR_BAD   = '#e53935';  /* var(--color-danger)   */
+    var COLOR_TRACK = '#e2e5ea';  /* var(--border-light)   */
 
     var GAUGE_WARN_PCT = 60;  /* % usage that flips ok→warn */
     var GAUGE_BAD_PCT  = 85;  /* % usage that flips warn→bad */
