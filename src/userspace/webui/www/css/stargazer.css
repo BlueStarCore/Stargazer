@@ -48,7 +48,7 @@
     --topbar-h:      60px;
 
     /* Typography */
-    --font-pixel:    'Press Start 2P', monospace;
+    --font-pixel:    'Press Start 2P', 'Courier New', monospace;
     --font-mono:     'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
 
     /* Surfaces */
@@ -293,6 +293,7 @@ html, body {
 }
 
 /* Scrollbar styling */
+.sidebar { scrollbar-width: thin; scrollbar-color: var(--sky-light) transparent; }
 .sidebar::-webkit-scrollbar { width: 4px; }
 .sidebar::-webkit-scrollbar-track { background: transparent; }
 .sidebar::-webkit-scrollbar-thumb { background: var(--sky-light); border-radius: 2px; }
@@ -457,6 +458,9 @@ html, body {
     color: var(--text-secondary);
     cursor: pointer;
     padding: 4px;
+    background: none;
+    border: none;
+    line-height: 1;
 }
 
 .topbar-search {
@@ -1234,10 +1238,10 @@ html, body {
 }
 
 /* Wide form-row variant — used for description/comment fields that
- * should stretch to fill the form grid.  Replaces inline
- * style="min-width:400px" on the input. */
+ * should stretch to fill the form grid. */
 .form-row-wide .form-input {
-    min-width: 400px;
+    min-width: min(400px, 100%);
+    flex: 1;
 }
 
 /* Trailing unit label after a form-input (e.g. "seconds" for lease-time). */
@@ -1391,7 +1395,7 @@ html, body {
     transform: translate(-50%, -50%);
     z-index: 200;
     width: fit-content;
-    min-width: 420px;
+    min-width: min(420px, 90vw);
     max-width: 90vw;
     max-height: 80vh;
     padding: 0;
@@ -1594,6 +1598,7 @@ html, body {
 }
 
 /* Scrollbar for overflowing modals */
+.add-form { scrollbar-width: thin; scrollbar-color: var(--sky-light) #f5f6f8; }
 .add-form::-webkit-scrollbar { width: 6px; }
 .add-form::-webkit-scrollbar-track { background: #f5f6f8; }
 .add-form::-webkit-scrollbar-thumb { background: var(--sky-light); border-radius: 3px; }
@@ -1624,7 +1629,7 @@ html, body {
 /* Right-click context menu */
 .context-menu {
     position: fixed;
-    z-index: 300;
+    z-index: 150;
     background: var(--bg-card);
     border: 1px solid var(--border-light);
     border-radius: 3px;
@@ -1694,8 +1699,8 @@ html, body {
 .bulk-actions .btn {
     padding: 6px 12px;
     font-size: 12px;
-    background: rgba(255, 255, 255, 0.06);
-    border-color: rgba(255, 255, 255, 0.15);
+    background: rgba(255, 255, 255, 0.12);
+    border-color: rgba(255, 255, 255, 0.25);
     color: #e0e4ec;
 }
 .bulk-actions .btn:hover {
@@ -1729,6 +1734,11 @@ html, body {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 20px;
+}
+
+@media (max-width: 1200px) {
+    .data-table tbody td { font-size: 13px; padding: 10px 8px; }
+    .data-table thead th { font-size: 8px; padding: 10px 8px; }
 }
 
 @media (max-width: 1100px) {
@@ -1800,6 +1810,7 @@ html, body {
     box-shadow: var(--card-shadow);
 }
 
+.scroll-box { scrollbar-width: thin; scrollbar-color: var(--gray-text-soft) #f5f6f8; }
 .scroll-box::-webkit-scrollbar { width: 6px; }
 .scroll-box::-webkit-scrollbar-track { background: #f5f6f8; }
 .scroll-box::-webkit-scrollbar-thumb { background: var(--gray-text-soft); border-radius: 3px; }
@@ -2009,3 +2020,261 @@ html, body {
 .toast-success { background: var(--color-success); }
 .toast-error { background: var(--color-danger); }
 .toast-fade { opacity: 0; }
+
+/* ================================================================
+ *  DRAG-TO-REORDER
+ * ================================================================ */
+
+/* Drag handle column — narrow, centered */
+.th-drag, .td-drag {
+    width: 28px;
+    min-width: 28px;
+    max-width: 28px;
+    text-align: center;
+    padding-left: 4px !important;
+    padding-right: 4px !important;
+    color: var(--gray-text-dim);
+    cursor: grab;
+    user-select: none;
+    font-size: 16px;
+}
+
+.th-drag { cursor: default; }
+
+/* Builtin rows cannot be dragged */
+tr[data-builtin="yes"] .td-drag {
+    color: transparent;
+    cursor: default;
+}
+
+/* Row being dragged */
+tr.drag-active {
+    opacity: 0.4;
+    background: rgba(232, 149, 106, 0.1) !important;
+}
+
+/* Drop indicator — orange line above or below target row */
+tr.drop-above {
+    box-shadow: inset 0 2px 0 var(--dawn-orange);
+}
+
+tr.drop-below {
+    box-shadow: inset 0 -2px 0 var(--dawn-orange);
+}
+
+/* ================================================================
+ *  ACCESSIBILITY
+ * ================================================================ */
+
+/* Screen-reader only — visually hidden but accessible */
+.sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+}
+
+/* Focus-visible outlines for keyboard navigation */
+.btn:focus-visible,
+.btn-create:focus-visible,
+.btn-primary:focus-visible {
+    outline: 2px solid var(--dawn-orange);
+    outline-offset: 2px;
+}
+
+.nav-category-header:focus-visible {
+    outline: 2px solid var(--dawn-peach);
+    outline-offset: -2px;
+}
+
+.nav-sub-item:focus-visible {
+    outline: 2px solid var(--dawn-peach);
+    outline-offset: -2px;
+    background: rgba(255, 255, 255, 0.06);
+}
+
+.topbar-hamburger:focus-visible {
+    outline: 2px solid var(--dawn-orange);
+    outline-offset: 2px;
+}
+
+.modal-close:focus-visible {
+    outline: 2px solid var(--dawn-orange);
+    outline-offset: 2px;
+}
+
+.user-dropdown-item:focus-visible {
+    outline: 2px solid var(--dawn-orange);
+    outline-offset: -2px;
+    background: rgba(232, 149, 106, 0.1);
+}
+
+.topbar-user:focus-visible {
+    outline: 2px solid var(--dawn-orange);
+    outline-offset: 2px;
+}
+
+.rf-btn:focus-visible {
+    outline: 2px solid var(--dawn-orange);
+    outline-offset: 2px;
+}
+
+.context-menu-item:focus-visible {
+    outline: 2px solid var(--dawn-orange);
+    outline-offset: -2px;
+    background: rgba(232, 149, 106, 0.1);
+}
+
+/* ================================================================
+ *  CONFIRM DIALOG (styled replacement for native confirm())
+ * ================================================================ */
+.confirm-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(10, 14, 26, 0.55);
+    z-index: 2000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.confirm-box {
+    background: var(--bg-card);
+    border: 1px solid var(--border-light);
+    box-shadow: var(--card-shadow);
+    padding: 24px;
+    min-width: min(360px, 90vw);
+    max-width: 90vw;
+    border-radius: 4px;
+}
+.confirm-message {
+    font-size: 14px;
+    color: var(--gray-text);
+    margin-bottom: 20px;
+    line-height: 1.5;
+}
+.confirm-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+}
+
+/* ================================================================
+ *  UTILITY CLASSES
+ * ================================================================ */
+
+/* Margin-top helpers — replace inline style="margin-top:Xpx" */
+.mt-8  { margin-top: 8px; }
+.mt-16 { margin-top: 16px; }
+.mt-24 { margin-top: 24px; }
+
+/* Borderless table variant — for nested tables inside form-cards */
+.table-borderless { border: none; }
+
+/* Gauge value used inline (no absolute positioning) — replaces
+ * inline style="position:static;transform:none;margin:20px 0"
+ * on the Network Overview page.  Needs .gauge-card prefix to
+ * override .gauge-card .gauge-value specificity. */
+.gauge-card .gauge-value.gauge-value-inline {
+    position: static;
+    top: auto;
+    left: auto;
+    transform: none;
+    margin: 20px 0;
+}
+
+/* Horizontal scroll wrapper for data tables on mobile */
+.table-scroll {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: thin;
+    scrollbar-color: var(--gray-text-soft) transparent;
+}
+
+.table-scroll::-webkit-scrollbar { height: 6px; }
+.table-scroll::-webkit-scrollbar-track { background: transparent; }
+.table-scroll::-webkit-scrollbar-thumb { background: var(--gray-text-soft); border-radius: 3px; }
+
+/* ================================================================
+ *  RESPONSIVE — MOBILE (max-width: 600px)
+ * ================================================================ */
+@media (max-width: 600px) {
+    .content {
+        padding: 14px;
+    }
+
+    .dashboard-grid {
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 12px;
+    }
+
+    .gauge-card {
+        padding: 18px;
+    }
+
+    .gauge-card .gauge-ring {
+        width: 110px;
+        height: 110px;
+    }
+
+    .gauge-card .gauge-value {
+        font-size: 16px;
+    }
+
+    .form-label {
+        min-width: 120px;
+        font-size: 13px;
+    }
+
+    .form-input {
+        min-width: 0;
+        flex: 1;
+    }
+
+    .form-row {
+        flex-wrap: wrap;
+    }
+
+    .toolbar-search {
+        max-width: 100%;
+    }
+
+    .topbar-search {
+        max-width: 200px;
+    }
+
+    .topbar-user .user-name {
+        display: none;
+    }
+
+    .page-title {
+        font-size: 11px;
+    }
+
+    /* Route flow — stack on mobile */
+    .rf-header {
+        flex-wrap: wrap;
+        gap: 6px;
+    }
+
+    .route-row {
+        flex-wrap: wrap;
+        gap: 6px;
+        padding: 10px 12px;
+    }
+
+    .rf-pager {
+        flex-direction: column;
+        gap: 8px;
+        align-items: flex-start;
+    }
+
+    /* Login box (if loaded standalone) */
+    .login-box {
+        padding: 32px 24px 28px;
+    }
+}

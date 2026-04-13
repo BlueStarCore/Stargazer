@@ -92,6 +92,7 @@
      */
     function validatePasswordChange(newPw, confirmPw) {
         if (!newPw || !confirmPw) return 'ENTER NEW PASSWORD AND CONFIRMATION';
+        if (newPw.length < 8) return 'PASSWORD MUST BE AT LEAST 8 CHARACTERS';
         if (newPw !== confirmPw) return 'PASSWORDS DO NOT MATCH';
         return null;
     }

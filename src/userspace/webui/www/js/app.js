@@ -100,13 +100,18 @@
             selection.clear();
         if (typeof hideCtx === 'function')
             hideCtx();
+        /* Clear stale drag state on page navigation */
+        if (typeof dragRow !== 'undefined') {
+            dragRow = null;
+            dragEntity = null;
+        }
     }
 
     categories.forEach(function (cat) {
         var header = cat.querySelector('.nav-category-header');
         if (!header) return;
 
-        header.addEventListener('click', function () {
+        function handleCategoryActivate() {
             navClearTransient();
 
             /* Direct page link (e.g. Dashboard) — no sub-arrow */
@@ -128,6 +133,19 @@
 
             /* Sidebar expanded: toggle the dropdown */
             cat.classList.toggle('open');
+            /* Update ARIA state */
+            var isOpen = cat.classList.contains('open');
+            header.setAttribute('aria-expanded', String(isOpen));
+        }
+
+        header.addEventListener('click', handleCategoryActivate);
+
+        /* Keyboard: Enter or Space activates the category */
+        header.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                handleCategoryActivate();
+            }
         });
     });
 
@@ -311,9 +329,8 @@
      *   api('/system/resources').then(function (data) { ... });
      *   api('/config/interfaces/eth0', { method: 'PUT', body: {...} });
      *
-     * In demo mode (no backend), returns null so callers fall through
-     * to demo data. When the webui HTTP server is ready, remove the
-     * demo fallback paths and rely solely on API responses.
+     * Returns null when backend is unreachable so callers can keep
+     * their placeholder state instead of showing fake data.
      */
     function api(endpoint, opts) {
         var url = API_BASE + endpoint;
@@ -480,14 +497,29 @@
      *  TOAST NOTIFICATIONS
      * ================================================================ */
 
+    var activeToasts = [];
+
+    function repositionToasts() {
+        for (var i = 0; i < activeToasts.length; i++) {
+            activeToasts[i].style.top = (20 + i * 56) + 'px';
+        }
+    }
+
     function showToast(message, type) {
         var toast = document.createElement('div');
         toast.className = 'toast toast-' + (type || 'success');
         toast.textContent = message;
         document.body.appendChild(toast);
+        activeToasts.push(toast);
+        repositionToasts();
         setTimeout(function () {
             toast.classList.add('toast-fade');
-            setTimeout(function () { toast.remove(); }, 300);
+            setTimeout(function () {
+                toast.remove();
+                var idx = activeToasts.indexOf(toast);
+                if (idx !== -1) activeToasts.splice(idx, 1);
+                repositionToasts();
+            }, 300);
         }, 3000);
     }
 
@@ -501,12 +533,15 @@
      *  GAUGE RENDERING (donut ring charts)
      * ================================================================ */
 
-    /* Draw a donut gauge on a canvas element */
+    /* Draw a donut gauge on a canvas element.
+     * Caches canvas setup (width/height/transform) to avoid triggering
+     * a full re-composite on every 5s poll cycle. */
+    var gaugeCache = {};
+
     function drawGauge(canvasId, percent, color) {
         var canvas = document.getElementById(canvasId);
         if (!canvas) return;
 
-        var ctx = canvas.getContext('2d');
         var dpr = window.devicePixelRatio || 1;
         var size = 280;  /* canvas logical size */
         var cx = size / 2;
@@ -514,9 +549,19 @@
         var radius = 112;
         var lineWidth = 20;
 
-        canvas.width = size * dpr;
-        canvas.height = size * dpr;
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        /* Only set canvas dimensions once per element */
+        var cached = gaugeCache[canvasId];
+        if (!cached || cached.dpr !== dpr) {
+            canvas.width = size * dpr;
+            canvas.height = size * dpr;
+            var ctx = canvas.getContext('2d');
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            gaugeCache[canvasId] = { dpr: dpr, ctx: ctx };
+            cached = gaugeCache[canvasId];
+        }
+
+        var ctx = cached.ctx;
+        ctx.clearRect(0, 0, size, size);
 
         /* Background track */
         ctx.beginPath();
@@ -607,17 +652,16 @@
      *     disk_pct, disk_used_mb, disk_total_mb,
      *     sessions, sessions_max, cpu_cores, cpu_mhz }
      *
-     * Falls back to demo data when API is unavailable.
+     * Keeps initial placeholder state when API is unavailable.
      */
     function renderGauges() {
         return api('/system/resources').then(function (data) {
             if (!data) {
-                /* Demo fallback */
-                data = {
-                    cpu_pct: 12, mem_pct: 45, mem_used_mb: 920, mem_total_mb: 2048,
-                    disk_pct: 23, disk_used_mb: 118, disk_total_mb: 512,
-                    sessions: 37, sessions_max: 65536, cpu_cores: 4, cpu_mhz: 1800
-                };
+                ['detail-cpu','detail-mem','detail-disk','detail-sessions'].forEach(function (id) {
+                    var el = setEl(id);
+                    if (el) { el.textContent = 'No data'; el.classList.remove('loading'); }
+                });
+                return;
             }
 
             var sessPct = data.sessions_max > 0 ? Math.round(data.sessions / data.sessions_max * 100) : 0;
@@ -645,7 +689,7 @@
      *   { temp_c, cpu_pct, load_avg, mem_pct, mem_used_mb, mem_total_mb,
      *     disk_pct, disk_used_mb, disk_total_mb }
      *
-     * Falls back to demo data when API is unavailable.
+     * Keeps initial placeholder state when API is unavailable.
      */
     /* Helper: format kB value to human-readable MB string */
     function fmtMB(kb) {
@@ -750,11 +794,11 @@
     function renderResourceGauges() {
         return api('/system/resources/detail').then(function (data) {
             if (!data) {
-                data = {
-                    temp_c: 52, cpu_pct: 12, load_avg: '0.48 0.56 0.32',
-                    mem_pct: 45, mem_used_mb: 920, mem_total_mb: 2048,
-                    disk_pct: 23, disk_used_mb: 118, disk_total_mb: 512
-                };
+                ['detail-res-temp','detail-res-cpu','detail-res-mem','detail-res-disk'].forEach(function (id) {
+                    var el = setEl(id);
+                    if (el) { el.textContent = 'No data'; el.classList.remove('loading'); }
+                });
+                return;
             }
 
             var tempPct = Math.round((data.temp_c / 85) * 100);
@@ -786,7 +830,7 @@
     /* Poll functions per page — only pages with live data need entries */
     var PAGE_POLLERS = {
         'dashboard':    renderGauges,
-        'resources':    renderResourceGauges
+        'resources':    function () { renderResourceGauges(); renderResourceDetails(); }
     };
 
     function startPolling() {
@@ -1372,7 +1416,34 @@
         form.classList.remove('closing');
         form.classList.add('visible');
         backdrop.classList.add('visible');
+        /* Focus the first focusable element inside the modal */
+        setTimeout(function () {
+            var first = form.querySelector('input:not([type="hidden"]), select, button, textarea');
+            if (first) first.focus();
+        }, 50);
     }
+
+    /* Focus trap — keep Tab cycling within the active modal */
+    document.addEventListener('keydown', function (e) {
+        if (e.key !== 'Tab' || !activeModal) return;
+        var focusable = activeModal.querySelectorAll(
+            'input:not([type="hidden"]):not([disabled]), select:not([disabled]), ' +
+            'button:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])');
+        if (focusable.length === 0) return;
+        var first = focusable[0];
+        var last = focusable[focusable.length - 1];
+        if (e.shiftKey) {
+            if (document.activeElement === first) {
+                e.preventDefault();
+                last.focus();
+            }
+        } else {
+            if (document.activeElement === last) {
+                e.preventDefault();
+                first.focus();
+            }
+        }
+    });
 
     /* Reset all editable inputs in a modal back to their defaults.
      * Used by closeModal *after* the slide-out animation completes
@@ -1454,9 +1525,12 @@
         });
     }
 
-    /* Escape key to close */
+    /* Escape key to close modal or dismiss bulk selection */
     document.addEventListener('keydown', function (e) {
-        if (e.key === 'Escape' && activeModal) closeModal(false);
+        if (e.key === 'Escape') {
+            if (activeModal) { closeModal(false); return; }
+            if (selection.count > 0) selection.clear();
+        }
     });
 
     /* ================================================================
@@ -1524,6 +1598,7 @@
             configType: 'network_nat',
             createTitle: 'NEW NAT RULE',
             editTitle: 'EDIT NAT RULE',
+            orderable: true,
             hasStatus: true,
             statusLabels: { on: 'Enabled', off: 'Disabled', dotOn: 'up', dotOff: 'disabled' },
             fields: [
@@ -1546,6 +1621,7 @@
             configType: 'firewall_policy',
             createTitle: 'NEW FIREWALL POLICY',
             editTitle: 'EDIT FIREWALL POLICY',
+            orderable: true,
             hasStatus: true,
             statusLabels: { on: 'Enabled', off: 'Disabled', dotOn: 'up', dotOff: 'disabled' },
             fields: [
@@ -1783,6 +1859,61 @@
         bulkCloseBtn.addEventListener('click', function () { selection.clear(); });
     }
 
+    /* Styled confirm dialog — replaces native confirm() for visual
+     * consistency and security mindset.  Returns a Promise<boolean>. */
+    function confirmAction(message) {
+        return new Promise(function (resolve) {
+            var overlay = document.createElement('div');
+            overlay.className = 'confirm-overlay';
+
+            var box = document.createElement('div');
+            box.className = 'confirm-box';
+            box.setAttribute('role', 'alertdialog');
+            box.setAttribute('aria-modal', 'true');
+            box.setAttribute('aria-label', 'Confirmation');
+
+            var msg = document.createElement('div');
+            msg.className = 'confirm-message';
+            msg.textContent = message;
+            box.appendChild(msg);
+
+            var actions = document.createElement('div');
+            actions.className = 'confirm-actions';
+
+            var confirmBtn = document.createElement('button');
+            confirmBtn.className = 'btn btn-primary';
+            confirmBtn.textContent = 'Confirm';
+            confirmBtn.style.background = 'var(--color-danger)';
+            confirmBtn.style.borderColor = 'var(--color-danger-dark)';
+
+            var cancelBtn = document.createElement('button');
+            cancelBtn.className = 'btn';
+            cancelBtn.textContent = 'Cancel';
+
+            actions.appendChild(confirmBtn);
+            actions.appendChild(cancelBtn);
+            box.appendChild(actions);
+            overlay.appendChild(box);
+            document.body.appendChild(overlay);
+
+            var escHandler = function (e) {
+                if (e.key === 'Escape') close(false);
+            };
+            function close(result) {
+                document.removeEventListener('keydown', escHandler);
+                overlay.remove();
+                resolve(result);
+            }
+            confirmBtn.addEventListener('click', function () { close(true); });
+            cancelBtn.addEventListener('click', function () { close(false); });
+            overlay.addEventListener('click', function (e) {
+                if (e.target === overlay) close(false);
+            });
+            document.addEventListener('keydown', escHandler);
+            setTimeout(function () { cancelBtn.focus(); }, 0);
+        });
+    }
+
     /* Inline input prompt — replaces native prompt() for visual
      * consistency with the rest of the UI.  Returns a Promise that
      * resolves with the entered string or null on cancel. */
@@ -1838,8 +1969,41 @@
 
     function handleBulkAction(action) {
         if (action === 'delete') {
-            forEachSelected(function (row) { deleteRow(row); });
-            selection.clear();
+            confirmAction('Delete ' + selection.count + ' selected entries?').then(function (confirmed) {
+                if (!confirmed) return;
+                var deletePromises = [];
+                var failCount = 0;
+                forEachSelected(function (row) {
+                    var table = row.closest('table[data-entity]');
+                    var entity = table ? table.dataset.entity : null;
+                    var rowId = row.dataset.rowId || '';
+                    if (row.dataset.builtin === 'yes') return;
+                    row.style.transition = 'opacity 0.25s, background 0.25s';
+                    row.style.background = 'rgba(198, 40, 40, 0.1)';
+                    row.style.opacity = '0';
+                    if (entity) {
+                        deletePromises.push(
+                            api('/config/' + cfgType(entity) + '/' + rowId, { method: 'DELETE' })
+                                .then(function () { setTimeout(function () { row.remove(); }, 250); })
+                                .catch(function () {
+                                    row.style.background = '';
+                                    row.style.opacity = '1';
+                                    failCount++;
+                                })
+                        );
+                    } else {
+                        setTimeout(function () { row.remove(); }, 250);
+                    }
+                });
+                Promise.all(deletePromises).then(function () {
+                    selection.clear();
+                    if (failCount > 0) {
+                        showToast(failCount + ' delete(s) failed', 'error');
+                    } else {
+                        showToast('Entries deleted', 'success');
+                    }
+                });
+            });
             return;
         }
         if (action === 'enable' || action === 'disable') {
@@ -1852,13 +2016,14 @@
         if (action.indexOf('bulk-') === 0) {
             var key = action.replace('bulk-', '');
             var config = ENTITIES[selection.entity];
+            var colOffset = config.orderable ? 2 : 1;
             var field = null;
             config.fields.forEach(function (f) { if (f.key === key) field = f; });
             if (!field) return;
             promptInput('New value for ' + field.label, '').then(function (val) {
                 if (val === null) return;
                 forEachSelected(function (row) {
-                    var cell = row.cells[field.col + 1]; /* +1 for checkbox */
+                    var cell = row.cells[field.col + colOffset]; /* +1 checkbox, +1 drag handle if orderable */
                     if (cell) cell.textContent = val;
                 });
             });
@@ -1980,9 +2145,10 @@
                 populateForm(config, keyMap, data, body);
             } else {
                 /* Demo fallback: read from table row cells */
+                var colOffset = config.orderable ? 2 : 1;
                 var rowData = {};
                 config.fields.forEach(function (field) {
-                    var cell = row.cells[field.col + 1]; /* +1 for checkbox col */
+                    var cell = row.cells[field.col + colOffset]; /* +1 checkbox, +1 drag handle if orderable */
                     if (cell) rowData[field.key] = cellText(cell);
                 });
                 populateForm(config, keyMap, rowData, body);
@@ -2155,29 +2321,31 @@
             return;
         }
 
-        if (!confirm('Delete "' + rowId + '"?')) return;
+        confirmAction('Delete "' + rowId + '"?').then(function (confirmed) {
+            if (!confirmed) return;
 
-        /* Visual feedback immediately */
-        row.style.transition = 'opacity 0.25s, background 0.25s';
-        row.style.background = 'rgba(198, 40, 40, 0.1)';
-        row.style.opacity = '0';
+            /* Visual feedback immediately */
+            row.style.transition = 'opacity 0.25s, background 0.25s';
+            row.style.background = 'rgba(198, 40, 40, 0.1)';
+            row.style.opacity = '0';
 
-        if (entity) {
-            api('/config/' + cfgType(entity) + '/' + rowId, { method: 'DELETE' })
-                .then(function (data) {
-                    /* API succeeded or no backend — remove row */
-                    setTimeout(function () { row.remove(); }, 250);
-                    showToast('Entry deleted', 'success');
-                })
-                .catch(function (err) {
-                    /* API error — revert visual state */
-                    row.style.background = '';
-                    row.style.opacity = '1';
-                    showToast(err.message || 'Delete failed', 'error');
-                });
-        } else {
-            setTimeout(function () { row.remove(); }, 250);
-        }
+            if (entity) {
+                api('/config/' + cfgType(entity) + '/' + rowId, { method: 'DELETE' })
+                    .then(function (data) {
+                        /* API succeeded or no backend — remove row */
+                        setTimeout(function () { row.remove(); }, 250);
+                        showToast('Entry deleted', 'success');
+                    })
+                    .catch(function (err) {
+                        /* API error — revert visual state */
+                        row.style.background = '';
+                        row.style.opacity = '1';
+                        showToast(err.message || 'Delete failed', 'error');
+                    });
+            } else {
+                setTimeout(function () { row.remove(); }, 250);
+            }
+        });
     }
 
     /*
@@ -2242,6 +2410,90 @@
      * nav handlers via navClearTransient() — no duplicate listeners. */
 
     /* ================================================================
+     *  DRAG-TO-REORDER — policies & NAT sequence reordering
+     * ================================================================ */
+
+    var dragRow = null, dragEntity = null;
+
+    function clearDropIndicator(tbody) {
+        tbody.querySelectorAll('.drop-above, .drop-below').forEach(function (el) {
+            el.classList.remove('drop-above', 'drop-below');
+        });
+    }
+
+    document.querySelectorAll('table[data-entity]').forEach(function (table) {
+        var entity = table.dataset.entity;
+        var config = ENTITIES[entity];
+        if (!config || !config.orderable) return;
+        var tbody = table.querySelector('tbody');
+        if (!tbody) return;
+
+        tbody.addEventListener('dragstart', function (e) {
+            var row = e.target.closest('tr');
+            if (!row || !row.draggable) return;
+            dragRow = row;
+            dragEntity = entity;
+            row.classList.add('drag-active');
+            e.dataTransfer.effectAllowed = 'move';
+            e.dataTransfer.setData('text/plain', '');
+        });
+
+        tbody.addEventListener('dragover', function (e) {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'move';
+            var target = e.target.closest('tr');
+            if (!target || target === dragRow || !target.dataset.rowId) return;
+            clearDropIndicator(tbody);
+            var rect = target.getBoundingClientRect();
+            var mid = rect.top + rect.height / 2;
+            target.classList.add(e.clientY < mid ? 'drop-above' : 'drop-below');
+        });
+
+        tbody.addEventListener('dragleave', function (e) {
+            var target = e.target.closest('tr');
+            if (target) target.classList.remove('drop-above', 'drop-below');
+        });
+
+        tbody.addEventListener('drop', function (e) {
+            e.preventDefault();
+            clearDropIndicator(tbody);
+            var target = e.target.closest('tr');
+            if (!target || target === dragRow || !target.dataset.rowId) return;
+            if (!dragRow) return;
+
+            var targetSeq = parseInt(target.dataset.seq, 10);
+            if (isNaN(targetSeq)) return;
+
+            /* Table sorted descending: higher seq = top.
+             * Drop ABOVE target → higher priority → targetSeq + 1
+             * Drop BELOW target → take target's seq, rotate pushes target down */
+            var rect = target.getBoundingClientRect();
+            var mid = rect.top + rect.height / 2;
+            var newSeq = (e.clientY < mid) ? targetSeq + 1 : targetSeq;
+            if (newSeq < 1) newSeq = 1;
+            if (newSeq > 9999) newSeq = 9999;
+
+            var rowId = dragRow.dataset.rowId;
+            api('/config/' + cfgType(dragEntity) + '/' + rowId + '/move', {
+                method: 'PATCH',
+                body: { sequence: newSeq }
+            }).then(function () {
+                showToast('Reordered', 'success');
+                refreshPage(activePage);
+            }).catch(function (err) {
+                showToast(err.message || 'Reorder failed', 'error');
+            });
+        });
+
+        tbody.addEventListener('dragend', function () {
+            if (dragRow) dragRow.classList.remove('drag-active');
+            clearDropIndicator(tbody);
+            dragRow = null;
+            dragEntity = null;
+        });
+    });
+
+    /* ================================================================
      *  USER DROPDOWN (topbar admin menu)
      * ================================================================ */
 
@@ -2249,13 +2501,54 @@
     var userDrop = document.getElementById('user-dropdown');
 
     if (userBtn && userDrop) {
-        userBtn.addEventListener('click', function (e) {
+        function toggleUserDropdown(e) {
             e.stopPropagation();
-            userDrop.classList.toggle('open');
+            var isOpen = userDrop.classList.toggle('open');
+            userBtn.setAttribute('aria-expanded', String(isOpen));
+            if (isOpen) {
+                var firstItem = userDrop.querySelector('.user-dropdown-item');
+                if (firstItem) firstItem.focus();
+            }
+        }
+
+        userBtn.addEventListener('click', toggleUserDropdown);
+
+        /* Keyboard: Enter/Space to toggle, Escape to close */
+        userBtn.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                toggleUserDropdown(e);
+            } else if (e.key === 'Escape') {
+                userDrop.classList.remove('open');
+                userBtn.setAttribute('aria-expanded', 'false');
+            }
+        });
+
+        /* Arrow key navigation within dropdown */
+        userDrop.addEventListener('keydown', function (e) {
+            var items = Array.prototype.slice.call(
+                userDrop.querySelectorAll('.user-dropdown-item'));
+            var idx = items.indexOf(document.activeElement);
+            if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                var next = (idx + 1) % items.length;
+                items[next].focus();
+            } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                var prev = (idx - 1 + items.length) % items.length;
+                items[prev].focus();
+            } else if (e.key === 'Escape') {
+                userDrop.classList.remove('open');
+                userBtn.setAttribute('aria-expanded', 'false');
+                userBtn.focus();
+            } else if (e.key === 'Enter' || e.key === ' ') {
+                /* Let the click handler on the item fire */
+            }
         });
 
         document.addEventListener('click', function () {
             userDrop.classList.remove('open');
+            userBtn.setAttribute('aria-expanded', 'false');
         });
 
         userDrop.addEventListener('click', function (e) {
@@ -2623,6 +2916,19 @@
             tdCb.appendChild(cb);
             tr.appendChild(tdCb);
 
+            /* Drag handle column — only for orderable entities */
+            if (config.orderable) {
+                var tdDrag = document.createElement('td');
+                tdDrag.className = 'td-drag';
+                if (!isBuiltin) {
+                    tdDrag.textContent = '\u2807';  /* ⠇ drag handle */
+                    tr.draggable = true;
+                }
+                tr.appendChild(tdDrag);
+                if (row.sequence !== undefined)
+                    tr.dataset.seq = String(row.sequence);
+            }
+
             config.fields.forEach(function (f) {
                 if (f.col === -1) return;
                 var val = row[f.key] || '';
@@ -2914,6 +3220,7 @@
             var nameEl = inp.parentElement.querySelector('.file-upload-name');
             if (nameEl) {
                 nameEl.textContent = inp.files.length ? inp.files[0].name : 'No file selected';
+                nameEl.title = inp.files.length ? inp.files[0].name : '';
             }
         });
     });
@@ -3042,6 +3349,10 @@
         var cfInp = pwAll[1];
         if (!pwInp || !pwInp.value) {
             showToast('Password is required for new admin', 'error');
+            return;
+        }
+        if (pwInp.value.length < 8) {
+            showToast('Password must be at least 8 characters', 'error');
             return;
         }
         if (cfInp && cfInp.value !== pwInp.value) {
@@ -3318,8 +3629,8 @@
             var file = fileInput.files[0];
 
             /* Validate file extension */
-            if (!file.name.match(/\.itb$/i)) {
-                showToast('Invalid firmware file: must be .itb format', 'error');
+            if (!file.name.match(/\.tar\.gz$/i)) {
+                showToast('Invalid firmware file: must be .tar.gz format', 'error');
                 return;
             }
 
@@ -3329,13 +3640,16 @@
                 return;
             }
 
-            var formData = new FormData();
-            formData.append('firmware', fileInput.files[0]);
+            confirmAction('Installing firmware will reboot the device. Continue?').then(function (ok) {
+                if (!ok) return;
 
-            fwInstallBtn.textContent = 'Uploading...';
-            fwInstallBtn.disabled = true;
+                var formData = new FormData();
+                formData.append('firmware', fileInput.files[0]);
 
-            api('/system/firmware/upgrade', { method: 'POST', body: formData })
+                fwInstallBtn.textContent = 'Uploading...';
+                fwInstallBtn.disabled = true;
+
+                api('/system/firmware/upgrade', { method: 'POST', body: formData })
                 .then(function (data) {
                     if (!data) {
                         showToast('No backend available', 'error');
@@ -3380,6 +3694,7 @@
                     fwInstallBtn.textContent = 'Install Firmware';
                     fwInstallBtn.disabled = false;
                 });
+            });
         });
     }
 
@@ -3387,10 +3702,12 @@
     document.querySelectorAll('#page-sys-firmware .btn').forEach(function (btn) {
         if (btn.textContent.trim() === 'Reboot to NAND') {
             btn.addEventListener('click', function () {
-                if (!confirm('Reboot to recovery?')) return;
-                api('/system/reboot', { method: 'POST', body: { device: 'nand' } })
-                    .then(function () { showToast('Rebooting to recovery...', 'success'); })
-                    .catch(function (err) { showToast(err.message || 'Reboot failed', 'error'); });
+                confirmAction('Reboot to recovery? The system will restart.').then(function (confirmed) {
+                    if (!confirmed) return;
+                    api('/system/reboot', { method: 'POST', body: { device: 'nand' } })
+                        .then(function () { showToast('Rebooting to recovery...', 'success'); })
+                        .catch(function (err) { showToast(err.message || 'Reboot failed', 'error'); });
+                });
             });
         }
     });
@@ -3507,18 +3824,18 @@
         var rdet = document.getElementById('net-routes-detail');
         if (rdet) rdet.textContent = disabled + ' disabled';
 
-        /* Throughput / ARP placeholders — backend not yet wired */
+        /* Throughput / ARP — no backend API yet */
         var tp = document.getElementById('net-throughput');
         if (tp) {
             tp.textContent = '--';
             tp.appendChild(makeSpan('gauge-unit', ' Mbps'));
         }
         var tpd = document.getElementById('net-throughput-detail');
-        if (tpd) tpd.textContent = 'not yet available';
+        if (tpd) tpd.textContent = 'Unknown';
         var arp = document.getElementById('net-arp');
         if (arp) arp.textContent = '--';
         var arpd = document.getElementById('net-arp-detail');
-        if (arpd) arpd.textContent = 'not yet available';
+        if (arpd) arpd.textContent = 'Unknown';
     }
 
     function renderNetTrafficTable() {

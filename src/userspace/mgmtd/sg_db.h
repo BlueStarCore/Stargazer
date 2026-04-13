@@ -124,6 +124,13 @@ char *sg_db_list_types(void);
  */
 int sg_db_purge_type(const char *type);
 
+/*
+ * Get MAX(CAST(value AS INTEGER)) for entries of a given type + key.
+ * Single SQL query — efficient for finding highest sequence number.
+ * Returns heap-allocated string or NULL.  Caller must free().
+ */
+char *sg_db_get_max_int(const char *type, const char *key);
+
 /* ── Auth lockout helpers ────────────────────────────────────────────────── */
 
 /*

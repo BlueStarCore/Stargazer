@@ -589,6 +589,33 @@ int sg_db_set_val(const char *type, const char *id, const char *key,
 	return (rc == SQLITE_DONE) ? 0 : -1;
 }
 
+/* ── sg_db_get_max_int ───────────────────────────────────────────────────── */
+
+char *sg_db_get_max_int(const char *type, const char *key)
+{
+	if (!g_db || !type || !key) return NULL;
+
+	sqlite3_stmt *stmt;
+	const char *sql =
+		"SELECT MAX(CAST(value AS INTEGER)) FROM config "
+		"WHERE type=?1 AND key=?2;";
+	if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) != SQLITE_OK)
+		return NULL;
+
+	sqlite3_bind_text(stmt, 1, type, -1, SQLITE_STATIC);
+	sqlite3_bind_text(stmt, 2, key, -1, SQLITE_STATIC);
+
+	char *result = NULL;
+	if (sqlite3_step(stmt) == SQLITE_ROW) {
+		const char *v = (const char *)sqlite3_column_text(stmt, 0);
+		if (v)
+			result = strdup(v);
+	}
+
+	sqlite3_finalize(stmt);
+	return result;
+}
+
 /* ── sg_db_find_referencing ───────────────────────────────────────────────── */
 
 char *sg_db_find_referencing(const char *ref_type, const char *ref_key,

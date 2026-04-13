@@ -19,44 +19,53 @@
  *   seq=3  enable  → kernel pos 3 (1 above + 2)
  *   seq=2  disable → not in kernel
  *   seq=1  enable  → kernel pos 4 (2 above + 2) — checked last
+ *
+ * Rotation algorithm (replaces old seq_shift inflate approach):
+ *   When moving entry from old_seq to new_seq, entries in the
+ *   affected range rotate by ±1.  Total sequence set stays bounded.
  */
 
 #include "mgmtd_sequence.h"
 #include "mgmtd_apply.h"
 #include "sg_db.h"
+#include "sg_validate.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* ── seq_get_max ─────────────────────────────────────────────────────────── */
+/* ── Orderable type registry ────────────────────────────────────────── */
+
+const char *SEQ_ORDERABLE_TYPES[] = {
+	"firewall_policy",
+	"network_nat",
+	/* Add new orderable types here — all seq_* functions and
+	 * stargazer-mgmtd.c checks use this array automatically. */
+	NULL
+};
+
+int seq_type_is_orderable(const char *type)
+{
+	if (!type) return 0;
+	for (int i = 0; SEQ_ORDERABLE_TYPES[i]; i++) {
+		if (strcmp(type, SEQ_ORDERABLE_TYPES[i]) == 0)
+			return 1;
+	}
+	return 0;
+}
+
+/* ── seq_get_max ────────────────────────────────────────────────────── */
 
 int seq_get_max(const char *type)
 {
-	char *list = sg_db_list(type);
-	if (!list)
-		return 0;
-
-	int max_seq = 0;
-	char *saveptr = NULL;
-
-	for (char *tok = strtok_r(list, "\n", &saveptr);
-	     tok;
-	     tok = strtok_r(NULL, "\n", &saveptr)) {
-		char *seq_str = sg_db_get_val(type, tok, "sequence");
-		if (seq_str) {
-			int seq = atoi(seq_str);
-			if (seq > max_seq)
-				max_seq = seq;
-			free(seq_str);
-		}
-	}
-
-	free(list);
-	return max_seq;
+	/* Single SQL query instead of N sg_db_get_val() calls */
+	char *max_str = sg_db_get_max_int(type, "sequence");
+	int result = max_str ? atoi(max_str) : 0;
+	free(max_str);
+	return result;
 }
 
-/* ── seq_auto_assign ─────────────────────────────────────────────────────── */
+/* ── seq_auto_assign ────────────────────────────────────────────────── */
 
 int seq_auto_assign(const char *type, char *data, size_t data_sz)
 {
@@ -83,80 +92,50 @@ int seq_auto_assign(const char *type, char *data, size_t data_sz)
  * (sg_db_list_ordered returns entries in sequence DESC order,
  * and rebuild appends them with -A in that order). */
 
-/* ── seq_has_collision ───────────────────────────────────────────────────── */
+/* ── Internal helpers ───────────────────────────────────────────────── */
 
-int seq_has_collision(const char *type, int seq, const char *exclude_id)
-{
-	char *list = sg_db_list(type);
-	if (!list)
-		return 0;
-
-	int found = 0;
-	char *saveptr = NULL;
-
-	for (char *tok = strtok_r(list, "\n", &saveptr);
-	     tok;
-	     tok = strtok_r(NULL, "\n", &saveptr)) {
-		if (exclude_id && strcmp(tok, exclude_id) == 0)
-			continue;
-
-		char *seq_str = sg_db_get_val(type, tok, "sequence");
-		if (seq_str) {
-			if (atoi(seq_str) == seq)
-				found = 1;
-			free(seq_str);
-		}
-		if (found)
-			break;
-	}
-
-	free(list);
-	return found;
-}
-
-/* ── seq_shift ───────────────────────────────────────────────────────────── *
- *
- * When a new entry takes a sequence already occupied, shift the
- * existing entry (and everything above it) UP by +1.
- *
- * Higher sequence = higher priority = checked first.
- * Shifting up = promoting existing entries, so the NEW entry
- * (which keeps the original sequence) has lower priority than
- * the entries that were already there.
- *
- * Builtin entries are never shifted (pinned in place).
- *
- * Process highest-first so each +1 doesn't collide with the next.
- * Example: existing 3, 4, 5.  New entry takes seq=4.
- *   Shift 5→6, then 4→5.
- *   Result: 3, 5, 6.  Gap at 4 is now free for the new entry.
- *   New entry at 4 has lower priority than old-4 (now 5).
- */
-
-/* Helper: collect (id, sequence) pairs for sorting */
 struct seq_entry {
 	char  id[64];
 	int   seq;
 };
 
-static int seq_entry_cmp_desc(const void *a, const void *b)
+static int seq_cmp_asc(const void *a, const void *b)
 {
-	const struct seq_entry *ea = a;
-	const struct seq_entry *eb = b;
-	return eb->seq - ea->seq;	/* descending */
+	return ((const struct seq_entry *)a)->seq -
+	       ((const struct seq_entry *)b)->seq;
 }
 
-int seq_shift(const char *type, int new_seq, const char *exclude_id)
+static int seq_cmp_desc(const void *a, const void *b)
 {
+	return ((const struct seq_entry *)b)->seq -
+	       ((const struct seq_entry *)a)->seq;
+}
+
+/*
+ * Collect non-builtin entries whose sequence falls in [lo, hi].
+ * Skips exclude_id.  Caller must free(*out) when done — even if
+ * the returned count is 0, *out may still be a valid allocation.
+ *
+ * Returns: number of entries collected (>= 0), or -1 on malloc failure.
+ */
+static int collect_seq_range(const char *type, int lo, int hi,
+			     const char *exclude_id,
+			     struct seq_entry **out)
+{
+	*out = NULL;
+
 	char *list = sg_db_list(type);
 	if (!list)
 		return 0;
 
-	/* Collect entries with sequence >= new_seq (dynamic array) */
-	size_t cap = 64;
+	size_t cap = 32;
 	struct seq_entry *entries = malloc(cap * sizeof(*entries));
-	if (!entries) { free(list); return 0; }
-	int nentries = 0;
+	if (!entries) {
+		free(list);
+		return -1;
+	}
+
+	int n = 0;
 	char *saveptr = NULL;
 
 	for (char *tok = strtok_r(list, "\n", &saveptr);
@@ -165,13 +144,12 @@ int seq_shift(const char *type, int new_seq, const char *exclude_id)
 		if (exclude_id && strcmp(tok, exclude_id) == 0)
 			continue;
 
-		/* Never shift builtin entries — they are pinned */
+		/* Builtin entries are pinned — never rotate them */
 		char *bi = sg_db_get_val(type, tok, "builtin");
-		if (bi && strcmp(bi, "yes") == 0) {
-			free(bi);
-			continue;
-		}
+		int is_builtin = (bi && strcmp(bi, "yes") == 0);
 		free(bi);
+		if (is_builtin)
+			continue;
 
 		char *seq_str = sg_db_get_val(type, tok, "sequence");
 		if (!seq_str)
@@ -180,42 +158,105 @@ int seq_shift(const char *type, int new_seq, const char *exclude_id)
 		int seq = atoi(seq_str);
 		free(seq_str);
 
-		if (seq >= new_seq) {
-			if ((size_t)nentries >= cap) {
+		if (seq >= lo && seq <= hi) {
+			if ((size_t)n >= cap) {
 				cap *= 2;
 				struct seq_entry *nb = realloc(
 					entries, cap * sizeof(*entries));
-				if (!nb) break;
+				if (!nb) {
+					/* Alloc failure: abort rather than
+					 * rotate an incomplete set */
+					free(entries);
+					free(list);
+					*out = NULL;
+					return -1;
+				}
 				entries = nb;
 			}
-			snprintf(entries[nentries].id,
-				 sizeof(entries[nentries].id), "%s", tok);
-			entries[nentries].seq = seq;
-			nentries++;
+			snprintf(entries[n].id,
+				 sizeof(entries[n].id), "%s", tok);
+			entries[n].seq = seq;
+			n++;
 		}
 	}
 
 	free(list);
+	*out = entries;
+	return n;
+}
 
-	if (nentries == 0) {
+/* ── seq_has_collision ──────────────────────────────────────────────── */
+
+int seq_has_collision(const char *type, int seq, const char *exclude_id)
+{
+	struct seq_entry *entries = NULL;
+	int n = collect_seq_range(type, seq, seq, exclude_id, &entries);
+	free(entries);
+	return n > 0;
+}
+
+/* ── seq_rotate ─────────────────────────────────────────────────────── *
+ *
+ * When an entry moves from old_seq to new_seq, the entries in between
+ * rotate to fill the gap.  No sequence inflation — the set of
+ * sequence values remains the same, just reassigned.
+ *
+ * Move UP (old_seq < new_seq, higher priority):
+ *   Entries in (old_seq, new_seq] each shift -1
+ *   Source entry takes new_seq.
+ *
+ *   Example: A=1, B=2, C=3.  Move A → seq=3:
+ *     B(2) → 1, C(3) → 2, A → 3.  Result: B=1, C=2, A=3.
+ *
+ * Move DOWN (old_seq > new_seq, lower priority):
+ *   Entries in [new_seq, old_seq) each shift +1
+ *   Source entry takes new_seq.
+ *
+ *   Example: A=1, B=2, C=3.  Move C → seq=1:
+ *     A(1) → 2, B(2) → 3, C → 1.  Result: C=1, A=2, B=3.
+ *
+ * Sort order matters to avoid intermediate collisions:
+ *   delta=-1: process ascending  (lowest first, each frees slot for next)
+ *   delta=+1: process descending (highest first, each frees slot for next)
+ */
+int seq_rotate(const char *type, int old_seq, int new_seq,
+	       const char *exclude_id)
+{
+	if (old_seq == new_seq)
+		return 0;
+
+	int moving_up = (new_seq > old_seq);
+	int lo, hi, delta;
+
+	if (moving_up) {
+		lo = old_seq + 1;
+		hi = new_seq;
+		delta = -1;
+	} else {
+		lo = new_seq;
+		hi = old_seq - 1;
+		delta = +1;
+	}
+
+	struct seq_entry *entries = NULL;
+	int n = collect_seq_range(type, lo, hi, exclude_id, &entries);
+
+	if (n <= 0) {
 		free(entries);
 		return 0;
 	}
 
-	/* Sort descending — shift highest first so each +1 doesn't
-	 * collide with the entry above it. */
-	qsort(entries, (size_t)nentries, sizeof(entries[0]),
-	      seq_entry_cmp_desc);
+	qsort(entries, (size_t)n, sizeof(entries[0]),
+	      moving_up ? seq_cmp_asc : seq_cmp_desc);
 
-	int shifted = 0;
-	for (int i = 0; i < nentries; i++) {
-		char new_val[16];
-		snprintf(new_val, sizeof(new_val), "%d", entries[i].seq + 1);
-		if (sg_db_set_val(type, entries[i].id, "sequence",
-				  new_val) == 0)
-			shifted++;
+	int rotated = 0;
+	for (int i = 0; i < n; i++) {
+		char val[16];
+		snprintf(val, sizeof(val), "%d", entries[i].seq + delta);
+		if (sg_db_set_val(type, entries[i].id, "sequence", val) == 0)
+			rotated++;
 	}
 
 	free(entries);
-	return shifted;
+	return rotated;
 }

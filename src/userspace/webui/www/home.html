@@ -12,7 +12,7 @@
 <div class="app-shell">
 
     <!-- ======== SIDEBAR ======== -->
-    <nav class="sidebar">
+    <nav class="sidebar" role="navigation" aria-label="Main navigation">
         <div class="sidebar-brand">
             <img class="brand-icon" src="img/icon.png" alt="Stargazer">
             <div class="brand-text">STARGAZER</div>
@@ -22,10 +22,10 @@
 
             <!-- Home -->
             <div class="nav-category active open" data-section="home">
-                <div class="nav-category-header">
-                    <span class="nav-icon">&#9733;</span>
+                <div class="nav-category-header" tabindex="0" aria-expanded="true">
+                    <span class="nav-icon" aria-hidden="true">&#9733;</span>
                     <span class="nav-label">HOME</span>
-                    <span class="nav-arrow">&#9656;</span>
+                    <span class="nav-arrow" aria-hidden="true">&#9656;</span>
                 </div>
                 <div class="nav-sub">
                     <div class="nav-sub-item active" data-page="dashboard">
@@ -42,10 +42,10 @@
 
             <!-- Network -->
             <div class="nav-category" data-section="network">
-                <div class="nav-category-header">
-                    <span class="nav-icon">&#9678;</span>
+                <div class="nav-category-header" tabindex="0" aria-expanded="false">
+                    <span class="nav-icon" aria-hidden="true">&#9678;</span>
                     <span class="nav-label">NETWORK</span>
-                    <span class="nav-arrow">&#9656;</span>
+                    <span class="nav-arrow" aria-hidden="true">&#9656;</span>
                 </div>
                 <div class="nav-sub">
                     <div class="nav-sub-item" data-page="interfaces">
@@ -65,10 +65,10 @@
 
             <!-- Firewall -->
             <div class="nav-category" data-section="firewall">
-                <div class="nav-category-header">
-                    <span class="nav-icon">&#9730;</span>
+                <div class="nav-category-header" tabindex="0" aria-expanded="false">
+                    <span class="nav-icon" aria-hidden="true">&#9730;</span>
                     <span class="nav-label">FIREWALL</span>
-                    <span class="nav-arrow">&#9656;</span>
+                    <span class="nav-arrow" aria-hidden="true">&#9656;</span>
                 </div>
                 <div class="nav-sub">
                     <div class="nav-sub-item" data-page="fw-policies">
@@ -88,10 +88,10 @@
 
             <!-- System -->
             <div class="nav-category" data-section="system">
-                <div class="nav-category-header">
-                    <span class="nav-icon">&#9881;</span>
+                <div class="nav-category-header" tabindex="0" aria-expanded="false">
+                    <span class="nav-icon" aria-hidden="true">&#9881;</span>
                     <span class="nav-label">SYSTEM</span>
-                    <span class="nav-arrow">&#9656;</span>
+                    <span class="nav-arrow" aria-hidden="true">&#9656;</span>
                 </div>
                 <div class="nav-sub">
                     <div class="nav-sub-item" data-page="sys-settings">
@@ -114,10 +114,10 @@
 
             <!-- Diagnostics -->
             <div class="nav-category" data-section="diagnostics">
-                <div class="nav-category-header">
-                    <span class="nav-icon">&#9883;</span>
+                <div class="nav-category-header" tabindex="0" aria-expanded="false">
+                    <span class="nav-icon" aria-hidden="true">&#9883;</span>
                     <span class="nav-label">DIAGNOSTICS</span>
-                    <span class="nav-arrow">&#9656;</span>
+                    <span class="nav-arrow" aria-hidden="true">&#9656;</span>
                 </div>
                 <div class="nav-sub">
                     <div class="nav-sub-item" data-page="diag-tools">
@@ -135,10 +135,10 @@
 
         <!-- Top bar -->
         <header class="topbar">
-            <span class="topbar-hamburger">&#9776;</span>
+            <button class="topbar-hamburger" aria-label="Toggle sidebar" type="button">&#9776;</button>
             <div class="topbar-search">
-                <input type="text" placeholder="Search...">
-                <button class="search-btn" type="button">&#9906;</button>
+                <input type="text" placeholder="Search..." aria-label="Search pages">
+                <button class="search-btn" type="button" aria-label="Search">&#9906;</button>
             </div>
             <div class="topbar-spacer"></div>
             <!-- Connection status pill — auto-managed by ConnStatus
@@ -149,20 +149,20 @@
                 <span class="conn-banner-text"></span>
             </div>
             <div class="topbar-spacer"></div>
-            <div class="topbar-user" id="topbar-user">
-                <div class="user-avatar">A</div>
+            <div class="topbar-user" id="topbar-user" tabindex="0" role="button" aria-haspopup="true" aria-expanded="false" aria-label="User menu">
+                <div class="user-avatar" aria-hidden="true">A</div>
                 <span class="user-name">admin</span>
-                <span style="color: #666; font-size: 10px;">&#9662;</span>
-                <div class="user-dropdown" id="user-dropdown">
+                <span style="color: #666; font-size: 10px;" aria-hidden="true">&#9662;</span>
+                <div class="user-dropdown" id="user-dropdown" role="menu">
                     <div class="user-dropdown-header">
                         <strong>admin</strong>
                         <span>super_admin</span>
                     </div>
                     <div class="user-dropdown-sep"></div>
-                    <div class="user-dropdown-item" data-action="profile">&#9998; My Profile</div>
-                    <div class="user-dropdown-item" data-action="password">&#9919; Change Password</div>
-                    <div class="user-dropdown-sep"></div>
-                    <div class="user-dropdown-item user-dropdown-logout" data-action="logout">&#10140; Logout</div>
+                    <div class="user-dropdown-item" data-action="profile" role="menuitem" tabindex="-1">&#9998; My Profile</div>
+                    <div class="user-dropdown-item" data-action="password" role="menuitem" tabindex="-1">&#9919; Change Password</div>
+                    <div class="user-dropdown-sep" role="separator"></div>
+                    <div class="user-dropdown-item user-dropdown-logout" data-action="logout" role="menuitem" tabindex="-1">&#10140; Logout</div>
                 </div>
             </div>
         </header>
@@ -216,7 +216,7 @@
                 </div>
 
                 <!-- Interfaces summary table (JS-rendered with sort + search) -->
-                <div class="page-header" style="margin-top: 8px;">
+                <div class="page-header mt-8">
                     <h2 class="page-title">INTERFACES</h2>
                     <div class="widget-search">
                         <input type="text" id="iface-search" placeholder="Filter interfaces...">
@@ -279,7 +279,7 @@
                 </div>
 
                 <!-- CPU / SoC Details -->
-                <div class="page-header" style="margin-top:8px"><h2 class="page-title">CPU / SOC</h2></div>
+                <div class="page-header mt-8"><h2 class="page-title">CPU / SOC</h2></div>
                 <div class="res-detail-grid">
                     <div class="form-card">
                         <div class="form-section">MEDIATEK MT7988A (FILOGIC 880)</div>
@@ -293,7 +293,7 @@
                     </div>
                     <div class="form-card">
                         <div class="form-section">PER-CORE STATUS</div>
-                        <table class="data-table" style="border:none">
+                        <table class="data-table table-borderless">
                             <thead><tr><th>CORE</th><th>FREQ</th><th>USAGE</th><th>TEMP</th><th></th></tr></thead>
                             <tbody>
                             </tbody>
@@ -302,7 +302,7 @@
                 </div>
 
                 <!-- RAM Details -->
-                <div class="page-header" style="margin-top:24px"><h2 class="page-title">MEMORY</h2></div>
+                <div class="page-header mt-24"><h2 class="page-title">MEMORY</h2></div>
                 <div class="res-detail-grid">
                     <div class="form-card">
                         <div class="form-section">PHYSICAL RAM</div>
@@ -347,13 +347,13 @@
                                 <span class="mem-bar-val" id="bar-swap-val">--</span>
                             </div>
                         </div>
-                        <div class="form-section" style="margin-top:16px">SLAB / KERNEL</div>
+                        <div class="form-section mt-16">SLAB / KERNEL</div>
                         <div class="form-row"><label class="form-label">Slab</label><span class="form-value" id="ram-slab">--</span></div>
                     </div>
                 </div>
 
                 <!-- Disk Details -->
-                <div class="page-header" style="margin-top:24px"><h2 class="page-title">DISK / STORAGE</h2></div>
+                <div class="page-header mt-24"><h2 class="page-title">DISK / STORAGE</h2></div>
                 <div class="res-detail-grid">
                     <div class="form-card">
                         <div class="form-section">eMMC &mdash; PRIMARY BOOT</div>
@@ -366,7 +366,7 @@
                 </div>
 
                 <!-- Top Processes -->
-                <div class="page-header" style="margin-top:24px"><h2 class="page-title">TOP PROCESSES</h2><div class="widget-search"><input type="text" placeholder="Filter processes..." class="table-filter" data-target="res-procs"></div></div>
+                <div class="page-header mt-24"><h2 class="page-title">TOP PROCESSES</h2><div class="widget-search"><input type="text" placeholder="Filter processes..." class="table-filter" data-target="res-procs"></div></div>
                 <table class="data-table" id="proctop-table">
                     <thead><tr><th>PID</th><th>NAME</th><th>CPU TICKS</th><th>MEM (RSS)</th><th>STATE</th></tr></thead>
                     <tbody id="proctop-tbody">
@@ -380,26 +380,26 @@
                 <div class="dashboard-grid">
                     <div class="gauge-card">
                         <div class="gauge-title">INTERFACES UP</div>
-                        <div class="gauge-value" style="position:static;transform:none;margin:20px 0" id="net-ifaces-up">--<span class="gauge-unit"> / --</span></div>
+                        <div class="gauge-value gauge-value-inline" id="net-ifaces-up">--<span class="gauge-unit"> / --</span></div>
                         <div class="gauge-detail loading" id="net-ifaces-detail">loading</div>
                     </div>
                     <div class="gauge-card">
                         <div class="gauge-title">ACTIVE ROUTES</div>
-                        <div class="gauge-value" style="position:static;transform:none;margin:20px 0" id="net-routes-up">--</div>
+                        <div class="gauge-value gauge-value-inline" id="net-routes-up">--</div>
                         <div class="gauge-detail loading" id="net-routes-detail">loading</div>
                     </div>
                     <div class="gauge-card">
                         <div class="gauge-title">THROUGHPUT</div>
-                        <div class="gauge-value" style="position:static;transform:none;margin:20px 0" id="net-throughput">--<span class="gauge-unit"> Mbps</span></div>
+                        <div class="gauge-value gauge-value-inline" id="net-throughput">--<span class="gauge-unit"> Mbps</span></div>
                         <div class="gauge-detail loading" id="net-throughput-detail">loading</div>
                     </div>
                     <div class="gauge-card">
                         <div class="gauge-title">ARP ENTRIES</div>
-                        <div class="gauge-value" style="position:static;transform:none;margin:20px 0" id="net-arp">--</div>
+                        <div class="gauge-value gauge-value-inline" id="net-arp">--</div>
                         <div class="gauge-detail loading" id="net-arp-detail">loading</div>
                     </div>
                 </div>
-                <div class="page-header" style="margin-top:8px"><h2 class="page-title">INTERFACE TRAFFIC</h2><div class="widget-search"><input type="text" placeholder="Filter..." class="table-filter" data-target="net-traffic"></div></div>
+                <div class="page-header mt-8"><h2 class="page-title">INTERFACE TRAFFIC</h2><div class="widget-search"><input type="text" placeholder="Filter..." class="table-filter" data-target="net-traffic"></div></div>
                 <table class="data-table" id="net-traffic-table">
                     <thead><tr><th>INTERFACE</th><th>IP / NETMASK</th><th>SPEED</th><th>STATUS</th></tr></thead>
                     <tbody id="net-traffic-tbody">
@@ -407,7 +407,7 @@
                 </table>
 
                 <!-- DHCP Summary -->
-                <div class="page-header" style="margin-top:24px"><h2 class="page-title">DHCP POOLS</h2></div>
+                <div class="page-header mt-24"><h2 class="page-title">DHCP POOLS</h2></div>
                 <table class="data-table" id="net-dhcp-table">
                     <thead><tr><th>POOL</th><th>INTERFACE</th><th>RANGE</th><th>STATUS</th></tr></thead>
                     <tbody id="net-dhcp-tbody">
@@ -415,7 +415,7 @@
                 </table>
 
                 <!-- Route Flows (JS-rendered with sort + search + pagination) -->
-                <div class="page-header" style="margin-top: 24px;">
+                <div class="page-header mt-24">
                     <h2 class="page-title">ROUTE FLOWS</h2>
                     <div class="widget-search">
                         <input type="text" id="rf-search" placeholder="Filter routes...">
@@ -439,9 +439,9 @@
                                 <option value="25">25 / page</option>
                                 <option value="50">50 / page</option>
                             </select>
-                            <button class="btn rf-btn" id="rf-prev">&#9664;</button>
+                            <button class="btn rf-btn" id="rf-prev" aria-label="Previous page">&#9664;</button>
                             <span class="rf-page-num" id="rf-page-num"></span>
-                            <button class="btn rf-btn" id="rf-next">&#9654;</button>
+                            <button class="btn rf-btn" id="rf-next" aria-label="Next page">&#9654;</button>
                         </div>
                     </div>
                 </div>
@@ -453,17 +453,17 @@
                     <h1 class="page-title">INTERFACES</h1>
                     <button class="btn-create" data-toggle-form="form-iface"><span class="btn-create-plus">+</span> Create New <span class="btn-create-caret">&#9662;</span></button>
                 </div>
-                <div class="add-form form-card" id="form-iface">
-                    <div class="form-section"><span class="modal-title-text">NEW INTERFACE</span><span class="modal-close" data-toggle-form="form-iface">&#10005;</span></div>
+                <div class="add-form form-card" id="form-iface" role="dialog" aria-modal="true" aria-label="Interface form">
+                    <div class="form-section"><span class="modal-title-text">NEW INTERFACE</span><span class="modal-close" role="button" tabindex="0" aria-label="Close" data-toggle-form="form-iface">&#10005;</span></div>
                     <div class="modal-body">
                         <div class="form-grid">
-                            <div class="form-row" data-key="name"><label class="form-label">Name</label><input class="form-input" type="text" placeholder="e.g. vlan300"></div>
+                            <div class="form-row" data-key="name"><label class="form-label">Name</label><input class="form-input" type="text" placeholder="e.g. vlan300" maxlength="64"></div>
                             <div class="form-row" data-key="mode"><label class="form-label">Mode</label><select class="form-input"><option value="static" selected>Static</option><option value="dhcp">DHCP</option></select></div>
-                            <div class="form-row" data-key="ip"><label class="form-label">IP / Netmask</label><input class="form-input" type="text" placeholder="10.0.0.1/24"></div>
-                            <div class="form-row" data-key="mtu"><label class="form-label">MTU</label><input class="form-input" type="text" value="1500"></div>
+                            <div class="form-row" data-key="ip"><label class="form-label">IP / Netmask</label><input class="form-input" type="text" placeholder="10.0.0.1/24" maxlength="18" pattern="[0-9./]+" title="e.g. 10.0.0.1/24"></div>
+                            <div class="form-row" data-key="mtu"><label class="form-label">MTU</label><input class="form-input" type="number" min="576" max="65535" value="1500"></div>
                             <div class="form-row" data-key="status"><label class="form-label">Status</label><select class="form-input"><option value="up" selected>Enabled</option><option value="down">Disabled</option></select></div>
                             <div class="form-row form-row-full" data-key="allowaccess"><label class="form-label">Admin Access</label><div class="checkbox-group"><label class="checkbox-pill"><input type="checkbox" value="ping"> PING</label><label class="checkbox-pill"><input type="checkbox" value="http"> HTTP</label><label class="checkbox-pill"><input type="checkbox" value="https"> HTTPS</label><label class="checkbox-pill"><input type="checkbox" value="ssh"> SSH</label><label class="checkbox-pill"><input type="checkbox" value="snmp"> SNMP</label><label class="checkbox-pill"><input type="checkbox" value="telnet"> TELNET</label></div></div>
-                            <div class="form-row form-row-full form-row-wide" data-key="description"><label class="form-label">Description</label><input class="form-input" type="text" placeholder="Optional description"></div>
+                            <div class="form-row form-row-full form-row-wide" data-key="description"><label class="form-label">Description</label><input class="form-input" type="text" placeholder="Optional description" maxlength="255"></div>
                         </div>
                     </div>
                     <div class="modal-footer"><button class="btn btn-primary">Save</button><button class="btn" data-toggle-form="form-iface">Cancel</button></div>
@@ -471,11 +471,13 @@
                 <div class="toolbar">
                     <div class="toolbar-search"><input type="text" placeholder="Search interfaces..."><button class="search-btn" type="button">&#9906;</button></div>
                 </div>
+                <div class="table-scroll">
                 <table class="data-table" data-entity="interfaces">
                     <thead><tr><th class="th-checkbox"><input type="checkbox" class="select-all"></th><th>NAME</th><th>MODE</th><th>IP / NETMASK</th><th>STATUS</th><th>MTU</th><th>ADMIN ACCESS</th></tr></thead>
                     <tbody>
                     </tbody>
                 </table>
+                </div>
             </div>
 
             <!-- ======== NETWORK > DHCP PAGE ======== -->
@@ -484,19 +486,19 @@
                     <h1 class="page-title">DHCP SERVER</h1>
                     <button class="btn-create" data-toggle-form="form-dhcp"><span class="btn-create-plus">+</span> Create Pool <span class="btn-create-caret">&#9662;</span></button>
                 </div>
-                <div class="add-form form-card" id="form-dhcp">
-                    <div class="form-section"><span class="modal-title-text">NEW DHCP POOL</span><span class="modal-close" data-toggle-form="form-dhcp">&#10005;</span></div>
+                <div class="add-form form-card" id="form-dhcp" role="dialog" aria-modal="true" aria-label="DHCP pool form">
+                    <div class="form-section"><span class="modal-title-text">NEW DHCP POOL</span><span class="modal-close" role="button" tabindex="0" aria-label="Close" data-toggle-form="form-dhcp">&#10005;</span></div>
                     <div class="modal-body">
                         <div class="form-grid">
-                            <div class="form-row" data-key="name"><label class="form-label">Pool Name</label><input class="form-input" type="text" placeholder="e.g. SERVER-Pool"></div>
+                            <div class="form-row" data-key="name"><label class="form-label">Pool Name</label><input class="form-input" type="text" placeholder="e.g. SERVER-Pool" maxlength="64"></div>
                             <div class="form-row" data-key="interface"><label class="form-label">Interface</label><select class="form-input iface-select"></select></div>
-                            <div class="form-row" data-key="start-ip"><label class="form-label">Range Start</label><input class="form-input" type="text" placeholder="192.168.1.100"></div>
-                            <div class="form-row" data-key="end-ip"><label class="form-label">Range End</label><input class="form-input" type="text" placeholder="192.168.1.200"></div>
-                            <div class="form-row" data-key="gateway"><label class="form-label">Gateway</label><input class="form-input" type="text" placeholder="192.168.1.1"></div>
-                            <div class="form-row" data-key="netmask"><label class="form-label">Netmask</label><input class="form-input" type="text" placeholder="255.255.255.0"></div>
-                            <div class="form-row" data-key="dns"><label class="form-label">DNS Server 1</label><input class="form-input" type="text" placeholder="192.168.1.1"></div>
-                            <div class="form-row" data-key="domain"><label class="form-label">Domain</label><input class="form-input" type="text" placeholder="stargazer.local"></div>
-                            <div class="form-row" data-key="lease-time"><label class="form-label">Lease Time</label><input class="form-input" type="text" value="86400"> <span class="form-suffix">seconds</span></div>
+                            <div class="form-row" data-key="start-ip"><label class="form-label">Range Start</label><input class="form-input" type="text" placeholder="192.168.1.100" maxlength="15" pattern="[0-9.]+" title="e.g. 192.168.1.100"></div>
+                            <div class="form-row" data-key="end-ip"><label class="form-label">Range End</label><input class="form-input" type="text" placeholder="192.168.1.200" maxlength="15" pattern="[0-9.]+" title="e.g. 192.168.1.200"></div>
+                            <div class="form-row" data-key="gateway"><label class="form-label">Gateway</label><input class="form-input" type="text" placeholder="192.168.1.1" maxlength="15" pattern="[0-9.]+" title="e.g. 192.168.1.1"></div>
+                            <div class="form-row" data-key="netmask"><label class="form-label">Netmask</label><input class="form-input" type="text" placeholder="255.255.255.0" maxlength="15" pattern="[0-9.]+" title="e.g. 255.255.255.0"></div>
+                            <div class="form-row" data-key="dns"><label class="form-label">DNS Server 1</label><input class="form-input" type="text" placeholder="192.168.1.1" maxlength="15" pattern="[0-9.]+" title="e.g. 8.8.8.8"></div>
+                            <div class="form-row" data-key="domain"><label class="form-label">Domain</label><input class="form-input" type="text" placeholder="stargazer.local" maxlength="253"></div>
+                            <div class="form-row" data-key="lease-time"><label class="form-label">Lease Time</label><input class="form-input" type="number" min="60" max="604800" value="86400"> <span class="form-suffix">seconds</span></div>
                             <div class="form-row" data-key="status"><label class="form-label">Status</label><select class="form-input"><option value="enable" selected>Enabled</option><option value="disable">Disabled</option></select></div>
                         </div>
                     </div>
@@ -507,7 +509,7 @@
                 <!-- Active Leases in scrollable box (top) -->
                 <div class="page-header"><h2 class="page-title">ACTIVE LEASES</h2><div class="widget-search"><input type="text" placeholder="Filter leases..." class="table-filter" data-target="dhcp-leases"></div></div>
                 <div class="scroll-box">
-                    <table class="data-table" style="border:none">
+                    <table class="data-table table-borderless">
                         <thead><tr><th>POOL</th><th>IP ADDRESS</th><th>MAC ADDRESS</th><th>HOSTNAME</th><th>LEASE START</th><th>EXPIRES</th><th>REMAINING</th></tr></thead>
                         <tbody>
                         </tbody>
@@ -515,12 +517,14 @@
                 </div>
 
                 <!-- DHCP Pools table (bottom) -->
-                <div class="page-header" style="margin-top:24px"><h2 class="page-title">POOLS</h2></div>
+                <div class="page-header mt-24"><h2 class="page-title">POOLS</h2></div>
+                <div class="table-scroll">
                 <table class="data-table" data-entity="dhcp">
                     <thead><tr><th class="th-checkbox"><input type="checkbox" class="select-all"></th><th>POOL NAME</th><th>INTERFACE</th><th>RANGE START</th><th>RANGE END</th><th>GATEWAY</th><th>DNS</th><th>LEASE (s)</th><th>STATUS</th></tr></thead>
                     <tbody>
                     </tbody>
                 </table>
+                </div>
             </div>
 
             <!-- ======== NETWORK > STATIC ROUTES PAGE ======== -->
@@ -529,16 +533,16 @@
                     <h1 class="page-title">STATIC ROUTES</h1>
                     <button class="btn-create" data-toggle-form="form-route"><span class="btn-create-plus">+</span> Add Route <span class="btn-create-caret">&#9662;</span></button>
                 </div>
-                <div class="add-form form-card" id="form-route">
-                    <div class="form-section"><span class="modal-title-text">NEW STATIC ROUTE</span><span class="modal-close" data-toggle-form="form-route">&#10005;</span></div>
+                <div class="add-form form-card" id="form-route" role="dialog" aria-modal="true" aria-label="Static route form">
+                    <div class="form-section"><span class="modal-title-text">NEW STATIC ROUTE</span><span class="modal-close" role="button" tabindex="0" aria-label="Close" data-toggle-form="form-route">&#10005;</span></div>
                     <div class="modal-body">
                         <div class="form-grid">
-                            <div class="form-row" data-key="dst"><label class="form-label">Destination</label><input class="form-input" type="text" placeholder="10.0.0.0/24"></div>
-                            <div class="form-row" data-key="gateway"><label class="form-label">Gateway</label><input class="form-input" type="text" placeholder="192.168.1.1"></div>
+                            <div class="form-row" data-key="dst"><label class="form-label">Destination</label><input class="form-input" type="text" placeholder="10.0.0.0/24" maxlength="18" pattern="[0-9./]+" title="e.g. 10.0.0.0/24"></div>
+                            <div class="form-row" data-key="gateway"><label class="form-label">Gateway</label><input class="form-input" type="text" placeholder="192.168.1.1" maxlength="15" pattern="[0-9.]+" title="e.g. 192.168.1.1"></div>
                             <div class="form-row" data-key="device"><label class="form-label">Interface</label><select class="form-input iface-select"></select></div>
-                            <div class="form-row" data-key="distance"><label class="form-label">Admin Distance</label><input class="form-input" type="text" value="10"></div>
+                            <div class="form-row" data-key="distance"><label class="form-label">Admin Distance</label><input class="form-input" type="number" min="1" max="255" value="10"></div>
                             <div class="form-row" data-key="status"><label class="form-label">Status</label><select class="form-input"><option value="enable" selected>Enabled</option><option value="disable">Disabled</option></select></div>
-                            <div class="form-row form-row-full form-row-wide" data-key="comment"><label class="form-label">Comment</label><input class="form-input" type="text" placeholder="Optional description"></div>
+                            <div class="form-row form-row-full form-row-wide" data-key="comment"><label class="form-label">Comment</label><input class="form-input" type="text" placeholder="Optional description" maxlength="255"></div>
                         </div>
                     </div>
                     <div class="modal-footer"><button class="btn btn-primary">Save</button><button class="btn" data-toggle-form="form-route">Cancel</button></div>
@@ -557,18 +561,18 @@
                     <h1 class="page-title">NAT</h1>
                     <button class="btn-create" data-toggle-form="form-nat"><span class="btn-create-plus">+</span> Add Rule <span class="btn-create-caret">&#9662;</span></button>
                 </div>
-                <div class="add-form form-card" id="form-nat">
-                    <div class="form-section"><span class="modal-title-text">NEW NAT RULE</span><span class="modal-close" data-toggle-form="form-nat">&#10005;</span></div>
+                <div class="add-form form-card" id="form-nat" role="dialog" aria-modal="true" aria-label="NAT rule form">
+                    <div class="form-section"><span class="modal-title-text">NEW NAT RULE</span><span class="modal-close" role="button" tabindex="0" aria-label="Close" data-toggle-form="form-nat">&#10005;</span></div>
                     <div class="modal-body">
                         <div class="form-grid">
                             <div class="form-row" data-key="sequence"><label class="form-label">Sequence</label><input class="form-input" type="number" min="0" max="9999" placeholder="Auto if empty"></div>
                             <div class="form-row" data-key="type"><label class="form-label">Type</label><select class="form-input"><option value="snat" selected>SNAT (Source)</option><option value="dnat">DNAT (Destination)</option></select></div>
                             <div class="form-row" data-key="protocol"><label class="form-label">Protocol</label><select class="form-input"><option value="all" selected>ALL</option><option value="tcp">TCP</option><option value="udp">UDP</option><option value="tcp+udp">TCP+UDP</option></select></div>
-                            <div class="form-row" data-key="srcaddr"><label class="form-label">Original Source</label><input class="form-input" type="text" placeholder="192.168.1.0/24 or all"></div>
-                            <div class="form-row" data-key="dstaddr"><label class="form-label">Original Destination</label><input class="form-input" type="text" placeholder="0.0.0.0/0 or all"></div>
-                            <div class="form-row" data-key="dstport"><label class="form-label">Destination Port</label><input class="form-input" type="text" placeholder="Optional, e.g. 443"></div>
-                            <div class="form-row" data-key="mapped-ip"><label class="form-label">Translated Address</label><input class="form-input" type="text" placeholder="203.0.113.1"></div>
-                            <div class="form-row" data-key="mapped-port"><label class="form-label">Translated Port</label><input class="form-input" type="text" placeholder="Optional, e.g. 8443"></div>
+                            <div class="form-row" data-key="srcaddr"><label class="form-label">Original Source</label><input class="form-input" type="text" placeholder="192.168.1.0/24 or all" maxlength="64"></div>
+                            <div class="form-row" data-key="dstaddr"><label class="form-label">Original Destination</label><input class="form-input" type="text" placeholder="0.0.0.0/0 or all" maxlength="64"></div>
+                            <div class="form-row" data-key="dstport"><label class="form-label">Destination Port</label><input class="form-input" type="number" min="1" max="65535" placeholder="Optional, e.g. 443"></div>
+                            <div class="form-row" data-key="mapped-ip"><label class="form-label">Translated Address</label><input class="form-input" type="text" placeholder="203.0.113.1" maxlength="15" pattern="[0-9.]+" title="e.g. 203.0.113.1"></div>
+                            <div class="form-row" data-key="mapped-port"><label class="form-label">Translated Port</label><input class="form-input" type="number" min="1" max="65535" placeholder="Optional, e.g. 8443"></div>
                             <div class="form-row" data-key="srcintf"><label class="form-label">Source Interface</label><select class="form-input iface-select"></select></div>
                             <div class="form-row" data-key="dstintf"><label class="form-label">Destination Interface</label><select class="form-input iface-select"></select></div>
                             <div class="form-row" data-key="status"><label class="form-label">Status</label><select class="form-input"><option value="enable" selected>Enabled</option><option value="disable">Disabled</option></select></div>
@@ -577,11 +581,13 @@
                     <div class="modal-footer"><button class="btn btn-primary">Save</button><button class="btn" data-toggle-form="form-nat">Cancel</button></div>
                 </div>
                 <div class="toolbar"><div class="toolbar-search"><input type="text" placeholder="Filter rules..." class="table-filter" data-target="tbl-nat"><button class="search-btn" type="button">&#9906;</button></div></div>
+                <div class="table-scroll">
                 <table class="data-table" data-entity="nat">
-                    <thead><tr><th class="th-checkbox"><input type="checkbox" class="select-all"></th><th>#</th><th>SEQ</th><th>TYPE</th><th>SOURCE</th><th>DESTINATION</th><th>INTERFACE</th><th>STATUS</th></tr></thead>
+                    <thead><tr><th class="th-checkbox"><input type="checkbox" class="select-all"></th><th class="th-drag"></th><th>#</th><th>SEQ</th><th>TYPE</th><th>SOURCE</th><th>DESTINATION</th><th>INTERFACE</th><th>STATUS</th></tr></thead>
                     <tbody>
                     </tbody>
                 </table>
+                </div>
             </div>
 
             <!-- ======== FIREWALL > POLICIES PAGE ======== -->
@@ -590,11 +596,11 @@
                     <h1 class="page-title">FIREWALL POLICIES</h1>
                     <button class="btn-create" data-toggle-form="form-policy"><span class="btn-create-plus">+</span> Create Policy <span class="btn-create-caret">&#9662;</span></button>
                 </div>
-                <div class="add-form form-card" id="form-policy">
-                    <div class="form-section"><span class="modal-title-text">NEW FIREWALL POLICY</span><span class="modal-close" data-toggle-form="form-policy">&#10005;</span></div>
+                <div class="add-form form-card" id="form-policy" role="dialog" aria-modal="true" aria-label="Firewall policy form">
+                    <div class="form-section"><span class="modal-title-text">NEW FIREWALL POLICY</span><span class="modal-close" role="button" tabindex="0" aria-label="Close" data-toggle-form="form-policy">&#10005;</span></div>
                     <div class="modal-body">
                         <div class="form-grid">
-                            <div class="form-row" data-key="name"><label class="form-label">Name</label><input class="form-input" type="text" placeholder="e.g. Allow-HTTPS-Out"></div>
+                            <div class="form-row" data-key="name"><label class="form-label">Name</label><input class="form-input" type="text" placeholder="e.g. Allow-HTTPS-Out" maxlength="64"></div>
                             <div class="form-row" data-key="sequence"><label class="form-label">Sequence</label><input class="form-input" type="number" min="0" max="9999" placeholder="Auto if empty"></div>
                             <div class="form-row" data-key="status"><label class="form-label">Status</label><select class="form-input"><option value="enable" selected>Enabled</option><option value="disable">Disabled</option></select></div>
                             <div class="form-row" data-key="srcintf"><label class="form-label">Incoming Interface</label><select class="form-input iface-select"><option>any</option></select></div>
@@ -603,18 +609,20 @@
                             <div class="form-row" data-key="dstaddr"><label class="form-label">Destination</label><select class="form-input addr-select"><option value="all" selected>all</option></select></div>
                             <div class="form-row" data-key="service"><label class="form-label">Service</label><select class="form-input svc-select"><option value="all" selected>ALL</option></select></div>
                             <div class="form-row" data-key="action"><label class="form-label">Action</label><select class="form-input"><option value="accept" selected>ACCEPT</option><option value="deny">DENY</option><option value="drop">DROP</option></select></div>
-                            <div class="form-row" data-key="schedule"><label class="form-label">Schedule</label><input class="form-input" type="text" value="all" placeholder="all or schedule name"></div>
-                            <div class="form-row form-row-full form-row-wide" data-key="comment"><label class="form-label">Comment</label><input class="form-input" type="text" placeholder="Optional description"></div>
+                            <div class="form-row" data-key="schedule"><label class="form-label">Schedule</label><input class="form-input" type="text" value="all" placeholder="all or schedule name" maxlength="64"></div>
+                            <div class="form-row form-row-full form-row-wide" data-key="comment"><label class="form-label">Comment</label><input class="form-input" type="text" placeholder="Optional description" maxlength="255"></div>
                         </div>
                     </div>
                     <div class="modal-footer"><button class="btn btn-primary">Save</button><button class="btn" data-toggle-form="form-policy">Cancel</button></div>
                 </div>
                 <div class="toolbar"><div class="toolbar-search"><input type="text" placeholder="Filter policies..." class="table-filter" data-target="tbl-policies"><button class="search-btn" type="button">&#9906;</button></div></div>
+                <div class="table-scroll">
                 <table class="data-table" data-entity="policies">
-                    <thead><tr><th class="th-checkbox"><input type="checkbox" class="select-all"></th><th>#</th><th>SEQ</th><th>NAME</th><th>FROM</th><th>TO</th><th>SOURCE</th><th>DEST</th><th>SERVICE</th><th>ACTION</th><th>STATUS</th></tr></thead>
+                    <thead><tr><th class="th-checkbox"><input type="checkbox" class="select-all"></th><th class="th-drag"></th><th>#</th><th>SEQ</th><th>NAME</th><th>FROM</th><th>TO</th><th>SOURCE</th><th>DEST</th><th>SERVICE</th><th>ACTION</th><th>STATUS</th></tr></thead>
                     <tbody>
                     </tbody>
                 </table>
+                </div>
             </div>
 
             <!-- ======== FIREWALL > ADDRESSES PAGE ======== -->
@@ -623,14 +631,14 @@
                     <h1 class="page-title">ADDRESSES</h1>
                     <button class="btn-create" data-toggle-form="form-address"><span class="btn-create-plus">+</span> Create Address <span class="btn-create-caret">&#9662;</span></button>
                 </div>
-                <div class="add-form form-card" id="form-address">
-                    <div class="form-section"><span class="modal-title-text">NEW ADDRESS OBJECT</span><span class="modal-close" data-toggle-form="form-address">&#10005;</span></div>
+                <div class="add-form form-card" id="form-address" role="dialog" aria-modal="true" aria-label="Address form">
+                    <div class="form-section"><span class="modal-title-text">NEW ADDRESS OBJECT</span><span class="modal-close" role="button" tabindex="0" aria-label="Close" data-toggle-form="form-address">&#10005;</span></div>
                     <div class="modal-body">
                         <div class="form-grid">
-                            <div class="form-row" data-key="name"><label class="form-label">Name</label><input class="form-input" type="text" placeholder="e.g. DB_Servers"></div>
+                            <div class="form-row" data-key="name"><label class="form-label">Name</label><input class="form-input" type="text" placeholder="e.g. DB_Servers" maxlength="64"></div>
                             <div class="form-row" data-key="type"><label class="form-label">Type</label><select class="form-input"><option value="ipmask" selected>Subnet</option><option value="iprange">IP Range</option><option value="fqdn">FQDN</option></select></div>
-                            <div class="form-row" data-key="subnet"><label class="form-label">Subnet / IP</label><input class="form-input" type="text" placeholder="10.0.0.0/24"></div>
-                            <div class="form-row form-row-full form-row-wide" data-key="comment"><label class="form-label">Comment</label><input class="form-input" type="text" placeholder="Optional description"></div>
+                            <div class="form-row" data-key="subnet"><label class="form-label">Subnet / IP</label><input class="form-input" type="text" placeholder="10.0.0.0/24" maxlength="18" pattern="[0-9./]+" title="e.g. 10.0.0.0/24"></div>
+                            <div class="form-row form-row-full form-row-wide" data-key="comment"><label class="form-label">Comment</label><input class="form-input" type="text" placeholder="Optional description" maxlength="255"></div>
                         </div>
                     </div>
                     <div class="modal-footer"><button class="btn btn-primary">Save</button><button class="btn" data-toggle-form="form-address">Cancel</button></div>
@@ -649,14 +657,14 @@
                     <h1 class="page-title">SERVICES</h1>
                     <button class="btn-create" data-toggle-form="form-service"><span class="btn-create-plus">+</span> Create Service <span class="btn-create-caret">&#9662;</span></button>
                 </div>
-                <div class="add-form form-card" id="form-service">
-                    <div class="form-section"><span class="modal-title-text">NEW SERVICE</span><span class="modal-close" data-toggle-form="form-service">&#10005;</span></div>
+                <div class="add-form form-card" id="form-service" role="dialog" aria-modal="true" aria-label="Service form">
+                    <div class="form-section"><span class="modal-title-text">NEW SERVICE</span><span class="modal-close" role="button" tabindex="0" aria-label="Close" data-toggle-form="form-service">&#10005;</span></div>
                     <div class="modal-body">
                         <div class="form-grid">
-                            <div class="form-row" data-key="name"><label class="form-label">Name</label><input class="form-input" type="text" placeholder="e.g. MySQL"></div>
+                            <div class="form-row" data-key="name"><label class="form-label">Name</label><input class="form-input" type="text" placeholder="e.g. MySQL" maxlength="64"></div>
                             <div class="form-row" data-key="protocol"><label class="form-label">Protocol</label><select class="form-input"><option value="tcp" selected>TCP</option><option value="udp">UDP</option><option value="icmp">ICMP</option></select></div>
-                            <div class="form-row" data-key="port-range"><label class="form-label">Port / Range</label><input class="form-input" type="text" placeholder="e.g. 3306 or 8000-8080"></div>
-                            <div class="form-row form-row-full form-row-wide" data-key="comment"><label class="form-label">Comment</label><input class="form-input" type="text" placeholder="Optional description"></div>
+                            <div class="form-row" data-key="port-range"><label class="form-label">Port / Range</label><input class="form-input" type="text" placeholder="e.g. 3306 or 8000-8080" maxlength="11" pattern="[0-9-]+" title="e.g. 443 or 8000-8080"></div>
+                            <div class="form-row form-row-full form-row-wide" data-key="comment"><label class="form-label">Comment</label><input class="form-input" type="text" placeholder="Optional description" maxlength="255"></div>
                         </div>
                     </div>
                     <div class="modal-footer"><button class="btn btn-primary">Save</button><button class="btn" data-toggle-form="form-service">Cancel</button></div>
@@ -674,14 +682,14 @@
                 <div class="page-header"><h1 class="page-title">SYSTEM SETTINGS</h1></div>
                 <div class="form-card" data-settings="system">
                     <div class="form-section">GENERAL</div>
-                    <div class="form-row" data-key="hostname"><label class="form-label">Hostname</label><input class="form-input" type="text" placeholder="e.g. stargazer-fw01"></div>
+                    <div class="form-row" data-key="hostname"><label class="form-label">Hostname</label><input class="form-input" type="text" placeholder="e.g. stargazer-fw01" maxlength="64"></div>
                     <div class="form-row" data-key="ip-forward"><label class="form-label">IP Forward</label><select class="form-input"><option value="enable">Enabled</option><option value="disable">Disabled</option></select></div>
                     <div class="form-section">SYSTEM TIME</div>
                     <div class="form-row" data-key="timezone"><label class="form-label">Timezone</label><select class="form-input"><option value="UTC">UTC</option><option value="Asia/Ho_Chi_Minh">Asia/Ho_Chi_Minh (UTC+7)</option><option value="US/Eastern">US/Eastern</option><option value="US/Pacific">US/Pacific</option><option value="Europe/London">Europe/London</option></select></div>
-                    <div class="form-row" data-key="server"><label class="form-label">NTP Server</label><input class="form-input" type="text" placeholder="pool.ntp.org"></div>
+                    <div class="form-row" data-key="server"><label class="form-label">NTP Server</label><input class="form-input" type="text" placeholder="pool.ntp.org" maxlength="253"></div>
                     <div class="form-section">DNS</div>
-                    <div class="form-row" data-key="primary"><label class="form-label">Primary DNS</label><input class="form-input" type="text" placeholder="1.1.1.1"></div>
-                    <div class="form-row" data-key="secondary"><label class="form-label">Secondary DNS</label><input class="form-input" type="text" placeholder="8.8.8.8"></div>
+                    <div class="form-row" data-key="primary"><label class="form-label">Primary DNS</label><input class="form-input" type="text" placeholder="1.1.1.1" maxlength="15" pattern="[0-9.]+" title="e.g. 1.1.1.1"></div>
+                    <div class="form-row" data-key="secondary"><label class="form-label">Secondary DNS</label><input class="form-input" type="text" placeholder="8.8.8.8" maxlength="15" pattern="[0-9.]+" title="e.g. 8.8.8.8"></div>
                     <div class="form-actions"><button class="btn btn-primary">Apply</button><button class="btn">Reset</button></div>
                 </div>
             </div>
@@ -692,16 +700,16 @@
                     <h1 class="page-title">ADMINISTRATORS</h1>
                     <button class="btn-create" data-toggle-form="form-admin"><span class="btn-create-plus">+</span> Create Admin <span class="btn-create-caret">&#9662;</span></button>
                 </div>
-                <div class="add-form form-card" id="form-admin">
-                    <div class="form-section"><span class="modal-title-text">NEW ADMINISTRATOR</span><span class="modal-close" data-toggle-form="form-admin">&#10005;</span></div>
+                <div class="add-form form-card" id="form-admin" role="dialog" aria-modal="true" aria-label="Administrator form">
+                    <div class="form-section"><span class="modal-title-text">NEW ADMINISTRATOR</span><span class="modal-close" role="button" tabindex="0" aria-label="Close" data-toggle-form="form-admin">&#10005;</span></div>
                     <div class="modal-body">
                         <div class="form-grid">
-                            <div class="form-row" data-key="id"><label class="form-label">Username</label><input class="form-input" type="text" placeholder="e.g. secops"></div>
+                            <div class="form-row" data-key="id"><label class="form-label">Username</label><input class="form-input" type="text" placeholder="e.g. secops" maxlength="64"></div>
                             <div class="form-row" data-key="profile"><label class="form-label">Profile</label><select class="form-input" id="admin-profile-select"></select></div>
                             <div class="form-row" data-key="enforce-change-password"><label class="form-label">Enforce Change Password</label><select class="form-input"><option value="enable" selected>Enabled</option><option value="disable">Disabled</option></select></div>
                             <div class="form-row" data-key="enforce-password-policy"><label class="form-label">Enforce Password Policy</label><select class="form-input"><option value="enable" selected>Enabled</option><option value="disable">Disabled</option></select></div>
-                            <div class="form-row admin-create-only"><label class="form-label">Password</label><input class="form-input" type="password" placeholder="Min 8 chars"></div>
-                            <div class="form-row admin-create-only"><label class="form-label">Confirm Password</label><input class="form-input" type="password" placeholder="Re-enter password"></div>
+                            <div class="form-row admin-create-only"><label class="form-label">Password</label><input class="form-input" type="password" placeholder="Min 8 chars" minlength="8" maxlength="256"></div>
+                            <div class="form-row admin-create-only"><label class="form-label">Confirm Password</label><input class="form-input" type="password" placeholder="Re-enter password" minlength="8" maxlength="256"></div>
                         </div>
                     </div>
                     <div class="modal-footer"><button class="btn btn-primary">Save</button><button class="btn" data-toggle-form="form-admin">Cancel</button></div>
@@ -720,13 +728,13 @@
                     <h1 class="page-title">ADMIN PROFILES</h1>
                     <button class="btn-create" data-toggle-form="form-profile"><span class="btn-create-plus">+</span> Create Profile <span class="btn-create-caret">&#9662;</span></button>
                 </div>
-                <div class="add-form form-card" id="form-profile">
-                    <div class="form-section"><span class="modal-title-text">NEW ADMIN PROFILE</span><span class="modal-close" data-toggle-form="form-profile">&#10005;</span></div>
+                <div class="add-form form-card" id="form-profile" role="dialog" aria-modal="true" aria-label="Admin profile form">
+                    <div class="form-section"><span class="modal-title-text">NEW ADMIN PROFILE</span><span class="modal-close" role="button" tabindex="0" aria-label="Close" data-toggle-form="form-profile">&#10005;</span></div>
                     <div class="modal-body">
                         <div class="form-grid">
-                            <div class="form-row" data-key="id"><label class="form-label">Profile Name</label><input class="form-input" type="text" placeholder="e.g. security_auditor"></div>
+                            <div class="form-row" data-key="id"><label class="form-label">Profile Name</label><input class="form-input" type="text" placeholder="e.g. security_auditor" maxlength="64"></div>
                             <div class="form-row form-row-full" data-key="permissions"><label class="form-label">Permissions</label><div class="checkbox-group"><label class="checkbox-pill"><input type="checkbox" value="monitor"> MONITOR</label><label class="checkbox-pill"><input type="checkbox" value="configure"> CONFIGURE</label><label class="checkbox-pill"><input type="checkbox" value="admin"> ADMIN</label></div></div>
-                            <div class="form-row form-row-full form-row-wide" data-key="description"><label class="form-label">Description</label><input class="form-input" type="text" placeholder="Optional description"></div>
+                            <div class="form-row form-row-full form-row-wide" data-key="description"><label class="form-label">Description</label><input class="form-input" type="text" placeholder="Optional description" maxlength="255"></div>
                         </div>
                     </div>
                     <div class="modal-footer"><button class="btn btn-primary">Save</button><button class="btn" data-toggle-form="form-profile">Cancel</button></div>
@@ -744,11 +752,11 @@
                 <div class="page-header"><h1 class="page-title">PASSWORD POLICY</h1></div>
                 <div class="form-card" data-settings="password-policy">
                     <div class="form-section">REQUIREMENTS</div>
-                    <div class="form-row" data-key="min-length"><label class="form-label">Minimum Length</label><input class="form-input" type="number" min="1" placeholder="8"></div>
-                    <div class="form-row" data-key="min-uppercase"><label class="form-label">Min Uppercase</label><input class="form-input" type="number" min="0" placeholder="0"></div>
-                    <div class="form-row" data-key="min-lowercase"><label class="form-label">Min Lowercase</label><input class="form-input" type="number" min="0" placeholder="0"></div>
-                    <div class="form-row" data-key="min-digit"><label class="form-label">Min Digits</label><input class="form-input" type="number" min="0" placeholder="0"></div>
-                    <div class="form-row" data-key="min-special"><label class="form-label">Min Special Chars</label><input class="form-input" type="number" min="0" placeholder="0"></div>
+                    <div class="form-row" data-key="min-length"><label class="form-label">Minimum Length</label><input class="form-input" type="number" min="1" max="128" placeholder="8"></div>
+                    <div class="form-row" data-key="min-uppercase"><label class="form-label">Min Uppercase</label><input class="form-input" type="number" min="0" max="128" placeholder="0"></div>
+                    <div class="form-row" data-key="min-lowercase"><label class="form-label">Min Lowercase</label><input class="form-input" type="number" min="0" max="128" placeholder="0"></div>
+                    <div class="form-row" data-key="min-digit"><label class="form-label">Min Digits</label><input class="form-input" type="number" min="0" max="128" placeholder="0"></div>
+                    <div class="form-row" data-key="min-special"><label class="form-label">Min Special Chars</label><input class="form-input" type="number" min="0" max="128" placeholder="0"></div>
                     <div class="form-actions"><button class="btn btn-primary">Apply</button><button class="btn">Reset</button></div>
                 </div>
             </div>
@@ -758,16 +766,16 @@
                 <div class="page-header"><h1 class="page-title">FIRMWARE</h1></div>
                 <div class="form-card">
                     <div class="form-section">CURRENT FIRMWARE</div>
-                    <div class="form-row"><label class="form-label">Version</label><span class="form-value">StargazerOS v0.1.3</span></div>
-                    <div class="form-row"><label class="form-label">Build</label><span class="form-value">build-20260310-arm64</span></div>
-                    <div class="form-row"><label class="form-label">Kernel</label><span class="form-value">6.6.22-stargazer</span></div>
-                    <div class="form-row"><label class="form-label">Installed</label><span class="form-value">2026-03-10 14:00 UTC</span></div>
+                    <div class="form-row"><label class="form-label">Version</label><span class="form-value">Unknown</span></div>
+                    <div class="form-row"><label class="form-label">Build</label><span class="form-value">Unknown</span></div>
+                    <div class="form-row"><label class="form-label">Kernel</label><span class="form-value">Unknown</span></div>
+                    <div class="form-row"><label class="form-label">Installed</label><span class="form-value">Unknown</span></div>
                     <div class="form-row"><label class="form-label">Boot Device</label><span class="form-value">eMMC (mmcblk0)</span></div>
                     <div class="form-section">UPGRADE</div>
-                    <div class="form-row"><label class="form-label">Upload File</label><label class="file-upload"><input type="file" accept=".itb" class="file-upload-input"><span class="file-upload-btn">Choose File</span><span class="file-upload-name">No file selected</span></label></div>
+                    <div class="form-row"><label class="form-label">Upload File</label><label class="file-upload"><input type="file" accept=".gz" class="file-upload-input"><span class="file-upload-btn">Choose File</span><span class="file-upload-name">No file selected</span></label></div>
                     <div class="form-actions"><button class="btn btn-primary">Install Firmware</button></div>
                     <div class="form-section">RECOVERY</div>
-                    <div class="form-row"><label class="form-label">NAND Recovery</label><span class="form-value">Available (v0.1.2)</span></div>
+                    <div class="form-row"><label class="form-label">NAND Recovery</label><span class="form-value">Unknown</span></div>
                     <div class="form-row"><label class="form-label">Boot to Recovery</label><button class="btn">Reboot to NAND</button></div>
                 </div>
             </div>
@@ -778,7 +786,7 @@
                     <h1 class="page-title">SESSIONS</h1>
                     <div class="widget-search"><input type="text" placeholder="Filter sessions..."></div>
                 </div>
-                <div style="margin-bottom:16px;color:#555;font-size:14px">Active: <strong>37</strong> / max: <strong>65536</strong>&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;TCP: <strong>28</strong>&nbsp;&nbsp;UDP: <strong>6</strong>&nbsp;&nbsp;ICMP: <strong>3</strong></div>
+                <div id="session-summary" style="margin-bottom:16px;color:#555;font-size:14px">Active: <strong>--</strong> / max: <strong>--</strong></div>
                 <table class="data-table">
                     <thead><tr><th>PROTO</th><th>SOURCE</th><th>DESTINATION</th><th>POLICY</th><th>DURATION</th><th>BYTES</th><th>STATE</th></tr></thead>
                     <tbody>
@@ -794,25 +802,25 @@
                     <div class="form-section">PING</div>
                     <div class="form-row">
                         <label class="form-label">Target</label>
-                        <input class="form-input" type="text" placeholder="IP or hostname">
+                        <input class="form-input" type="text" placeholder="IP or hostname" maxlength="253">
                         <button class="btn btn-primary" data-tool="ping" style="margin-left:12px">Ping</button>
                     </div>
                     <div class="form-section">TRACEROUTE</div>
                     <div class="form-row">
                         <label class="form-label">Target</label>
-                        <input class="form-input" type="text" placeholder="IP or hostname">
+                        <input class="form-input" type="text" placeholder="IP or hostname" maxlength="253">
                         <button class="btn btn-primary" data-tool="traceroute" style="margin-left:12px">Trace</button>
                     </div>
                     <div class="form-section">DNS LOOKUP</div>
                     <div class="form-row">
                         <label class="form-label">Hostname</label>
-                        <input class="form-input" type="text" placeholder="example.com">
+                        <input class="form-input" type="text" placeholder="example.com" maxlength="253">
                         <button class="btn btn-primary" data-tool="nslookup" style="margin-left:12px">Lookup</button>
                     </div>
                     <div class="form-section">ARP PING</div>
                     <div class="form-row">
                         <label class="form-label">Target IP</label>
-                        <input class="form-input" type="text" placeholder="192.168.1.1">
+                        <input class="form-input" type="text" placeholder="192.168.1.1" maxlength="15" pattern="[0-9.]+" title="e.g. 192.168.1.1">
                     </div>
                     <div class="form-row">
                         <label class="form-label">Interface</label>
@@ -820,7 +828,7 @@
                         <button class="btn btn-primary" data-tool="arping" style="margin-left:12px">Arping</button>
                     </div>
                 </div>
-                <div class="form-card" style="margin-top:20px">
+                <div class="form-card mt-24">
                     <div class="form-section">OUTPUT</div>
                     <div id="diag-output" style="font-family:'SFMono-Regular',Consolas,monospace;font-size:13px;padding:16px;background:#f5f6f8;border-radius:3px;min-height:120px;color:#666;white-space:pre-wrap">Select a tool and run it to see output here...</div>
                 </div>

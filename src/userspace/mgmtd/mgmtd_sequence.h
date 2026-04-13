@@ -18,6 +18,18 @@
 #include <stddef.h>
 
 /*
+ * Registry: which config types support sequence ordering.
+ * NULL-terminated array — add new orderable types here only.
+ */
+extern const char *SEQ_ORDERABLE_TYPES[];
+
+/*
+ * Check if a config type supports sequence ordering.
+ * Returns 1 if orderable, 0 otherwise.
+ */
+int seq_type_is_orderable(const char *type);
+
+/*
  * Auto-assign sequence = max(existing) + 1.
  * Appends "sequence=N\n" to data buffer if no "sequence=" key exists.
  * Returns 0 on success, -1 if buffer too small.
@@ -31,12 +43,17 @@ int seq_auto_assign(const char *type, char *data, size_t data_sz);
 int seq_has_collision(const char *type, int seq, const char *exclude_id);
 
 /*
- * Shift entries with sequence >= new_seq upward by 1.
- * Skips exclude_id.  Processes highest-first to avoid collision.
- * Only called when an actual collision exists.
- * Returns number of entries shifted.
+ * Rotate sequences in the affected range when moving an entry.
+ *
+ * Moving UP   (old_seq < new_seq): entries in (old_seq, new_seq] get -1
+ * Moving DOWN (old_seq > new_seq): entries in [new_seq, old_seq) get +1
+ *
+ * No-op when old_seq == new_seq.  Builtin entries are never moved.
+ * Processes entries in safe order to avoid intermediate collisions.
+ * Returns number of entries rotated.
  */
-int seq_shift(const char *type, int new_seq, const char *exclude_id);
+int seq_rotate(const char *type, int old_seq, int new_seq,
+	       const char *exclude_id);
 
 /*
  * Get highest sequence number for a type.

@@ -51,7 +51,8 @@ body {
     border: 1px solid rgba(100, 160, 240, 0.20);
     border-radius: 4px;
     padding: 56px 50px 44px;
-    width: 530px;
+    max-width: 530px;
+    width: 90vw;
     backdrop-filter: blur(12px);
     -webkit-backdrop-filter: blur(12px);
     box-shadow:
@@ -215,12 +216,12 @@ body {
             <div class="login-field">
                 <label>USERNAME</label>
                 <input type="text" id="login-user" name="username"
-                       placeholder="admin" autofocus required>
+                       placeholder="admin" autocomplete="username" autofocus required>
             </div>
             <div class="login-field">
                 <label>PASSWORD</label>
                 <input type="password" id="login-pass" name="password"
-                       placeholder="--------" required>
+                       placeholder="--------" autocomplete="current-password" required>
             </div>
             <button type="submit" class="login-btn">LOGIN</button>
         </form>

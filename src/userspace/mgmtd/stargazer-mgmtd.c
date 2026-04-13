@@ -1786,9 +1786,7 @@ static void mgmtd_reconcile_config(void)
 	 * monotonically increasing sequence numbers to firewall_policy
 	 * and network_nat entries that lack one. */
 	{
-		static const char *seq_types[] = {
-			"firewall_policy", "network_nat", NULL
-		};
+		const char **seq_types = SEQ_ORDERABLE_TYPES;
 		for (int t = 0; seq_types[t]; t++) {
 			char *list = sg_db_list(seq_types[t]);
 			if (!list)
@@ -4058,9 +4056,7 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		/* Auto-assign sequence for firewall/NAT on new entries.
 		 * Sequence = max(existing) + 1.  Must happen before
 		 * apply_config so the apply handler knows the position. */
-		if (is_new_entry &&
-		    (strcmp(db_type, "firewall_policy") == 0 ||
-		     strcmp(db_type, "network_nat") == 0)) {
+		if (is_new_entry && seq_type_is_orderable(db_type)) {
 			seq_auto_assign(db_type, clean, sizeof(clean));
 		}
 
@@ -4536,9 +4532,8 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		sg_db_parse_section(section, db_type, sizeof(db_type),
 				    db_id, sizeof(db_id));
 
-		/* Only firewall_policy and network_nat have sequences */
-		if (strcmp(db_type, "firewall_policy") != 0 &&
-		    strcmp(db_type, "network_nat") != 0) {
+		/* Only orderable types support sequence reordering */
+		if (!seq_type_is_orderable(db_type)) {
 			send_error(client_fd, SG_ERR_INVALID_ARG,
 				   "Type does not support sequence ordering");
 			return 0;
@@ -4592,7 +4587,7 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		char old_seq_str[VALBUFSZ];
 		extract_val(entry_data, "sequence", old_seq_str,
 			    sizeof(old_seq_str));
-		int old_seq = old_seq_str[0] ? atoi(old_seq_str) : 999999;
+		int old_seq = old_seq_str[0] ? atoi(old_seq_str) : 0;
 
 		/* No-op if sequence unchanged */
 		if (old_seq == new_seq) {
@@ -4603,9 +4598,8 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 
 		free(entry_data);
 
-		/* Step 1: Handle sequence collision in DB */
-		if (seq_has_collision(db_type, new_seq, db_id))
-			seq_shift(db_type, new_seq, db_id);
+		/* Step 1: Rotate sequences in affected range */
+		seq_rotate(db_type, old_seq, new_seq, db_id);
 
 		/* Step 2: Update sequence in DB */
 		{
