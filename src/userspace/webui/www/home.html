@@ -153,7 +153,7 @@
             <div class="topbar-user" id="topbar-user" tabindex="0" role="button" aria-haspopup="true" aria-expanded="false" aria-label="User menu">
                 <div class="user-avatar" aria-hidden="true">A</div>
                 <span class="user-name">admin</span>
-                <span style="color: #666; font-size: 10px;" aria-hidden="true">&#9662;</span>
+                <span class="user-caret" aria-hidden="true">&#9662;</span>
                 <div class="user-dropdown" id="user-dropdown" role="menu">
                     <div class="user-dropdown-header">
                         <strong>admin</strong>
@@ -455,7 +455,7 @@
                     <button class="btn-create" data-toggle-form="form-iface"><span class="btn-create-plus">+</span> Create New <span class="btn-create-caret">&#9662;</span></button>
                 </div>
                 <div class="add-form form-card" id="form-iface" role="dialog" aria-modal="true" aria-label="Interface form">
-                    <div class="form-section"><span class="modal-title-text">NEW INTERFACE</span><span class="modal-close" role="button" tabindex="0" aria-label="Close" data-toggle-form="form-iface">&#10005;</span></div>
+                    <div class="form-section"><span class="modal-title-text">NEW INTERFACE</span><button class="modal-close" type="button" aria-label="Close" data-toggle-form="form-iface">&#10005;</button></div>
                     <div class="modal-body">
                         <div class="form-grid">
                             <div class="form-row" data-key="name"><label class="form-label">Name</label><input class="form-input" type="text" placeholder="e.g. vlan300" maxlength="64"></div>
@@ -488,7 +488,7 @@
                     <button class="btn-create" data-toggle-form="form-dhcp"><span class="btn-create-plus">+</span> Create Pool <span class="btn-create-caret">&#9662;</span></button>
                 </div>
                 <div class="add-form form-card" id="form-dhcp" role="dialog" aria-modal="true" aria-label="DHCP pool form">
-                    <div class="form-section"><span class="modal-title-text">NEW DHCP POOL</span><span class="modal-close" role="button" tabindex="0" aria-label="Close" data-toggle-form="form-dhcp">&#10005;</span></div>
+                    <div class="form-section"><span class="modal-title-text">NEW DHCP POOL</span><button class="modal-close" type="button" aria-label="Close" data-toggle-form="form-dhcp">&#10005;</button></div>
                     <div class="modal-body">
                         <div class="form-grid">
                             <div class="form-row" data-key="name"><label class="form-label">Pool Name</label><input class="form-input" type="text" placeholder="e.g. SERVER-Pool" maxlength="64"></div>
@@ -497,8 +497,8 @@
                             <div class="form-row" data-key="end-ip"><label class="form-label">Range End</label><input class="form-input" type="text" placeholder="192.168.1.200" maxlength="15" pattern="[0-9.]+" title="e.g. 192.168.1.200"></div>
                             <div class="form-row" data-key="gateway"><label class="form-label">Gateway</label><input class="form-input" type="text" placeholder="192.168.1.1" maxlength="15" pattern="[0-9.]+" title="e.g. 192.168.1.1"></div>
                             <div class="form-row" data-key="netmask"><label class="form-label">Netmask</label><input class="form-input" type="text" placeholder="255.255.255.0" maxlength="15" pattern="[0-9.]+" title="e.g. 255.255.255.0"></div>
-                            <div class="form-row" data-key="dns"><label class="form-label">DNS Server 1</label><input class="form-input" type="text" placeholder="192.168.1.1" maxlength="15" pattern="[0-9.]+" title="e.g. 8.8.8.8"></div>
-                            <div class="form-row" data-key="domain"><label class="form-label">Domain</label><input class="form-input" type="text" placeholder="stargazer.local" maxlength="253"></div>
+                            <div class="form-row" data-key="dns-server"><label class="form-label">DNS Server 1</label><input class="form-input" type="text" placeholder="192.168.1.1" maxlength="15" pattern="[0-9.]+" title="e.g. 8.8.8.8"></div>
+                            <div class="form-row" data-key="domain-name"><label class="form-label">Domain</label><input class="form-input" type="text" placeholder="stargazer.local" maxlength="253"></div>
                             <div class="form-row" data-key="lease-time"><label class="form-label">Lease Time</label><input class="form-input" type="number" min="60" max="604800" value="86400"> <span class="form-suffix">seconds</span></div>
                             <div class="form-row" data-key="status"><label class="form-label">Status</label><select class="form-input"><option value="enable" selected>Enabled</option><option value="disable">Disabled</option></select></div>
                         </div>
@@ -535,7 +535,7 @@
                     <button class="btn-create" data-toggle-form="form-route"><span class="btn-create-plus">+</span> Add Route <span class="btn-create-caret">&#9662;</span></button>
                 </div>
                 <div class="add-form form-card" id="form-route" role="dialog" aria-modal="true" aria-label="Static route form">
-                    <div class="form-section"><span class="modal-title-text">NEW STATIC ROUTE</span><span class="modal-close" role="button" tabindex="0" aria-label="Close" data-toggle-form="form-route">&#10005;</span></div>
+                    <div class="form-section"><span class="modal-title-text">NEW STATIC ROUTE</span><button class="modal-close" type="button" aria-label="Close" data-toggle-form="form-route">&#10005;</button></div>
                     <div class="modal-body">
                         <div class="form-grid">
                             <div class="form-row" data-key="dst"><label class="form-label">Destination</label><input class="form-input" type="text" placeholder="10.0.0.0/24" maxlength="18" pattern="[0-9./]+" title="e.g. 10.0.0.0/24"></div>
@@ -563,7 +563,7 @@
                     <button class="btn-create" data-toggle-form="form-nat"><span class="btn-create-plus">+</span> Add Rule <span class="btn-create-caret">&#9662;</span></button>
                 </div>
                 <div class="add-form form-card" id="form-nat" role="dialog" aria-modal="true" aria-label="NAT rule form">
-                    <div class="form-section"><span class="modal-title-text">NEW NAT RULE</span><span class="modal-close" role="button" tabindex="0" aria-label="Close" data-toggle-form="form-nat">&#10005;</span></div>
+                    <div class="form-section"><span class="modal-title-text">NEW NAT RULE</span><button class="modal-close" type="button" aria-label="Close" data-toggle-form="form-nat">&#10005;</button></div>
                     <div class="modal-body">
                         <div class="form-grid">
                             <div class="form-row" data-key="sequence"><label class="form-label">Sequence</label><input class="form-input" type="number" min="0" max="9999" placeholder="Auto if empty"></div>
@@ -598,7 +598,7 @@
                     <button class="btn-create" data-toggle-form="form-policy"><span class="btn-create-plus">+</span> Create Policy <span class="btn-create-caret">&#9662;</span></button>
                 </div>
                 <div class="add-form form-card" id="form-policy" role="dialog" aria-modal="true" aria-label="Firewall policy form">
-                    <div class="form-section"><span class="modal-title-text">NEW FIREWALL POLICY</span><span class="modal-close" role="button" tabindex="0" aria-label="Close" data-toggle-form="form-policy">&#10005;</span></div>
+                    <div class="form-section"><span class="modal-title-text">NEW FIREWALL POLICY</span><button class="modal-close" type="button" aria-label="Close" data-toggle-form="form-policy">&#10005;</button></div>
                     <div class="modal-body">
                         <div class="form-grid">
                             <div class="form-row" data-key="name"><label class="form-label">Name</label><input class="form-input" type="text" placeholder="e.g. Allow-HTTPS-Out" maxlength="64"></div>
@@ -633,7 +633,7 @@
                     <button class="btn-create" data-toggle-form="form-address"><span class="btn-create-plus">+</span> Create Address <span class="btn-create-caret">&#9662;</span></button>
                 </div>
                 <div class="add-form form-card" id="form-address" role="dialog" aria-modal="true" aria-label="Address form">
-                    <div class="form-section"><span class="modal-title-text">NEW ADDRESS OBJECT</span><span class="modal-close" role="button" tabindex="0" aria-label="Close" data-toggle-form="form-address">&#10005;</span></div>
+                    <div class="form-section"><span class="modal-title-text">NEW ADDRESS OBJECT</span><button class="modal-close" type="button" aria-label="Close" data-toggle-form="form-address">&#10005;</button></div>
                     <div class="modal-body">
                         <div class="form-grid">
                             <div class="form-row" data-key="name"><label class="form-label">Name</label><input class="form-input" type="text" placeholder="e.g. DB_Servers" maxlength="64"></div>
@@ -659,7 +659,7 @@
                     <button class="btn-create" data-toggle-form="form-service"><span class="btn-create-plus">+</span> Create Service <span class="btn-create-caret">&#9662;</span></button>
                 </div>
                 <div class="add-form form-card" id="form-service" role="dialog" aria-modal="true" aria-label="Service form">
-                    <div class="form-section"><span class="modal-title-text">NEW SERVICE</span><span class="modal-close" role="button" tabindex="0" aria-label="Close" data-toggle-form="form-service">&#10005;</span></div>
+                    <div class="form-section"><span class="modal-title-text">NEW SERVICE</span><button class="modal-close" type="button" aria-label="Close" data-toggle-form="form-service">&#10005;</button></div>
                     <div class="modal-body">
                         <div class="form-grid">
                             <div class="form-row" data-key="name"><label class="form-label">Name</label><input class="form-input" type="text" placeholder="e.g. MySQL" maxlength="64"></div>
@@ -702,7 +702,7 @@
                     <button class="btn-create" data-toggle-form="form-admin"><span class="btn-create-plus">+</span> Create Admin <span class="btn-create-caret">&#9662;</span></button>
                 </div>
                 <div class="add-form form-card" id="form-admin" role="dialog" aria-modal="true" aria-label="Administrator form">
-                    <div class="form-section"><span class="modal-title-text">NEW ADMINISTRATOR</span><span class="modal-close" role="button" tabindex="0" aria-label="Close" data-toggle-form="form-admin">&#10005;</span></div>
+                    <div class="form-section"><span class="modal-title-text">NEW ADMINISTRATOR</span><button class="modal-close" type="button" aria-label="Close" data-toggle-form="form-admin">&#10005;</button></div>
                     <div class="modal-body">
                         <div class="form-grid">
                             <div class="form-row" data-key="id"><label class="form-label">Username</label><input class="form-input" type="text" placeholder="e.g. secops" maxlength="64"></div>
@@ -730,7 +730,7 @@
                     <button class="btn-create" data-toggle-form="form-profile"><span class="btn-create-plus">+</span> Create Profile <span class="btn-create-caret">&#9662;</span></button>
                 </div>
                 <div class="add-form form-card" id="form-profile" role="dialog" aria-modal="true" aria-label="Admin profile form">
-                    <div class="form-section"><span class="modal-title-text">NEW ADMIN PROFILE</span><span class="modal-close" role="button" tabindex="0" aria-label="Close" data-toggle-form="form-profile">&#10005;</span></div>
+                    <div class="form-section"><span class="modal-title-text">NEW ADMIN PROFILE</span><button class="modal-close" type="button" aria-label="Close" data-toggle-form="form-profile">&#10005;</button></div>
                     <div class="modal-body">
                         <div class="form-grid">
                             <div class="form-row" data-key="id"><label class="form-label">Profile Name</label><input class="form-input" type="text" placeholder="e.g. security_auditor" maxlength="64"></div>
@@ -767,16 +767,16 @@
                 <div class="page-header"><h1 class="page-title">FIRMWARE</h1></div>
                 <div class="form-card">
                     <div class="form-section">CURRENT FIRMWARE</div>
-                    <div class="form-row"><label class="form-label">Version</label><span class="form-value">Unknown</span></div>
-                    <div class="form-row"><label class="form-label">Build</label><span class="form-value">Unknown</span></div>
-                    <div class="form-row"><label class="form-label">Kernel</label><span class="form-value">Unknown</span></div>
-                    <div class="form-row"><label class="form-label">Installed</label><span class="form-value">Unknown</span></div>
+                    <div class="form-row"><label class="form-label">Version</label><span class="form-value" data-fw="version">Unknown</span></div>
+                    <div class="form-row"><label class="form-label">Build</label><span class="form-value" data-fw="build">Unknown</span></div>
+                    <div class="form-row"><label class="form-label">Kernel</label><span class="form-value" data-fw="kernel">Unknown</span></div>
+                    <div class="form-row"><label class="form-label">Installed</label><span class="form-value" data-fw="installed">Unknown</span></div>
                     <div class="form-row"><label class="form-label">Boot Device</label><span class="form-value">eMMC (mmcblk0)</span></div>
                     <div class="form-section">UPGRADE</div>
                     <div class="form-row"><label class="form-label">Upload File</label><label class="file-upload"><input type="file" accept=".gz" class="file-upload-input"><span class="file-upload-btn">Choose File</span><span class="file-upload-name">No file selected</span></label></div>
                     <div class="form-actions"><button class="btn btn-primary">Install Firmware</button></div>
                     <div class="form-section">RECOVERY</div>
-                    <div class="form-row"><label class="form-label">NAND Recovery</label><span class="form-value">Unknown</span></div>
+                    <div class="form-row"><label class="form-label">NAND Recovery</label><span class="form-value" data-fw="recovery">Unknown</span></div>
                     <div class="form-row"><label class="form-label">Boot to Recovery</label><button class="btn">Reboot to NAND</button></div>
                 </div>
             </div>
@@ -787,7 +787,7 @@
                     <h1 class="page-title">SESSIONS</h1>
                     <div class="widget-search"><input type="text" placeholder="Filter sessions..."></div>
                 </div>
-                <div id="session-summary" style="margin-bottom:16px;color:#555;font-size:14px">Active: <strong>--</strong> / max: <strong>--</strong></div>
+                <div id="session-summary" class="session-summary">Active: <strong>--</strong> / max: <strong>--</strong></div>
                 <table class="data-table">
                     <thead><tr><th>PROTO</th><th>SOURCE</th><th>DESTINATION</th><th>POLICY</th><th>DURATION</th><th>BYTES</th><th>STATE</th></tr></thead>
                     <tbody>
@@ -831,7 +831,7 @@
                 </div>
                 <div class="form-card mt-24">
                     <div class="form-section">OUTPUT</div>
-                    <div id="diag-output" style="font-family:'SFMono-Regular',Consolas,monospace;font-size:13px;padding:16px;background:#f5f6f8;border-radius:3px;min-height:120px;color:#666;white-space:pre-wrap">Select a tool and run it to see output here...</div>
+                    <div id="diag-output" class="diag-output">Select a tool and run it to see output here...</div>
                 </div>
             </div>
 

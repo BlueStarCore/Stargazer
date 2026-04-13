@@ -786,9 +786,9 @@
     }
 
     function renderResourceDetails() {
-        var ramP  = api('/system/resources/ram').then(function (d) { if (d) renderRamDetails(d); });
-        var diskP = api('/system/resources/disk').then(function (d) { if (d) renderDiskDetails(d); });
-        var procP = api('/system/resources/proctop').then(function (d) { if (d) renderProcTop(d); });
+        var ramP  = api('/system/resources/ram').then(function (d) { if (d) renderRamDetails(d); }).catch(function () {});
+        var diskP = api('/system/resources/disk').then(function (d) { if (d) renderDiskDetails(d); }).catch(function () {});
+        var procP = api('/system/resources/proctop').then(function (d) { if (d) renderProcTop(d); }).catch(function () {});
         return Promise.all([ramP, diskP, procP]);
     }
 
@@ -1261,7 +1261,8 @@
         tbody.innerHTML = '';
 
         if (sorted.length === 0) {
-            tbody.appendChild(buildEmptyRow(6));
+            var ifColCount = document.querySelectorAll('#iface-table thead th').length;
+            tbody.appendChild(buildEmptyRow(ifColCount || 6));
         } else {
             var frag = document.createDocumentFragment();
             for (var g = 0; g < groupOrder.length; g++) {
@@ -1954,16 +1955,23 @@
             overlay.appendChild(box);
             document.body.appendChild(overlay);
 
+            var escHandler = function (e) {
+                if (e.key === 'Escape') close(null);
+            };
             function close(value) {
+                document.removeEventListener('keydown', escHandler);
                 overlay.remove();
                 resolve(value);
             }
             ok.addEventListener('click', function () { close(input.value); });
             cancel.addEventListener('click', function () { close(null); });
+            overlay.addEventListener('click', function (e) {
+                if (e.target === overlay) close(null);
+            });
             input.addEventListener('keydown', function (e) {
                 if (e.key === 'Enter') close(input.value);
-                else if (e.key === 'Escape') close(null);
             });
+            document.addEventListener('keydown', escHandler);
             setTimeout(function () { input.focus(); }, 0);
         });
     }
@@ -2023,9 +2031,29 @@
             if (!field) return;
             promptInput('New value for ' + field.label, '').then(function (val) {
                 if (val === null) return;
+                var updatePromises = [];
                 forEachSelected(function (row) {
-                    var cell = row.cells[field.col + colOffset]; /* +1 checkbox, +1 drag handle if orderable */
+                    var cell = row.cells[field.col + colOffset];
                     if (cell) cell.textContent = val;
+                    var rowId = row.dataset.rowId;
+                    if (rowId) {
+                        var body = {};
+                        body[field.key] = val;
+                        updatePromises.push(
+                            api('/config/' + cfgType(selection.entity) + '/' + rowId, {
+                                method: 'PUT', body: body
+                            }).catch(function () { return { failed: true }; })
+                        );
+                    }
+                });
+                Promise.all(updatePromises).then(function (results) {
+                    var failed = results.filter(function (r) { return r && r.failed; }).length;
+                    if (failed > 0) {
+                        showToast(failed + ' update(s) failed', 'error');
+                        refreshPage(activePage);
+                    } else {
+                        showToast('Updated ' + results.length + ' entries', 'success');
+                    }
                 });
             });
         }
@@ -3919,9 +3947,15 @@
      * the cached API result returns the same data. */
     function populateSelectFrom(sel, entries, preserveValue) {
         if (!sel) return;
-        var preserved = preserveValue
-            ? sel.querySelector('option[value="' + preserveValue + '"]')
-            : null;
+        var preserved = null;
+        if (preserveValue) {
+            for (var pi = 0; pi < sel.options.length; pi++) {
+                if (sel.options[pi].value === preserveValue) {
+                    preserved = sel.options[pi];
+                    break;
+                }
+            }
+        }
         sel.innerHTML = '';
         if (preserved) sel.appendChild(preserved);
         entries.forEach(function (e) {
@@ -3980,12 +4014,11 @@
             if (!data) return;
             var page = document.getElementById('page-sys-firmware');
             if (!page) return;
-            var values = page.querySelectorAll('.form-value');
-            if (data.version && values[0]) values[0].textContent = data.version;
-            if (data.build && values[1]) values[1].textContent = data.build;
-            if (data.kernel && values[2]) values[2].textContent = data.kernel;
-            if (data.installed && values[3]) values[3].textContent = data.installed;
-            if (data.recovery && values[5]) values[5].textContent = data.recovery;
+            ['version', 'build', 'kernel', 'installed', 'recovery'].forEach(function (key) {
+                if (!data[key]) return;
+                var el = page.querySelector('[data-fw="' + key + '"]');
+                if (el) el.textContent = data[key];
+            });
         });
     }
 

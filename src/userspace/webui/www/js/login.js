@@ -556,22 +556,61 @@
             ? 'Your password does not meet the current security policy.'
             : 'An administrator requires you to change your password.';
 
-        container.innerHTML =
-            '<div class="login-title" style="font-size:16px;margin-bottom:12px">CHANGE PASSWORD</div>' +
-            '<p style="color:#aab;font-size:13px;margin-bottom:16px">' + reasonText + '</p>' +
-            '<div class="login-field">' +
-            '<input id="cp-new" type="password" placeholder="New Password" autocomplete="new-password">' +
-            '</div>' +
-            '<div class="login-field">' +
-            '<input id="cp-confirm" type="password" placeholder="Confirm Password" autocomplete="new-password">' +
-            '</div>' +
-            '<div id="cp-error" class="login-error" style="display:none"></div>' +
-            '<button id="cp-btn" class="login-btn" type="button">CHANGE PASSWORD</button>' +
-            '<div style="text-align:center;margin-top:16px">' +
-            '<a href="login.html" style="color:rgba(120,180,255,0.5);font-size:9px;text-decoration:none;letter-spacing:1px">BACK TO LOGIN</a></div>';
+        /* Build change-password form via DOM API (no innerHTML concat) */
+        container.innerHTML = '';
 
-        var cpBtn = document.getElementById('cp-btn');
-        var cpErr = document.getElementById('cp-error');
+        var title = document.createElement('div');
+        title.className = 'login-title';
+        title.style.cssText = 'font-size:16px;margin-bottom:12px';
+        title.textContent = 'CHANGE PASSWORD';
+        container.appendChild(title);
+
+        var desc = document.createElement('p');
+        desc.style.cssText = 'color:#aab;font-size:13px;margin-bottom:16px';
+        desc.textContent = reasonText;
+        container.appendChild(desc);
+
+        var newField = document.createElement('div');
+        newField.className = 'login-field';
+        var newInp = document.createElement('input');
+        newInp.id = 'cp-new';
+        newInp.type = 'password';
+        newInp.placeholder = 'New Password';
+        newInp.autocomplete = 'new-password';
+        newField.appendChild(newInp);
+        container.appendChild(newField);
+
+        var confirmField = document.createElement('div');
+        confirmField.className = 'login-field';
+        var confirmInp = document.createElement('input');
+        confirmInp.id = 'cp-confirm';
+        confirmInp.type = 'password';
+        confirmInp.placeholder = 'Confirm Password';
+        confirmInp.autocomplete = 'new-password';
+        confirmField.appendChild(confirmInp);
+        container.appendChild(confirmField);
+
+        var cpErr = document.createElement('div');
+        cpErr.id = 'cp-error';
+        cpErr.className = 'login-error';
+        cpErr.style.display = 'none';
+        container.appendChild(cpErr);
+
+        var cpBtn = document.createElement('button');
+        cpBtn.id = 'cp-btn';
+        cpBtn.className = 'login-btn';
+        cpBtn.type = 'button';
+        cpBtn.textContent = 'CHANGE PASSWORD';
+        container.appendChild(cpBtn);
+
+        var backDiv = document.createElement('div');
+        backDiv.style.cssText = 'text-align:center;margin-top:16px';
+        var backLink = document.createElement('a');
+        backLink.href = 'login.html';
+        backLink.style.cssText = 'color:rgba(120,180,255,0.5);font-size:9px;text-decoration:none;letter-spacing:1px';
+        backLink.textContent = 'BACK TO LOGIN';
+        backDiv.appendChild(backLink);
+        container.appendChild(backDiv);
 
         cpBtn.addEventListener('click', function () {
             var newPw = document.getElementById('cp-new').value;
