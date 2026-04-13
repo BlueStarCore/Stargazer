@@ -581,6 +581,8 @@ $(ROOTFS_DIR)/.stamp: modules busybox dash iptables logind mgmtd cli webd tools
 	@chmod +x $(ROOTFS_DIR)/sbin/stargazer-webd
 	@mkdir -p $(ROOTFS_DIR)/usr/share/stargazer/www
 	cp -r $(PROJECT_ROOT)/src/userspace/webui/www/* $(ROOTFS_DIR)/usr/share/stargazer/www/
+	@find $(ROOTFS_DIR)/usr/share/stargazer/www -type f \( -name '*.html' -o -name '*.js' \) \
+		-exec sed -i 's/@VERSION@/$(VERSION)/g' {} +
 
 	# Install tools (sg-partinit — first-boot partition creator)
 	cp $(BUILD_DIR)/tools/sg-partinit $(ROOTFS_DIR)/sbin/sg-partinit
@@ -997,6 +999,8 @@ test-build: modules busybox dash iptables logind mgmtd cli webd tools uboot
 	@chmod +x $(BUILD_DIR)/test/initramfs/sbin/stargazer-webd
 	@mkdir -p $(BUILD_DIR)/test/initramfs/usr/share/stargazer/www
 	cp -r $(PROJECT_ROOT)/src/userspace/webui/www/* $(BUILD_DIR)/test/initramfs/usr/share/stargazer/www/
+	@find $(BUILD_DIR)/test/initramfs/usr/share/stargazer/www -type f \( -name '*.html' -o -name '*.js' \) \
+		-exec sed -i 's/@VERSION@/$(VERSION)/g' {} +
 
 	# Install tools (sg-partinit — first-boot partition creator)
 	cp $(BUILD_DIR)/tools/sg-partinit $(BUILD_DIR)/test/initramfs/sbin/sg-partinit

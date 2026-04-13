@@ -25,6 +25,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 
 #include "mgmtd_internal.h"
@@ -183,6 +184,12 @@ int handle_upgrade_status(int client_fd, const char *user,
 				verbuf[0] ? verbuf : "unknown");
 	}
 #endif
+
+	/* Kernel version via uname() */
+	struct utsname uts;
+	if (uname(&uts) == 0)
+		off += snprintf(result + off, sizeof(result) - (size_t)off,
+				"  Kernel version: %s\n", uts.release);
 
 	/* Check for staged firmware */
 	FILE *mf = fopen("/tmp/sg-fw-staged/manifest.txt", "r");

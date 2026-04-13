@@ -773,8 +773,13 @@
                     <div class="form-row"><label class="form-label">Installed</label><span class="form-value" data-fw="installed">Unknown</span></div>
                     <div class="form-row"><label class="form-label">Boot Device</label><span class="form-value">eMMC (mmcblk0)</span></div>
                     <div class="form-section">UPGRADE</div>
-                    <div class="form-row"><label class="form-label">Upload File</label><label class="file-upload"><input type="file" accept=".gz" class="file-upload-input"><span class="file-upload-btn">Choose File</span><span class="file-upload-name">No file selected</span></label></div>
-                    <div class="form-actions"><button class="btn btn-primary">Install Firmware</button></div>
+                    <div class="form-row form-row-disabled"><label class="form-label">Upload File</label><label class="file-upload"><input type="file" accept=".gz" class="file-upload-input" disabled><span class="file-upload-btn">Choose File</span><span class="file-upload-name">No file selected</span></label></div>
+                    <div class="form-actions"><button class="btn btn-primary" disabled title="Firmware upload not yet available — use CLI for firmware upgrade">Install Firmware</button></div>
+                    <div class="form-section">SYSTEM</div>
+                    <div class="form-row">
+                        <label class="form-label">Restart Device</label>
+                        <button class="btn btn-danger" id="btn-reboot">Reboot</button>
+                    </div>
                 </div>
             </div>
 

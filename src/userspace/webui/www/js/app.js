@@ -3727,6 +3727,30 @@
         });
     }
 
+    /* ================================================================
+     *  REBOOT — restart the device via POST /api/system/reboot
+     * ================================================================ */
+    var rebootBtn = document.getElementById('btn-reboot');
+    if (rebootBtn) {
+        rebootBtn.addEventListener('click', function () {
+            confirmAction(
+                'This will restart the device. All active sessions will be dropped. Continue?'
+            ).then(function (ok) {
+                if (!ok) return;
+                rebootBtn.disabled = true;
+                rebootBtn.textContent = 'Rebooting...';
+                api('/system/reboot', { method: 'POST', body: {} })
+                    .then(function () {
+                        showToast('Device is rebooting — you will be disconnected', 'info');
+                    })
+                    .catch(function (err) {
+                        showToast(err.message || 'Reboot failed', 'error');
+                        rebootBtn.disabled = false;
+                        rebootBtn.textContent = 'Reboot';
+                    });
+            });
+        });
+    }
 
     /* ================================================================
      *  PAGE-LOAD DATA FETCHING

@@ -935,6 +935,7 @@ static void flow_config_update(work_item_t *item)
 /* ── Shared resource data collector ───────────────────────────────── */
 
 typedef struct {
+	int  cpu_pct;
 	int  mem_pct;
 	unsigned long mem_used_mb, mem_total_mb;
 	int  disk_pct;
@@ -1007,6 +1008,24 @@ static void fetch_resources(work_item_t *item, sys_resources_t *r)
 			char *nl = strchr(r->load_avg, '\n');
 			if (nl) *nl = '\0';
 		}
+
+		/* Compute cpu_pct from aggregate "cpu " jiffie line.
+		 * Format: cpu  user nice system idle iowait irq softirq steal
+		 * Since-boot average — not per-interval, but non-zero and
+		 * directionally correct for a dashboard overview. */
+		const char *cpuline = cpu_resp.payload;
+		if (strncmp(cpuline, "cpu ", 4) == 0 ||
+		    (cpuline = strstr(cpu_resp.payload, "\ncpu ")) != NULL) {
+			if (*cpuline == '\n') cpuline++;
+			unsigned long cu = 0, cn = 0, cs = 0, ci = 0,
+				     cw = 0, cq = 0, csi = 0, cst = 0;
+			sscanf(cpuline + 4, "%lu %lu %lu %lu %lu %lu %lu %lu",
+			       &cu, &cn, &cs, &ci, &cw, &cq, &csi, &cst);
+			unsigned long total = cu+cn+cs+ci+cw+cq+csi+cst;
+			unsigned long busy = total - ci - cw;
+			r->cpu_pct = total > 0
+				? (int)(busy * 100 / total) : 0;
+		}
 	}
 
 	if (cpu_ok) webd_ipc_resp_free(&cpu_resp);
@@ -1022,7 +1041,7 @@ static void flow_resources(work_item_t *item)
 	char *json = malloc(512);
 	if (json)
 		snprintf(json, 512,
-			 "{\"cpu_pct\":0,"
+			 "{\"cpu_pct\":%d,"
 			 "\"mem_pct\":%d,"
 			 "\"mem_used_mb\":%lu,"
 			 "\"mem_total_mb\":%lu,"
@@ -1033,6 +1052,7 @@ static void flow_resources(work_item_t *item)
 			 "\"sessions_max\":65536,"
 			 "\"cpu_cores\":%d,"
 			 "\"cpu_mhz\":%d}",
+			 r.cpu_pct,
 			 r.mem_pct, r.mem_used_mb, r.mem_total_mb,
 			 r.disk_pct, r.disk_used_mb, r.disk_total_mb,
 			 session_count(),
@@ -1051,7 +1071,7 @@ static void flow_resources_detail(work_item_t *item)
 	if (json)
 		snprintf(json, 512,
 			 "{\"temp_c\":%d,"
-			 "\"cpu_pct\":0,"
+			 "\"cpu_pct\":%d,"
 			 "\"load_avg\":\"%s\","
 			 "\"mem_pct\":%d,"
 			 "\"mem_used_mb\":%lu,"
@@ -1059,7 +1079,8 @@ static void flow_resources_detail(work_item_t *item)
 			 "\"disk_pct\":%d,"
 			 "\"disk_used_mb\":%lu,"
 			 "\"disk_total_mb\":%lu}",
-			 r.temp_c, ela ? ela : "0 0 0",
+			 r.temp_c, r.cpu_pct,
+			 ela ? ela : "0 0 0",
 			 r.mem_pct, r.mem_used_mb, r.mem_total_mb,
 			 r.disk_pct, r.disk_used_mb, r.disk_total_mb);
 	free(ela);
@@ -1367,7 +1388,7 @@ static void flow_firmware_info(work_item_t *item)
 	if (json)
 		snprintf(json, 512,
 			 "{\"version\":\"%s\",\"build\":\"arm64\","
-			 "\"kernel\":\"%s\",\"status\":\"idle\"}",
+			 "\"kernel\":\"%s\",\"installed\":\"N/A\"}",
 			 esc_ver ? esc_ver : version,
 			 esc_ker ? esc_ker : "");
 	free(esc_ver);

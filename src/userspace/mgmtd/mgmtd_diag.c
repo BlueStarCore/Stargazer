@@ -172,6 +172,47 @@ int handle_diag_cpu(int client_fd, const char *user,
 		}
 	}
 
+	/* Parse /proc/cpuinfo — single pass for core count + MHz */
+	int cores = 0;
+	int mhz_val = 0;
+	char cpuinfo[8192];
+	if (read_small_file("/proc/cpuinfo", cpuinfo, sizeof(cpuinfo)) > 0) {
+		char *line = cpuinfo;
+		while (*line) {
+			char *nl = strchr(line, '\n');
+			if (!nl) nl = line + strlen(line);
+
+			if (strncmp(line, "processor", 9) == 0)
+				cores++;
+			else if (mhz_val == 0 &&
+				 (strncmp(line, "cpu MHz", 7) == 0 ||
+				  strncmp(line, "BogoMIPS", 8) == 0)) {
+				const char *colon = memchr(line, ':',
+							   (size_t)(nl - line));
+				if (colon)
+					mhz_val = (int)strtol(colon + 1, NULL, 10);
+			}
+
+			line = *nl ? nl + 1 : nl;
+		}
+	}
+	buf_appendf(resp, sizeof(resp), &pos,
+		    "cpu_cores=%d\n", cores > 0 ? cores : 1);
+	buf_appendf(resp, sizeof(resp), &pos,
+		    "cpu_mhz=%d\n", mhz_val);
+
+	/* Load average from /proc/loadavg (first 3 fields: 1m 5m 15m) */
+	char lavg[128];
+	if (read_small_file("/proc/loadavg", lavg, sizeof(lavg)) > 0) {
+		char *nl2 = strchr(lavg, '\n');
+		if (nl2) *nl2 = '\0';
+		int spaces = 0;
+		for (char *c = lavg; *c; c++) {
+			if (*c == ' ' && ++spaces == 3) { *c = '\0'; break; }
+		}
+		buf_appendf(resp, sizeof(resp), &pos, "loadavg=%s\n", lavg);
+	}
+
 	send_ok(client_fd, NULL, pos > 0 ? resp : NULL);
 	return 0;
 }
