@@ -44,7 +44,6 @@ extern void sess_update(struct session *s, struct sk_buff *skb, int dir);
 static atomic64_t pkts_forwarded = ATOMIC64_INIT(0);
 static atomic64_t pkts_dropped   = ATOMIC64_INIT(0);
 static atomic64_t sess_tracked   = ATOMIC64_INIT(0);
-static atomic64_t sess_created   = ATOMIC64_INIT(0);
 
 /**
  * is_valid_ipv4 - Validate IPv4 packet header
@@ -109,9 +108,6 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 			dir = 0; /* Default forward direction */
 			sess_update(s, skb, dir);
 			atomic64_inc(&sess_tracked);
-			if (atomic64_read(&s->stats.pkts_fwd) == 1 &&
-			    atomic64_read(&s->stats.pkts_bwd) == 0)
-				atomic64_inc(&sess_created);
 		}
 	}
 
@@ -152,11 +148,10 @@ static int __init pkt_forward_init(void)
 static void __exit pkt_forward_exit(void)
 {
 	nf_unregister_net_hook(&init_net, &nf_forward_ops);
-	pr_info("pkt_forward: unloaded (fwd=%lld drop=%lld sess=%lld created=%lld)\n",
+	pr_info("pkt_forward: unloaded (fwd=%lld drop=%lld sess=%lld)\n",
 		atomic64_read(&pkts_forwarded),
 		atomic64_read(&pkts_dropped),
-		atomic64_read(&sess_tracked),
-		atomic64_read(&sess_created));
+		atomic64_read(&sess_tracked));
 }
 
 module_init(pkt_forward_init);
