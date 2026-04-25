@@ -9,7 +9,8 @@
   ## Core Architecture (summary)
   - **Kernel data-plane**: `pkt_forward.ko` (Netfilter `NF_INET_FORWARD`).
     - Accept valid IPv4, drop invalid, atomic counters.
-  - **Session tracking**: `session.c` exists (RCU hash), **not wired yet**.
+    - Session tracking via RCU hash (5-tuple keys, per-flow stats).
+  - **Session tracking**: `session.c` — loaded, wired into pkt_forward.
   - **Planned**: IPS + ML scoring (userspace daemon), feed score via netlink/ioctl.
 
   ## Target & Build
@@ -48,11 +49,11 @@
   - `src/userspace/etc/init.d/stargazer` — loads modules + sysctl at boot.
 
   ## Repo highlights
-  - `src/modules/pkt_forward.c` — active data-plane hook.
-  - `src/modules/session.c` — session table (RCU), not wired.
-  - `src/userspace/cli/cli_readline.c` — zero-fork readline with abbreviation resolution.
-  - `src/userspace/cli/cli_configure.c` — interactive config contexts (table/entry/single).
-  - `src/userspace/mgmtd/sg_db.c` — SQLite config backend.
+  - `src/modules/pkt_forward.c` — active data-plane hook + session tracking
+  - `src/modules/session.c` — session table (RCU), wired into pkt_forward
+  - `src/userspace/cli/cli_readline.c` — zero-fork readline with abbreviation resolution
+  - `src/userspace/cli/cli_configure.c` — interactive config contexts (table/entry/single)
+  - `src/userspace/mgmtd/sg_db.c` — SQLite config backend
 
   ## Constraints
   - The mindset is, the firewall is always in dangerous position and can be hacked at anytime in any ways. Making the system honest, tests that verify real behavior, errors that say what's actually wrong, outputs that show actual data, and a build that doesn't silently break, A buffer is alway checked,
@@ -66,7 +67,6 @@
   - Do not add `Co-Authored-By` lines.
 
   ## Next (if continuing)
-  - Wire `session.c` into `pkt_forward.c`.
   - Add procfs/netlink export for sessions.
   - IPS module + ML daemon integration.
 
