@@ -8,8 +8,7 @@
  * packets traversing the router. All valid IPv4 packets are accepted;
  * malformed packets are dropped and counted.
  *
- * Future phases:
- *   - Phase 2: Session tracking integration
+ * Session tracking: Uses session.c RCU hash table for 5-tuple tracking.
  *   - Phase 3: IPS signature matching
  *   - Phase 4: ML-based threat detection
  */
@@ -19,6 +18,23 @@
 #include <linux/netfilter_ipv4.h>
 #include <linux/ip.h>
 #include <linux/skbuff.h>
+#include <linux/if_ether.h>
+#include <net/ip.h>
+
+/* Session tracking API (exported by session.ko) */
+struct sess_key {
+	__be32	src_ip;
+	__be32	dst_ip;
+	__be16	src_port;
+	__be16	dst_port;
+	u8	proto;
+} __packed;
+
+struct session;
+
+extern int extract_key(struct sk_buff *skb, struct sess_key *key);
+extern struct session *sess_get_or_create(const struct sess_key *key);
+extern void sess_update(struct session *s, struct sk_buff *skb, int dir);
 
 #ifndef PKT_FWD_VERSION
 #define PKT_FWD_VERSION "unknown"
@@ -27,6 +43,8 @@
 /* Statistics counters (atomic for SMP safety) */
 static atomic64_t pkts_forwarded = ATOMIC64_INIT(0);
 static atomic64_t pkts_dropped   = ATOMIC64_INIT(0);
+static atomic64_t sess_tracked   = ATOMIC64_INIT(0);
+static atomic64_t sess_created   = ATOMIC64_INIT(0);
 
 /**
  * is_valid_ipv4 - Validate IPv4 packet header
@@ -60,7 +78,7 @@ static bool is_valid_ipv4(struct sk_buff *skb)
  * @state: hook state containing in/out interfaces
  *
  * Called for every packet being forwarded between interfaces.
- * Validates packet and updates statistics.
+ * Validates packet, tracks sessions, and updates statistics.
  *
  * Return: NF_ACCEPT to forward, NF_DROP to discard
  */
@@ -68,6 +86,9 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 				 const struct nf_hook_state *state)
 {
 	struct iphdr *iph;
+	struct sess_key key;
+	struct session *s;
+	int dir = 0; /* 0 = forward (client->server), 1 = backward */
 
 	if (!is_valid_ipv4(skb)) {
 		atomic64_inc(&pkts_dropped);
@@ -75,6 +96,24 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 	}
 
 	iph = ip_hdr(skb);
+
+	/* Extract 5-tuple session key */
+	if (extract_key(skb, &key) == 0) {
+		/* Lookup or create session */
+		s = sess_get_or_create(&key);
+		if (s) {
+			/* Determine packet direction based on interface
+			 * If incoming interface is LAN/WAN relative to session
+			 * first-seen direction, classify accordingly.
+			 */
+			dir = 0; /* Default forward direction */
+			sess_update(s, skb, dir);
+			atomic64_inc(&sess_tracked);
+			if (atomic64_read(&s->stats.pkts_fwd) == 1 &&
+			    atomic64_read(&s->stats.pkts_bwd) == 0)
+				atomic64_inc(&sess_created);
+		}
+	}
 
 	/* Rate-limited logging for debugging */
 	if (net_ratelimit()) {
@@ -113,9 +152,11 @@ static int __init pkt_forward_init(void)
 static void __exit pkt_forward_exit(void)
 {
 	nf_unregister_net_hook(&init_net, &nf_forward_ops);
-	pr_info("pkt_forward: unloaded (fwd=%lld drop=%lld)\n",
+	pr_info("pkt_forward: unloaded (fwd=%lld drop=%lld sess=%lld created=%lld)\n",
 		atomic64_read(&pkts_forwarded),
-		atomic64_read(&pkts_dropped));
+		atomic64_read(&pkts_dropped),
+		atomic64_read(&sess_tracked),
+		atomic64_read(&sess_created));
 }
 
 module_init(pkt_forward_init);
