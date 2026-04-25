@@ -43,8 +43,8 @@ IMG_FILE       := $(BUILD_DIR)/stargazer-bpi-r4-EMMC-$(VERSION).img
 MODULE_NAME    := pkt_forward
 
 # BusyBox settings
-BUSYBOX_REPO   := https://git.busybox.net/busybox
-BUSYBOX_TAG    := 1_36_1
+BUSYBOX_REPO   := https://github.com/mirror/busybox.git
+BUSYBOX_TAG    := 1_36_stable
 BUSYBOX_CACHE_DIR := $(PROJECT_ROOT)/.cache
 BUSYBOX_DIR    := $(BUSYBOX_CACHE_DIR)/busybox-src
 BUSYBOX_BIN    := $(BUILD_DIR)/busybox/busybox
