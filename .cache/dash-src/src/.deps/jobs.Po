@@ -1,0 +1,110 @@
+jobs.o: jobs.c \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/stdc-predef.h \
+ ../config.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/fcntl.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/features.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/bits/alltypes.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/bits/fcntl.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/signal.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/bits/signal.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/unistd.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/bits/posix.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/stdlib.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/alloca.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/paths.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/sys/types.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/endian.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/sys/select.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/sys/param.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/sys/resource.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/sys/time.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/bits/resource.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/limits.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/bits/limits.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/sys/wait.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/sys/ioctl.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/bits/ioctl.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/bits/ioctl_fix.h \
+ shell.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/termios.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/bits/termios.h \
+ exec.h eval.h init.h redir.h show.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/stdarg.h \
+ main.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/errno.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/bits/errno.h \
+ parser.h token.h nodes.h jobs.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/inttypes.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/stdint.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/bits/stdint.h \
+ options.h trap.h syntax.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/ctype.h \
+ input.h output.h memalloc.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/stddef.h \
+ error.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/setjmp.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/bits/setjmp.h \
+ mystring.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/string.h \
+ /home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/strings.h \
+ system.h
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/stdc-predef.h:
+../config.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/fcntl.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/features.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/bits/alltypes.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/bits/fcntl.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/signal.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/bits/signal.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/unistd.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/bits/posix.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/stdlib.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/alloca.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/paths.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/sys/types.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/endian.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/sys/select.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/sys/param.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/sys/resource.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/sys/time.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/bits/resource.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/limits.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/bits/limits.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/sys/wait.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/sys/ioctl.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/bits/ioctl.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/bits/ioctl_fix.h:
+shell.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/termios.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/bits/termios.h:
+exec.h:
+eval.h:
+init.h:
+redir.h:
+show.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/stdarg.h:
+main.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/errno.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/bits/errno.h:
+parser.h:
+token.h:
+nodes.h:
+jobs.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/inttypes.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/stdint.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/bits/stdint.h:
+options.h:
+trap.h:
+syntax.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/ctype.h:
+input.h:
+output.h:
+memalloc.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/stddef.h:
+error.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/setjmp.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/bits/setjmp.h:
+mystring.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/string.h:
+/home/rusted/projects/Stargazer/.cache/aarch64-linux-musl-cross/aarch64-linux-musl/include/strings.h:
+system.h:

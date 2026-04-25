@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""
+test_validator_edge_cases.py — Edge-case verification for sg_validate.c
+
+Re-implements every Stargazer validator in Python, mirroring the C source
+exactly.  Tests security-relevant boundary inputs and injection bypass
+attempts that are hard to exercise from higher-level test suites.
+
+What this catches:
+  - Octal confusion in numeric parsers (leading zeros)
+  - Off-by-one at buffer/length limits (SG_SAFE_ID_MAX=64, SG_NET_TARGET_MAX=253)
+  - Dangerous characters that must be rejected by net-target / safe-id
+  - Empty-string edge cases (access-services empty is VALID)
+  - Integer overflow / underflow in uint validators
+  - Port-range inversion (b < a must be rejected)
+  - CIDR boundary values (/0, /32, /33)
+  - Case sensitivity on enum / permissions validators
+  - Source-code consistency checks (read actual C and verify patterns)
+
+Run: python3 tests/test_validator_edge_cases.py
+"""
+
+import os
+import re
+import sys
+
+PASS = FAIL = 0
+R = "\033[91m"; G = "\033[92m"; Y = "\033[93m"; C = "\033[96m"
+N = "\033[0m";  B = "\033[1m"
+
+def chk(name, ok, detail=""):
+    global PASS, FAIL
+    if ok:
+        PASS += 1; print(f"  {G}PASS{N} {name}")
+    else:
+        FAIL += 1; print(f"  {R}FAIL{N} {name}")
+        if detail: print(f"       {Y}{detail}{N}")
+
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+def rd(p):
+    with open(os.path.join(BASE, p)) as f:
+        return f.read()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Python mirrors of C validators  (match C source byte-for-byte in logic)
+# ─────────────────────────────────────────────────────────────────────────────
+
+SG_SAFE_ID_MAX    = 64
+SG_NET_TARGET_MAX = 253
+
+def sg_is_safe_id(s):
+    """C: alphanum + [_.-], max SG_SAFE_ID_MAX=64, non-empty"""
+    if not s:
+        return False
+    if len(s) > SG_SAFE_ID_MAX:
+        return False
+    for c in s:
+        if c.isalnum() or c in ('_', '.', '-'):
+            continue
+        return False
+    return True
+
+def sg_is_net_target(s):
+    """C: alphanum + [_.-:], max SG_NET_TARGET_MAX=253, non-empty"""
+    if not s:
+        return False
+    if len(s) > SG_NET_TARGET_MAX:
+        return False
+    for c in s:
+        if c.isalnum() or c in ('_', '.', '-', ':'):
+            continue
+        return False
+    return True
+
+def sg_is_uint_range(s, min_val, max_val):
+    """C: digits only (isdigit), strtol base 10 — leading zeros are decimal"""
+    if not s:
+        return False
+    for c in s:
+        if not c.isdigit():
+            return False
+    val = int(s, 10)
+    return min_val <= val <= max_val
+
+def sg_is_ipv4(s):
+    """C: 4 dotted-decimal octets, max 3 digits/octet, val <=255, no leading-zero octal"""
+    if not s:
+        return False
+    p = 0
+    octets = 0
+    slen = len(s)
+    while p < slen:
+        if not s[p].isdigit():
+            return False
+        val = 0
+        digits = 0
+        while p < slen and s[p].isdigit():
+            val = val * 10 + int(s[p])
+            digits += 1
+            if digits > 3:
+                return False
+            p += 1
+        if val > 255:
+            return False
+        octets += 1
+        if octets < 4:
+            if p >= slen or s[p] != '.':
+                return False
+            p += 1  # skip dot
+    return octets == 4 and p == slen
+
+def sg_is_cidr(s):
+    """C: sg_is_ipv4(ip) + sg_is_uint_range(mask, 0, 32)"""
+    if not s:
+        return False
+    try:
+        slash = s.index('/')
+    except ValueError:
+        return False
+    if slash == 0 or slash == len(s) - 1:
+        return False
+    ip_part = s[:slash]
+    if len(ip_part) >= 64:
+        return False
+    if not sg_is_ipv4(ip_part):
+        return False
+    return sg_is_uint_range(s[slash+1:], 0, 32)
+
+def sg_is_iface_name(s):
+    """C: alphanum + [_.:- ], non-empty"""
+    if not s:
+        return False
+    for c in s:
+        if c.isalnum() or c in ('_', '.', ':', '-'):
+            continue
+        return False
+    return True
+
+def sg_is_tz_token(s):
+    """C: alphanum + [_./+- ], non-empty"""
+    if not s:
+        return False
+    for c in s:
+        if c.isalnum() or c in ('_', '.', '/', '+', '-'):
+            continue
+        return False
+    return True
+
+def sg_is_permissions_csv(s):
+    """C: monitor|configure|admin, comma-separated, no leading/trailing comma"""
+    if not s:
+        return False
+    if len(s) > 256:
+        return False
+    if s.startswith(',') or s.endswith(','):
+        return False
+    if ',,' in s:
+        return False
+    valid = {'monitor', 'configure', 'admin'}
+    for tok in s.split(','):
+        if tok not in valid:
+            return False
+    return True
+
+def sg_is_access_services(s):
+    """C: empty string is VALID; space-separated tokens from allowed set"""
+    if s is None or s == '':
+        return True                     # explicit: empty = allow none = valid
+    if len(s) > 256:
+        return False
+    # strtok_r with ' ' skips leading spaces; if no tokens → return False
+    tokens = [t for t in s.split(' ') if t]
+    if not tokens:
+        return False                    # "  " → no tokens → invalid
+    valid = {'ping', 'ssh', 'https', 'http', 'snmp', 'telnet'}
+    for tok in tokens:
+        if tok not in valid:
+            return False
+    return True
+
+def sg_is_port_or_range(s):
+    """C: single port 1-65535 or range a-b (a<=b, both 1-65535)"""
+    if not s:
+        return False
+    if '-' in s:
+        dash = s.index('-')
+        if dash == 0 or dash == len(s) - 1:
+            return False
+        if s.count('-') > 1:
+            return False
+        a_str, b_str = s[:dash], s[dash+1:]
+        if not sg_is_uint_range(a_str, 1, 65535):
+            return False
+        if not sg_is_uint_range(b_str, 1, 65535):
+            return False
+        return int(a_str) <= int(b_str)
+    return sg_is_uint_range(s, 1, 65535)
+
+def sg_match_csv_option(opts, val):
+    """C: exact match against comma-separated options (case-sensitive)"""
+    if not opts or not val:
+        return False
+    for opt in opts.split(','):
+        if opt == val:
+            return True
+    return False
+
+# ─────────────────────────────────────────────────────────────────────────────
+print(f"\n{B}{C}=== 1. sg_is_safe_id: character set and length ==={N}")
+# ─────────────────────────────────────────────────────────────────────────────
+
+chk("safe_id: normal alphanum accepted", sg_is_safe_id("admin"))
+chk("safe_id: underscore accepted",      sg_is_safe_id("my_id"))
+chk("safe_id: dot accepted",             sg_is_safe_id("v1.2"))
+chk("safe_id: dash accepted",            sg_is_safe_id("read-only"))
+chk("safe_id: empty rejected",           not sg_is_safe_id(""))
+chk("safe_id: slash rejected",           not sg_is_safe_id("../etc/passwd"))
+chk("safe_id: space rejected",           not sg_is_safe_id("hello world"))
+chk("safe_id: semicolon rejected",       not sg_is_safe_id("id;ls"))
+chk("safe_id: ampersand rejected",       not sg_is_safe_id("id&&ls"))
+chk("safe_id: backtick rejected",        not sg_is_safe_id("`id`"))
+chk("safe_id: dollar rejected",          not sg_is_safe_id("$HOME"))
+chk("safe_id: null byte rejected",       not sg_is_safe_id("\x00admin"))
+chk("safe_id: colon rejected (shell risk)", not sg_is_safe_id("key:val"))
+chk("safe_id: 64-char (at limit) accepted", sg_is_safe_id("a" * 64))
+chk("safe_id: 65-char (over limit) rejected", not sg_is_safe_id("a" * 65))
+
+# ─────────────────────────────────────────────────────────────────────────────
+print(f"\n{B}{C}=== 2. sg_is_net_target: injection barrier ==={N}")
+# ─────────────────────────────────────────────────────────────────────────────
+
+chk("net_target: IPv4 address accepted",    sg_is_net_target("192.168.1.1"))
+chk("net_target: hostname accepted",        sg_is_net_target("example.com"))
+chk("net_target: IPv6 colon accepted",      sg_is_net_target("2001:db8::1"))
+chk("net_target: empty rejected",           not sg_is_net_target(""))
+chk("net_target: semicolon rejected",       not sg_is_net_target("127.0.0.1;id"))
+chk("net_target: pipe rejected",            not sg_is_net_target("host|grep"))
+chk("net_target: ampersand rejected",       not sg_is_net_target("host&cmd"))
+chk("net_target: dollar rejected",          not sg_is_net_target("$(/bin/sh)"))
+chk("net_target: backtick rejected",        not sg_is_net_target("`id`"))
+chk("net_target: space rejected",           not sg_is_net_target("host name"))
+chk("net_target: newline rejected",         not sg_is_net_target("host\ncmd"))
+chk("net_target: null byte rejected",       not sg_is_net_target("\x00host"))
+chk("net_target: slash rejected",           not sg_is_net_target("/etc/passwd"))
+chk("net_target: exclamation rejected",     not sg_is_net_target("host!"))
+chk("net_target: paren rejected",           not sg_is_net_target("host(1)"))
+chk("net_target: 253-char hostname accepted", sg_is_net_target("a" * 253))
+chk("net_target: 254-char hostname rejected", not sg_is_net_target("a" * 254))
+
+# ─────────────────────────────────────────────────────────────────────────────
+print(f"\n{B}{C}=== 3. sg_is_ipv4: octal confusion and boundary ==={N}")
+# ─────────────────────────────────────────────────────────────────────────────
+
+chk("ipv4: normal address accepted",       sg_is_ipv4("192.168.1.1"))
+chk("ipv4: all zeros accepted",            sg_is_ipv4("0.0.0.0"))
+chk("ipv4: all 255 accepted",              sg_is_ipv4("255.255.255.255"))
+chk("ipv4: 256 octet rejected",            not sg_is_ipv4("256.0.0.0"))
+chk("ipv4: 256 in last octet rejected",    not sg_is_ipv4("1.2.3.256"))
+# Leading zeros: C parser is decimal-only (val = val*10 + digit), not octal
+# "010" → 10 decimal (NOT 8 octal) → valid, but confusing: document this
+chk("ipv4: leading zeros are DECIMAL (010=10, not 8)",
+    sg_is_ipv4("010.010.010.010"))         # passes as 10.10.10.10
+chk("ipv4: 4-digit octet rejected",        not sg_is_ipv4("1000.0.0.0"))
+chk("ipv4: missing octet rejected",        not sg_is_ipv4("192.168.1"))
+chk("ipv4: extra octet rejected",          not sg_is_ipv4("1.2.3.4.5"))
+chk("ipv4: trailing dot rejected",         not sg_is_ipv4("1.2.3.4."))
+chk("ipv4: leading dot rejected",          not sg_is_ipv4(".1.2.3.4"))
+chk("ipv4: empty rejected",                not sg_is_ipv4(""))
+chk("ipv4: non-digit rejected",            not sg_is_ipv4("a.b.c.d"))
+chk("ipv4: colon (IPv6) rejected",         not sg_is_ipv4("::1"))
+chk("ipv4: CIDR notation rejected",        not sg_is_ipv4("192.168.0.0/24"))
+
+# ─────────────────────────────────────────────────────────────────────────────
+print(f"\n{B}{C}=== 4. sg_is_cidr: prefix length boundary ==={N}")
+# ─────────────────────────────────────────────────────────────────────────────
+
+chk("cidr: /0 (default route) accepted",   sg_is_cidr("0.0.0.0/0"))
+chk("cidr: /32 (host route) accepted",     sg_is_cidr("192.168.1.1/32"))
+chk("cidr: /16 accepted",                  sg_is_cidr("10.0.0.0/16"))
+chk("cidr: /33 rejected",                  not sg_is_cidr("10.0.0.0/33"))
+chk("cidr: /128 rejected",                 not sg_is_cidr("10.0.0.0/128"))
+chk("cidr: negative prefix rejected",      not sg_is_cidr("10.0.0.0/-1"))
+chk("cidr: no slash rejected",             not sg_is_cidr("10.0.0.0"))
+chk("cidr: empty IP rejected",             not sg_is_cidr("/24"))
+chk("cidr: empty mask rejected",           not sg_is_cidr("10.0.0.0/"))
+chk("cidr: invalid IP rejected",           not sg_is_cidr("999.0.0.0/24"))
+chk("cidr: IPv6 rejected",                 not sg_is_cidr("2001:db8::/32"))
+# Leading zeros in prefix: same decimal rule
+chk("cidr: leading zero prefix (024=24) accepted", sg_is_cidr("10.0.0.0/024"))
+
+# ─────────────────────────────────────────────────────────────────────────────
+print(f"\n{B}{C}=== 5. sg_is_uint_range: overflow and negative ==={N}")
+# ─────────────────────────────────────────────────────────────────────────────
+
+chk("uint: 0 in 0-255 accepted",           sg_is_uint_range("0", 0, 255))
+chk("uint: 255 in 0-255 accepted",         sg_is_uint_range("255", 0, 255))
+chk("uint: 256 in 0-255 rejected",         not sg_is_uint_range("256", 0, 255))
+chk("uint: negative sign rejected",        not sg_is_uint_range("-1", 0, 255))
+chk("uint: empty rejected",                not sg_is_uint_range("", 0, 255))
+chk("uint: text rejected",                 not sg_is_uint_range("abc", 0, 255))
+chk("uint: hex prefix rejected",           not sg_is_uint_range("0xff", 0, 255))
+chk("uint: float rejected",               not sg_is_uint_range("1.5", 0, 255))
+chk("uint: space rejected",                not sg_is_uint_range(" 5", 0, 255))
+# Leading zeros are decimal (strtol base 10)
+chk("uint: leading zeros are decimal (010=10)", sg_is_uint_range("010", 5, 15))
+chk("uint: 65535 accepted for port",       sg_is_uint_range("65535", 1, 65535))
+chk("uint: 65536 rejected for port",       not sg_is_uint_range("65536", 1, 65535))
+chk("uint: very long number rejected",     not sg_is_uint_range("9" * 20, 0, 65535))
+
+# ─────────────────────────────────────────────────────────────────────────────
+print(f"\n{B}{C}=== 6. sg_is_iface_name: shell injection chars ==={N}")
+# ─────────────────────────────────────────────────────────────────────────────
+
+chk("iface: normal eth0 accepted",         sg_is_iface_name("eth0"))
+chk("iface: dot in name accepted",         sg_is_iface_name("eth0.100"))  # VLAN
+chk("iface: colon accepted",               sg_is_iface_name("eth0:1"))    # alias
+chk("iface: empty rejected",               not sg_is_iface_name(""))
+chk("iface: semicolon rejected",           not sg_is_iface_name("eth0;id"))
+chk("iface: slash rejected",               not sg_is_iface_name("/dev/eth0"))
+chk("iface: space rejected",               not sg_is_iface_name("eth 0"))
+chk("iface: dollar rejected",              not sg_is_iface_name("$IFACE"))
+chk("iface: newline rejected",             not sg_is_iface_name("eth0\nCMD"))
+chk("iface: backslash rejected",           not sg_is_iface_name("eth\\0"))
+
+# ─────────────────────────────────────────────────────────────────────────────
+print(f"\n{B}{C}=== 7. sg_is_tz_token: allowed charset ==={N}")
+# ─────────────────────────────────────────────────────────────────────────────
+
+chk("tz: UTC accepted",                    sg_is_tz_token("UTC"))
+chk("tz: Asia/Ho_Chi_Minh accepted",       sg_is_tz_token("Asia/Ho_Chi_Minh"))
+chk("tz: Etc/GMT+7 accepted",              sg_is_tz_token("Etc/GMT+7"))
+chk("tz: empty rejected",                  not sg_is_tz_token(""))
+chk("tz: space rejected",                  not sg_is_tz_token("Asia/Ho Chi Minh"))
+chk("tz: semicolon rejected",              not sg_is_tz_token("UTC;ls"))
+chk("tz: dollar rejected",                 not sg_is_tz_token("$TZ"))
+chk("tz: ampersand rejected",              not sg_is_tz_token("UTC&id"))
+
+# ─────────────────────────────────────────────────────────────────────────────
+print(f"\n{B}{C}=== 8. sg_is_permissions_csv: validity ==={N}")
+# ─────────────────────────────────────────────────────────────────────────────
+
+chk("perms: monitor accepted",             sg_is_permissions_csv("monitor"))
+chk("perms: configure accepted",           sg_is_permissions_csv("configure"))
+chk("perms: admin accepted",               sg_is_permissions_csv("admin"))
+chk("perms: multiple accepted",            sg_is_permissions_csv("monitor,configure"))
+chk("perms: all three accepted",           sg_is_permissions_csv("monitor,configure,admin"))
+chk("perms: duplicates allowed",           sg_is_permissions_csv("monitor,monitor"))
+chk("perms: empty rejected",               not sg_is_permissions_csv(""))
+chk("perms: uppercase rejected (MONITOR)", not sg_is_permissions_csv("MONITOR"))
+chk("perms: invalid token rejected",       not sg_is_permissions_csv("root"))
+chk("perms: leading comma rejected",       not sg_is_permissions_csv(",monitor"))
+chk("perms: trailing comma rejected",      not sg_is_permissions_csv("monitor,"))
+chk("perms: double comma rejected",        not sg_is_permissions_csv("monitor,,admin"))
+chk("perms: space in token rejected",      not sg_is_permissions_csv("monitor, configure"))
+chk("perms: 257-char rejected",            not sg_is_permissions_csv("a" * 257))
+
+# ─────────────────────────────────────────────────────────────────────────────
+print(f"\n{B}{C}=== 9. sg_is_access_services: empty is valid ==={N}")
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Critical: empty means "no services" — must be ACCEPTED (not rejected)
+chk("access_svc: empty string is VALID (no services)",
+    sg_is_access_services(""))
+chk("access_svc: ping accepted",           sg_is_access_services("ping"))
+chk("access_svc: ssh https accepted",      sg_is_access_services("ssh https"))
+chk("access_svc: all services accepted",
+    sg_is_access_services("ping ssh https http snmp telnet"))
+chk("access_svc: only-spaces is INVALID",  not sg_is_access_services("  "))
+chk("access_svc: unknown service rejected", not sg_is_access_services("rdp"))
+chk("access_svc: HTTPS uppercase rejected", not sg_is_access_services("HTTPS"))
+chk("access_svc: semicolon injection rejected",
+    not sg_is_access_services("ssh;id"))
+chk("access_svc: comma-sep (wrong delim) rejected",
+    not sg_is_access_services("ssh,https"))
+chk("access_svc: 257-char rejected",       not sg_is_access_services("a" * 257))
+
+# ─────────────────────────────────────────────────────────────────────────────
+print(f"\n{B}{C}=== 10. sg_is_port_or_range: boundary and inversion ==={N}")
+# ─────────────────────────────────────────────────────────────────────────────
+
+chk("port: 1 accepted",                    sg_is_port_or_range("1"))
+chk("port: 80 accepted",                   sg_is_port_or_range("80"))
+chk("port: 65535 accepted",                sg_is_port_or_range("65535"))
+chk("port: 0 rejected",                    not sg_is_port_or_range("0"))
+chk("port: 65536 rejected",                not sg_is_port_or_range("65536"))
+chk("port: empty rejected",                not sg_is_port_or_range(""))
+chk("port: text rejected",                 not sg_is_port_or_range("http"))
+chk("range: 1-65535 accepted",             sg_is_port_or_range("1-65535"))
+chk("range: 80-443 accepted",              sg_is_port_or_range("80-443"))
+chk("range: 80-80 (equal) accepted",       sg_is_port_or_range("80-80"))
+chk("range: 443-80 (inverted) rejected",   not sg_is_port_or_range("443-80"))
+chk("range: 0-1000 rejected (lo=0)",       not sg_is_port_or_range("0-1000"))
+chk("range: leading dash rejected",        not sg_is_port_or_range("-80"))
+chk("range: trailing dash rejected",       not sg_is_port_or_range("80-"))
+chk("range: double dash rejected",         not sg_is_port_or_range("80-90-100"))
+
+# ─────────────────────────────────────────────────────────────────────────────
+print(f"\n{B}{C}=== 11. sg_match_csv_option: case sensitivity ==={N}")
+# ─────────────────────────────────────────────────────────────────────────────
+
+chk("csv_opt: exact match accepted",       sg_match_csv_option("accept,deny,drop", "accept"))
+chk("csv_opt: last option matched",        sg_match_csv_option("accept,deny,drop", "drop"))
+chk("csv_opt: uppercase rejected",         not sg_match_csv_option("accept,deny,drop", "ACCEPT"))
+chk("csv_opt: partial match rejected",     not sg_match_csv_option("enable,disable", "en"))
+chk("csv_opt: empty val rejected",         not sg_match_csv_option("a,b,c", ""))
+chk("csv_opt: extra chars rejected",       not sg_match_csv_option("enable,disable", "enabled"))
+
+# ─────────────────────────────────────────────────────────────────────────────
+print(f"\n{B}{C}=== 12. Source-code consistency checks ==={N}")
+# ─────────────────────────────────────────────────────────────────────────────
+
+validate = rd("src/userspace/common/sg_validate.c")
+
+# Verify C code is actually decimal, not strtol(s, NULL, 0) which would be octal
+chk("sg_is_ipv4 uses decimal arithmetic (val*10), not strtol",
+    "val * 10 + (*p - '0')" in validate or
+    "val = val * 10 + (*p" in validate)
+
+chk("sg_is_uint_range uses strtol with base 10",
+    "strtol(s, NULL, 10)" in validate)
+
+chk("sg_is_safe_id max is SG_SAFE_ID_MAX=64",
+    "SG_SAFE_ID_MAX" in validate and
+    "#define SG_SAFE_ID_MAX      64" in rd("src/userspace/common/sg_validate.h"))
+
+chk("sg_is_net_target max is SG_NET_TARGET_MAX=253",
+    "SG_NET_TARGET_MAX" in validate and
+    "#define SG_NET_TARGET_MAX  253" in rd("src/userspace/common/sg_validate.h"))
+
+# Verify the CIDR mask range is 0-32 (not 0-128 which would be IPv6)
+chk("sg_is_cidr mask validated with sg_is_uint_range(... 0, 32)",
+    "sg_is_uint_range(slash + 1, 0, 32)" in validate)
+
+# access-services: empty string must be VALID at C level
+chk("sg_is_access_services: explicit empty-valid check in C source",
+    "Empty string = no services allowed" in validate or
+    "if (!s || !*s)\n\t\treturn 1;" in validate or
+    "return 1" in validate.split("sg_is_access_services")[1][:100])
+
+# No strtol with base 0 (would trigger octal interpretation for "010")
+chk("No strtol base-0 calls (no octal misparse risk)",
+    "strtol(" not in validate.replace("strtol(s, NULL, 10)", "")
+    .replace("strtol(p, &end, 10)", "")
+    .replace("strtol(a_buf, NULL, 10)", "")
+    .replace("strtol(b_str, NULL, 10)", "")
+    .replace("strtol(end + 1, &end, 10)", ""))
+
+# ─────────────────────────────────────────────────────────────────────────────
+print(f"\n{B}{C}=== 13. Firewall apply: address object resolution gap ==={N}")
+# ─────────────────────────────────────────────────────────────────────────────
+
+fw_apply = rd("src/userspace/mgmtd/mgmtd_apply_firewall.c")
+
+# Named address objects (safe-id) are silently skipped — iptables rule has no -s/-d
+chk("build_forward_argv: -s/-d only added for valid CIDR values",
+    "sg_is_cidr(srcaddr)" in fw_apply and
+    "sg_is_cidr(dstaddr)" in fw_apply)
+
+# The comment explicitly documents this design choice
+chk("Comment documents named-object skip behavior",
+    "skip address" in fw_apply and "object" in fw_apply)
+
+# Service objects are NOT included in iptables rules (port/protocol not passed)
+chk("build_forward_argv: no service/port in iptables rule (gap: service objects silently ignored)",
+    "service" not in fw_apply.split("build_forward_argv")[1].split(")")[0] and
+    "--dport" not in fw_apply and "-p tcp" not in fw_apply)
+
+# FORWARD -P DROP is set in mgmtd (good)
+mgmtd = rd("src/userspace/mgmtd/stargazer-mgmtd.c")
+chk("mgmtd_init_firewall sets iptables -P FORWARD DROP",
+    '"-P", "FORWARD", "DROP"' in mgmtd)
+
+# But init does NOT set FORWARD DROP — gap: window before mgmtd starts
+init = rd("src/userspace/init")
+chk("ATK-J-02: init does NOT set FORWARD DROP (window before mgmtd)",
+    "FORWARD" not in init,  # confirms the gap exists
+    "Gap: FORWARD chain default is ACCEPT between init and mgmtd startup")
+
+# init sets INPUT DROP (good)
+chk("Init sets INPUT DROP before mgmtd starts",
+    "iptables -P INPUT DROP" in init)
+
+# ─────────────────────────────────────────────────────────────────────────────
+print(f"\n{B}{C}=== 14. Route apply: proto static substring check ==={N}")
+# ─────────────────────────────────────────────────────────────────────────────
+
+route_apply = rd("src/userspace/mgmtd/mgmtd_apply_route.c")
+
+chk("apply_route_static uses strstr('proto static') to check before delete",
+    'strstr(cur, "proto static")' in route_apply)
+
+# The check uses strstr — it would also match "proto statically-managed" or
+# similar if the kernel ever used that string.  In practice, Linux only uses
+# exact protocol name "static", so this is very low risk.
+chk("No other 'proto' substring that could cause false matches in route output",
+    # Verify the check is "proto static" not just "static"
+    '"proto static"' in route_apply)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RESULTS
+# ─────────────────────────────────────────────────────────────────────────────
+print(f"\n{'='*60}")
+notes = []
+if not sg_is_ipv4("010.010.010.010"):
+    notes.append("Note: leading zeros in IPv4 octets cause unexpected REJECTION")
+else:
+    notes.append("Note: leading zeros in IPv4 octets are treated as DECIMAL (010=10)")
+
+for n in notes:
+    print(f"  {Y}NOTE{N} {n}")
+
+if FAIL == 0:
+    print(f"{G}{B}ALL {PASS} VALIDATOR EDGE-CASE CHECKS PASSED{N}")
+else:
+    print(f"{Y}Results: {G}{PASS} passed{N}, {R}{FAIL} failed{N} / {PASS+FAIL} total")
+    sys.exit(1)

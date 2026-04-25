@@ -1,0 +1,174 @@
+#!/bin/sh
+# Stargazer NGFW - Login Handler
+# Ensures Linux admin user exists, then runs login loop via stargazer-logind.
+# Database seeding is handled by mgmtd on first boot — this script only
+# maintains the Linux user account (passwd/shadow/group).
+
+CMD_DIR="/usr/libexec/stargazer"
+. "$CMD_DIR/config_lib.sh"
+
+# ----------------------------------------------------------------------------
+# Ensure built-in admin account exists in Linux user database
+# Only manages passwd/shadow/group — config lives in mgmtd's SQLite DB
+# ----------------------------------------------------------------------------
+ensure_admin_account() {
+	mkdir -p "$STARGAZER_CONF_DIR"
+	chmod 700 "$STARGAZER_CONF_DIR" 2>/dev/null
+
+	# ── Instance ID (unique per install) ──────────────────────────────────
+	if [ ! -f "$STARGAZER_CONF_DIR/.instance-id" ]; then
+		cat /proc/sys/kernel/random/uuid \
+			> "$STARGAZER_CONF_DIR/.instance-id" 2>/dev/null \
+			|| echo "no-uuid" > "$STARGAZER_CONF_DIR/.instance-id"
+	fi
+
+	# Find next available UID >= 1000 for admin
+	_ea_next_uid=1000
+	if [ -f /etc/passwd ]; then
+		while grep -q "^[^:]*:[^:]*:${_ea_next_uid}:" /etc/passwd 2>/dev/null; do
+			_ea_next_uid=$((_ea_next_uid + 1))
+		done
+	fi
+
+	if grep -q '^admin:' /etc/passwd 2>/dev/null; then
+		# Admin exists — ensure shell is correct, but preserve existing UID
+		_ea_cur_uid=$(grep '^admin:' /etc/passwd | head -1 | cut -d: -f3)
+		if [ "$_ea_cur_uid" = "0" ]; then
+			# Migrate UID 0 admin to unprivileged UID (VULN-06)
+			_ea_tmp=$(mktemp /etc/passwd.XXXXXX 2>/dev/null) || _ea_tmp="/etc/passwd.tmp.$$"
+			sed "s|^admin:[^:]*:[0-9]*:[0-9]*:[^:]*:[^:]*:.*|admin:x:${_ea_next_uid}:${_ea_next_uid}:Stargazer Admin:/home/admin:/sbin/stargazer-cli|" /etc/passwd > "$_ea_tmp" && mv "$_ea_tmp" /etc/passwd
+			if ! grep -q "^admin:" /etc/group 2>/dev/null; then
+				echo "admin:x:${_ea_next_uid}:" >> /etc/group
+			fi
+			mkdir -p /home/admin 2>/dev/null
+			chown "${_ea_next_uid}:${_ea_next_uid}" /home/admin 2>/dev/null
+		else
+			# Non-root UID — just fix shell
+			_ea_tmp=$(mktemp /etc/passwd.XXXXXX 2>/dev/null) || _ea_tmp="/etc/passwd.tmp.$$"
+			sed "s|^admin:\([^:]*\):\([0-9]*\):\([0-9]*\):[^:]*:[^:]*:.*|admin:\1:\2:\3:Stargazer Admin:/home/admin:/sbin/stargazer-cli|" /etc/passwd > "$_ea_tmp" && mv "$_ea_tmp" /etc/passwd
+		fi
+	else
+		echo "admin:x:${_ea_next_uid}:${_ea_next_uid}:Stargazer Admin:/home/admin:/sbin/stargazer-cli" >> /etc/passwd
+		if ! grep -q "^admin:" /etc/group 2>/dev/null; then
+			echo "admin:x:${_ea_next_uid}:" >> /etc/group
+		fi
+		mkdir -p /home/admin 2>/dev/null
+		chown "${_ea_next_uid}:${_ea_next_uid}" /home/admin 2>/dev/null
+	fi
+
+	# Only create shadow entry if missing — never reset existing password
+	if ! grep -q '^admin:' /etc/shadow 2>/dev/null; then
+		echo 'admin::19700:0:99999:7:::' >> /etc/shadow
+	fi
+
+	# Add admin to stargazer group (for socket + config access)
+	if grep -q '^stargazer:' /etc/group 2>/dev/null; then
+		if ! grep '^stargazer:' /etc/group | grep -q -E '(:|,)admin(,|$)' 2>/dev/null; then
+			_ea_grp_line=$(grep '^stargazer:' /etc/group)
+			_ea_members="${_ea_grp_line##*:}"
+			if [ -n "$_ea_members" ]; then
+				_ea_new="${_ea_grp_line},admin"
+			else
+				_ea_new="${_ea_grp_line}admin"
+			fi
+			_ea_tmp=$(mktemp /etc/group.XXXXXX 2>/dev/null) || _ea_tmp="/etc/group.tmp.$$"
+			sed "s|^stargazer:.*|${_ea_new}|" /etc/group > "$_ea_tmp" && mv "$_ea_tmp" /etc/group
+		fi
+	fi
+
+	# Set DB file permissions: root-only (CLI reads via mgmtd IPC)
+	if [ -f "$STARGAZER_DB_PATH" ]; then
+		chmod 600 "$STARGAZER_DB_PATH" 2>/dev/null
+	fi
+	chmod 700 "$STARGAZER_CONF_DIR" 2>/dev/null
+}
+
+# ----------------------------------------------------------------------------
+# Main: ensure admin exists on every boot
+# ----------------------------------------------------------------------------
+ensure_admin_account
+
+# Auth lockout is handled inside mgmtd's AUTH_LOGIN handler.
+# No shell-side lockout checks needed — eliminates sqlite3 process
+# spawns from the login hot path (OpenSSH/PAM model).
+
+# ── Ctrl+C resets to fresh login prompt (no process restart) ──
+_login_interrupted=0
+trap '_login_interrupted=1' INT
+# ── SIGTERM = system shutdown/reboot: exit silently ──
+trap 'exit 0' TERM
+# PID file so the shutdown script can kill this shell first
+echo $$ > /tmp/stargazer-login.pid
+
+while true; do
+	# ── Clean ALL login context at start of each iteration ──
+	_login_interrupted=0
+	unset STARGAZER_LOGIN_USER
+	unset STARGAZER_USER
+	unset LOGIN
+	_login_user=""
+
+	# ── Restore terminal sanity after CLI exit ──
+	# CLI uses raw mode (no echo, no canonical) for readline.
+	# After CLI exits, terminal may still be in that state.
+	# Force echo + canonical mode so the login prompt works.
+	stty sane 2>/dev/null
+
+	printf "login: "
+	read -r _login_user
+	_read_rc=$?
+
+	# ── Handle Ctrl+C: reset to fresh login prompt ──
+	if [ "$_login_interrupted" -eq 1 ]; then
+		echo ""
+		continue
+	fi
+
+	# ── Handle EOF (Ctrl+D) or read failure: restart prompt ──
+	if [ "$_read_rc" -ne 0 ]; then
+		echo ""
+		continue
+	fi
+
+	# ── Normalize username to lowercase (BUG-AUTH-04: prevent lockout bypass) ──
+	_login_user=$(printf '%s' "$_login_user" | tr 'A-Z' 'a-z')
+
+	# ── Set login context for this attempt only ──
+	export STARGAZER_USER="$_login_user"
+	export STARGAZER_LOGIN_USER="$_login_user"
+	export LOGIN="$_login_user"
+	auth_debug "login_attempt attempt_user=${_login_user} env_STARGAZER_LOGIN_USER=${STARGAZER_LOGIN_USER} env_LOGIN=${LOGIN}"
+
+	# Lockout is checked inside mgmtd's AUTH_LOGIN handler —
+	# no shell-side pre-check needed (instant password prompt).
+	/sbin/stargazer-logind "$_login_user"
+	_logind_rc=$?
+
+	# ── Ctrl+C during password/change-password → reset to login prompt ──
+	if [ "$_logind_rc" -eq 130 ] || [ "$_login_interrupted" -eq 1 ]; then
+		echo ""
+		unset STARGAZER_LOGIN_USER STARGAZER_USER LOGIN
+		continue
+	fi
+
+	if [ "$_logind_rc" -eq 0 ]; then
+		audit_log "login_success" "user=${_login_user}"
+		# CLI exited normally — loop back to login prompt immediately
+		# (no init respawn needed, avoids delay + terminal state issues)
+		unset STARGAZER_LOGIN_USER
+		unset STARGAZER_USER
+		unset LOGIN
+		continue
+	fi
+
+	# ── Cleanup ALL login context after failed attempt ──
+	unset STARGAZER_LOGIN_USER
+	unset STARGAZER_USER
+	unset LOGIN
+
+	# Lockout accounting is handled inside mgmtd — just audit here.
+	audit_log "login_reject" "user=${_login_user}"
+	sleep 1
+	# ── Ctrl+C during failure delay → reset ──
+	if [ "$_login_interrupted" -eq 1 ]; then echo ""; continue; fi
+done

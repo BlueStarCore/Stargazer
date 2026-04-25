@@ -33,3 +33,15 @@ rootfs/
 
 # Do not commit copyrighted book PDFs or other proprietary documents
 docs/*.pdf
+
+# Private keys & secrets
+*.pem
+*.key
+.env
+
+# Cache
+.cache
+*.tmp
+
+# AI conversation exchange
+ai-conversation/

@@ -1,0 +1,56 @@
+/dts-v1/;
+
+/ {
+	description = "ARM64 Stargazer NGFW FIT (Flattened Image Tree)";
+	#address-cells = <1>;
+
+	images {
+		kernel-1 {
+			description = "ARM64 Stargazer Linux";
+			data = /incbin/("Image.lzma");
+			type = "kernel";
+			arch = "arm64";
+			os = "linux";
+			compression = "lzma";
+			load = <0x48080000>;
+			entry = <0x48080000>;
+			hash-1 {
+				algo = "crc32";
+			};
+		};
+
+		fdt-1 {
+			description = "ARM64 Stargazer BPI-R4 device tree blob";
+			data = /incbin/("bpi-r4.dtb");
+			type = "flat_dt";
+			arch = "arm64";
+			compression = "none";
+			hash-1 {
+				algo = "crc32";
+			};
+		};
+
+		initrd-1 {
+			description = "ARM64 Stargazer initramfs";
+			data = /incbin/("initramfs.gz");
+			type = "ramdisk";
+			arch = "arm64";
+			os = "linux";
+			compression = "none";
+			hash-1 {
+				algo = "crc32";
+			};
+		};
+	};
+
+	configurations {
+		default = "config-1";
+
+		config-1 {
+			description = "Stargazer NGFW (NAND)";
+			kernel = "kernel-1";
+			fdt = "fdt-1";
+			ramdisk = "initrd-1";
+		};
+	};
+};

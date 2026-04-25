@@ -3,7 +3,7 @@
 **Next-Generation Firewall with Machine Learning for Banana Pi BPI-R4**
 
 [![License](https://img.shields.io/badge/license-GPL-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-BPI--R4-orange.svg)](https://wiki.banana-pi.org/Banana_Pi_BPI-R4)
+[![Platform](https://img.shields.io/badge/platform-BPI--R4-orange.svg)](https://docs.banana-pi.org/en/BPI-R4/BananaPi_BPI-R4)
 
 ## Project Overview
 

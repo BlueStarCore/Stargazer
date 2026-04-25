@@ -1,6 +1,10 @@
 #!/bin/sh
 # Stargazer NGFW Service
 # Manages module loading and kernel parameters
+#
+# NOTE: Config replay is handled by stargazer-login (runs after config
+# files are generated on first boot). This script only handles modules
+# and sysctl which don't depend on config files.
 
 NAME="stargazer"
 MODULE_DIR="/lib/modules/stargazer"
@@ -45,8 +49,15 @@ apply_sysctl() {
     done < "$SYSCTL_CONF"
 }
 
+harden_perms() {
+    # Restrict config files to root-only — CLI reads via mgmtd IPC
+    [ -f "$MODULES_CONF" ] && chmod 0600 "$MODULES_CONF"
+    [ -f "$SYSCTL_CONF" ]  && chmod 0600 "$SYSCTL_CONF"
+    [ -d /etc/stargazer ]  && chmod 0700 /etc/stargazer
+}
+
 case "$1" in
-    start)   log "Starting..."; apply_sysctl; load_modules; log "Started" ;;
+    start)   log "Starting..."; harden_perms; apply_sysctl; load_modules; log "Started" ;;
     stop)    log "Stopping..."; unload_modules; log "Stopped" ;;
     restart) $0 stop; sleep 1; $0 start ;;
     status)  lsmod | grep -q pkt_forward && log "Running" || log "Not running" ;;
