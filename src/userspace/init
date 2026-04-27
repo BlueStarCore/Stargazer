@@ -25,6 +25,26 @@ _blkid_val() { # $1=FIELD $2=/dev/device
 	blkid "$2" 2>/dev/null | sed -n 's/.*'"$1"'="\([^"]*\)".*/\1/p'
 }
 
+# Logging helper: write to kernel log (dmesg) and console.
+# Uses /dev/kmsg for kernel ring buffer (persistent across boot).
+# Log levels: 0=EMERG 1=ALERT 2=CRIT 3=ERR 4=WARN 5=NOTICE 6=INFO 7=DEBUG
+_sg_log() { # $1=level $2=message
+	_lvl="$1"
+	shift
+	_msg="$*"
+	# Try kernel log first (survives in dmesg)
+	if [ -w /dev/kmsg ]; then
+		echo "<${_lvl}>stargazer: ${_msg}" > /dev/kmsg 2>/dev/null
+	fi
+	# Always print to console for real-time visibility
+	echo "[stargazer] ${_msg}"
+}
+
+# Convenience wrappers
+_sg_info() { _sg_log 6 "$@"; }    # INFO level
+_sg_warn() { _sg_log 4 "$@"; }    # WARNING level
+_sg_err()  { _sg_log 3 "$@"; }    # ERROR level
+
 # --- Persistent storage detection (eMMC-primary boot) ---
 #
 # Strategy: use known partition for sgdata (mmcblk0p5 or QEMU vdb).
@@ -53,30 +73,33 @@ _sg_prepare() {
 	_type=$(_blkid_val TYPE "$_dev")
 	_lbl=$(_blkid_val LABEL "$_dev")
 
+	_sg_info "_sg_prepare: device=$_dev type='$_type' label='$_lbl' expected_label='$_label'"
+
 	if [ "$_lbl" = "$_label" ] && [ "$_type" = "ext2" ]; then
 		# Correct label and type — use as-is
+		_sg_info "_sg_prepare: $_dev already has correct label and type"
 		return 0
 	fi
 
 	if [ -z "$_type" ]; then
 		# Blank partition (first boot or wiped) — format
-		echo "[stargazer] First boot: formatting $_dev as $_label..."
+		_sg_info "First boot: formatting $_dev as $_label..."
 		_sg_mkfs "$_label" "$_dev"
 		return $?
 	fi
 
 	if [ "$_type" != "ext2" ]; then
 		# Wrong filesystem type (e.g. old OpenWrt squashfs/ext4)
-		echo "[stargazer] WARNING: $_dev has type '$_type', expected ext2"
-		echo "[stargazer] Reformatting $_dev as $_label (old data will be lost)..."
+		_sg_warn "$_dev has type '$_type', expected ext2"
+		_sg_warn "Reformatting $_dev as $_label (old data will be lost)..."
 		_sg_mkfs "$_label" "$_dev"
 		return $?
 	fi
 
 	# ext2 but wrong/missing label — reformat (no tune2fs in busybox)
 	if [ "$_lbl" != "$_label" ]; then
-		echo "[stargazer] WARNING: $_dev is ext2 but labeled '$_lbl', expected $_label"
-		echo "[stargazer] Reformatting $_dev as $_label..."
+		_sg_warn "$_dev is ext2 but labeled '$_lbl', expected $_label"
+		_sg_warn "Reformatting $_dev as $_label..."
 		_sg_mkfs "$_label" "$_dev"
 		return $?
 	fi
@@ -87,14 +110,14 @@ _sg_fsck() { # $1=/dev/device $2=label (for reformat)
 	if ! command -v e2fsck >/dev/null 2>&1; then
 		return 0  # e2fsck not available, skip check
 	fi
-	echo "[stargazer] Checking filesystem on $1..."
+	_sg_info "Checking filesystem on $1..."
 	e2fsck -p "$1" 2>/dev/null
 	_rc=$?
 	if [ "$_rc" -ge 4 ]; then
 		# Exit code >= 4 means uncorrectable errors
 		_fsck_lbl="${2:-sgdata}"
-		echo "[stargazer] ERROR: filesystem on $1 has uncorrectable errors (rc=$_rc)"
-		echo "[stargazer] Reformatting $1 as $_fsck_lbl..."
+		_sg_err "filesystem on $1 has uncorrectable errors (rc=$_rc)"
+		_sg_warn "Reformatting $1 as $_fsck_lbl..."
 		_sg_mkfs "$_fsck_lbl" "$1"
 	fi
 }
@@ -103,40 +126,55 @@ _sg_fsck() { # $1=/dev/device $2=label (for reformat)
 # GPT layout: p1=env, p2=factory, p3=fip, p4=firmware, p5=sgdata, p6=sglogs
 # Hardcoded to known devices only — never scan USB/removable media.
 _init_errors=""
+_sg_dev=""
 
-if [ -b /dev/mmcblk0p5 ]; then
-	_sg_dev=/dev/mmcblk0p5
-elif [ -b /dev/vdb ]; then
-	_sg_dev=/dev/vdb   # QEMU: vda=boot, vdb=sgdata, vdc=sglogs
-else
-	echo "[stargazer] ERROR: sgdata target not found (no mmcblk0p5, no vdb)"
+# Wait up to 5 seconds for storage device to appear (kernel async probing)
+_wait_count=0
+while [ $_wait_count -lt 50 ]; do
+	if [ -b /dev/mmcblk0p5 ]; then
+		_sg_dev=/dev/mmcblk0p5
+		break
+	elif [ -b /dev/vdb ]; then
+		_sg_dev=/dev/vdb   # QEMU: vda=boot, vdb=sgdata, vdc=sglogs
+		break
+	fi
+	_wait_count=$((_wait_count + 1))
+	sleep 0.1 2>/dev/null || usleep 100000 2>/dev/null || true
+done
+
+if [ -z "$_sg_dev" ]; then
+	_sg_err "sgdata target not found (no mmcblk0p5, no vdb) after 5s wait"
 	_init_errors="${_init_errors}storage "
+else
+	_sg_info "Found sgdata device: $_sg_dev"
 fi
 
 # Prepare, fsck, and mount sgdata
 if [ -n "$_sg_dev" ]; then
 	if ! _sg_prepare sgdata "$_sg_dev"; then
-		echo "[stargazer] ERROR: failed to prepare $_sg_dev as sgdata"
+		_sg_err "failed to prepare $_sg_dev as sgdata"
 		_init_errors="${_init_errors}storage "
 		_sg_dev=""
+	else
+		_sg_info "Prepared $_sg_dev successfully"
 	fi
 fi
 
 if [ -n "$_sg_dev" ] && ! mountpoint -q /etc/stargazer 2>/dev/null; then
-	echo "[stargazer] Found data partition: $_sg_dev"
+	_sg_info "Found data partition: $_sg_dev"
 	_sg_fsck "$_sg_dev" sgdata
 	if mount -o rw "$_sg_dev" /etc/stargazer 2>/tmp/sg_mount.log; then
-		echo "[stargazer] Persistent storage: $_sg_dev -> /etc/stargazer"
+		_sg_info "Persistent storage: $_sg_dev -> /etc/stargazer"
 	else
-		echo "[stargazer] ERROR: mount $_sg_dev failed:"
+		_sg_err "mount $_sg_dev failed:"
 		cat /tmp/sg_mount.log 2>/dev/null
 		# Last resort: reformat and retry
-		echo "[stargazer] Attempting reformat of $_sg_dev..."
+		_sg_warn "Attempting reformat of $_sg_dev..."
 		_sg_mkfs sgdata "$_sg_dev"
 		if mount -o rw "$_sg_dev" /etc/stargazer 2>/dev/null; then
-			echo "[stargazer] Persistent storage recovered: $_sg_dev -> /etc/stargazer"
+			_sg_info "Persistent storage recovered: $_sg_dev -> /etc/stargazer"
 		else
-			echo "[stargazer] CRITICAL: $_sg_dev unusable after reformat"
+			_sg_err "CRITICAL: $_sg_dev unusable after reformat"
 			_init_errors="${_init_errors}storage "
 			_sg_dev=""
 		fi
@@ -148,15 +186,15 @@ if mountpoint -q /etc/stargazer 2>/dev/null; then
 	if [ -f /etc/stargazer/shadow ]; then
 		cp /etc/stargazer/shadow /etc/shadow
 		chmod 640 /etc/shadow
-		echo "[stargazer] Restored /etc/shadow from persistent storage"
+		_sg_info "Restored /etc/shadow from persistent storage"
 	fi
 	if [ -f /etc/stargazer/passwd ]; then
 		cp /etc/stargazer/passwd /etc/passwd
-		echo "[stargazer] Restored /etc/passwd from persistent storage"
+		_sg_info "Restored /etc/passwd from persistent storage"
 	fi
 	if [ -f /etc/stargazer/group ]; then
 		cp /etc/stargazer/group /etc/group
-		echo "[stargazer] Restored /etc/group from persistent storage"
+		_sg_info "Restored /etc/group from persistent storage"
 	fi
 fi
 
@@ -170,32 +208,32 @@ if [ -n "$_sg_dev" ]; then
 	esac
 
 	if [ -z "$_logs_dev" ]; then
-		echo "[stargazer] WARNING: cannot determine sglogs device for $_sg_dev"
+		_sg_warn "cannot determine sglogs device for $_sg_dev"
 		_init_errors="${_init_errors}logs "
 	elif [ ! -b "$_logs_dev" ]; then
 		# eMMC: partition may not exist yet — create it
 		case "$_logs_dev" in
 			/dev/mmcblk0p6)
-				echo "[stargazer] sglogs partition missing, running sg-partinit..."
+				_sg_info "sglogs partition missing, running sg-partinit..."
 				if command -v sg-partinit >/dev/null 2>&1 && \
 				   sg-partinit /dev/mmcblk0 2>/tmp/sg_partinit.log; then
 					# sg-partinit waits for the device node
 					# to appear before returning (verified via
 					# stat loop after BLKRRPART ioctl).
 					if [ ! -b "$_logs_dev" ]; then
-						echo "[stargazer] ERROR: $_logs_dev still missing after sg-partinit"
+						_sg_err "$_logs_dev still missing after sg-partinit"
 						_init_errors="${_init_errors}logs "
 						_logs_dev=""
 					fi
 				else
-					echo "[stargazer] ERROR: sg-partinit failed:"
+					_sg_err "sg-partinit failed:"
 					cat /tmp/sg_partinit.log 2>/dev/null
 					_init_errors="${_init_errors}logs "
 					_logs_dev=""
 				fi
 				;;
 			*)
-				echo "[stargazer] WARNING: $_logs_dev not present (QEMU without logs drive?)"
+				_sg_warn "$_logs_dev not present (QEMU without logs drive?)"
 				_init_errors="${_init_errors}logs "
 				_logs_dev=""
 				;;
@@ -205,7 +243,7 @@ if [ -n "$_sg_dev" ]; then
 	# Prepare, fsck, and mount sglogs
 	if [ -n "$_logs_dev" ]; then
 		if ! _sg_prepare sglogs "$_logs_dev"; then
-			echo "[stargazer] ERROR: failed to prepare $_logs_dev as sglogs"
+			_sg_err "failed to prepare $_logs_dev as sglogs"
 			_init_errors="${_init_errors}logs "
 			_logs_dev=""
 		fi
@@ -215,9 +253,9 @@ if [ -n "$_sg_dev" ]; then
 		mkdir -p /etc/stargazer/logs
 		_sg_fsck "$_logs_dev" sglogs
 		if mount -o rw "$_logs_dev" /etc/stargazer/logs 2>/dev/null; then
-			echo "[stargazer] Logs storage: $_logs_dev -> /etc/stargazer/logs"
+			_sg_info "Logs storage: $_logs_dev -> /etc/stargazer/logs"
 		else
-			echo "[stargazer] WARNING: mount $_logs_dev failed, reformatting..."
+			_sg_warn "mount $_logs_dev failed, reformatting..."
 			_sg_mkfs sglogs "$_logs_dev"
 			if mount -o rw "$_logs_dev" /etc/stargazer/logs 2>/dev/null; then
 				echo "[stargazer] Logs storage recovered: $_logs_dev -> /etc/stargazer/logs"
@@ -287,6 +325,9 @@ fi
 # where traffic is accepted before mgmtd sets firewall rules.
 # mgmtd_init_firewall() will re-set this and add proper rules later.
 iptables -P INPUT DROP 2>/dev/null
+iptables -P FORWARD DROP 2>/dev/null
+# Also set IPv6 FORWARD to DROP if ip6tables is available
+ip6tables -P FORWARD DROP 2>/dev/null
 
 # Start services
 [ -x /etc/init.d/stargazer ] && /etc/init.d/stargazer start
@@ -475,10 +516,10 @@ dmesg -n 4 2>/dev/null
 # Login loop
 # -c: set stdin as controlling terminal so Ctrl+C generates SIGINT
 if [ -z "$_init_errors" ]; then
-	echo "[stargazer] Ready."
+	_sg_info "Ready."
 else
-	echo "[stargazer] ERROR: init completed with failures: ${_init_errors}"
-	echo "[stargazer] Some features may not work correctly."
+	_sg_err "init completed with failures: ${_init_errors}"
+	_sg_warn "Some features may not work correctly."
 fi
 while true; do
 	setsid -c /sbin/stargazer-login </dev/console >/dev/console 2>&1

@@ -1135,7 +1135,7 @@ test-run:
 		-drive file=$(BUILD_DIR)/test/boot.img,format=raw,if=virtio \
 		-drive file=$(BUILD_DIR)/test/data.img,format=raw,if=virtio \
 		-drive file=$(BUILD_DIR)/test/logs.img,format=raw,if=virtio \
-		-netdev user,id=net0,hostfwd=tcp::2222-:22,net=10.0.1.0/24,host=10.0.1.1,tftp=$(BUILD_DIR)/test/tftp \
+		-netdev user,id=net0,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:80,net=10.0.1.0/24,host=10.0.1.1,tftp=$(BUILD_DIR)/test/tftp \
 		-device virtio-net-device,netdev=net0 \
 		-nographic
 

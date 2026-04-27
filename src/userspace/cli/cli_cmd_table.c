@@ -15,6 +15,7 @@
 #include "cli_configure.h"
 #include "cli_diagnose.h"
 #include "cli_diagnose_sys.h"
+#include "cli_diagnose_bootlog.h"
 #include "cli_debug.h"
 #include "cli_show.h"
 #include "cli_ipc.h"

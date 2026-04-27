@@ -36,7 +36,7 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 
 # Auto-detect the host's internet-facing interface
 detect_wan_iface() {
-    ip route get 8.8.8.8 2>/dev/null | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1
+    ip route get 8.8.8.8 2>/dev/null | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -n 1
 }
 
 # ── helpers ──────────────────────────────────────────────────────────────────

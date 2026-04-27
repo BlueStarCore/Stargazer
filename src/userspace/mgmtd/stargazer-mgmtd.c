@@ -809,6 +809,134 @@ int handle_log_clear_audit(int client_fd, const char *user,
 	return 0;
 }
 
+/*
+ * handle_diag_stargazer_log — Filter dmesg for stargazer init messages.
+ * Shows [stargazer], sgdata, _sg_prepare, mmcblk0p related messages.
+ */
+int handle_diag_stargazer_log(int client_fd, const char *user,
+			      const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)payload;
+	(void)hdr;
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "Requires 'monitor' permission");
+		return 0;
+	}
+
+	const char *argv[] = {
+		"sh", "-c",
+		"/bin/dmesg | /bin/grep -E '\\[stargazer\\]|sgdata|_sg_prepare|mmcblk0p'",
+		NULL
+	};
+	char *out = safe_exec(argv);
+	if (!out || !out[0]) {
+		free(out);
+		send_ok(client_fd, NULL, "  No stargazer messages found in kernel log.\n");
+		return 0;
+	}
+
+	send_ok(client_fd, NULL, out);
+	free(out);
+	return 0;
+}
+
+/*
+ * handle_diag_storage — Show storage device and mount status.
+ * Reports partition devices, mount points, blkid info, and database status.
+ */
+int handle_diag_storage(int client_fd, const char *user,
+		       const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)payload;
+	(void)hdr;
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "Requires 'monitor' permission");
+		return 0;
+	}
+
+	char *buf = malloc(SG_RESPONSE_MAX);
+	if (!buf) {
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL, "Out of memory");
+		return 0;
+	}
+	size_t pos = 0;
+
+	/* Storage devices */
+	pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+			"Storage devices:\n");
+	const char *argv1[] = {"sh", "-c",
+			       "/bin/ls -la /dev/mmcblk0p* 2>/dev/null || echo '  No eMMC partitions found'",
+			       NULL};
+	char *out1 = safe_exec(argv1);
+	if (out1) {
+		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos, "%s", out1);
+		free(out1);
+	}
+
+	/* Mount points */
+	pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+			"\nStorage mount points:\n");
+	const char *argv2[] = {"sh", "-c",
+			       "/bin/mount | /bin/grep -E 'stargazer|mmcblk'",
+			       NULL};
+	char *out2 = safe_exec(argv2);
+	if (out2 && out2[0]) {
+		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos, "%s", out2);
+		free(out2);
+	} else {
+		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+				"  No stargazer/mmcblk mounts found\n");
+		free(out2);
+	}
+
+	/* Partition info */
+	pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+			"\nPartition info:\n");
+	const char *argv3[] = {"blkid", "/dev/mmcblk0p5", NULL};
+	char *out3 = safe_exec(argv3);
+	if (out3 && out3[0]) {
+		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+				"/dev/mmcblk0p5: %s", out3);
+		free(out3);
+	} else {
+		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+				"/dev/mmcblk0p5: not found or unformatted\n");
+		free(out3);
+	}
+
+	const char *argv4[] = {"blkid", "/dev/mmcblk0p6", NULL};
+	char *out4 = safe_exec(argv4);
+	if (out4 && out4[0]) {
+		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+				"/dev/mmcblk0p6: %s", out4);
+		free(out4);
+	} else {
+		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+				"/dev/mmcblk0p6: not found or unformatted\n");
+		free(out4);
+	}
+
+	/* Database status */
+	pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+			"\nConfig database:\n");
+	const char *argv5[] = {"sh", "-c",
+			       "/bin/ls -lh /etc/stargazer/stargazer.db 2>/dev/null || echo '  Database not found'",
+			       NULL};
+	char *out5 = safe_exec(argv5);
+	if (out5) {
+		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos, "%s", out5);
+		free(out5);
+	}
+
+	send_ok(client_fd, NULL, buf);
+	free(buf);
+	return 0;
+}
+
 /* ── Signal handling ────────────────────────────────────────────────────── */
 
 static void sig_handler(int sig)
@@ -5088,6 +5216,10 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		return handle_log_mgmtd(client_fd, user, payload, hdr);
 	case SG_CMD_LOG_CLEAR_AUDIT:
 		return handle_log_clear_audit(client_fd, user, payload, hdr);
+	case SG_CMD_DIAG_STARGAZER_LOG:
+		return handle_diag_stargazer_log(client_fd, user, payload, hdr);
+	case SG_CMD_DIAG_STORAGE:
+		return handle_diag_storage(client_fd, user, payload, hdr);
 
 	case SG_CMD_PING:
 		send_ok(client_fd, "pong", NULL);

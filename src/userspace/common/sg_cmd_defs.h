@@ -109,6 +109,11 @@ X("execute diagnose firewall policy",       "Show firewall policy and rules",   
 X("execute diagnose firewall policy nat",   "Show NAT rules",                          "admin",           0,  NULL)
 X("execute diagnose firewall conntrack",    "Show connection tracking entries",         "admin",           0,  cmd_diag_fw_conntrack)
 
+X("execute diagnose system",                "System diagnostics",                      "monitor",         0,  NULL)
+X("execute diagnose system bootlog",        "Show kernel boot log (dmesg)",            "monitor",         0,  cmd_diagnose_system_bootlog)
+X("execute diagnose system stargazer-log",  "Show stargazer init messages",            "monitor",         0,  cmd_diagnose_system_stargazer_log)
+X("execute diagnose system storage",        "Show storage mount status",               "monitor",         0,  cmd_diagnose_system_storage)
+
 X("execute diagnose nat",                  "NAT diagnostics",                         "admin",           0,  NULL)
 X("execute diagnose nat policy",           "Show kernel NAT table rules",             "admin",           0,  cmd_diag_nat_policy)
 
