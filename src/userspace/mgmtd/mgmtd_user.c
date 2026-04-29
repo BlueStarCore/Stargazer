@@ -1193,7 +1193,9 @@ int handle_auth_login(int client_fd, const char *user,
  * SG_CMD_AUTH_CHANGE_PW — Change password during forced login flow.
  *
  * Payload: "username\nnew_password\nsource\n"
- *   source = "admin-flag" or "policy-mismatch"
+ *   source = "first-login"     (empty password, initial setup)
+ *            "admin-flag"      (enforce-change-password enabled)
+ *            "policy-mismatch" (password doesn't meet updated policy)
  *
  * On success: updates shadow, clears enforce flag if admin-flag,
  *             audits event, returns SG_OK.
@@ -1278,8 +1280,10 @@ int handle_auth_change_pw(int client_fd, const char *user,
 	}
 	explicit_bzero(new_pw, sizeof(new_pw));
 
-	/* If source=admin-flag, clear the enforce-change-password flag */
-	if (strcmp(source, "admin-flag") == 0) {
+	/* Clear enforce-change-password flag for admin-flag and first-login.
+	 * Both represent initial/forced password setup, not voluntary change. */
+	if (strcmp(source, "admin-flag") == 0 ||
+	    strcmp(source, "first-login") == 0) {
 		sg_db_set_val("system_admin", target,
 			      "enforce-change-password", "disable");
 	}

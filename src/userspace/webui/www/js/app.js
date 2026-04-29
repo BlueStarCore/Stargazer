@@ -3426,7 +3426,24 @@
             .then(function () {
                 closeModal(false);
                 showToast(isEdit ? 'Entry updated' : 'Entry created', 'success');
-                refreshPage(activePage);
+
+                /* Interface changes may restart network briefly.
+                 * Delay + retry reload to avoid connection drop. */
+                if (config.configType === 'system_interface') {
+                    showToast('Network reconfiguring, please wait...', 'info');
+                    var retryCount = 0;
+                    function retryRefresh() {
+                        refreshPage(activePage).catch(function () {
+                            if (retryCount < 3) {
+                                retryCount++;
+                                setTimeout(retryRefresh, 1000);
+                            }
+                        });
+                    }
+                    setTimeout(retryRefresh, 2000);
+                } else {
+                    refreshPage(activePage);
+                }
             })
             .catch(function (err) {
                 showToast(err.message || 'Save failed', 'error');

@@ -1099,7 +1099,7 @@ test-build: modules busybox dash iptables logind mgmtd cli webd tools uboot
 		$(BUILD_DIR)/test/boot-fs.img 64M 2>/dev/null
 	@# Wrap filesystem in a partitioned image (1MB MBR + 64MB partition)
 	dd if=/dev/zero of=$(BUILD_DIR)/test/boot.img bs=1M count=65 2>/dev/null
-	printf 'start=2048, type=linux\n' | sfdisk $(BUILD_DIR)/test/boot.img >/dev/null 2>&1
+	printf 'start=2048, type=linux, bootable\n' | sfdisk $(BUILD_DIR)/test/boot.img >/dev/null 2>&1
 	dd if=$(BUILD_DIR)/test/boot-fs.img of=$(BUILD_DIR)/test/boot.img \
 		bs=512 seek=2048 conv=notrunc 2>/dev/null
 	@rm -f $(BUILD_DIR)/test/boot-fs.img
@@ -1108,6 +1108,26 @@ test-build: modules busybox dash iptables logind mgmtd cli webd tools uboot
 
 	# TFTP directory for QEMU built-in TFTP server (firmware testing)
 	@mkdir -p $(BUILD_DIR)/test/tftp
+	# Copy kernel and initramfs for TFTP boot (fallback when virtio partition fails)
+	cp $(KERNEL_IMAGE) $(BUILD_DIR)/test/tftp/kernel
+	cp $(BUILD_DIR)/test/initramfs.gz $(BUILD_DIR)/test/tftp/initramfs.gz
+	# Wrap initramfs in U-Boot image format
+	mkimage -A arm64 -T ramdisk -C gzip -n "Stargazer Initramfs" \
+		-d $(BUILD_DIR)/test/tftp/initramfs.gz \
+		$(BUILD_DIR)/test/tftp/initramfs.uimg >/dev/null
+	# Create U-Boot boot script
+	@echo '# U-Boot TFTP boot script' > $(BUILD_DIR)/test/tftp/boot.cmd
+	@echo 'echo "=== Stargazer TFTP Boot ==="' >> $(BUILD_DIR)/test/tftp/boot.cmd
+	@echo 'setenv serverip 10.0.1.1' >> $(BUILD_DIR)/test/tftp/boot.cmd
+	@echo 'setenv ipaddr 10.0.1.15' >> $(BUILD_DIR)/test/tftp/boot.cmd
+	@echo 'tftp $${kernel_addr_r} kernel' >> $(BUILD_DIR)/test/tftp/boot.cmd
+	@echo 'tftp $${ramdisk_addr_r} initramfs.uimg' >> $(BUILD_DIR)/test/tftp/boot.cmd
+	@echo 'setenv bootargs "console=ttyAMA0 root=/dev/ram0 rw"' >> $(BUILD_DIR)/test/tftp/boot.cmd
+	@echo 'booti $${kernel_addr_r} $${ramdisk_addr_r} $${fdt_addr}' >> $(BUILD_DIR)/test/tftp/boot.cmd
+	mkimage -A arm64 -T script -C none -n "Stargazer TFTP Boot" \
+		-d $(BUILD_DIR)/test/tftp/boot.cmd \
+		$(BUILD_DIR)/test/tftp/boot.scr.uimg >/dev/null
+	@echo "TFTP boot files created: $(BUILD_DIR)/test/tftp/"
 
 test: test-build
 	@$(MAKE) --no-print-directory test-run
@@ -1129,12 +1149,17 @@ test-run:
 	fi
 	# Run QEMU — U-Boot loads kernel+initramfs from boot.img (virtio0)
 	# Drive order: vda=boot, vdb=sgdata, vdc=sglogs
+	# Note: ARM virt machine uses virtio-mmio, not virtio-pci
+	# bootindex=0 on boot drive tells U-Boot/firmware to boot from it
 	qemu-system-aarch64 \
 		-machine virt -cpu cortex-a72 -smp 4 -m 2G \
 		-bios $(UBOOT_BIN) \
-		-drive file=$(BUILD_DIR)/test/boot.img,format=raw,if=virtio \
-		-drive file=$(BUILD_DIR)/test/data.img,format=raw,if=virtio \
-		-drive file=$(BUILD_DIR)/test/logs.img,format=raw,if=virtio \
+		-drive file=$(BUILD_DIR)/test/boot.img,format=raw,if=none,id=hd0 \
+		-device virtio-blk-device,drive=hd0,bootindex=0 \
+		-drive file=$(BUILD_DIR)/test/data.img,format=raw,if=none,id=hd1 \
+		-device virtio-blk-device,drive=hd1 \
+		-drive file=$(BUILD_DIR)/test/logs.img,format=raw,if=none,id=hd2 \
+		-device virtio-blk-device,drive=hd2 \
 		-netdev user,id=net0,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:80,net=10.0.1.0/24,host=10.0.1.1,tftp=$(BUILD_DIR)/test/tftp \
 		-device virtio-net-device,netdev=net0 \
 		-nographic

@@ -591,6 +591,13 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 
 		/* GET /api/config/{type}/{id} — get single entry */
 		if (nseg >= 3 && mg_str_eq(hm->method, "GET")) {
+			/* Validate entry ID to prevent injection attacks */
+			if (!sg_is_safe_id(segs[2])) {
+				reply_json(c, 400,
+					   "{\"error\":\"Invalid entry ID\"}");
+				return -1;
+			}
+
 			char section[512];
 			snprintf(section, sizeof(section), "%s:%s\n",
 				 type, segs[2]);
@@ -749,6 +756,13 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 
 		/* PUT /api/config/{type}/{id} — update entry */
 		if (nseg >= 3 && mg_str_eq(hm->method, "PUT")) {
+			/* Validate entry ID to prevent injection attacks */
+			if (!sg_is_safe_id(segs[2])) {
+				reply_json(c, 400,
+					   "{\"error\":\"Invalid entry ID\"}");
+				return -1;
+			}
+
 			char *kv_raw = json_body_to_kv(hm->body);
 			if (!kv_raw) {
 				reply_json(c, 400,
@@ -787,6 +801,13 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 
 		/* DELETE /api/config/{type}/{id} — delete entry */
 		if (nseg >= 3 && mg_str_eq(hm->method, "DELETE")) {
+			/* Validate entry ID to prevent injection attacks */
+			if (!sg_is_safe_id(segs[2])) {
+				reply_json(c, 400,
+					   "{\"error\":\"Invalid entry ID\"}");
+				return -1;
+			}
+
 			char payload[512];
 			snprintf(payload, sizeof(payload), "%s:%s\n",
 				 type, segs[2]);

@@ -332,7 +332,7 @@ debug_get() {
 	_dg_key="$1"
 	_dg_def="$2"
 	debug_state_init
-	_dg_val=$(grep "^${_dg_key}=" "$STARGAZER_DEBUG_STATE_FILE" 2>/dev/null | tail -1 | cut -d= -f2-)
+	_dg_val=$(grep "^${_dg_key}=" "$STARGAZER_DEBUG_STATE_FILE" 2>/dev/null | sed -n '$p' | cut -d= -f2-)
 	if [ -z "$_dg_val" ] && [ -n "$_dg_def" ]; then
 		echo "$_dg_def"
 		return

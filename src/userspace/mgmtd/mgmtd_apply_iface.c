@@ -313,7 +313,9 @@ sg_status_t apply_interface(const char *id, const char *data,
 		free(out);
 	}
 
-	/* Address: DHCP or static */
+	/* Address: DHCP or static
+	 * For static mode, try adding new IP before flushing to minimize
+	 * connection drop on management interface changes. */
 	if (strcmp(mode, "dhcp") == 0) {
 		/* Flush any static IP before starting DHCP */
 		const char *a1[] = {"ip", "addr", "flush", "dev", id, NULL};
@@ -324,13 +326,25 @@ sg_status_t apply_interface(const char *id, const char *data,
 	} else {
 		/* Static mode */
 		if (ip[0]) {
-			const char *a1[] = {"ip", "addr", "flush", "dev",
-					    id, NULL};
-			free(safe_exec(a1));
-			const char *a2[] = {"ip", "addr", "add", ip, "dev",
-					    id, NULL};
-			char *out = safe_exec(a2);
-			if (out && out[0]) {
+			/* Try adding new IP first (allows brief dual-IP state).
+			 * Ignore EEXIST — IP already assigned is OK. */
+			const char *a_add[] = {"ip", "addr", "add", ip, "dev",
+					       id, NULL};
+			char *add_out = safe_exec(a_add);
+			int add_failed = (add_out && add_out[0] &&
+					  !strstr(add_out, "File exists"));
+			free(add_out);
+
+			/* Flush all IPs (including the one we just added) */
+			const char *a_flush[] = {"ip", "addr", "flush", "dev",
+						 id, NULL};
+			free(safe_exec(a_flush));
+
+			/* Re-add desired IP */
+			const char *a_readd[] = {"ip", "addr", "add", ip, "dev",
+						 id, NULL};
+			char *out = safe_exec(a_readd);
+			if (out && out[0] && !strstr(out, "File exists")) {
 				snprintf(result, rsize,
 					 "IP %s failed on %s: %s",
 					 ip, id, out);
@@ -338,6 +352,13 @@ sg_status_t apply_interface(const char *id, const char *data,
 				return SG_ERR_SYSTEM_FAIL;
 			}
 			free(out);
+
+			/* If initial add failed (invalid CIDR etc), report it */
+			if (add_failed) {
+				snprintf(result, rsize,
+					 "Invalid IP address %s for %s.", ip, id);
+				return SG_ERR_INVALID_VAL;
+			}
 		}
 	}
 

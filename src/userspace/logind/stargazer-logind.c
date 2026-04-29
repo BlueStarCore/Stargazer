@@ -27,6 +27,7 @@
 #include <fcntl.h>
 #include <grp.h>
 #include <pwd.h>
+#include <shadow.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -237,7 +238,9 @@ static int ipc_password_change(const char *username, const char *source)
 	int rc;
 
 	fprintf(stderr, "\n");
-	if (strcmp(source, "admin-flag") == 0) {
+	if (strcmp(source, "first-login") == 0) {
+		/* First-login: message already printed in main(), skip header */
+	} else if (strcmp(source, "admin-flag") == 0) {
 		fprintf(stderr, " PASSWORD CHANGE REQUIRED\n");
 		fprintf(stderr, " Account '%s' must change password now.\n\n",
 			username);
@@ -590,6 +593,20 @@ int main(int argc, char *argv[])
 		perror("initgroups");
 
 	/*
+	 * Check if password is empty (first-login scenario).
+	 * getspnam() reads /etc/shadow — must happen before seccomp.
+	 * If shadow password is empty, we'll skip authentication and
+	 * go straight to password creation (better UX than prompting
+	 * for a password that doesn't exist yet).
+	 */
+	int empty_password = 0;
+	if (user_found) {
+		struct spwd *sp = getspnam(username);
+		if (sp && sp->sp_pwdp && sp->sp_pwdp[0] == '\0')
+			empty_password = 1;
+	}
+
+	/*
 	 * Open console fd for later use (before seccomp blocks openat).
 	 * The actual dup2() + TIOCSCTTY happen in Phase 3.
 	 */
@@ -611,6 +628,32 @@ int main(int argc, char *argv[])
 
 	/* ── Phase 2: Authentication via IPC (sandboxed) ─────────────── */
 
+	/*
+	 * First-login fast path: if password is empty, skip authentication
+	 * and go straight to password creation. Better UX than prompting
+	 * "Password:" when no password exists yet.
+	 */
+	if (empty_password) {
+		fprintf(stderr,
+			"\n"
+			" FIRST LOGIN\n"
+			" No password set for account '%s'.\n"
+			" You must create a password now.\n\n",
+			username);
+
+		int rc = ipc_password_change(username, "first-login");
+		if (rc == -2) return EXIT_SIGINT;
+		if (rc != 0)  return 1;
+
+		fprintf(stderr,
+			" Password created successfully.\n"
+			" Please log in again with your new password.\n\n");
+		return 0;
+	}
+
+	/*
+	 * Normal authentication flow (password exists)
+	 */
 	char password[MAX_PASS_LEN];
 	int pw_rc = read_password("Password: ", password, sizeof(password));
 	if (pw_rc == -2) {

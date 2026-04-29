@@ -13,6 +13,38 @@ SYSCTL_CONF="/etc/sysctl.d/10-stargazer.conf"
 
 log() { echo "[$NAME] $1"; }
 
+# --------------------------------------------------------------------------
+# Secure boot: set default firewall policies before mgmtd starts
+# --------------------------------------------------------------------------
+harden_firewall() {
+    # IPv4: Default deny on FORWARD chain (fail-closed)
+    if command -v iptables >/dev/null 2>&1; then
+        if iptables -P FORWARD DROP 2>/dev/null; then
+            log "Set iptables -P FORWARD DROP"
+        else
+            log "WARNING: Could not set FORWARD policy to DROP"
+        fi
+        # Flush any existing FORWARD rules (policy DROP protects us)
+        iptables -F FORWARD 2>/dev/null
+    fi
+    # IPv6: Explicitly deny all forwarding and drop all packets
+    if command -v ip6tables >/dev/null 2>&1; then
+        if ip6tables -P FORWARD DROP 2>/dev/null; then
+            log "Set ip6tables -P FORWARD DROP"
+        else
+            log "WARNING: Could not set ip6tables FORWARD policy to DROP"
+        fi
+        # Flush existing FORWARD rules
+        ip6tables -F FORWARD 2>/dev/null
+        # Also drop all INPUT/OUTPUT on IPv6 for consistency
+        ip6tables -P INPUT DROP 2>/dev/null
+        ip6tables -P OUTPUT DROP 2>/dev/null
+        # Allow loopback on IPv6
+        ip6tables -A INPUT -i lo -j ACCEPT 2>/dev/null
+        ip6tables -A OUTPUT -o lo -j ACCEPT 2>/dev/null
+    fi
+}
+
 load_modules() {
     [ -f "$MODULES_CONF" ] || return 0
     while read -r mod || [ -n "$mod" ]; do
@@ -41,7 +73,8 @@ apply_sysctl() {
     [ -f "$SYSCTL_CONF" ] || return 0
     log "Applying sysctl..."
     while IFS='=' read -r key val || [ -n "$key" ]; do
-        case "$key" in \#*|"") continue ;; esac
+        case "$key" in \#*|"") continue ;;
+esac
         key=$(echo "$key" | tr -d ' ')
         val=$(echo "$val" | tr -d ' ')
         path="/proc/sys/$(echo "$key" | tr '.' '/')"
@@ -57,7 +90,7 @@ harden_perms() {
 }
 
 case "$1" in
-    start)   log "Starting..."; harden_perms; apply_sysctl; load_modules; log "Started" ;;
+    start)   log "Starting..."; harden_perms; harden_firewall; apply_sysctl; load_modules; log "Started" ;;
     stop)    log "Stopping..."; unload_modules; log "Stopped" ;;
     restart) $0 stop; sleep 1; $0 start ;;
     status)  lsmod | grep -q pkt_forward && log "Running" || log "Not running" ;;
