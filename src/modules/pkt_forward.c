@@ -4,14 +4,11 @@
  *
  * Copyright (C) 2026 Stargazer Team
  *
- * Registers Netfilter hook at NF_INET_FORWARD to inspect and control
- * packets traversing the router. All valid IPv4 packets are accepted;
- * malformed packets are dropped and counted.
- *
- * Future phases:
- *   - Phase 2: Session tracking integration
- *   - Phase 3: IPS signature matching
- *   - Phase 4: ML-based threat detection
+ * Registers a Netfilter hook at NF_INET_FORWARD to inspect and account
+ * packets traversing the router. Each forwarded packet is associated
+ * with a session entry maintained by session.ko; per-direction stats
+ * are updated for later ML/IPS feature extraction. Sessions whose
+ * SESS_BLOCKED flag has been set (by ML scoring or policy) are dropped.
  */
 
 #include <linux/module.h>
@@ -19,26 +16,19 @@
 #include <linux/netfilter_ipv4.h>
 #include <linux/ip.h>
 #include <linux/skbuff.h>
+#include <linux/rcupdate.h>
+
+#include "session.h"
 
 #ifndef PKT_FWD_VERSION
 #define PKT_FWD_VERSION "unknown"
 #endif
 
-/* Statistics counters (atomic for SMP safety) */
+/* Counters (atomic for SMP) */
 static atomic64_t pkts_forwarded = ATOMIC64_INIT(0);
 static atomic64_t pkts_dropped   = ATOMIC64_INIT(0);
+static atomic64_t pkts_blocked   = ATOMIC64_INIT(0);
 
-/**
- * is_valid_ipv4 - Validate IPv4 packet header
- * @skb: socket buffer containing the packet
- *
- * Performs basic sanity checks on IP header:
- *   - Ensures header is accessible via pskb_may_pull
- *   - Verifies IPv4 version field
- *   - Checks minimum header length (20 bytes)
- *
- * Return: true if valid, false otherwise
- */
 static bool is_valid_ipv4(struct sk_buff *skb)
 {
 	struct iphdr *iph;
@@ -53,40 +43,60 @@ static bool is_valid_ipv4(struct sk_buff *skb)
 	return true;
 }
 
-/**
- * forward_hook - Netfilter hook callback for FORWARD chain
- * @priv: private data (unused)
- * @skb: socket buffer
- * @state: hook state containing in/out interfaces
+/*
+ * forward_hook - Netfilter callback for the FORWARD chain.
  *
- * Called for every packet being forwarded between interfaces.
- * Validates packet and updates statistics.
- *
- * Return: NF_ACCEPT to forward, NF_DROP to discard
+ * Validates the IPv4 header, then performs session lookup/create/update
+ * inside a single RCU read-side critical section so the session pointer
+ * stays valid for the entire dereference window. Direction is inferred
+ * by sess_lookup_or_create() using the first-packet-wins rule.
  */
 static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 				 const struct nf_hook_state *state)
 {
-	struct iphdr *iph;
+	struct sess_key key;
+	struct session *s;
+	int dir;
+	unsigned int verdict = NF_ACCEPT;
 
 	if (!is_valid_ipv4(skb)) {
 		atomic64_inc(&pkts_dropped);
 		return NF_DROP;
 	}
 
-	iph = ip_hdr(skb);
+	if (extract_key(skb, &key) != 0) {
+		/* Header malformed enough that we cannot key the session;
+		 * count as forwarded but skip session bookkeeping.
+		 */
+		atomic64_inc(&pkts_forwarded);
+		return NF_ACCEPT;
+	}
 
-	/* Rate-limited logging for debugging */
+	rcu_read_lock();
+	s = sess_lookup_or_create(&key, &dir);
+	if (s) {
+		if (READ_ONCE(s->flags) & SESS_BLOCKED) {
+			rcu_read_unlock();
+			atomic64_inc(&pkts_blocked);
+			return NF_DROP;
+		}
+		sess_update(s, skb, dir);
+	}
+	rcu_read_unlock();
+
 	if (net_ratelimit()) {
-		pr_debug("[%s->%s] %pI4 -> %pI4 proto=%u len=%u\n",
-			 state->in ? state->in->name : "?",
+		struct iphdr *iph = ip_hdr(skb);
+
+		pr_debug("[%s->%s] %pI4 -> %pI4 proto=%u len=%u dir=%s\n",
+			 state->in  ? state->in->name  : "?",
 			 state->out ? state->out->name : "?",
 			 &iph->saddr, &iph->daddr,
-			 iph->protocol, ntohs(iph->tot_len));
+			 iph->protocol, ntohs(iph->tot_len),
+			 dir == SESS_DIR_ORIG ? "orig" : "reply");
 	}
 
 	atomic64_inc(&pkts_forwarded);
-	return NF_ACCEPT;
+	return verdict;
 }
 
 static const struct nf_hook_ops nf_forward_ops = {
@@ -113,9 +123,10 @@ static int __init pkt_forward_init(void)
 static void __exit pkt_forward_exit(void)
 {
 	nf_unregister_net_hook(&init_net, &nf_forward_ops);
-	pr_info("pkt_forward: unloaded (fwd=%lld drop=%lld)\n",
+	pr_info("pkt_forward: unloaded (fwd=%lld drop=%lld block=%lld)\n",
 		atomic64_read(&pkts_forwarded),
-		atomic64_read(&pkts_dropped));
+		atomic64_read(&pkts_dropped),
+		atomic64_read(&pkts_blocked));
 }
 
 module_init(pkt_forward_init);
@@ -125,3 +136,4 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Stargazer Team");
 MODULE_DESCRIPTION("Packet forwarding module for BPI-R4 NGFW");
 MODULE_VERSION(PKT_FWD_VERSION);
+MODULE_SOFTDEP("pre: session");
