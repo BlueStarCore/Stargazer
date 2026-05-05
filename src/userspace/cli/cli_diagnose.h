@@ -123,4 +123,13 @@ int cli_diagnose_test_webd(int mode, diag_result_t *out);
  */
 int cli_diagnose_test_busybox(int mode, diag_result_t *out);
 
+/*
+ * Run session tracking diagnostics.
+ *   mode=0: verify session.ko is loaded and procfs format is correct.
+ *   mode=1: full test — loads session_test.ko via mgmtd to verify
+ *           the session API creates, updates, and tracks bidirectional sessions.
+ * Returns 0 on all-pass, 1 on any failure.
+ */
+int cli_diagnose_test_session(int mode, diag_result_t *out);
+
 #endif /* CLI_DIAGNOSE_H */

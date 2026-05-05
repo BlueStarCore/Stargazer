@@ -1393,6 +1393,173 @@ int handle_show_sessions(int client_fd, const char *user,
 	return 0;
 }
 
+/* ── SG_CMD_DIAG_SESSION (654) — session_test.ko kernel self-test ──────── */
+
+int handle_diag_session(int client_fd, const char *user,
+			const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)hdr;
+
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "monitor permission required");
+		return 0;
+	}
+
+	char proc_buf[SG_RESPONSE_MAX];
+	ssize_t n = read_small_file("/proc/stargazer/sessions",
+				    proc_buf, sizeof(proc_buf));
+	if (n < 0) {
+		send_error(client_fd, SG_ERR_NOT_FOUND,
+			   "session module not loaded");
+		return 0;
+	}
+
+	/* Status mode: return live session table */
+	if (!payload || !strstr(payload, "inject")) {
+		send_ok(client_fd, NULL, proc_buf);
+		return 0;
+	}
+
+	/* ── Inject mode: load session_test.ko, read its procfs output ──────── */
+
+	/* Clean up any leftover from a prior run */
+	system("rmmod session_test 2>/dev/null");
+
+	if (system("insmod /lib/modules/stargazer/session_test.ko") != 0) {
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL,
+			   "error=session_test_load_failed "
+			   "(run 'make modules' to build session_test.ko)\n");
+		return 0;
+	}
+
+	/* Give module_init() time to complete and write procfs */
+	usleep(50000);
+
+	/* Try primary path first, then fallback name */
+	n = read_small_file("/proc/stargazer/session_test",
+			    proc_buf, sizeof(proc_buf));
+	if (n < 0)
+		n = read_small_file("/proc/stargazer_session_test",
+				    proc_buf, sizeof(proc_buf));
+
+	system("rmmod session_test 2>/dev/null");
+
+	if (n < 0) {
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL,
+			   "error=session_test_procfs_missing\n");
+		return 0;
+	}
+
+	send_ok(client_fd, NULL, proc_buf);
+	return 0;
+}
+
+/* ── SG_CMD_SESSION_STATS (656) ────────────────────────────────────────── */
+
+int handle_session_stats(int client_fd, const char *user,
+			 const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)payload; (void)hdr;
+
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "monitor permission required");
+		return 0;
+	}
+
+	char proc_buf[SG_RESPONSE_MAX];
+	ssize_t n = read_small_file("/proc/stargazer/sessions",
+				    proc_buf, sizeof(proc_buf));
+
+	int session_loaded = (n >= 0);
+	int pkt_fwd_loaded = (access("/sys/module/pkt_forward", F_OK) == 0);
+
+	/* Parse counters from the first line of the procfs header */
+	long long active = 0, created = 0, expired = 0, invalid = 0;
+	if (session_loaded) {
+		const char *p = proc_buf;
+		const char *kv;
+
+		kv = strstr(p, "active=");
+		if (kv) active = strtoll(kv + 7, NULL, 10);
+		kv = strstr(p, "created=");
+		if (kv) created = strtoll(kv + 8, NULL, 10);
+		kv = strstr(p, "expired=");
+		if (kv) expired = strtoll(kv + 8, NULL, 10);
+		kv = strstr(p, "invalid=");
+		if (kv) invalid = strtoll(kv + 8, NULL, 10);
+	}
+
+	char resp[512];
+	snprintf(resp, sizeof(resp),
+		 "session_loaded=%d\n"
+		 "pkt_forward_loaded=%d\n"
+		 "active=%lld\n"
+		 "created=%lld\n"
+		 "expired=%lld\n"
+		 "invalid=%lld\n",
+		 session_loaded, pkt_fwd_loaded,
+		 active, created, expired, invalid);
+
+	send_ok(client_fd, NULL, resp);
+	return 0;
+}
+
+/* ── SG_CMD_SESSION_CLEAR (655) ─────────────────────────────────────────── */
+
+int handle_session_clear(int client_fd, const char *user,
+			 const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)payload; (void)hdr;
+
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "admin")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "admin permission required");
+		return 0;
+	}
+
+	/* Read current active count before flushing */
+	char proc_buf[SG_RESPONSE_MAX];
+	ssize_t n = read_small_file("/proc/stargazer/sessions",
+				    proc_buf, sizeof(proc_buf));
+	if (n < 0) {
+		send_error(client_fd, SG_ERR_NOT_FOUND,
+			   "session module not loaded");
+		return 0;
+	}
+
+	long long active_before = 0;
+	const char *kv = strstr(proc_buf, "active=");
+	if (kv) active_before = strtoll(kv + 7, NULL, 10);
+
+	/* Write "flush" to the kernel control interface */
+	int fd = open("/proc/stargazer/session_ctl", O_WRONLY);
+	if (fd < 0) {
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL,
+			   "session_ctl not available "
+			   "(session.ko too old — rebuild modules)");
+		return 0;
+	}
+	const char *cmd = "flush\n";
+	ssize_t w = write(fd, cmd, strlen(cmd));
+	close(fd);
+
+	if (w < 0) {
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL,
+			   "flush write failed");
+		return 0;
+	}
+
+	char resp[128];
+	snprintf(resp, sizeof(resp), "flushed=%lld\n", active_before);
+	send_ok(client_fd, NULL, resp);
+	return 0;
+}
+
 /* ── SG_CMD_SHOW_BOOT_CONFIG (651) ─────────────────────────────────────── */
 
 int handle_show_boot_config(int client_fd, const char *user,

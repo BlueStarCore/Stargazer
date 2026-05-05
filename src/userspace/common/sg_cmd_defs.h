@@ -100,7 +100,9 @@ X("execute diagnose selftest database",     "Database health tests (full)",     
 X("execute diagnose selftest disk",         "Disk partition health tests (full)",      "admin",           0,  NULL)
 X("execute diagnose selftest dhcp",         "DHCP client/server cross-validation",     "admin",           0,  NULL)
 X("execute diagnose selftest supervisor",  "Supervisor process management tests",      "admin",           0,  NULL)
-X("execute diagnose selftest webd",       "Web API handler tests",                    "admin",           0,  NULL)
+X("execute diagnose selftest webd",         "Web API handler tests (full)",            "admin",           0,  NULL)
+X("execute diagnose selftest busybox",      "BusyBox applet whitelist check (full)",   "admin",           0,  NULL)
+X("execute diagnose selftest session",      "Session tracking tests (full)",           "admin",           0,  NULL)
 X("execute diagnose pentest",              "Run security penetration tests",          "admin",           1,  cmd_diag_pentest)
 X("execute diagnose pentest full",         "Full pentest with SEC-1..18",             "admin",           0,  NULL)
 
@@ -118,3 +120,8 @@ X("execute diagnose nat",                  "NAT diagnostics",                   
 X("execute diagnose nat policy",           "Show kernel NAT table rules",             "admin",           0,  cmd_diag_nat_policy)
 
 X("execute diagnose routes",               "Show routing table",                       "admin",           0,  cmd_diag_routes)
+
+X("execute diagnose session",              "Session table diagnostics",               "monitor",         0,  cmd_diag_session)
+X("execute diagnose session status",       "Show live session table",                 "monitor",         0,  NULL)
+X("execute diagnose session stats",        "Show session counters and module status", "monitor",         0,  NULL)
+X("execute diagnose session clear",        "Flush all active sessions",               "admin",           0,  NULL)

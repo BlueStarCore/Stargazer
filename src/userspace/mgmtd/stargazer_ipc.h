@@ -134,6 +134,9 @@ typedef enum {
 	SG_CMD_SHOW_BOOT_CONFIG  = 651,  /* modules + sysctl config files      */
 	SG_CMD_DIAG_NTP          = 652,  /* NTP status: server, pid, time      */
 	SG_CMD_DIAG_BUSYBOX_LIST = 653,  /* Enumerate busybox applet symlinks  */
+	SG_CMD_DIAG_SESSION      = 654,  /* Session table status + inject test */
+	SG_CMD_SESSION_CLEAR     = 655,  /* Flush all active sessions          */
+	SG_CMD_SESSION_STATS     = 656,  /* Parsed session counters + status   */
 
 	/* Debug state (66x) */
 	SG_CMD_DEBUG_STATE_GET   = 660,  /* Read debug conf key=value pairs    */

@@ -727,6 +727,108 @@ static int cmd_diag_disk_smart(const char *args, const char *permissions)
 	return 0;
 }
 
+/* ── Session diagnostic handler ──────────────────────────────────────── */
+
+static int cmd_diag_session(const char *args, const char *permissions)
+{
+	(void)permissions;
+
+	const char *sub = args;
+	while (sub && *sub == ' ')
+		sub++;
+
+	/* ── status: live session table ─────────────────────────────── */
+	if (!sub || !*sub || strcmp(sub, "status") == 0) {
+		struct ipc_response resp = {0};
+		int rc = ipc_send_str(SG_CMD_DIAG_SESSION, "", &resp);
+		if (rc != 0 || resp.status != SG_OK) {
+			printf("  Session module not available.\n");
+			ipc_resp_free(&resp);
+			return 0;
+		}
+		printf("  === Session Table ===\n");
+		if (resp.payload && resp.payload[0])
+			printf("%s", resp.payload);
+		else
+			printf("  No active sessions.\n");
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	/* ── stats: counters + module status ────────────────────────── */
+	if (strcmp(sub, "stats") == 0) {
+		struct ipc_response resp = {0};
+		int rc = ipc_send_str(SG_CMD_SESSION_STATS, "", &resp);
+		if (rc != 0 || resp.status != SG_OK) {
+			print_ipc_error("Error", &resp);
+			ipc_resp_free(&resp);
+			return 0;
+		}
+		const char *p = resp.payload ? resp.payload : "";
+		long long active = 0, created = 0, expired = 0, invalid = 0;
+		int sess_loaded = 0, pkt_fwd_loaded = 0;
+		const char *kv;
+		kv = strstr(p, "session_loaded=");
+		if (kv) sess_loaded = (int)strtol(kv + 15, NULL, 10);
+		kv = strstr(p, "pkt_forward_loaded=");
+		if (kv) pkt_fwd_loaded = (int)strtol(kv + 19, NULL, 10);
+		kv = strstr(p, "active=");
+		if (kv) active = strtoll(kv + 7, NULL, 10);
+		kv = strstr(p, "created=");
+		if (kv) created = strtoll(kv + 8, NULL, 10);
+		kv = strstr(p, "expired=");
+		if (kv) expired = strtoll(kv + 8, NULL, 10);
+		kv = strstr(p, "invalid=");
+		if (kv) invalid = strtoll(kv + 8, NULL, 10);
+
+		printf("  === Session Statistics ===\n");
+		printf("  session.ko     : %s\n", sess_loaded    ? C_GREEN "loaded" C_NC : C_RED "not loaded" C_NC);
+		printf("  pkt_forward.ko : %s\n", pkt_fwd_loaded ? C_GREEN "loaded" C_NC : C_RED "not loaded" C_NC);
+		printf("  Active sessions: %lld\n", active);
+		printf("  Created        : %lld\n", created);
+		printf("  Expired        : %lld\n", expired);
+		printf("  Invalid (drops): %lld\n", invalid);
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	/* ── clear: flush all sessions ───────────────────────────────── */
+	if (strcmp(sub, "clear") == 0) {
+		printf("  WARNING: This will drop all active sessions.\n");
+		printf("  Existing connections will be interrupted.\n");
+		printf("  Continue? [y/N] ");
+		fflush(stdout);
+		cli_term_echo_on();
+		char confirm[8] = {0};
+		if (!fgets(confirm, sizeof(confirm), stdin) ||
+		    (confirm[0] != 'y' && confirm[0] != 'Y')) {
+			cli_term_echo_off();
+			printf("  Cancelled.\n");
+			return 0;
+		}
+		cli_term_echo_off();
+
+		struct ipc_response resp = {0};
+		int rc = ipc_send_str(SG_CMD_SESSION_CLEAR, "", &resp);
+		if (rc != 0 || resp.status != SG_OK) {
+			print_ipc_error("Error", &resp);
+			ipc_resp_free(&resp);
+			return 0;
+		}
+		const char *p = resp.payload ? resp.payload : "";
+		long long flushed = 0;
+		const char *kv = strstr(p, "flushed=");
+		if (kv) flushed = strtoll(kv + 8, NULL, 10);
+		printf("  Flushed %lld session(s).\n", flushed);
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	printf("  Unknown subcommand: %s\n", sub);
+	printf("  Usage: execute diagnose session [status|stats|clear]\n");
+	return 0;
+}
+
 /* ── Selftest suite table ─────────────────────────────────────────────── */
 
 /*
@@ -797,6 +899,11 @@ static int st_run_busybox(int mode, diag_result_t *out)
 	return cli_diagnose_test_busybox(mode, out);
 }
 
+static int st_run_session(int mode, diag_result_t *out)
+{
+	return cli_diagnose_test_session(mode, out);
+}
+
 static const struct {
 	const char  *name;
 	st_runner_t  run;
@@ -812,6 +919,7 @@ static const struct {
 	{ "supervisor",  st_run_supervisor },
 	{ "webd",        st_run_webd },
 	{ "busybox",     st_run_busybox },
+	{ "session",     st_run_session },
 	{ NULL,          NULL }
 };
 
