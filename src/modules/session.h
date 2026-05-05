@@ -19,6 +19,7 @@
 #include <linux/spinlock.h>
 #include <linux/ktime.h>
 #include <linux/rcupdate.h>
+#include <linux/proc_fs.h>
 
 struct sk_buff;
 
@@ -39,6 +40,29 @@ struct sess_key {
 #define SESS_ACTIVE	0x0001
 #define SESS_BLOCKED	0x0002	/* drop further packets (set by ML/policy) */
 #define SESS_MARKED	0x0004	/* flagged suspicious, still allowed */
+
+/* TCP connection states — managed by sess_tcp_check() in the forward path */
+#define SESS_TCP_NONE         0  /* no packet seen yet */
+#define SESS_TCP_SYN_SENT     1  /* SYN from orig, awaiting SYN-ACK */
+#define SESS_TCP_SYN_RECV     2  /* SYN-ACK from reply, awaiting final ACK */
+#define SESS_TCP_ESTABLISHED  3  /* three-way handshake complete */
+#define SESS_TCP_FIN_WAIT     4  /* FIN from orig (active close) */
+#define SESS_TCP_CLOSE_WAIT   5  /* FIN from reply (passive close) */
+#define SESS_TCP_LAST_ACK     6  /* FIN from orig after CLOSE_WAIT */
+#define SESS_TCP_TIME_WAIT    7  /* both FINs exchanged */
+#define SESS_TCP_CLOSE        8  /* RST seen or fully closed */
+#define SESS_TCP_STATE_MAX    9
+
+/*
+ * Per-direction TCP window state — used by sess_tcp_check() to validate
+ * RST sequence numbers and detect RST injection attacks.
+ */
+struct sess_tcp_win {
+	u32  ack_seq;   /* last ACK sequence number seen FROM this direction */
+	u16  win;       /* last advertised window FROM this direction (unscaled) */
+	u8   scale;     /* window scale factor negotiated in SYN/SYN-ACK (0..14) */
+	u8   _pad;
+};
 
 /* Per-direction packet length min/max */
 struct sess_pkt_len {
@@ -75,8 +99,11 @@ struct session {
 	struct sess_key		key;
 	u32			id;
 	u16			flags;
-	u8			tcp_state;	/* reserved for Phase 2.6 */
+	u8			tcp_state;	/* SESS_TCP_* — see sess_tcp_check() */
 	u8			_rsv;
+	struct sess_tcp_win	tcp_win[2];	/* [SESS_DIR_ORIG/REPLY] RST validation */
+	u32			ifindex_in;	/* ingress interface at session creation */
+	u32			ifindex_out;	/* egress interface at session creation */
 	u32			policy_id;	/* reserved for Phase 3 */
 	struct sess_stats	stats;
 	s32			ml_score;	/* fixed-point score × 1000 */
@@ -84,6 +111,12 @@ struct session {
 	spinlock_t		lock;
 	struct rcu_head		rcu;
 };
+
+/*
+ * /proc/stargazer/ directory entry, exported so session_test.ko can place
+ * its results in the same directory without re-creating it.
+ */
+extern struct proc_dir_entry *sg_proc_root;
 
 /*
  * Public API exported by session.ko.
@@ -101,8 +134,21 @@ int extract_key(struct sk_buff *skb, struct sess_key *key);
 
 struct session *sess_lookup(const struct sess_key *key);
 
+/* Bidirectional lookup only — never creates. Returns NULL if not found. */
+struct session *sess_lookup_bidir(const struct sess_key *key, int *dir_out);
+
 struct session *sess_lookup_or_create(const struct sess_key *key,
 				      int *dir_out);
+
+/*
+ * sess_tcp_check - Validate TCP state and drive the session state machine.
+ *
+ * Must be called from forward_hook inside rcu_read_lock(), BEFORE sess_update().
+ * Returns NF_ACCEPT if the packet is valid for the current session state.
+ * Returns NF_DROP for RST injection, SYN injection into ESTABLISHED, and
+ * other state-machine violations.
+ */
+unsigned int sess_tcp_check(struct session *s, struct sk_buff *skb, int dir);
 
 void sess_update(struct session *s, struct sk_buff *skb, int dir);
 

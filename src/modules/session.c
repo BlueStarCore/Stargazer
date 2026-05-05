@@ -30,6 +30,7 @@
 #include <linux/seq_file.h>
 #include <linux/workqueue.h>
 #include <linux/jiffies.h>
+#include <linux/random.h>
 
 #include "session.h"
 
@@ -41,11 +42,23 @@
 #define SESSION_TABLE_BITS	10		/* 2^10 = 1024 buckets */
 #define MAX_SESSIONS		65536
 
-/* Per-protocol idle timeouts (Phase 2.6 will add TCP-state-aware timeouts) */
-#define SESS_TIMEOUT_TCP_SEC	3600
+/* Non-TCP idle timeouts */
 #define SESS_TIMEOUT_UDP_SEC	180
 #define SESS_TIMEOUT_ICMP_SEC	60
 #define SESS_TIMEOUT_OTHER_SEC	300
+
+/* Per-state TCP timeouts (seconds) — indexed by SESS_TCP_* constants */
+static const u32 tcp_timeouts[SESS_TCP_STATE_MAX] = {
+	[SESS_TCP_NONE]        = 120,   /* before handshake completes   */
+	[SESS_TCP_SYN_SENT]    = 120,   /* half-open; scanner bait      */
+	[SESS_TCP_SYN_RECV]    =  60,   /* SYN-ACK sent, waiting ACK    */
+	[SESS_TCP_ESTABLISHED] = 3600,  /* live connection              */
+	[SESS_TCP_FIN_WAIT]    = 120,   /* graceful close in progress   */
+	[SESS_TCP_CLOSE_WAIT]  =  60,
+	[SESS_TCP_LAST_ACK]    =  30,
+	[SESS_TCP_TIME_WAIT]   = 120,   /* RFC 793 2MSL                 */
+	[SESS_TCP_CLOSE]       =  10,   /* RST — clean up fast          */
+};
 
 /* Reaper cadence */
 #define SESS_REAPER_INTERVAL_SEC 30
@@ -54,15 +67,22 @@
 static DEFINE_HASHTABLE(sess_table, SESSION_TABLE_BITS);
 static DEFINE_SPINLOCK(table_lock);
 
+/* Randomized hash seed — initialized at module load from kernel RNG.
+ * Prevents hash-bucket collision attacks (hash DoS). */
+static u32 sess_hash_rnd;
+
 /* Counters */
 static atomic_t   next_id      = ATOMIC_INIT(1);
-static atomic64_t sess_created = ATOMIC64_INIT(0);
-static atomic64_t sess_active  = ATOMIC64_INIT(0);
-static atomic64_t sess_expired = ATOMIC64_INIT(0);
+static atomic64_t sess_created  = ATOMIC64_INIT(0);
+static atomic64_t sess_active   = ATOMIC64_INIT(0);
+static atomic64_t sess_expired  = ATOMIC64_INIT(0);
+static atomic64_t pkts_invalid  = ATOMIC64_INIT(0); /* state machine drops */
 
 /* procfs handles */
-static struct proc_dir_entry *proc_root;
+struct proc_dir_entry *sg_proc_root;
+EXPORT_SYMBOL_GPL(sg_proc_root);
 static struct proc_dir_entry *proc_sessions;
+static struct proc_dir_entry *proc_session_ctl;
 
 /* Reaper */
 static void sess_reaper_fn(struct work_struct *work);
@@ -74,7 +94,7 @@ static DECLARE_DELAYED_WORK(sess_reaper, sess_reaper_fn);
 
 static inline u32 sess_hash(const struct sess_key *key)
 {
-	return jhash(key, sizeof(*key), 0);
+	return jhash(key, sizeof(*key), sess_hash_rnd);
 }
 
 static inline bool sess_key_eq(const struct sess_key *a,
@@ -96,7 +116,7 @@ static inline void sess_reverse_key(struct sess_key *r,
 static inline u32 sess_timeout_for_proto(u8 proto)
 {
 	switch (proto) {
-	case IPPROTO_TCP:  return SESS_TIMEOUT_TCP_SEC;
+	case IPPROTO_TCP:  return tcp_timeouts[SESS_TCP_NONE]; /* pre-handshake baseline */
 	case IPPROTO_UDP:  return SESS_TIMEOUT_UDP_SEC;
 	case IPPROTO_ICMP: return SESS_TIMEOUT_ICMP_SEC;
 	default:           return SESS_TIMEOUT_OTHER_SEC;
@@ -162,6 +182,28 @@ struct session *sess_lookup(const struct sess_key *key)
 	return NULL;
 }
 EXPORT_SYMBOL_GPL(sess_lookup);
+
+struct session *sess_lookup_bidir(const struct sess_key *key, int *dir_out)
+{
+	struct session *s;
+	struct sess_key rkey;
+
+	s = sess_lookup(key);
+	if (s) {
+		*dir_out = SESS_DIR_ORIG;
+		return s;
+	}
+
+	sess_reverse_key(&rkey, key);
+	s = sess_lookup(&rkey);
+	if (s) {
+		*dir_out = SESS_DIR_REPLY;
+		return s;
+	}
+
+	return NULL;
+}
+EXPORT_SYMBOL_GPL(sess_lookup_bidir);
 
 /* Allocate and initialize a session. Caller must insert into the table. */
 static struct session *sess_alloc(const struct sess_key *key)
@@ -304,6 +346,176 @@ static void accumulate_tcp_flags(struct session *s, struct sk_buff *skb,
 	}
 }
 
+/* True if seq falls within [start, start+size) in TCP sequence space.
+ * Uses u32 arithmetic so it handles wrap-around and scaled windows correctly. */
+static inline bool tcp_in_window(u32 seq, u32 start, u32 size)
+{
+	return (u32)(seq - start) < size;
+}
+
+/* RFC 793 / RFC 7323 TCP option types — defined locally to avoid net/tcp.h */
+#define SG_TCPOPT_EOL    0  /* end of option list */
+#define SG_TCPOPT_NOP    1  /* no-operation (1 byte, no length field) */
+#define SG_TCPOPT_WSCALE 3  /* window scale (RFC 7323), length = 3 */
+
+/*
+ * Parse the TCP window scale option from a SYN or SYN-ACK.
+ * Caller must ensure the full TCP header including options is linear
+ * (pskb_may_pull to iph->ihl*4 + tcph->doff*4) before calling.
+ * Returns scale value 0..14, or 0 if option absent (no scaling).
+ */
+static u8 tcp_parse_wscale(const struct tcphdr *tcph)
+{
+	const u8 *opt = (const u8 *)tcph + sizeof(struct tcphdr);
+	int optlen    = tcph->doff * 4 - (int)sizeof(struct tcphdr);
+	int i = 0;
+
+	while (i < optlen) {
+		switch (opt[i]) {
+		case SG_TCPOPT_EOL:
+			return 0;
+		case SG_TCPOPT_NOP:
+			i++;
+			continue;
+		default:
+			if (i + 1 >= optlen)
+				return 0;
+			if (opt[i] == SG_TCPOPT_WSCALE && opt[i + 1] == 3) {
+				if (i + 2 >= optlen)
+					return 0;
+				/* RFC 7323: valid scale values are 0..14 */
+				return min_t(u8, opt[i + 2], 14);
+			}
+			/* Skip unknown option — length field at opt[i+1] */
+			i += opt[i + 1] ? opt[i + 1] : 1;
+			continue;
+		}
+	}
+	return 0;
+}
+
+unsigned int sess_tcp_check(struct session *s, struct sk_buff *skb, int dir)
+{
+	struct iphdr  *iph;
+	struct tcphdr *tcph;
+	u8  new_state;
+	u8  wscale = 0;
+	u32 seq, ack_seq;
+	u16 win;
+
+	iph = ip_hdr(skb);
+	if (!pskb_may_pull(skb, iph->ihl * 4 + sizeof(struct tcphdr)))
+		return NF_ACCEPT;
+
+	/* Re-fetch after pull — pskb_may_pull may reallocate the skb head */
+	iph  = ip_hdr(skb);
+	tcph = tcp_hdr(skb);
+
+	/* SYN and SYN-ACK carry the window scale TCP option (RFC 7323).
+	 * Pull the full TCP header to reach the options, then parse. */
+	if (tcph->syn) {
+		unsigned int full_hdr = (unsigned int)iph->ihl * 4 +
+					(unsigned int)tcph->doff * 4;
+		if (pskb_may_pull(skb, full_hdr)) {
+			iph    = ip_hdr(skb);
+			tcph   = tcp_hdr(skb);
+			wscale = tcp_parse_wscale(tcph);
+		}
+	}
+
+	seq     = ntohl(tcph->seq);
+	ack_seq = ntohl(tcph->ack_seq);
+	win     = ntohs(tcph->window);
+
+	spin_lock(&s->lock);
+	new_state = s->tcp_state;
+
+	/* ── RST: validate sequence, then tear down ──────────────────── */
+	if (tcph->rst) {
+		/* A legitimate RST seq must fall within the peer's receive window.
+		 * Apply the negotiated window scale before the range check.
+		 * Skip validation if we haven't seen an ACK yet (ack_seq == 0). */
+		u32 peer_ack = s->tcp_win[1 - dir].ack_seq;
+		u32 peer_win = (u32)s->tcp_win[1 - dir].win
+			       << s->tcp_win[1 - dir].scale;
+
+		if (peer_ack != 0 && peer_win > 0 &&
+		    !tcp_in_window(seq, peer_ack, peer_win)) {
+			spin_unlock(&s->lock);
+			atomic64_inc(&pkts_invalid);
+			return NF_DROP;
+		}
+		new_state = SESS_TCP_CLOSE;
+		goto apply;
+	}
+
+	/* ── State machine ───────────────────────────────────────────── */
+	switch (s->tcp_state) {
+
+	case SESS_TCP_NONE:
+	case SESS_TCP_SYN_SENT:
+		if (tcph->syn && !tcph->ack && dir == SESS_DIR_ORIG) {
+			new_state = SESS_TCP_SYN_SENT;
+			s->tcp_win[SESS_DIR_ORIG].scale = wscale;
+		} else if (tcph->syn && tcph->ack && dir == SESS_DIR_REPLY) {
+			new_state = SESS_TCP_SYN_RECV;
+			s->tcp_win[SESS_DIR_REPLY].scale = wscale;
+		}
+		break;
+
+	case SESS_TCP_SYN_RECV:
+		if (!tcph->syn && tcph->ack && !tcph->fin && dir == SESS_DIR_ORIG)
+			new_state = SESS_TCP_ESTABLISHED;
+		break;
+
+	case SESS_TCP_ESTABLISHED:
+		if (tcph->syn) {
+			spin_unlock(&s->lock);
+			atomic64_inc(&pkts_invalid);
+			return NF_DROP;
+		}
+		if (tcph->fin)
+			new_state = (dir == SESS_DIR_ORIG) ? SESS_TCP_FIN_WAIT
+							    : SESS_TCP_CLOSE_WAIT;
+		break;
+
+	case SESS_TCP_FIN_WAIT:
+		if (tcph->fin && dir == SESS_DIR_REPLY)
+			new_state = SESS_TCP_TIME_WAIT;
+		break;
+
+	case SESS_TCP_CLOSE_WAIT:
+		if (tcph->fin && dir == SESS_DIR_ORIG)
+			new_state = SESS_TCP_LAST_ACK;
+		break;
+
+	case SESS_TCP_LAST_ACK:
+		if (tcph->ack && dir == SESS_DIR_REPLY)
+			new_state = SESS_TCP_CLOSE;
+		break;
+
+	case SESS_TCP_TIME_WAIT:
+	case SESS_TCP_CLOSE:
+		break;
+	}
+
+apply:
+	if (tcph->ack) {
+		s->tcp_win[dir].ack_seq = ack_seq;
+		s->tcp_win[dir].win     = win;
+	}
+
+	if (new_state != s->tcp_state)
+		WRITE_ONCE(s->tcp_state, new_state);
+
+	s->expires_at = ktime_add_ns(ktime_get(),
+		(u64)tcp_timeouts[new_state] * NSEC_PER_SEC);
+
+	spin_unlock(&s->lock);
+	return NF_ACCEPT;
+}
+EXPORT_SYMBOL_GPL(sess_tcp_check);
+
 void sess_update(struct session *s, struct sk_buff *skb, int dir)
 {
 	ktime_t now = ktime_get();
@@ -329,8 +541,12 @@ void sess_update(struct session *s, struct sk_buff *skb, int dir)
 	s->stats.iat_count++;
 	s->stats.last_seen = now;
 
-	s->expires_at = ktime_add_ns(now,
-		(u64)sess_timeout_for_proto(s->key.proto) * NSEC_PER_SEC);
+	/* TCP expiry is managed by sess_tcp_check() which runs before this.
+	 * Overwriting it here would reset the state-aware timeout to the
+	 * generic baseline. */
+	if (s->key.proto != IPPROTO_TCP)
+		s->expires_at = ktime_add_ns(now,
+			(u64)sess_timeout_for_proto(s->key.proto) * NSEC_PER_SEC);
 
 	spin_unlock(&s->lock);
 }
@@ -349,9 +565,9 @@ static void sess_free_rcu(struct rcu_head *head)
 
 void sess_delete(struct session *s)
 {
-	spin_lock(&table_lock);
+	spin_lock_bh(&table_lock);
 	hash_del_rcu(&s->node);
-	spin_unlock(&table_lock);
+	spin_unlock_bh(&table_lock);
 
 	atomic64_dec(&sess_active);
 	call_rcu(&s->rcu, sess_free_rcu);
@@ -397,9 +613,40 @@ static void sess_flush_all(void)
 		call_rcu(&s->rcu, sess_free_rcu);
 	}
 	spin_unlock_bh(&table_lock);
-
-	rcu_barrier();
+	/* Caller calls rcu_barrier() if it needs to wait for all frees to complete.
+	 * session_exit() does; the runtime flush path (sess_ctl_write) does not. */
 }
+
+/* ---------------------------------------------------------------------- */
+/* /proc/stargazer/session_ctl — control interface (write-only)           */
+/* ---------------------------------------------------------------------- */
+
+static ssize_t sess_ctl_write(struct file *file, const char __user *buf,
+			      size_t count, loff_t *ppos)
+{
+	char cmd[16];
+	size_t len = min(count, sizeof(cmd) - 1);
+
+	if (copy_from_user(cmd, buf, len))
+		return -EFAULT;
+	cmd[len] = '\0';
+
+	/* Strip trailing newline */
+	if (len > 0 && cmd[len - 1] == '\n')
+		cmd[--len] = '\0';
+
+	if (strcmp(cmd, "flush") == 0) {
+		sess_flush_all();
+		return (ssize_t)count;
+	}
+
+	return -EINVAL;
+}
+
+static const struct proc_ops sess_ctl_proc_ops = {
+	.proc_write  = sess_ctl_write,
+	.proc_lseek  = noop_llseek,
+};
 
 /* ---------------------------------------------------------------------- */
 /* /proc/stargazer/sessions                                               */
@@ -490,12 +737,13 @@ static int sess_seq_show(struct seq_file *seq, void *v)
 
 	if (v == SEQ_START_TOKEN) {
 		seq_printf(seq,
-			"# Stargazer sessions  active=%lld created=%lld expired=%lld\n",
+			"# Stargazer sessions  active=%lld created=%lld expired=%lld invalid=%lld\n",
 			atomic64_read(&sess_active),
 			atomic64_read(&sess_created),
-			atomic64_read(&sess_expired));
+			atomic64_read(&sess_expired),
+			atomic64_read(&pkts_invalid));
 		seq_puts(seq,
-			"# proto src dst id pkts(o/r) bytes(o/r) age_ms expire_ms ml flags\n");
+			"# proto src dst id pkts(o/r) bytes(o/r) age_ms expire_ms ml flags tcp_state\n");
 		return 0;
 	}
 
@@ -505,7 +753,11 @@ static int sess_seq_show(struct seq_file *seq, void *v)
 	ttl_ms = ktime_to_ms(ktime_sub(s->expires_at, now));
 
 	seq_printf(seq,
-		"proto=%u src=%pI4:%u dst=%pI4:%u id=%u pkts=%llu/%llu bytes=%llu/%llu age_ms=%lld expire_ms=%lld ml=%d flags=0x%x\n",
+		"proto=%u src=%pI4:%u dst=%pI4:%u id=%u"
+		" pkts=%llu/%llu bytes=%llu/%llu"
+		" age_ms=%lld expire_ms=%lld"
+		" ml=%d flags=0x%x"
+		" dev=%u/%u",
 		s->key.proto,
 		&s->key.src_ip, ntohs(s->key.src_port),
 		&s->key.dst_ip, ntohs(s->key.dst_port),
@@ -513,7 +765,11 @@ static int sess_seq_show(struct seq_file *seq, void *v)
 		s->stats.pkts_orig, s->stats.pkts_reply,
 		s->stats.bytes_orig, s->stats.bytes_reply,
 		age_ms, ttl_ms,
-		s->ml_score, s->flags);
+		s->ml_score, s->flags,
+		s->ifindex_in, s->ifindex_out);
+	if (s->key.proto == IPPROTO_TCP)
+		seq_printf(seq, " tcp_state=%u", READ_ONCE(s->tcp_state));
+	seq_putc(seq, '\n');
 	return 0;
 }
 
@@ -544,19 +800,30 @@ static const struct proc_ops sess_proc_ops = {
 static int __init session_init(void)
 {
 	hash_init(sess_table);
+	get_random_bytes(&sess_hash_rnd, sizeof(sess_hash_rnd));
 
-	proc_root = proc_mkdir("stargazer", NULL);
-	if (!proc_root) {
+	sg_proc_root = proc_mkdir("stargazer", NULL);
+	if (!sg_proc_root) {
 		pr_err("session: failed to create /proc/stargazer\n");
 		return -ENOMEM;
 	}
 
-	proc_sessions = proc_create("sessions", 0444, proc_root,
+	proc_sessions = proc_create("sessions", 0444, sg_proc_root,
 				    &sess_proc_ops);
 	if (!proc_sessions) {
 		pr_err("session: failed to create /proc/stargazer/sessions\n");
-		proc_remove(proc_root);
-		proc_root = NULL;
+		proc_remove(sg_proc_root);
+		sg_proc_root = NULL;
+		return -ENOMEM;
+	}
+
+	proc_session_ctl = proc_create("session_ctl", 0200, sg_proc_root,
+				       &sess_ctl_proc_ops);
+	if (!proc_session_ctl) {
+		pr_err("session: failed to create /proc/stargazer/session_ctl\n");
+		proc_remove(proc_sessions);
+		proc_remove(sg_proc_root);
+		sg_proc_root = NULL;
 		return -ENOMEM;
 	}
 
@@ -572,12 +839,15 @@ static void __exit session_exit(void)
 {
 	cancel_delayed_work_sync(&sess_reaper);
 
+	if (proc_session_ctl)
+		proc_remove(proc_session_ctl);
 	if (proc_sessions)
 		proc_remove(proc_sessions);
-	if (proc_root)
-		proc_remove(proc_root);
+	if (sg_proc_root)
+		proc_remove(sg_proc_root);
 
 	sess_flush_all();
+	rcu_barrier(); /* wait for all call_rcu() frees before module memory unloads */
 
 	pr_info("session: unloaded (created=%lld expired=%lld)\n",
 		atomic64_read(&sess_created),

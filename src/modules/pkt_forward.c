@@ -15,6 +15,7 @@
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/ip.h>
+#include <linux/tcp.h>
 #include <linux/skbuff.h>
 #include <linux/rcupdate.h>
 
@@ -56,8 +57,8 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 {
 	struct sess_key key;
 	struct session *s;
-	int dir;
-	unsigned int verdict = NF_ACCEPT;
+	int dir = SESS_DIR_ORIG;
+	bool tcp_is_syn = false;
 
 	if (!is_valid_ipv4(skb)) {
 		atomic64_inc(&pkts_dropped);
@@ -65,24 +66,64 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 	}
 
 	if (extract_key(skb, &key) != 0) {
-		/* Header malformed enough that we cannot key the session;
-		 * count as forwarded but skip session bookkeeping.
-		 */
+		/* Header malformed; count as forwarded, skip session bookkeeping */
 		atomic64_inc(&pkts_forwarded);
 		return NF_ACCEPT;
 	}
 
+	/* extract_key() already pulled the TCP header — safe to read directly */
+	if (key.proto == IPPROTO_TCP)
+		tcp_is_syn = tcp_hdr(skb)->syn != 0;
+
 	rcu_read_lock();
-	s = sess_lookup_or_create(&key, &dir);
-	if (s) {
-		if (READ_ONCE(s->flags) & SESS_BLOCKED) {
-			rcu_read_unlock();
-			atomic64_inc(&pkts_blocked);
+
+	/*
+	 * Stateful enforcement: non-SYN TCP may only match an existing session.
+	 * Using sess_lookup_bidir() prevents creating a session for mid-stream
+	 * packets injected by an attacker or arriving after a reboot.
+	 */
+	if (key.proto == IPPROTO_TCP && !tcp_is_syn)
+		s = sess_lookup_bidir(&key, &dir);
+	else
+		s = sess_lookup_or_create(&key, &dir);
+
+	if (!s) {
+		rcu_read_unlock();
+		if (key.proto == IPPROTO_TCP) {
+			/* Non-SYN with no session: stateful drop.
+			 * SYN with table full: drop rather than forward untracked —
+			 * an untracked session bypasses all policy enforcement. */
+			atomic64_inc(&pkts_dropped);
 			return NF_DROP;
 		}
-		sess_update(s, skb, dir);
+		/* Non-TCP table full: forward untracked (UDP/ICMP are stateless) */
+		atomic64_inc(&pkts_forwarded);
+		return NF_ACCEPT;
 	}
-	rcu_read_unlock();
+
+	/* Record ingress/egress interface at session creation (set-once on first packet) */
+	if (state->in && READ_ONCE(s->ifindex_in) == 0) {
+		WRITE_ONCE(s->ifindex_in,  (u32)state->in->ifindex);
+		WRITE_ONCE(s->ifindex_out, state->out ? (u32)state->out->ifindex : 0u);
+	}
+
+	if (READ_ONCE(s->flags) & SESS_BLOCKED) {
+		rcu_read_unlock();
+		atomic64_inc(&pkts_blocked);
+		return NF_DROP;
+	}
+
+	if (key.proto == IPPROTO_TCP) {
+		unsigned int verdict = sess_tcp_check(s, skb, dir);
+
+		if (verdict != NF_ACCEPT) {
+			rcu_read_unlock();
+			atomic64_inc(&pkts_dropped);
+			return verdict;
+		}
+	}
+
+	sess_update(s, skb, dir);
 
 	if (net_ratelimit()) {
 		struct iphdr *iph = ip_hdr(skb);
@@ -95,8 +136,9 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 			 dir == SESS_DIR_ORIG ? "orig" : "reply");
 	}
 
+	rcu_read_unlock();
 	atomic64_inc(&pkts_forwarded);
-	return verdict;
+	return NF_ACCEPT;
 }
 
 static const struct nf_hook_ops nf_forward_ops = {
