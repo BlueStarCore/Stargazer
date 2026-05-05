@@ -31,6 +31,7 @@
 #include <linux/workqueue.h>
 #include <linux/jiffies.h>
 #include <linux/random.h>
+#include <linux/icmp.h>
 
 #include "session.h"
 
@@ -58,6 +59,7 @@ static const u32 tcp_timeouts[SESS_TCP_STATE_MAX] = {
 	[SESS_TCP_LAST_ACK]    =  30,
 	[SESS_TCP_TIME_WAIT]   = 120,   /* RFC 793 2MSL                 */
 	[SESS_TCP_CLOSE]       =  10,   /* RST — clean up fast          */
+	[SESS_TCP_SYN_SENT2]   =  60,   /* simultaneous open            */
 };
 
 /* Reaper cadence */
@@ -70,6 +72,13 @@ static DEFINE_SPINLOCK(table_lock);
 /* Randomized hash seed — initialized at module load from kernel RNG.
  * Prevents hash-bucket collision attacks (hash DoS). */
 static u32 sess_hash_rnd;
+
+/* Asymmetric routing mode: allow mid-stream TCP pickup for HA / ECMP paths. */
+bool sess_asymmetric_mode = false;
+module_param(sess_asymmetric_mode, bool, 0644);
+MODULE_PARM_DESC(sess_asymmetric_mode,
+		 "Allow mid-stream TCP pickup for asymmetric routing (default: N)");
+EXPORT_SYMBOL_GPL(sess_asymmetric_mode);
 
 /* Counters */
 static atomic_t   next_id      = ATOMIC_INIT(1);
@@ -457,9 +466,25 @@ unsigned int sess_tcp_check(struct session *s, struct sk_buff *skb, int dir)
 		if (tcph->syn && !tcph->ack && dir == SESS_DIR_ORIG) {
 			new_state = SESS_TCP_SYN_SENT;
 			s->tcp_win[SESS_DIR_ORIG].scale = wscale;
+		} else if (tcph->syn && !tcph->ack && dir == SESS_DIR_REPLY) {
+			/* Simultaneous open: both sides sent SYN before receiving one */
+			new_state = SESS_TCP_SYN_SENT2;
+			s->tcp_win[SESS_DIR_REPLY].scale = wscale;
 		} else if (tcph->syn && tcph->ack && dir == SESS_DIR_REPLY) {
 			new_state = SESS_TCP_SYN_RECV;
 			s->tcp_win[SESS_DIR_REPLY].scale = wscale;
+		} else if (!tcph->syn && !tcph->rst && READ_ONCE(sess_asymmetric_mode)) {
+			/* Asymmetric routing: data on half-open session — promote to ESTABLISHED */
+			new_state = SESS_TCP_ESTABLISHED;
+		}
+		break;
+
+	case SESS_TCP_SYN_SENT2:
+		/* Both sides have sent SYN; the first SYN+ACK from either direction
+		 * completes the handshake (RFC 793 simultaneous open). */
+		if (tcph->syn && tcph->ack) {
+			new_state = SESS_TCP_SYN_RECV;
+			s->tcp_win[dir].scale = wscale;
 		}
 		break;
 
@@ -647,6 +672,75 @@ static const struct proc_ops sess_ctl_proc_ops = {
 	.proc_write  = sess_ctl_write,
 	.proc_lseek  = noop_llseek,
 };
+
+/* ---------------------------------------------------------------------- */
+/* ICMP error → parent session mapping                                    */
+/* ---------------------------------------------------------------------- */
+
+struct session *sess_icmp_error_lookup(struct sk_buff *skb, int *dir_out)
+{
+	struct iphdr   *iph;
+	struct icmphdr *icmph;
+	struct iphdr   *inner_iph;
+	struct sess_key key;
+	unsigned int    outer_hlen;
+	unsigned int    inner_hlen;
+	const u8       *inner_l4;
+
+	iph        = ip_hdr(skb);
+	outer_hlen = iph->ihl * 4;
+
+	/* Pull outer IP + ICMP fixed header (8 bytes) */
+	if (!pskb_may_pull(skb, outer_hlen + sizeof(struct icmphdr)))
+		return NULL;
+
+	iph   = ip_hdr(skb);
+	icmph = (struct icmphdr *)((u8 *)iph + outer_hlen);
+
+	/* Only error types embed the original header */
+	if (icmph->type != ICMP_DEST_UNREACH &&
+	    icmph->type != ICMP_TIME_EXCEEDED &&
+	    icmph->type != ICMP_PARAMETERPROB)
+		return NULL;
+
+	/* Pull embedded IP header */
+	if (!pskb_may_pull(skb, outer_hlen + sizeof(struct icmphdr) +
+			       sizeof(struct iphdr)))
+		return NULL;
+
+	iph       = ip_hdr(skb);
+	icmph     = (struct icmphdr *)((u8 *)iph + outer_hlen);
+	inner_iph = (struct iphdr   *)((u8 *)icmph + sizeof(struct icmphdr));
+	inner_hlen = inner_iph->ihl * 4;
+
+	/* RFC 792 guarantees at least 8 bytes of embedded L4 */
+	if (!pskb_may_pull(skb, outer_hlen + sizeof(struct icmphdr) +
+			       inner_hlen + 8))
+		return NULL;
+
+	/* Re-fetch all pointers — pskb_may_pull may have reallocated skb head */
+	iph       = ip_hdr(skb);
+	icmph     = (struct icmphdr *)((u8 *)iph + outer_hlen);
+	inner_iph = (struct iphdr   *)((u8 *)icmph + sizeof(struct icmphdr));
+	inner_l4  = (const u8       *) inner_iph + inner_iph->ihl * 4;
+
+	key.src_ip   = inner_iph->saddr;
+	key.dst_ip   = inner_iph->daddr;
+	key.proto    = inner_iph->protocol;
+	key.src_port = 0;
+	key.dst_port = 0;
+
+	/* First 8 bytes of embedded L4: src_port at [0], dst_port at [2] */
+	if (key.proto == IPPROTO_TCP || key.proto == IPPROTO_UDP) {
+		memcpy(&key.src_port, inner_l4,     sizeof(__be16));
+		memcpy(&key.dst_port, inner_l4 + 2, sizeof(__be16));
+	}
+
+	/* The embedded header is in ORIG direction; the error arrived as REPLY.
+	 * sess_lookup_bidir() handles both directions correctly. */
+	return sess_lookup_bidir(&key, dir_out);
+}
+EXPORT_SYMBOL_GPL(sess_icmp_error_lookup);
 
 /* ---------------------------------------------------------------------- */
 /* /proc/stargazer/sessions                                               */

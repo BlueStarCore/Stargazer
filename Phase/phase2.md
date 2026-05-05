@@ -318,17 +318,49 @@ active=N created=N expired=N invalid=N
 
 ---
 
+## Asymmetric routing mode
+
+Enabled via module parameter (default off):
+
+```
+modprobe session sess_asymmetric_mode=1
+# or at runtime:
+echo 1 > /sys/module/session/parameters/sess_asymmetric_mode
+```
+
+When on, two behaviors change:
+
+1. Non-SYN TCP with no existing session is allowed to create one (pickup), instead of being dropped. `pkt_forward.ko` calls `sess_lookup_or_create()` as a fallback after `sess_lookup_bidir()` returns NULL.
+
+2. Data arriving on a half-open session (state NONE or SYN_SENT) promotes it directly to ESTABLISHED instead of staying half-open. This handles HA failover where the SYN+ACK took a different path.
+
+Keep this off unless the network topology requires it — it weakens stateful enforcement.
+
+## ICMP error → parent session mapping
+
+ICMP type 3 (Destination Unreachable), 11 (Time Exceeded), and 12 (Parameter Problem) embed the original IP+L4 header that caused the error. `sess_icmp_error_lookup()` in `session.c`:
+
+1. Pulls and checks the ICMP type.
+2. Pulls the embedded IP header + first 8 bytes of embedded L4.
+3. Builds a `sess_key` from the embedded 5-tuple.
+4. Calls `sess_lookup_bidir()` — the embedded header is in ORIG direction, but `bidir` handles both.
+
+In `forward_hook`, ICMP packets try `sess_icmp_error_lookup()` first. If the parent TCP/UDP session is found, the ICMP error packet uses that session for the `SESS_BLOCKED` check and `sess_update()` (bytes counted in the parent flow's stats). If no parent session exists (e.g., the original flow expired), a new ICMP-keyed session is created normally.
+
+## Simultaneous TCP open (RFC 793 §3.4)
+
+Tracked via the `SESS_TCP_SYN_SENT2` state (value 9):
+
+```
+NONE ──SYN(orig)──► SYN_SENT ──SYN(reply, no ACK)──► SYN_SENT2
+                                                            │
+                                              SYN+ACK(either side)
+                                                            │
+                                                       SYN_RECV ──ACK──► ESTABLISHED
+```
+
+When a SYN arrives from the reply direction while in `SYN_SENT`, the session moves to `SYN_SENT2` (60s timeout) instead of being silently ignored. The first SYN+ACK from either direction then transitions to `SYN_RECV`, and the normal final ACK → ESTABLISHED path follows.
+
 ## Known limitations (deferred to Phase 3+)
 
-- **NAT blindness** — the session key is the pre-NAT 5-tuple. Reply packets
-  from a NAT'd connection arrive with the translated addresses and will not
-  match the original session key. Requires adding `nat_key` to the session
-  struct and NAT-awareness in `extract_key()`.
-- **ICMP error mapping** — ICMP type 3/11 errors embed the original packet
-  header but are not mapped back to the parent TCP/UDP session.
-- **Simultaneous TCP open** — both sides send SYN. Not handled; one SYN will
-  create a session, the other SYN from reply direction looks like a SYN-only
-  packet in state SYN_SENT and is handled by the state machine's NONE/SYN_SENT
-  case. Rare in practice.
-- **Asymmetric routing** — if return traffic takes a different path, non-SYN
-  TCP drop will reject legitimate packets. Needs a configurable pickup mode.
+- **NAT blindness** — the session key is the pre-NAT 5-tuple. Reply packets from a NAT'd connection arrive with the translated addresses and will not match the original session key. Requires adding `nat_key` to the session struct and NAT-awareness in `extract_key()`.

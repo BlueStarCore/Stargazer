@@ -51,7 +51,8 @@ struct sess_key {
 #define SESS_TCP_LAST_ACK     6  /* FIN from orig after CLOSE_WAIT */
 #define SESS_TCP_TIME_WAIT    7  /* both FINs exchanged */
 #define SESS_TCP_CLOSE        8  /* RST seen or fully closed */
-#define SESS_TCP_STATE_MAX    9
+#define SESS_TCP_SYN_SENT2    9  /* simultaneous open: both sides sent SYN */
+#define SESS_TCP_STATE_MAX   10
 
 /*
  * Per-direction TCP window state — used by sess_tcp_check() to validate
@@ -119,6 +120,14 @@ struct session {
 extern struct proc_dir_entry *sg_proc_root;
 
 /*
+ * When true, non-SYN TCP pickup is allowed for asymmetric routing / HA.
+ * Set via module parameter: modprobe session sess_asymmetric_mode=1
+ * Can also be changed at runtime via /sys/module/session/parameters/sess_asymmetric_mode.
+ * Default: false (strict stateful enforcement).
+ */
+extern bool sess_asymmetric_mode;
+
+/*
  * Public API exported by session.ko.
  *
  * extract_key()           — fill sess_key from an skb (IPv4 + TCP/UDP).
@@ -153,5 +162,19 @@ unsigned int sess_tcp_check(struct session *s, struct sk_buff *skb, int dir);
 void sess_update(struct session *s, struct sk_buff *skb, int dir);
 
 void sess_delete(struct session *s);
+
+/*
+ * sess_icmp_error_lookup - Find the parent session for an ICMP error message.
+ *
+ * ICMP type 3 (Destination Unreachable), 11 (Time Exceeded), and 12
+ * (Parameter Problem) embed the original IP+L4 header that triggered the
+ * error. This function extracts that embedded 5-tuple and returns the
+ * matching parent session via sess_lookup_bidir().
+ *
+ * Must be called inside rcu_read_lock(). Returns NULL if the outer packet
+ * is not an ICMP error type, the embedded header cannot be pulled, or no
+ * matching session exists.
+ */
+struct session *sess_icmp_error_lookup(struct sk_buff *skb, int *dir_out);
 
 #endif /* _STARGAZER_SESSION_H */

@@ -77,15 +77,33 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 
 	rcu_read_lock();
 
-	/*
-	 * Stateful enforcement: non-SYN TCP may only match an existing session.
-	 * Using sess_lookup_bidir() prevents creating a session for mid-stream
-	 * packets injected by an attacker or arriving after a reboot.
-	 */
-	if (key.proto == IPPROTO_TCP && !tcp_is_syn)
+	if (key.proto == IPPROTO_TCP && !tcp_is_syn) {
+		/*
+		 * Stateful enforcement: non-SYN TCP must match an existing session.
+		 * sess_lookup_bidir() never creates, so injected mid-stream packets
+		 * with no session are dropped below.
+		 * Asymmetric routing exception: if sess_asymmetric_mode is on, a
+		 * non-SYN with no session is allowed to create one (pickup). The
+		 * TCP state machine will promote it to ESTABLISHED on the first
+		 * data packet.
+		 */
 		s = sess_lookup_bidir(&key, &dir);
-	else
+		if (!s && READ_ONCE(sess_asymmetric_mode))
+			s = sess_lookup_or_create(&key, &dir);
+	} else if (key.proto == IPPROTO_ICMP) {
+		/*
+		 * For ICMP error messages (type 3/11/12), look up the parent
+		 * TCP/UDP session using the embedded original header. If found,
+		 * policy from the parent session applies (SESS_BLOCKED check,
+		 * stats update). For non-error ICMP (echo, etc.), falls through
+		 * to sess_lookup_or_create() for a normal ICMP-keyed session.
+		 */
+		s = sess_icmp_error_lookup(skb, &dir);
+		if (!s)
+			s = sess_lookup_or_create(&key, &dir);
+	} else {
 		s = sess_lookup_or_create(&key, &dir);
+	}
 
 	if (!s) {
 		rcu_read_unlock();
@@ -96,7 +114,7 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 			atomic64_inc(&pkts_dropped);
 			return NF_DROP;
 		}
-		/* Non-TCP table full: forward untracked (UDP/ICMP are stateless) */
+		/* Non-TCP table full: forward untracked */
 		atomic64_inc(&pkts_forwarded);
 		return NF_ACCEPT;
 	}
