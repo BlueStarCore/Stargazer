@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <time.h>
@@ -1556,6 +1557,117 @@ int handle_session_clear(int client_fd, const char *user,
 
 	char resp[128];
 	snprintf(resp, sizeof(resp), "flushed=%lld\n", active_before);
+	send_ok(client_fd, NULL, resp);
+	return 0;
+}
+
+/* ── SG_CMD_NETFLOW_STATUS (657) ────────────────────────────────────────── */
+
+int handle_netflow_status(int client_fd, const char *user,
+			  const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)payload; (void)hdr;
+
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "monitor permission required");
+		return 0;
+	}
+
+	char stat_buf[512];
+	ssize_t n = read_small_file("/run/stargazer/flowd.stat",
+				    stat_buf, sizeof(stat_buf));
+	if (n < 0) {
+		send_ok(client_fd, NULL,
+			"running=0\n"
+			"records_sent=0\n"
+			"bytes_sent=0\n"
+			"errors=0\n"
+			"uptime_s=0\n"
+			"collector=\n"
+			"enabled=0\n");
+		return 0;
+	}
+
+	send_ok(client_fd, NULL, stat_buf);
+	return 0;
+}
+
+/* ── SG_CMD_NETFLOW_SET (658) ────────────────────────────────────────────── */
+
+int handle_netflow_set(int client_fd, const char *user,
+		       const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)hdr;
+
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "admin")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "admin permission required");
+		return 0;
+	}
+
+	if (!payload || payload[0] == '\0') {
+		send_error(client_fd, SG_ERR_INVALID_ARG,
+			   "payload required: collector=<ip>:<port> [enabled=<0|1>]");
+		return 0;
+	}
+
+	/* Parse key=value pairs from payload */
+	char   conf_ip[64]  = {0};
+	char   conf_port[8] = {0};
+	char   conf_en[4]   = {0};
+	const char *kv;
+
+	kv = strstr(payload, "collector=");
+	if (kv) {
+		kv += 10;
+		const char *colon = strchr(kv, ':');
+		if (colon && (colon - kv) < (int)sizeof(conf_ip)) {
+			int ip_len = (int)(colon - kv);
+			strncpy(conf_ip, kv, ip_len);
+			strncpy(conf_port, colon + 1,
+				sizeof(conf_port) - 1);
+		}
+	}
+	kv = strstr(payload, "enabled=");
+	if (kv)
+		strncpy(conf_en, kv + 8, sizeof(conf_en) - 1);
+
+	/* Write to /etc/stargazer/flowd.conf */
+	FILE *f = fopen("/etc/stargazer/flowd.conf", "w");
+	if (!f) {
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL,
+			   "cannot write /etc/stargazer/flowd.conf");
+		return 0;
+	}
+	if (conf_ip[0])
+		fprintf(f, "collector_ip=%s\n", conf_ip);
+	if (conf_port[0])
+		fprintf(f, "collector_port=%s\n", conf_port);
+	if (conf_en[0])
+		fprintf(f, "enabled=%s\n", conf_en);
+	fclose(f);
+
+	/* Send SIGHUP to flowd if running */
+	char pid_buf[16] = {0};
+	ssize_t pn = read_small_file("/run/stargazer/flowd.pid",
+				     pid_buf, sizeof(pid_buf));
+	int reloaded = 0;
+	if (pn > 0) {
+		pid_t pid = (pid_t)atoi(pid_buf);
+		if (pid > 0 && kill(pid, SIGHUP) == 0)
+			reloaded = 1;
+	}
+
+	char resp[128];
+	snprintf(resp, sizeof(resp),
+		 "collector=%s:%s\nenabled=%s\nreloaded=%d\n",
+		 conf_ip[0] ? conf_ip : "(unchanged)",
+		 conf_port[0] ? conf_port : "(unchanged)",
+		 conf_en[0] ? conf_en : "(unchanged)",
+		 reloaded);
 	send_ok(client_fd, NULL, resp);
 	return 0;
 }

@@ -20,6 +20,7 @@ X("logout",                                 "Logout from CLI",                  
 X("show",                                   "Show system information",                 "monitor",         0,  NULL)
 X("show status",                            "Module and system status",                "monitor",         0,  cmd_show_status)
 X("show sessions",                          "Active session table",                    "monitor",         0,  cmd_show_sessions)
+X("show netflow",                           "NetFlow exporter status and counters",    "monitor",         0,  cmd_show_netflow)
 X("show stats",                             "Packet statistics",                       "monitor",         0,  cmd_show_stats)
 X("show interfaces",                        "Network interfaces",                      "monitor",         0,  cmd_show_interfaces)
 X("show routes",                            "Routing table",                           "monitor",         0,  cmd_show_routes)
@@ -125,3 +126,6 @@ X("execute diagnose session",              "Session table diagnostics",         
 X("execute diagnose session status",       "Show live session table",                 "monitor",         0,  NULL)
 X("execute diagnose session stats",        "Show session counters and module status", "monitor",         0,  NULL)
 X("execute diagnose session clear",        "Flush all active sessions",               "admin",           0,  NULL)
+
+X("set netflow",                           "NetFlow exporter configuration",          "admin",           2,  cmd_set_netflow)
+X("set netflow collector",                 "Set collector <ip> <port>",               "admin",           2,  NULL)

@@ -32,8 +32,10 @@
 #include <linux/jiffies.h>
 #include <linux/random.h>
 #include <linux/icmp.h>
+#include <net/genetlink.h>
 
 #include "session.h"
+#include "sg_flow.h"
 
 #ifndef SESS_VERSION
 #define SESS_VERSION "unknown"
@@ -96,6 +98,9 @@ static struct proc_dir_entry *proc_session_ctl;
 /* Reaper */
 static void sess_reaper_fn(struct work_struct *work);
 static DECLARE_DELAYED_WORK(sess_reaper, sess_reaper_fn);
+
+/* Forward declaration — defined in the genl section, called from lookup/reaper */
+static void sess_genl_notify(const struct session *s, enum sg_flow_cmd cmd);
 
 /* ---------------------------------------------------------------------- */
 /* Helpers                                                                */
@@ -315,6 +320,12 @@ struct session *sess_lookup_or_create(const struct sess_key *key,
 	atomic64_inc(&sess_created);
 	atomic64_inc(&sess_active);
 	*dir_out = SESS_DIR_ORIG;
+
+	/* Notify subscribers (flowd, ML daemon) that a new session exists.
+	 * table_lock is released; fresh is in the hash table and immutable
+	 * for key/id fields.  Called from softirq (forward hook) — GFP_ATOMIC. */
+	sess_genl_notify(fresh, SG_FLOW_CMD_SESS_NEW);
+
 	return fresh;
 }
 EXPORT_SYMBOL_GPL(sess_lookup_or_create);
@@ -599,11 +610,19 @@ void sess_delete(struct session *s)
 }
 EXPORT_SYMBOL_GPL(sess_delete);
 
+/*
+ * Maximum sessions collected per reaper cycle for out-of-lock genl notification.
+ * 64 × 8 bytes = 512 bytes on the stack — within the 1024-byte kernel limit.
+ * Sessions beyond this limit are freed immediately (without genl notify).
+ */
+#define SESS_REAP_BATCH 64
+
 static void sess_reaper_fn(struct work_struct *work)
 {
 	struct session *s;
 	struct hlist_node *tmp;
-	int bucket;
+	struct session *to_notify[SESS_REAP_BATCH];
+	int bucket, i;
 	int reaped = 0;
 	ktime_t now = ktime_get();
 
@@ -613,11 +632,27 @@ static void sess_reaper_fn(struct work_struct *work)
 			hash_del_rcu(&s->node);
 			atomic64_dec(&sess_active);
 			atomic64_inc(&sess_expired);
-			call_rcu(&s->rcu, sess_free_rcu);
+			if (reaped < SESS_REAP_BATCH)
+				to_notify[reaped] = s;
+			else
+				call_rcu(&s->rcu, sess_free_rcu); /* batch overflow */
 			reaped++;
 		}
 	}
 	spin_unlock_bh(&table_lock);
+
+	/*
+	 * Send SESS_EXPIRED notifications outside the spinlock.  The sessions
+	 * are no longer reachable via the hash table (hash_del_rcu done) but
+	 * their memory is still valid — call_rcu has not been called yet.
+	 * Concurrent pkt_forward readers that already hold rcu_read_lock may
+	 * still be running sess_update; individual u64 field reads on ARM64
+	 * are atomic, so the stats snapshot is consistent enough for flow export.
+	 */
+	for (i = 0; i < min(reaped, SESS_REAP_BATCH); i++) {
+		sess_genl_notify(to_notify[i], SG_FLOW_CMD_SESS_EXPIRED);
+		call_rcu(&to_notify[i]->rcu, sess_free_rcu);
+	}
 
 	if (reaped)
 		pr_debug("session: reaped %d expired entries\n", reaped);
@@ -741,6 +776,194 @@ struct session *sess_icmp_error_lookup(struct sk_buff *skb, int *dir_out)
 	return sess_lookup_bidir(&key, dir_out);
 }
 EXPORT_SYMBOL_GPL(sess_icmp_error_lookup);
+
+/* ---------------------------------------------------------------------- */
+/* Generic Netlink family — flow event export and ML verdict receive      */
+/* ---------------------------------------------------------------------- */
+
+/*
+ * Attribute policy — only incoming command attributes need validation.
+ * SESS_BLOCK takes SESS_ID; SESS_SCORE takes SESS_ID + ML_SCORE.
+ * Outgoing event attributes (stats, IPs, ports) are not validated here.
+ */
+static const struct nla_policy sg_flow_attr_policy[__SG_FLOW_ATTR_MAX] = {
+	[SG_FLOW_ATTR_SESS_ID]  = { .type = NLA_U32 },
+	[SG_FLOW_ATTR_ML_SCORE] = { .type = NLA_S32 },
+};
+
+static int sg_flow_cmd_block(struct sk_buff *skb, struct genl_info *info)
+{
+	struct session *s;
+	u32 sess_id;
+	int bucket;
+	bool found = false;
+
+	if (!info->attrs[SG_FLOW_ATTR_SESS_ID])
+		return -EINVAL;
+
+	sess_id = nla_get_u32(info->attrs[SG_FLOW_ATTR_SESS_ID]);
+
+	rcu_read_lock();
+	hash_for_each_rcu(sess_table, bucket, s, node) {
+		if (s->id == sess_id) {
+			WRITE_ONCE(s->flags, READ_ONCE(s->flags) | SESS_BLOCKED);
+			found = true;
+			break;
+		}
+	}
+	rcu_read_unlock();
+
+	return found ? 0 : -ENOENT;
+}
+
+static int sg_flow_cmd_score(struct sk_buff *skb, struct genl_info *info)
+{
+	struct session *s;
+	u32 sess_id;
+	s32 score;
+	int bucket;
+	bool found = false;
+
+	if (!info->attrs[SG_FLOW_ATTR_SESS_ID] ||
+	    !info->attrs[SG_FLOW_ATTR_ML_SCORE])
+		return -EINVAL;
+
+	sess_id = nla_get_u32(info->attrs[SG_FLOW_ATTR_SESS_ID]);
+	score   = nla_get_s32(info->attrs[SG_FLOW_ATTR_ML_SCORE]);
+
+	rcu_read_lock();
+	hash_for_each_rcu(sess_table, bucket, s, node) {
+		if (s->id == sess_id) {
+			WRITE_ONCE(s->ml_score, score);
+			found = true;
+			break;
+		}
+	}
+	rcu_read_unlock();
+
+	return found ? 0 : -ENOENT;
+}
+
+static const struct genl_ops sg_flow_ops[] = {
+	{
+		.cmd   = SG_FLOW_CMD_SESS_BLOCK,
+		.doit  = sg_flow_cmd_block,
+		.flags = GENL_ADMIN_PERM,
+	},
+	{
+		.cmd   = SG_FLOW_CMD_SESS_SCORE,
+		.doit  = sg_flow_cmd_score,
+		.flags = GENL_ADMIN_PERM,
+	},
+};
+
+static const struct genl_multicast_group sg_flow_mcgrps[] = {
+	{ .name = SG_FLOW_MCGRP_NAME },
+};
+
+static struct genl_family sg_flow_family __ro_after_init = {
+	.name     = SG_FLOW_GENL_NAME,
+	.version  = SG_FLOW_GENL_VERSION,
+	.maxattr  = SG_FLOW_ATTR_MAX,
+	.policy   = sg_flow_attr_policy,
+	.ops      = sg_flow_ops,
+	.n_ops    = ARRAY_SIZE(sg_flow_ops),
+	.mcgrps   = sg_flow_mcgrps,
+	.n_mcgrps = ARRAY_SIZE(sg_flow_mcgrps),
+	.module   = THIS_MODULE,
+};
+
+/*
+ * sess_genl_notify - Multicast a session event to all subscribers.
+ *
+ * For SESS_NEW: only the 5-tuple and ID are sent (stats are zero at create).
+ * For SESS_EXPIRED: full stats snapshot is included.
+ *
+ * Called from softirq context (SESS_NEW via forward hook) and from workqueue
+ * context (SESS_EXPIRED via reaper).  GFP_ATOMIC throughout.
+ *
+ * IP addresses and ports are sent in network byte order (raw copy from
+ * sess_key).  Counters are sent in host byte order via nla_put_u64_64bit /
+ * nla_put_u32.
+ */
+static void sess_genl_notify(const struct session *s, enum sg_flow_cmd cmd)
+{
+	struct sk_buff *skb;
+	void *hdr;
+
+	skb = genlmsg_new(NLMSG_GOODSIZE, GFP_ATOMIC);
+	if (!skb)
+		return;
+
+	hdr = genlmsg_put(skb, 0, 0, &sg_flow_family, 0, cmd);
+	if (!hdr)
+		goto free_skb;
+
+	/* 5-tuple and session ID — immutable after creation, no lock needed */
+	if (nla_put_u32(skb,  SG_FLOW_ATTR_SESS_ID,   s->id)           ||
+	    nla_put_u8(skb,   SG_FLOW_ATTR_PROTO,      s->key.proto)    ||
+	    nla_put_be32(skb, SG_FLOW_ATTR_SRC_IP,     s->key.src_ip)   ||
+	    nla_put_be32(skb, SG_FLOW_ATTR_DST_IP,     s->key.dst_ip)   ||
+	    nla_put_be16(skb, SG_FLOW_ATTR_SRC_PORT,   s->key.src_port) ||
+	    nla_put_be16(skb, SG_FLOW_ATTR_DST_PORT,   s->key.dst_port))
+		goto cancel;
+
+	if (cmd == SG_FLOW_CMD_SESS_EXPIRED) {
+		/*
+		 * Stats snapshot without s->lock.  On ARM64 individual u64 reads
+		 * are atomic; we may see a mix of pre/post last-packet values
+		 * across fields, which is acceptable for flow export purposes.
+		 */
+		if (nla_put_u64_64bit(skb, SG_FLOW_ATTR_PKTS_ORIG,
+				      s->stats.pkts_orig,    SG_FLOW_ATTR_UNSPEC) ||
+		    nla_put_u64_64bit(skb, SG_FLOW_ATTR_PKTS_REPLY,
+				      s->stats.pkts_reply,   SG_FLOW_ATTR_UNSPEC) ||
+		    nla_put_u64_64bit(skb, SG_FLOW_ATTR_BYTES_ORIG,
+				      s->stats.bytes_orig,   SG_FLOW_ATTR_UNSPEC) ||
+		    nla_put_u64_64bit(skb, SG_FLOW_ATTR_BYTES_REPLY,
+				      s->stats.bytes_reply,  SG_FLOW_ATTR_UNSPEC) ||
+		    nla_put_u64_64bit(skb, SG_FLOW_ATTR_IAT_SUM_NS,
+				      s->stats.iat_sum_ns,   SG_FLOW_ATTR_UNSPEC) ||
+		    nla_put_u32(skb, SG_FLOW_ATTR_IAT_COUNT,
+				s->stats.iat_count)                               ||
+		    nla_put_u16(skb, SG_FLOW_ATTR_TCP_FLAGS_O,
+				s->stats.tcp_flags_orig)                          ||
+		    nla_put_u16(skb, SG_FLOW_ATTR_TCP_FLAGS_R,
+				s->stats.tcp_flags_reply)                         ||
+		    nla_put_u64_64bit(skb, SG_FLOW_ATTR_FIRST_SEEN_NS,
+				      (u64)ktime_to_ns(s->stats.first_seen),
+				      SG_FLOW_ATTR_UNSPEC)                        ||
+		    nla_put_u64_64bit(skb, SG_FLOW_ATTR_LAST_SEEN_NS,
+				      (u64)ktime_to_ns(s->stats.last_seen),
+				      SG_FLOW_ATTR_UNSPEC)                        ||
+		    nla_put_u8(skb,  SG_FLOW_ATTR_TCP_STATE,
+			       READ_ONCE(s->tcp_state))                       ||
+		    nla_put_s32(skb, SG_FLOW_ATTR_ML_SCORE,
+				READ_ONCE(s->ml_score))                           ||
+		    nla_put_u32(skb, SG_FLOW_ATTR_IFINDEX_IN,
+				READ_ONCE(s->ifindex_in))                         ||
+		    nla_put_u32(skb, SG_FLOW_ATTR_IFINDEX_OUT,
+				READ_ONCE(s->ifindex_out))                        ||
+		    nla_put_u32(skb, SG_FLOW_ATTR_LEN_ORIG_MIN,
+				s->stats.len_orig.min)                            ||
+		    nla_put_u32(skb, SG_FLOW_ATTR_LEN_ORIG_MAX,
+				s->stats.len_orig.max)                            ||
+		    nla_put_u32(skb, SG_FLOW_ATTR_LEN_REPLY_MIN,
+				s->stats.len_reply.min)                           ||
+		    nla_put_u32(skb, SG_FLOW_ATTR_LEN_REPLY_MAX,
+				s->stats.len_reply.max))
+			goto cancel;
+	}
+
+	genlmsg_end(skb, hdr);
+	genlmsg_multicast_allns(&sg_flow_family, skb, 0, 0);
+	return;
+
+cancel:
+	genlmsg_cancel(skb, hdr);
+free_skb:
+	nlmsg_free(skb);
+}
 
 /* ---------------------------------------------------------------------- */
 /* /proc/stargazer/sessions                                               */
@@ -923,14 +1146,28 @@ static int __init session_init(void)
 
 	schedule_delayed_work(&sess_reaper, SESS_REAPER_INTERVAL_SEC * HZ);
 
-	pr_info("session: loaded (v%s, %d buckets, reaper=%ds)\n",
+	int ret = genl_register_family(&sg_flow_family);
+	if (ret < 0) {
+		pr_err("session: genl_register_family failed (%d)\n", ret);
+		cancel_delayed_work_sync(&sess_reaper);
+		proc_remove(proc_session_ctl);
+		proc_remove(proc_sessions);
+		proc_remove(sg_proc_root);
+		sg_proc_root = NULL;
+		return ret;
+	}
+
+	pr_info("session: loaded (v%s, %d buckets, reaper=%ds, genl=%s)\n",
 		SESS_VERSION, 1 << SESSION_TABLE_BITS,
-		SESS_REAPER_INTERVAL_SEC);
+		SESS_REAPER_INTERVAL_SEC, SG_FLOW_GENL_NAME);
 	return 0;
 }
 
 static void __exit session_exit(void)
 {
+	/* Unregister genl first — no more notifications after this point */
+	genl_unregister_family(&sg_flow_family);
+
 	cancel_delayed_work_sync(&sess_reaper);
 
 	if (proc_session_ctl)

@@ -166,6 +166,10 @@ int handle_session_stats(int client_fd, const char *user,
 			 const char *payload, const sg_request_hdr_t *hdr);
 int handle_show_boot_config(int client_fd, const char *user,
 			    const char *payload, const sg_request_hdr_t *hdr);
+int handle_netflow_status(int client_fd, const char *user,
+			  const char *payload, const sg_request_hdr_t *hdr);
+int handle_netflow_set(int client_fd, const char *user,
+		       const char *payload, const sg_request_hdr_t *hdr);
 int handle_debug_state_get(int client_fd, const char *user,
 			   const char *payload, const sg_request_hdr_t *hdr);
 int handle_debug_state_set(int client_fd, const char *user,

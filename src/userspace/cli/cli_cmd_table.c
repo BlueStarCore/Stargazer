@@ -829,6 +829,122 @@ static int cmd_diag_session(const char *args, const char *permissions)
 	return 0;
 }
 
+/* ── show netflow ─────────────────────────────────────────────────────── */
+
+static int cmd_show_netflow(const char *args, const char *permissions)
+{
+	(void)args; (void)permissions;
+
+	struct ipc_response resp = {0};
+	int rc = ipc_send_str(SG_CMD_NETFLOW_STATUS, "", &resp);
+	if (rc != 0 || resp.status != SG_OK) {
+		print_ipc_error("Error", &resp);
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	const char *p = resp.payload ? resp.payload : "";
+	const char *kv;
+	int      running = 0, enabled = 0;
+	long long records = 0, bytes = 0, errors = 0, uptime = 0;
+	char     collector[128] = "(not configured)";
+
+	kv = strstr(p, "running=");
+	if (kv) running = atoi(kv + 8);
+	kv = strstr(p, "enabled=");
+	if (kv) enabled = atoi(kv + 8);
+	kv = strstr(p, "records_sent=");
+	if (kv) records = strtoll(kv + 13, NULL, 10);
+	kv = strstr(p, "bytes_sent=");
+	if (kv) bytes = strtoll(kv + 11, NULL, 10);
+	kv = strstr(p, "errors=");
+	if (kv) errors = strtoll(kv + 7, NULL, 10);
+	kv = strstr(p, "uptime_s=");
+	if (kv) uptime = strtoll(kv + 9, NULL, 10);
+	kv = strstr(p, "collector=");
+	if (kv) {
+		const char *end = strchr(kv + 10, '\n');
+		int len = end ? (int)(end - (kv + 10)) : (int)strlen(kv + 10);
+		if (len > 0 && len < (int)sizeof(collector)) {
+			memcpy(collector, kv + 10, (size_t)len);
+			collector[len] = '\0';
+		}
+	}
+
+	printf("  === NetFlow Exporter ===\n");
+	printf("  Status    : %s\n", running ? C_GREEN "running" C_NC
+					     : C_RED "stopped" C_NC);
+	printf("  Enabled   : %s\n", enabled ? "yes" : "no");
+	printf("  Collector : %s\n", collector);
+	printf("  Records   : %lld\n", records);
+	printf("  Bytes sent: %lld\n", bytes);
+	printf("  Errors    : %lld\n", errors);
+	printf("  Uptime    : %llds\n", uptime);
+
+	ipc_resp_free(&resp);
+	return 0;
+}
+
+/* ── set netflow ──────────────────────────────────────────────────────── */
+
+static int cmd_set_netflow(const char *args, const char *permissions)
+{
+	(void)permissions;
+
+	const char *sub = args;
+	while (sub && *sub == ' ')
+		sub++;
+
+	if (!sub || !*sub) {
+		printf("  Usage: set netflow collector <ip> <port>\n");
+		return 0;
+	}
+
+	if (strncmp(sub, "collector", 9) == 0) {
+		const char *rest = sub + 9;
+		while (*rest == ' ')
+			rest++;
+
+		/* Expect: <ip> <port> */
+		char ip[64] = {0};
+		char port_s[8] = {0};
+		if (sscanf(rest, "%63s %7s", ip, port_s) != 2) {
+			printf("  Usage: set netflow collector <ip> <port>\n");
+			return 0;
+		}
+
+		char payload[128];
+		snprintf(payload, sizeof(payload),
+			 "collector=%s:%s\nenabled=1\n", ip, port_s);
+
+		struct ipc_response resp = {0};
+		int rc = ipc_send_str(SG_CMD_NETFLOW_SET, payload, &resp);
+		if (rc != 0 || resp.status != SG_OK) {
+			print_ipc_error("Error", &resp);
+			ipc_resp_free(&resp);
+			return 0;
+		}
+
+		const char *p = resp.payload ? resp.payload : "";
+		int reloaded = 0;
+		const char *kv = strstr(p, "reloaded=");
+		if (kv) reloaded = atoi(kv + 9);
+
+		printf("  Collector set to %s:%s.\n", ip, port_s);
+		if (reloaded)
+			printf("  sg-flowd reloaded.\n");
+		else
+			printf("  Note: sg-flowd not running — start it to begin export.\n");
+
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	printf("  Unknown subcommand: %s\n", sub);
+	printf("  Usage: set netflow collector <ip> <port>\n");
+	return 0;
+}
+
 /* ── Selftest suite table ─────────────────────────────────────────────── */
 
 /*
