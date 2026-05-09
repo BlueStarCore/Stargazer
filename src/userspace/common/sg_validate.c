@@ -11,6 +11,7 @@
 #include "sg_validate.h"
 
 #include <ctype.h>
+#include <net/if.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -312,6 +313,8 @@ int
 sg_is_iface_name(const char *s)
 {
 	if (!s || !*s)
+		return 0;
+	if (strlen(s) >= IF_NAMESIZE)   /* IF_NAMESIZE = 16, same as kernel IFNAMSIZ */
 		return 0;
 	for (const char *p = s; *p; p++) {
 		if (isalnum((unsigned char)*p))

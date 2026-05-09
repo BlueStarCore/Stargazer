@@ -203,15 +203,20 @@ static int cmd_fw_upgrade(const char *args, const char *permissions)
 		return 0;
 	}
 
-	/* Confirm with admin */
+	/* Confirm with admin — switch to canonical echo mode so keystrokes are
+	 * visible (terminal is in raw/no-echo mode between readline calls). */
 	printf("  WARNING: This will download firmware, install it, and reboot the device.\n");
 	printf("  Carefully read change logs before proceeding.\n");
 	printf("  Do you want to continue? [y/N] ");
 	fflush(stdout);
 
+	cli_term_echo_on();
 	char confirm[16] = {0};
-	if (!fgets(confirm, sizeof(confirm), stdin) ||
-	    (confirm[0] != 'y' && confirm[0] != 'Y')) {
+	int cancelled = (!fgets(confirm, sizeof(confirm), stdin) ||
+			 (confirm[0] != 'y' && confirm[0] != 'Y'));
+	cli_term_echo_off();
+
+	if (cancelled) {
 		printf("  Firmware upgrade cancelled.\n");
 		return 0;
 	}

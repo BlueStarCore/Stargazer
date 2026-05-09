@@ -289,14 +289,26 @@ struct session *sess_lookup_or_create(const struct sess_key *key,
 
 	hash = sess_hash(key);
 
-	spin_lock(&table_lock);
+	spin_lock_bh(&table_lock);
+
+	/* Re-check capacity inside the lock — the lockless check above is only
+	 * a fast-path hint; another CPU may have filled the table between then
+	 * and now. */
+	if (atomic64_read(&sess_active) >= MAX_SESSIONS) {
+		spin_unlock_bh(&table_lock);
+		kfree(fresh);
+		pr_warn_ratelimited("session: table full (%d max)\n",
+				    MAX_SESSIONS);
+		return NULL;
+	}
+
 	/* Re-check both directions under the writer lock to handle the race
 	 * where another CPU inserted a matching session between our lockless
-	 * lookups and this point.
+	 * lookups and this point.  Use non-RCU walker inside the writer lock.
 	 */
-	hash_for_each_possible_rcu(sess_table, s, node, hash) {
+	hash_for_each_possible(sess_table, s, node, hash) {
 		if (sess_key_eq(&s->key, key)) {
-			spin_unlock(&table_lock);
+			spin_unlock_bh(&table_lock);
 			kfree(fresh);
 			*dir_out = SESS_DIR_ORIG;
 			return s;
@@ -305,9 +317,9 @@ struct session *sess_lookup_or_create(const struct sess_key *key,
 	{
 		u32 rhash = sess_hash(&rkey);
 
-		hash_for_each_possible_rcu(sess_table, s, node, rhash) {
+		hash_for_each_possible(sess_table, s, node, rhash) {
 			if (sess_key_eq(&s->key, &rkey)) {
-				spin_unlock(&table_lock);
+				spin_unlock_bh(&table_lock);
 				kfree(fresh);
 				*dir_out = SESS_DIR_REPLY;
 				return s;
@@ -315,10 +327,9 @@ struct session *sess_lookup_or_create(const struct sess_key *key,
 		}
 	}
 	hash_add_rcu(sess_table, &fresh->node, hash);
-	spin_unlock(&table_lock);
-
 	atomic64_inc(&sess_created);
 	atomic64_inc(&sess_active);
+	spin_unlock_bh(&table_lock);
 	*dir_out = SESS_DIR_ORIG;
 
 	/* Notify subscribers (flowd, ML daemon) that a new session exists.
@@ -351,11 +362,14 @@ static void accumulate_tcp_flags(struct session *s, struct sk_buff *skb,
 
 	if (iph->protocol != IPPROTO_TCP)
 		return;
-	if (!pskb_may_pull(skb, iph->ihl * 4 + sizeof(struct tcphdr)))
-		return;
-
+	/* TCP header is already linear — extract_key() and sess_tcp_check()
+	 * both called pskb_may_pull before we get here.  Do NOT call
+	 * pskb_may_pull here; this function runs under s->lock (spinlock). */
 	tcph  = tcp_hdr(skb);
-	flags = tcp_flag_word(tcph) >> 16;
+
+	/* tcp_flag_word() returns __be32; shift after be32_to_cpu for correct
+	 * flags extraction on little-endian ARM64. */
+	flags = (u16)(be32_to_cpu(tcp_flag_word(tcph)) >> 16);
 
 	if (dir == SESS_DIR_ORIG) {
 		s->stats.tcp_flags_orig |= flags;
@@ -430,6 +444,13 @@ unsigned int sess_tcp_check(struct session *s, struct sk_buff *skb, int dir)
 	/* Re-fetch after pull — pskb_may_pull may reallocate the skb head */
 	iph  = ip_hdr(skb);
 	tcph = tcp_hdr(skb);
+
+	/* Reject malformed TCP headers (doff < 5 means no room for mandatory
+	 * 20-byte fixed header — these are forged or corrupt packets). */
+	if (tcph->doff < 5) {
+		atomic64_inc(&pkts_invalid);
+		return NF_DROP;
+	}
 
 	/* SYN and SYN-ACK carry the window scale TCP option (RFC 7323).
 	 * Pull the full TCP header to reach the options, then parse. */
@@ -687,6 +708,9 @@ static ssize_t sess_ctl_write(struct file *file, const char __user *buf,
 	char cmd[16];
 	size_t len = min(count, sizeof(cmd) - 1);
 
+	if (!capable(CAP_NET_ADMIN))
+		return -EPERM;
+
 	if (copy_from_user(cmd, buf, len))
 		return -EFAULT;
 	cmd[len] = '\0';
@@ -746,6 +770,11 @@ struct session *sess_icmp_error_lookup(struct sk_buff *skb, int *dir_out)
 	iph       = ip_hdr(skb);
 	icmph     = (struct icmphdr *)((u8 *)iph + outer_hlen);
 	inner_iph = (struct iphdr   *)((u8 *)icmph + sizeof(struct icmphdr));
+
+	/* Reject malformed inner IP header before using ihl to compute offsets */
+	if (inner_iph->ihl < 5)
+		return NULL;
+
 	inner_hlen = inner_iph->ihl * 4;
 
 	/* RFC 792 guarantees at least 8 bytes of embedded L4 */
@@ -806,7 +835,11 @@ static int sg_flow_cmd_block(struct sk_buff *skb, struct genl_info *info)
 	rcu_read_lock();
 	hash_for_each_rcu(sess_table, bucket, s, node) {
 		if (s->id == sess_id) {
-			WRITE_ONCE(s->flags, READ_ONCE(s->flags) | SESS_BLOCKED);
+			/* Use per-session spinlock so the OR is atomic with respect
+			 * to other flag writers (ML daemon, reaper). */
+			spin_lock_bh(&s->lock);
+			s->flags |= SESS_BLOCKED;
+			spin_unlock_bh(&s->lock);
 			found = true;
 			break;
 		}
@@ -1082,7 +1115,7 @@ static int sess_seq_show(struct seq_file *seq, void *v)
 		s->stats.pkts_orig, s->stats.pkts_reply,
 		s->stats.bytes_orig, s->stats.bytes_reply,
 		age_ms, ttl_ms,
-		s->ml_score, s->flags,
+		READ_ONCE(s->ml_score), READ_ONCE(s->flags),
 		s->ifindex_in, s->ifindex_out);
 	if (s->key.proto == IPPROTO_TCP)
 		seq_printf(seq, " tcp_state=%u", READ_ONCE(s->tcp_state));

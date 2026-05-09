@@ -390,19 +390,8 @@ static int ipc_password_change(const char *username, const char *source)
 #define OFF_ARG1 24
 #define OFF_ARG2 32
 
-/*
- * Build modes for the default seccomp action:
- *   SANDBOX_LOG_ONLY:  SECCOMP_RET_LOG — violations logged in dmesg,
- *     syscall proceeds normally. Use for testing without killing.
- *   Default:           SECCOMP_RET_KILL_PROCESS — production mode.
- */
-/* TODO: Remove SANDBOX_LOG_ONLY after testing */
-#define SANDBOX_LOG_ONLY
-#ifdef SANDBOX_LOG_ONLY
-#define SECCOMP_RET_DEFAULT SECCOMP_RET_LOG
-#else
+/* Default seccomp action: kill the process on any syscall not in the allowlist. */
 #define SECCOMP_RET_DEFAULT SECCOMP_RET_KILL_PROCESS
-#endif
 
 static int logind_drop_privileges(void)
 {

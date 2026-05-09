@@ -932,24 +932,31 @@ void cli_hist_save_ipc(const char *username)
 	if (nhist == 0 || !username || !username[0])
 		return;
 
-	/* Build payload: "user=<username>\n<line1>\n<line2>\n..." */
-	char payload[CLI_MAX_LINE * CLI_MAX_HIST + 256];
+	/* Build payload: "user=<username>\n<line1>\n<line2>\n..."
+	 * Capped at SG_PAYLOAD_MAX — the IPC layer rejects larger messages.
+	 * Heap-allocated to avoid a 51 KB stack frame. */
+	char *payload = malloc(SG_PAYLOAD_MAX);
+	if (!payload)
+		return;
+
 	size_t pos = 0;
 
-	int n = snprintf(payload, sizeof(payload), "user=%s\n", username);
+	int n = snprintf(payload, SG_PAYLOAD_MAX, "user=%s\n", username);
 	if (n > 0)
 		pos = (size_t)n;
 
 	for (int i = 0; i < nhist; i++) {
-		n = snprintf(payload + pos, sizeof(payload) - pos,
+		n = snprintf(payload + pos, SG_PAYLOAD_MAX - pos,
 			     "%s\n", hist[i]);
-		if (n > 0 && (size_t)n < sizeof(payload) - pos)
+		if (n > 0 && (size_t)n < SG_PAYLOAD_MAX - pos)
 			pos += (size_t)n;
 	}
 
 	struct ipc_response resp = {0};
-	ipc_send(SG_CMD_HISTORY_SAVE, payload, pos, &resp);
+	if (ipc_send(SG_CMD_HISTORY_SAVE, payload, pos, &resp) < 0)
+		fprintf(stderr, "cli: history save failed (IPC error)\n");
 	ipc_resp_free(&resp);
+	free(payload);
 }
 
 /* ── Abbreviation resolution ──────────────────────────────────────────── */

@@ -1424,6 +1424,12 @@ int handle_diag_session(int client_fd, const char *user,
 	}
 
 	/* ── Inject mode: load session_test.ko, read its procfs output ──────── */
+	/* Loading a kernel module requires admin privilege */
+	if (!has_permission(perms, "admin")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "admin permission required for inject mode");
+		return 0;
+	}
 
 	/* Clean up any leftover from a prior run */
 	system("rmmod session_test 2>/dev/null");
@@ -1634,6 +1640,12 @@ int handle_netflow_set(int client_fd, const char *user,
 	kv = strstr(payload, "enabled=");
 	if (kv)
 		strncpy(conf_en, kv + 8, sizeof(conf_en) - 1);
+
+	/* Strip any embedded newlines/CR — prevent config file injection.
+	 * An attacker-controlled payload could otherwise append extra lines. */
+	for (char *p = conf_ip;   *p; p++) if (*p == '\n' || *p == '\r') { *p = '\0'; break; }
+	for (char *p = conf_port; *p; p++) if (*p == '\n' || *p == '\r') { *p = '\0'; break; }
+	for (char *p = conf_en;   *p; p++) if (*p == '\n' || *p == '\r') { *p = '\0'; break; }
 
 	/* Write to /etc/stargazer/flowd.conf */
 	FILE *f = fopen("/etc/stargazer/flowd.conf", "w");

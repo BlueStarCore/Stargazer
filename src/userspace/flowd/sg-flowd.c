@@ -167,7 +167,12 @@ static void config_load(flowd_config_t *cfg, const char *path)
 				sizeof(cfg->collector_ip) - 1);
 			cfg->collector_ip[sizeof(cfg->collector_ip) - 1] = '\0';
 		} else if (strcmp(line, "collector_port") == 0) {
-			cfg->collector_port = (uint16_t)atoi(eq + 1);
+			long port = strtol(eq + 1, NULL, 10);
+			if (port < 1 || port > 65535) {
+				fprintf(stderr, "flowd: invalid collector_port %ld, using default 2055\n", port);
+				port = 2055;
+			}
+			cfg->collector_port = (uint16_t)port;
 		} else if (strcmp(line, "source_id") == 0) {
 			cfg->source_id = (uint32_t)strtoul(eq + 1, NULL, 10);
 		} else if (strcmp(line, "enabled") == 0) {
@@ -188,8 +193,13 @@ typedef struct {
 
 static void stats_write(const flowd_stats_t *st, const flowd_config_t *cfg)
 {
-	FILE *f = fopen(FLOWD_STAT_PATH, "w");
+	/* Write to a temp file then rename() for atomic visibility — mgmtd
+	 * reading the stats file between an fopen()+fclose() pair would see
+	 * an empty file otherwise. */
+	char tmp[sizeof(FLOWD_STAT_PATH) + 5];
+	snprintf(tmp, sizeof(tmp), "%s.tmp", FLOWD_STAT_PATH);
 
+	FILE *f = fopen(tmp, "w");
 	if (!f)
 		return;
 	fprintf(f,
@@ -207,6 +217,7 @@ static void stats_write(const flowd_stats_t *st, const flowd_config_t *cfg)
 		cfg->collector_ip, cfg->collector_port,
 		cfg->enabled);
 	fclose(f);
+	rename(tmp, FLOWD_STAT_PATH);
 }
 
 /* ── Signals ─────────────────────────────────────────────────────────────── */

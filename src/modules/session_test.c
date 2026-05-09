@@ -133,11 +133,17 @@ static int __init session_test_init(void)
 	rcu_read_unlock();
 
 	/* ── Clean up test session ─────────────────────────────────────── */
+	/* sess_delete() calls call_rcu() internally — must not be called from
+	 * within an rcu_read_lock() critical section. Lookup under RCU, then
+	 * drop the lock before deleting. */
+	struct session *s_del;
+
 	rcu_read_lock();
-	struct session *s_del = sess_lookup(&orig_key);
+	s_del = sess_lookup(&orig_key);
+	rcu_read_unlock();
+
 	if (s_del)
 		sess_delete(s_del);
-	rcu_read_unlock();
 
 	kfree_skb(skb);
 

@@ -119,10 +119,14 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 		return NF_ACCEPT;
 	}
 
-	/* Record ingress/egress interface at session creation (set-once on first packet) */
+	/* Record ingress/egress interface (set-once on the first packet).
+	 * cmpxchg ensures only one CPU wins the race; the loser discards
+	 * its value without overwriting what the winner stored. */
 	if (state->in && READ_ONCE(s->ifindex_in) == 0) {
-		WRITE_ONCE(s->ifindex_in,  (u32)state->in->ifindex);
-		WRITE_ONCE(s->ifindex_out, state->out ? (u32)state->out->ifindex : 0u);
+		u32 ifin = (u32)state->in->ifindex;
+		if (cmpxchg(&s->ifindex_in, 0u, ifin) == 0)
+			WRITE_ONCE(s->ifindex_out,
+				   state->out ? (u32)state->out->ifindex : 0u);
 	}
 
 	if (READ_ONCE(s->flags) & SESS_BLOCKED) {
