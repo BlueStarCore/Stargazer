@@ -40,6 +40,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
@@ -441,31 +442,19 @@ static int logind_drop_privileges(void)
 		SC_ALLOW(SC_recvfrom),
 		SC_ALLOW(SC_getsockopt),
 
-		/* ── dup3 (musl dup2 wrapper on aarch64) ─────────── */
-		SC_ALLOW(SC_dup3),
-
 		/* ── ioctl(): only terminal ioctls ───────────────── *
-		 * If not ioctl, skip 10 instructions forward.       */
-		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SC_ioctl, 0, 10),
+		 * If not ioctl, skip 9 instructions forward.        */
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SC_ioctl, 0, 9),
 		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_ARG1),
-		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IOCTL_TCGETS, 6, 0),
-		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IOCTL_TCSETS, 5, 0),
-		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IOCTL_TCSETSW, 4, 0),
-		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IOCTL_TCSETSF, 3, 0),
-		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IOCTL_TIOCGWINSZ, 2, 0),
-		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IOCTL_TIOCSCTTY, 1, 0),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IOCTL_TCGETS, 5, 0),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IOCTL_TCSETS, 4, 0),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IOCTL_TCSETSW, 3, 0),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IOCTL_TCSETSF, 2, 0),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IOCTL_TIOCGWINSZ, 1, 0),
 		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_DEFAULT),
 		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
 		/* Reload syscall number */
 		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_NR),
-
-		/* ── Session / privilege drop (one-time) ─────────── */
-		SC_ALLOW(SC_setsid),
-		SC_ALLOW(SC_setgid),
-		SC_ALLOW(SC_setuid),
-
-		/* ── exec shell ──────────────────────────────────── */
-		SC_ALLOW(SC_execve),
 
 		/* ── Memory management ───────────────────────────── */
 
@@ -601,176 +590,215 @@ int main(int argc, char *argv[])
 	 */
 	int console_fd = open("/dev/console", O_RDWR);
 
-	/* ── Phase 1.5: Install seccomp sandbox ──────────────────────── */
-	if (logind_drop_privileges() != 0) {
-		fprintf(stderr, "stargazer-logind: security initialization failed\n");
-		return 1;
-	}
-
 	/*
-	 * From this point on:
-	 *   - open/openat BLOCKED (no file access)
-	 *   - fork/clone  BLOCKED (no process creation)
-	 *   - ptrace      BLOCKED (no debugging)
-	 *   - Only AF_UNIX sockets allowed (IPC to mgmtd)
-	 */
-
-	/* ── Phase 2: Authentication via IPC (sandboxed) ─────────────── */
-
-	/*
-	 * First-login fast path: if password is empty, skip authentication
-	 * and go straight to password creation. Better UX than prompting
-	 * "Password:" when no password exists yet.
-	 */
-	if (empty_password) {
-		fprintf(stderr,
-			"\n"
-			" FIRST LOGIN\n"
-			" No password set for account '%s'.\n"
-			" You must create a password now.\n\n",
-			username);
-
-		int rc = ipc_password_change(username, "first-login");
-		if (rc == -2) return EXIT_SIGINT;
-		if (rc != 0)  return 1;
-
-		fprintf(stderr,
-			" Password created successfully.\n"
-			" Please log in again with your new password.\n\n");
-		return 0;
-	}
-
-	/*
-	 * Normal authentication flow (password exists)
-	 */
-	char password[MAX_PASS_LEN];
-	int pw_rc = read_password("Password: ", password, sizeof(password));
-	if (pw_rc == -2) {
-		explicit_bzero(password, sizeof(password));
-		return EXIT_SIGINT;
-	}
-	if (pw_rc != 0) {
-		return 1;
-	}
-
-	/* Send credentials to mgmtd for authentication */
-	char auth_payload[MAX_PASS_LEN + SG_USERNAME_MAX + 4];
-	snprintf(auth_payload, sizeof(auth_payload), "%s\n%s\n",
-		 username, password);
-	explicit_bzero(password, sizeof(password));
-
-	uint32_t status;
-	char extra[SG_EXTRA_MAX];
-	char *resp_payload = NULL;
-	int ipc_rc = logind_ipc(SG_CMD_AUTH_LOGIN, username, auth_payload,
-				&status, extra, sizeof(extra), &resp_payload);
-	explicit_bzero(auth_payload, sizeof(auth_payload));
-
-	if (ipc_rc != 0) {
-		fprintf(stderr,
-			"stargazer-logind: cannot contact management daemon\n");
-		return 1;
-	}
-
-	if (status != SG_OK) {
-		/* Don't reveal whether it's bad password vs locked — same msg */
-		fprintf(stderr, "Invalid credentials\n");
-		free(resp_payload);
-		return 1;
-	}
-
-	/*
-	 * Defense-in-depth: if mgmtd authenticated a user that doesn't
-	 * exist in /etc/passwd, we cannot safely setuid/exec.  This
-	 * should never happen (mgmtd checks shadow which requires a
-	 * passwd entry), but catch it here rather than exec as nobody.
-	 */
-	if (!user_found) {
-		fprintf(stderr, "Internal error: user not in passwd\n");
-		free(resp_payload);
-		return 1;
-	}
-
-	/* Parse response: "enforce_change=0|1\npolicy_mismatch=0|1\n" */
-	int enforce_change = 0, policy_mismatch = 0;
-	if (resp_payload) {
-		const char *p;
-		p = strstr(resp_payload, "enforce_change=");
-		if (p) enforce_change = atoi(p + 15);
-		p = strstr(resp_payload, "policy_mismatch=");
-		if (p) policy_mismatch = atoi(p + 16);
-		free(resp_payload);
-		resp_payload = NULL;
-	}
-
-	/* Handle forced password changes */
-	if (enforce_change) {
-		int rc = ipc_password_change(username, "admin-flag");
-		if (rc == -2) return EXIT_SIGINT;
-		if (rc != 0)  return 1;
-		/* Admin flag change satisfies policy too */
-		policy_mismatch = 0;
-	}
-
-	if (policy_mismatch) {
-		int rc = ipc_password_change(username, "policy-mismatch");
-		if (rc == -2) return EXIT_SIGINT;
-		if (rc != 0)  return 1;
-	}
-
-	/* Audit successful login */
-	char login_payload[SG_USERNAME_MAX + 4];
-	snprintf(login_payload, sizeof(login_payload), "%s\n", username);
-	logind_ipc(SG_CMD_AUTH_LOGIN_OK, username, login_payload,
-		   &status, extra, sizeof(extra), NULL);
-
-	/* ── Phase 3: Privilege drop + exec ──────────────────────────── */
-
-	/* Restore signals to default before exec */
-	signal(SIGINT, SIG_DFL);
-	signal(SIGQUIT, SIG_DFL);
-
-	/*
-	 * Establish clean session and redirect stdio to /dev/console.
+	 * Create a pipe to carry the auth result from the sandboxed child
+	 * to the exec parent.  Fork happens BEFORE seccomp is installed so
+	 * the parent never inherits the filter and can freely exec the shell.
 	 *
-	 * setsid() creates a new session so the CLI is isolated from the
-	 * login shell's process group.  TIOCSCTTY(0) attempts to set the
-	 * controlling terminal.
+	 * Auth child  — installs seccomp, handles password prompts and all
+	 *               IPC calls to mgmtd, then writes one byte (0x01) to
+	 *               the pipe on success and exits.
+	 * Exec parent — waits for that byte, drops privileges, and execs the
+	 *               user shell without any seccomp restriction.
+	 *
+	 * This design prevents the seccomp filter from being inherited by the
+	 * exec'd program, which would kill it the moment its musl startup
+	 * called a syscall not in the logind allowlist.
 	 */
-	(void)setsid();
-	if (console_fd >= 0) {
-		(void)ioctl(console_fd, TIOCSCTTY, 0);
-		dup2(console_fd, STDIN_FILENO);
-		dup2(console_fd, STDOUT_FILENO);
-		dup2(console_fd, STDERR_FILENO);
-		if (console_fd > STDERR_FILENO)
-			close(console_fd);
-	}
-
-	/*
-	 * Drop to actual user credentials.
-	 * After setuid(), the process cannot regain root.
-	 */
-	if (setgid(cached_gid) != 0) {
-		perror("setgid");
-		return 1;
-	}
-	if (setuid(cached_uid) != 0) {
-		perror("setuid");
+	int result_pipe[2];
+	if (pipe(result_pipe) < 0) {
+		perror("stargazer-logind: pipe");
+		if (console_fd >= 0) close(console_fd);
 		return 1;
 	}
 
-	/* Set environment */
-	setenv("HOME", cached_home, 1);
-	setenv("SHELL", cached_shell, 1);
-	setenv("USER", username, 1);
-	setenv("LOGNAME", username, 1);
-	setenv("STARGAZER_USER", username, 1);
-	setenv("PATH", "/bin:/sbin:/usr/bin:/usr/sbin", 0);
-	setenv("TMOUT", "900", 1); /* 15-min idle session timeout */
+	pid_t auth_pid = fork();
+	if (auth_pid < 0) {
+		perror("stargazer-logind: fork");
+		close(result_pipe[0]);
+		close(result_pipe[1]);
+		if (console_fd >= 0) close(console_fd);
+		return 1;
+	}
 
-	/* exec user shell */
-	execl(cached_shell, cached_shell, (char *)NULL);
-	perror("exec");
-	return 1;
+	if (auth_pid == 0) {
+		/* ── Phase 1.5 / 2: Auth child (sandboxed) ──────────────── */
+		close(result_pipe[0]);
+
+		if (logind_drop_privileges() != 0) {
+			fprintf(stderr, "stargazer-logind: security initialization failed\n");
+			close(result_pipe[1]);
+			_exit(1);
+		}
+
+		/*
+		 * From this point on in the child:
+		 *   - open/openat BLOCKED (no file access)
+		 *   - fork/clone  BLOCKED (no process creation)
+		 *   - execve      BLOCKED (cannot exec arbitrary binaries)
+		 *   - setuid/setgid BLOCKED (cannot change credentials)
+		 *   - Only AF_UNIX sockets allowed (IPC to mgmtd)
+		 */
+
+		if (empty_password) {
+			fprintf(stderr,
+				"\n"
+				" FIRST LOGIN\n"
+				" No password set for account '%s'.\n"
+				" You must create a password now.\n\n",
+				username);
+
+			int rc = ipc_password_change(username, "first-login");
+			if (rc == -2) { close(result_pipe[1]); _exit(EXIT_SIGINT); }
+			if (rc != 0)  { close(result_pipe[1]); _exit(1); }
+
+			fprintf(stderr,
+				" Password created successfully.\n"
+				" Please log in again with your new password.\n\n");
+			close(result_pipe[1]);
+			_exit(0);
+		}
+
+		char password[MAX_PASS_LEN];
+		int pw_rc = read_password("Password: ", password, sizeof(password));
+		if (pw_rc == -2) {
+			explicit_bzero(password, sizeof(password));
+			close(result_pipe[1]);
+			_exit(EXIT_SIGINT);
+		}
+		if (pw_rc != 0) {
+			close(result_pipe[1]);
+			_exit(1);
+		}
+
+		char auth_payload[MAX_PASS_LEN + SG_USERNAME_MAX + 4];
+		snprintf(auth_payload, sizeof(auth_payload), "%s\n%s\n",
+			 username, password);
+		explicit_bzero(password, sizeof(password));
+
+		uint32_t status;
+		char extra[SG_EXTRA_MAX];
+		char *resp_payload = NULL;
+		int ipc_rc = logind_ipc(SG_CMD_AUTH_LOGIN, username, auth_payload,
+					&status, extra, sizeof(extra), &resp_payload);
+		explicit_bzero(auth_payload, sizeof(auth_payload));
+
+		if (ipc_rc != 0) {
+			fprintf(stderr,
+				"stargazer-logind: cannot contact management daemon\n");
+			close(result_pipe[1]);
+			_exit(1);
+		}
+
+		if (status != SG_OK) {
+			fprintf(stderr, "Invalid credentials\n");
+			free(resp_payload);
+			close(result_pipe[1]);
+			_exit(1);
+		}
+
+		if (!user_found) {
+			fprintf(stderr, "Internal error: user not in passwd\n");
+			free(resp_payload);
+			close(result_pipe[1]);
+			_exit(1);
+		}
+
+		int enforce_change = 0, policy_mismatch = 0;
+		if (resp_payload) {
+			const char *p;
+			p = strstr(resp_payload, "enforce_change=");
+			if (p) enforce_change = atoi(p + 15);
+			p = strstr(resp_payload, "policy_mismatch=");
+			if (p) policy_mismatch = atoi(p + 16);
+			free(resp_payload);
+			resp_payload = NULL;
+		}
+
+		if (enforce_change) {
+			int rc = ipc_password_change(username, "admin-flag");
+			if (rc == -2) { close(result_pipe[1]); _exit(EXIT_SIGINT); }
+			if (rc != 0)  { close(result_pipe[1]); _exit(1); }
+			policy_mismatch = 0;
+		}
+
+		if (policy_mismatch) {
+			int rc = ipc_password_change(username, "policy-mismatch");
+			if (rc == -2) { close(result_pipe[1]); _exit(EXIT_SIGINT); }
+			if (rc != 0)  { close(result_pipe[1]); _exit(1); }
+		}
+
+		/* Audit successful login */
+		char login_payload[SG_USERNAME_MAX + 4];
+		snprintf(login_payload, sizeof(login_payload), "%s\n", username);
+		logind_ipc(SG_CMD_AUTH_LOGIN_OK, username, login_payload,
+			   &status, extra, sizeof(extra), NULL);
+
+		/* Signal parent: authentication succeeded, proceed to exec */
+		uint8_t ok = 1;
+		write(result_pipe[1], &ok, sizeof(ok));
+		close(result_pipe[1]);
+		_exit(0);
+
+	} else {
+		/* ── Phase 3: Exec parent (no seccomp) ───────────────────── */
+		close(result_pipe[1]);
+
+		/*
+		 * Ignore SIGINT in the parent while the child handles the
+		 * terminal.  Restore to SIG_DFL before exec so the shell
+		 * gets the normal signal disposition.
+		 */
+		signal(SIGINT, SIG_IGN);
+
+		uint8_t result = 0;
+		ssize_t n = read(result_pipe[0], &result, sizeof(result));
+		close(result_pipe[0]);
+
+		int wstatus = 0;
+		waitpid(auth_pid, &wstatus, 0);
+
+		if (n != 1 || result != 1) {
+			/* Auth failed, first-login complete, or Ctrl+C */
+			return WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : 1;
+		}
+
+		/* Restore signals to default before exec */
+		signal(SIGINT, SIG_DFL);
+		signal(SIGQUIT, SIG_DFL);
+
+		/*
+		 * Establish clean session and redirect stdio to /dev/console.
+		 */
+		(void)setsid();
+		if (console_fd >= 0) {
+			(void)ioctl(console_fd, TIOCSCTTY, 0);
+			dup2(console_fd, STDIN_FILENO);
+			dup2(console_fd, STDOUT_FILENO);
+			dup2(console_fd, STDERR_FILENO);
+			if (console_fd > STDERR_FILENO)
+				close(console_fd);
+		}
+
+		if (setgid(cached_gid) != 0) {
+			perror("setgid");
+			return 1;
+		}
+		if (setuid(cached_uid) != 0) {
+			perror("setuid");
+			return 1;
+		}
+
+		setenv("HOME", cached_home, 1);
+		setenv("SHELL", cached_shell, 1);
+		setenv("USER", username, 1);
+		setenv("LOGNAME", username, 1);
+		setenv("STARGAZER_USER", username, 1);
+		setenv("PATH", "/bin:/sbin:/usr/bin:/usr/sbin", 0);
+		setenv("TMOUT", "900", 1);
+
+		execl(cached_shell, cached_shell, (char *)NULL);
+		perror("exec");
+		return 1;
+	}
 }
