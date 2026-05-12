@@ -9,11 +9,11 @@ mount -t sysfs none /sys
 mount -t devtmpfs none /dev 2>/dev/null || true
 mount -t tmpfs -o mode=1777 none /tmp 2>/dev/null || true
 mkdir -p /run 2>/dev/null
-
-# Suppress kernel messages on console during init (only show KERN_EMERG).
-# This prevents kernel log lines from interleaving with [stargazer] messages.
-# Restored to default (7) after init completes.
-dmesg -n 1 2>/dev/null
+# devtmpfs mounted from userspace gets a fresh superblock separate from
+# the kernel's internal instance — nodes may be absent.
+[ -c /dev/null ]    || mknod -m 666 /dev/null    c 1 3
+[ -c /dev/tty ]     || mknod -m 666 /dev/tty     c 5 0
+[ -c /dev/console ] || mknod -m 600 /dev/console c 5 1
 
 # Mount persistent data partition for config DB
 mkdir -p /etc/stargazer
@@ -25,25 +25,20 @@ _blkid_val() { # $1=FIELD $2=/dev/device
 	blkid "$2" 2>/dev/null | sed -n 's/.*'"$1"'="\([^"]*\)".*/\1/p'
 }
 
-# Logging helper: write to kernel log (dmesg) and console.
-# Uses /dev/kmsg for kernel ring buffer (persistent across boot).
-# Log levels: 0=EMERG 1=ALERT 2=CRIT 3=ERR 4=WARN 5=NOTICE 6=INFO 7=DEBUG
+# Writes to /dev/kmsg (persists in dmesg) and to stdout.
 _sg_log() { # $1=level $2=message
 	_lvl="$1"
 	shift
 	_msg="$*"
-	# Try kernel log first (survives in dmesg)
 	if [ -w /dev/kmsg ]; then
 		echo "<${_lvl}>stargazer: ${_msg}" > /dev/kmsg 2>/dev/null
 	fi
-	# Always print to console for real-time visibility
 	echo "[stargazer] ${_msg}"
 }
 
-# Convenience wrappers
-_sg_info() { _sg_log 6 "$@"; }    # INFO level
-_sg_warn() { _sg_log 4 "$@"; }    # WARNING level
-_sg_err()  { _sg_log 3 "$@"; }    # ERROR level
+_sg_info() { _sg_log 6 "$@"; }
+_sg_warn() { _sg_log 4 "$@"; }
+_sg_err()  { _sg_log 3 "$@"; }
 
 # --- Persistent storage detection (eMMC-primary boot) ---
 #
@@ -73,11 +68,7 @@ _sg_prepare() {
 	_type=$(_blkid_val TYPE "$_dev")
 	_lbl=$(_blkid_val LABEL "$_dev")
 
-	_sg_info "_sg_prepare: device=$_dev type='$_type' label='$_lbl' expected_label='$_label'"
-
 	if [ "$_lbl" = "$_label" ] && [ "$_type" = "ext2" ]; then
-		# Correct label and type — use as-is
-		_sg_info "_sg_prepare: $_dev already has correct label and type"
 		return 0
 	fi
 
@@ -128,9 +119,9 @@ _sg_fsck() { # $1=/dev/device $2=label (for reformat)
 _init_errors=""
 _sg_dev=""
 
-# Wait up to 5 seconds for storage device to appear (kernel async probing)
+# Wait up to 30 seconds for storage device to appear (kernel async probing)
 _wait_count=0
-while [ $_wait_count -lt 50 ]; do
+while [ $_wait_count -lt 300 ]; do
 	if [ -b /dev/mmcblk0p5 ]; then
 		_sg_dev=/dev/mmcblk0p5
 		break
@@ -143,7 +134,11 @@ while [ $_wait_count -lt 50 ]; do
 done
 
 if [ -z "$_sg_dev" ]; then
-	_sg_err "sgdata target not found (no mmcblk0p5, no vdb) after 5s wait"
+	_sg_err "sgdata target not found (no mmcblk0p5, no vdb) after 30s wait"
+	_sg_err "--- MMC diagnostic ---"
+	ls /dev/mmcblk* 2>/dev/null && true || _sg_err "  no /dev/mmcblk* devices found"
+	dmesg 2>/dev/null | grep -iE 'mmc|mtk.*mmc|msdc|blkrrpart|block|gpt|efi.part' | tail -30
+	_sg_err "--- end diagnostic ---"
 	_init_errors="${_init_errors}storage "
 else
 	_sg_info "Found sgdata device: $_sg_dev"
@@ -155,8 +150,6 @@ if [ -n "$_sg_dev" ]; then
 		_sg_err "failed to prepare $_sg_dev as sgdata"
 		_init_errors="${_init_errors}storage "
 		_sg_dev=""
-	else
-		_sg_info "Prepared $_sg_dev successfully"
 	fi
 fi
 
@@ -258,9 +251,9 @@ if [ -n "$_sg_dev" ]; then
 			_sg_warn "mount $_logs_dev failed, reformatting..."
 			_sg_mkfs sglogs "$_logs_dev"
 			if mount -o rw "$_logs_dev" /etc/stargazer/logs 2>/dev/null; then
-				echo "[stargazer] Logs storage recovered: $_logs_dev -> /etc/stargazer/logs"
+				_sg_info "Logs storage recovered: $_logs_dev -> /etc/stargazer/logs"
 			else
-				echo "[stargazer] ERROR: $_logs_dev unusable after reformat"
+				_sg_err "$_logs_dev unusable after reformat"
 				_init_errors="${_init_errors}logs "
 			fi
 		fi
@@ -269,25 +262,15 @@ fi
 
 # Report storage/logs failures
 if [ -z "$_sg_dev" ]; then
-	echo "[stargazer] WARNING: no partition for config storage"
-	echo "[stargazer] Config will not survive reboot"
+	_sg_warn "no partition for config storage — config will not survive reboot"
 fi
 
 # Ensure /dev/tty is accessible by non-root users (for readline terminal I/O)
 [ -c /dev/tty ] && chmod 0666 /dev/tty 2>/dev/null
 echo 1 > /proc/sys/kernel/sysrq
-# Determine console device from kernel command line
-_console_dev="/dev/console"
-for _arg in $(cat /proc/cmdline); do
-	case "$_arg" in
-		console=tty*)
-			_tty="${_arg#console=}"
-			_tty="${_tty%%,*}"
-			[ -c "/dev/$_tty" ] && _console_dev="/dev/$_tty"
-			;;
-	esac
-done
-exec 0<"$_console_dev" 1>"$_console_dev" 2>&1
+# tty_open() for major 5,1 sets O_NONBLOCK internally, so this never blocks
+# on carrier — unlike opening /dev/ttyS0 (major 4,64) directly.
+exec 0</dev/console 1>/dev/console 2>&1
 
 # Suppress kernel console messages (prevents raw terminal corruption)
 echo 1 > /proc/sys/kernel/printk
@@ -329,7 +312,6 @@ iptables -P FORWARD DROP 2>/dev/null
 # Also set IPv6 FORWARD to DROP if ip6tables is available
 ip6tables -P FORWARD DROP 2>/dev/null
 
-# Start services
 [ -x /etc/init.d/stargazer ] && /etc/init.d/stargazer start
 
 # DHCP is managed by mgmtd — interfaces with mode=dhcp get udhcpc

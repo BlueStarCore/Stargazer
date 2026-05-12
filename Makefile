@@ -659,8 +659,8 @@ $(ISO_FILE): $(ROOTFS_DIR)/.stamp
 	cp $(KERNEL_IMAGE) $(BUILD_DIR)/iso/boot/kernel
 	@if [ -f "$(KERNEL_DTB)" ]; then cp $(KERNEL_DTB) $(BUILD_DIR)/iso/boot/; fi
 
-	# Create initramfs from rootfs
-	cd $(ROOTFS_DIR) && find . | sort | cpio -o -H newc 2>/dev/null | gzip -n -9 > $(BUILD_DIR)/iso/boot/initramfs.gz
+	# Create initramfs from rootfs (fakeroot injects static /dev nodes without root)
+	cd $(ROOTFS_DIR) && fakeroot sh -c 'mknod -m 600 dev/console c 5 1; mknod -m 666 dev/null c 1 3; find . | sort | cpio -o -H newc 2>/dev/null' | gzip -n -9 > $(BUILD_DIR)/iso/boot/initramfs.gz
 
 	# Create ISO (for UEFI boot on BPI-R4)
 	@if command -v xorriso >/dev/null 2>&1; then \
@@ -701,13 +701,13 @@ NAND_FIT := $(BUILD_DIR)/stargazer-nand.itb
 nand-fit: rootfs
 	@echo "[5/5] Building NAND FIT image..."
 	@mkdir -p $(BUILD_DIR)/image/fit-nand
-	cd $(ROOTFS_DIR) && find . | sort | cpio -o -H newc 2>/dev/null | gzip -n -9 > $(BUILD_DIR)/image/fit-nand/initramfs.gz
+	cd $(ROOTFS_DIR) && fakeroot sh -c 'mknod -m 600 dev/console c 5 1; mknod -m 666 dev/null c 1 3; find . | sort | cpio -o -H newc 2>/dev/null' | gzip -n -9 > $(BUILD_DIR)/image/fit-nand/initramfs.gz
 	lzma -z -k -f $(KERNEL_IMAGE) -c > $(BUILD_DIR)/image/fit-nand/Image.lzma
 	# Use pre-merged DTB (base + eMMC overlay) so eMMC is accessible for sgdata
 	cp $(KERNEL_DTB) $(BUILD_DIR)/image/fit-nand/bpi-r4.dtb
 	# Clear stale bootargs (root=/dev/fit0 etc.) — U-Boot sets args at runtime
 	fdtput -t s $(BUILD_DIR)/image/fit-nand/bpi-r4.dtb /chosen bootargs \
-		"console=ttyS0,115200n1 earlycon=uart8250,mmio32,0x11000000"
+		"console=ttyS0,115200n1 earlycon=uart8250,mmio32,0x11000000 fw_devlink=off clk_ignore_unused"
 	# Fix SPI-NAND partition table to match MTK SDK layout.
 	# The stock DTB has UBI starting at 0x200000 (OpenWrt layout) which overlaps
 	# the FIP area at 0x580000. UBI's wear leveling erases the FIP, killing boot.
@@ -811,13 +811,13 @@ image: rootfs bpi-r4-bootloader
 
 	# Build FIT image (kernel + DTB + initramfs in single .itb)
 	# MTK U-Boot reads the "firmware" partition as a raw FIT image
-	cd $(ROOTFS_DIR) && find . | sort | cpio -o -H newc 2>/dev/null | gzip -n -9 > $(BUILD_DIR)/image/fit/initramfs.gz
+	cd $(ROOTFS_DIR) && fakeroot sh -c 'mknod -m 600 dev/console c 5 1; mknod -m 666 dev/null c 1 3; find . | sort | cpio -o -H newc 2>/dev/null' | gzip -n -9 > $(BUILD_DIR)/image/fit/initramfs.gz
 	lzma -z -k -f $(KERNEL_IMAGE) -c > $(BUILD_DIR)/image/fit/Image.lzma
 	cp $(KERNEL_DIR)/arch/$(ARCH)/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dtb $(BUILD_DIR)/image/fit/bpi-r4.dtb
 	# Clear hardcoded bootargs from base DTB (root=/dev/fit0, ubi.block etc.)
 	# U-Boot sets bootargs at runtime; stale DTB args conflict with initramfs boot
 	fdtput -t s $(BUILD_DIR)/image/fit/bpi-r4.dtb /chosen bootargs \
-		"console=ttyS0,115200n1 earlycon=uart8250,mmio32,0x11000000"
+		"console=ttyS0,115200n1 earlycon=uart8250,mmio32,0x11000000 fw_devlink=off clk_ignore_unused"
 	# Pre-merge eMMC overlay into base DTB (U-Boot lacks CONFIG_OF_LIBFDT_OVERLAY)
 	@if [ -f "$(KERNEL_DIR)/arch/$(ARCH)/boot/dts/mediatek/mt7988a-bananapi-bpi-r4-emmc.dtbo" ]; then \
 		echo "  Merging eMMC overlay into base DTB..."; \
@@ -902,11 +902,11 @@ firmware: rootfs
 	@echo "Building firmware upgrade package..."
 	@mkdir -p $(BUILD_DIR)/firmware $(BUILD_DIR)/firmware/fit
 	# Build FIT image (same as image target)
-	cd $(ROOTFS_DIR) && find . | sort | cpio -o -H newc 2>/dev/null | gzip -n -9 > $(BUILD_DIR)/firmware/fit/initramfs.gz
+	cd $(ROOTFS_DIR) && fakeroot sh -c 'mknod -m 600 dev/console c 5 1; mknod -m 666 dev/null c 1 3; find . | sort | cpio -o -H newc 2>/dev/null' | gzip -n -9 > $(BUILD_DIR)/firmware/fit/initramfs.gz
 	lzma -z -k -f $(KERNEL_IMAGE) -c > $(BUILD_DIR)/firmware/fit/Image.lzma
 	cp $(KERNEL_DIR)/arch/$(ARCH)/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dtb $(BUILD_DIR)/firmware/fit/bpi-r4.dtb
 	fdtput -t s $(BUILD_DIR)/firmware/fit/bpi-r4.dtb /chosen bootargs \
-		"console=ttyS0,115200n1 earlycon=uart8250,mmio32,0x11000000"
+		"console=ttyS0,115200n1 earlycon=uart8250,mmio32,0x11000000 fw_devlink=off clk_ignore_unused"
 	# Pre-merge eMMC overlay into base DTB
 	@if [ -f "$(KERNEL_DIR)/arch/$(ARCH)/boot/dts/mediatek/mt7988a-bananapi-bpi-r4-emmc.dtbo" ]; then \
 		fdtoverlay -i $(BUILD_DIR)/firmware/fit/bpi-r4.dtb \
