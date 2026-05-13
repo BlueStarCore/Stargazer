@@ -54,6 +54,10 @@ const char *resolve_address(const char *val, char *out, size_t outsz)
 	if (!val || !val[0])
 		return NULL;
 
+	/* "any" and "all" are match-all keywords — no DB lookup needed */
+	if (strcmp(val, "any") == 0 || strcmp(val, "all") == 0)
+		return NULL;
+
 	/* Raw CIDR passthrough (backward compat for NAT legacy data) */
 	if (sg_is_cidr(val)) {
 		if (strcmp(val, "0.0.0.0/0") == 0)

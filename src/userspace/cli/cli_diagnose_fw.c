@@ -520,27 +520,64 @@ static void test_fw_sequence(void)
 	fw_ipc_fire(SG_CMD_CFG_DEL, "firewall_policy:9902\n");
 }
 
+/* ── Interface helper ─────────────────────────────────────────────────── */
+
+/*
+ * Query the first interface name from system_interface DB.
+ * NAT tests need a real dstintf — lo is not seeded in system_interface.
+ * Returns 1 if found and copies name to buf, 0 if DB has no interfaces.
+ */
+static int fw_get_test_iface(char *buf, size_t bufsz)
+{
+	struct ipc_response resp;
+	buf[0] = '\0';
+	if (ipc_send_str(SG_CMD_CFG_LIST, "system_interface", &resp) != 0 ||
+	    resp.status != SG_OK || !resp.payload) {
+		ipc_resp_free(&resp);
+		return 0;
+	}
+	const char *p = resp.payload;
+	while (*p) {
+		const char *eol = strchr(p, '\n');
+		size_t len = eol ? (size_t)(eol - p) : strlen(p);
+		if (len > 0 && len < bufsz) {
+			memcpy(buf, p, len);
+			buf[len] = '\0';
+			ipc_resp_free(&resp);
+			return 1;
+		}
+		p += len + (eol ? 1 : 0);
+	}
+	ipc_resp_free(&resp);
+	return 0;
+}
+
 /* ── NAT-SEQ: NAT sequence ordering (IPC, mode=1) ────────────────────── */
 
 static void test_nat_sequence(void)
 {
 	struct ipc_response resp;
+	char test_iface[64];
+	char payload[512];
 
 	printf(C_CYAN "\n  --- NAT-SEQ-1: NAT sequence auto-assign ---" C_NC "\n");
+
+	if (!fw_get_test_iface(test_iface, sizeof(test_iface))) {
+		printf("  SKIP [NAT-SEQ] no interface in system_interface DB\n");
+		return;
+	}
 
 	/* Cleanup */
 	fw_ipc_fire(SG_CMD_CFG_DEL, "network_nat:9901\n");
 	fw_ipc_fire(SG_CMD_CFG_DEL, "network_nat:9902\n");
 
-	/* Create SNAT rule without sequence.
-	 * Use eth0 as dstintf — lo is not in system_interface DB. */
+	snprintf(payload, sizeof(payload),
+		 "network_nat:9901\n"
+		 "type=snat\nsrcintf=any\ndstintf=%s\n"
+		 "srcaddr=any\ndstaddr=any\n"
+		 "status=enable\n", test_iface);
 	fw_check("NAT-SEQ-1", "create SNAT 9901 (auto-seq)",
-		 fw_ipc(SG_CMD_CFG_SET,
-			"network_nat:9901\n"
-			"type=snat\nsrcintf=any\ndstintf=eth0\n"
-			"srcaddr=any\ndstaddr=any\n"
-			"status=enable\n",
-			&resp, SG_OK), 1);
+		 fw_ipc(SG_CMD_CFG_SET, payload, &resp, SG_OK), 1);
 	ipc_resp_free(&resp);
 
 	fw_check("NAT-SEQ-1", "NAT 9901 has sequence",
@@ -551,24 +588,22 @@ static void test_nat_sequence(void)
 
 	printf(C_CYAN "\n  --- NAT-SEQ-2: NAT disable/enable ---" C_NC "\n");
 
-	/* Disable NAT rule */
+	snprintf(payload, sizeof(payload),
+		 "network_nat:9901\n"
+		 "type=snat\nsrcintf=any\ndstintf=%s\n"
+		 "srcaddr=any\ndstaddr=any\n"
+		 "status=disable\nsequence=1\n", test_iface);
 	fw_check("NAT-SEQ-2", "disable NAT 9901",
-		 fw_ipc(SG_CMD_CFG_SET,
-			"network_nat:9901\n"
-			"type=snat\nsrcintf=any\ndstintf=eth0\n"
-			"srcaddr=any\ndstaddr=any\n"
-			"status=disable\nsequence=1\n",
-			&resp, SG_OK), 1);
+		 fw_ipc(SG_CMD_CFG_SET, payload, &resp, SG_OK), 1);
 	ipc_resp_free(&resp);
 
-	/* Re-enable */
+	snprintf(payload, sizeof(payload),
+		 "network_nat:9901\n"
+		 "type=snat\nsrcintf=any\ndstintf=%s\n"
+		 "srcaddr=any\ndstaddr=any\n"
+		 "status=enable\nsequence=1\n", test_iface);
 	fw_check("NAT-SEQ-2", "re-enable NAT 9901",
-		 fw_ipc(SG_CMD_CFG_SET,
-			"network_nat:9901\n"
-			"type=snat\nsrcintf=any\ndstintf=eth0\n"
-			"srcaddr=any\ndstaddr=any\n"
-			"status=enable\nsequence=1\n",
-			&resp, SG_OK), 1);
+		 fw_ipc(SG_CMD_CFG_SET, payload, &resp, SG_OK), 1);
 	ipc_resp_free(&resp);
 
 	/* Cleanup */
@@ -596,9 +631,16 @@ static int nat_kernel_has(const char *needle)
 static void test_nat_kernel_verify(void)
 {
 	struct ipc_response resp;
+	char test_iface[64];
+	char payload[512];
 
 	printf(C_CYAN "\n  --- NAT-KER-1: SNAT overload in kernel ---"
 	       C_NC "\n");
+
+	if (!fw_get_test_iface(test_iface, sizeof(test_iface))) {
+		printf("  SKIP [NAT-KER] no interface in system_interface DB\n");
+		return;
+	}
 
 	/* Cleanup */
 	fw_ipc_fire(SG_CMD_CFG_DEL, "network_nat:9903\n");
@@ -606,14 +648,13 @@ static void test_nat_kernel_verify(void)
 	fw_ipc_fire(SG_CMD_CFG_DEL, "network_nat:9905\n");
 	fw_ipc_fire(SG_CMD_CFG_DEL, "network_nat:9906\n");
 
-	/* Create SNAT overload rule — dstintf is the outgoing interface */
-	fw_check("NAT-KER-1", "create SNAT overload (eth0)",
-		 fw_ipc(SG_CMD_CFG_SET,
-			"network_nat:9903\n"
-			"type=snat\nsrcintf=any\ndstintf=eth0\n"
-			"srcaddr=any\ndstaddr=any\n"
-			"protocol=all\nstatus=enable\n",
-			&resp, SG_OK), 1);
+	snprintf(payload, sizeof(payload),
+		 "network_nat:9903\n"
+		 "type=snat\nsrcintf=any\ndstintf=%s\n"
+		 "srcaddr=any\ndstaddr=any\n"
+		 "protocol=all\nstatus=enable\n", test_iface);
+	fw_check("NAT-KER-1", "create SNAT overload",
+		 fw_ipc(SG_CMD_CFG_SET, payload, &resp, SG_OK), 1);
 	ipc_resp_free(&resp);
 
 	/* Verify MASQUERADE appears in kernel POSTROUTING */
@@ -702,31 +743,35 @@ static void test_nat_kernel_verify(void)
 static void test_iface_ref_integrity(void)
 {
 	struct ipc_response resp;
+	char test_iface[64];
+	char payload[512];
+	char del_section[128];
 
 	printf(C_CYAN "\n  --- REF-IFACE: interface referential integrity ---"
 	       C_NC "\n");
 
-	/* Create a static route referencing eth0 (exists in DB
-	 * after mgmtd_sync_interfaces on QEMU). */
+	if (!fw_get_test_iface(test_iface, sizeof(test_iface))) {
+		printf("  SKIP [REF-IFACE] no interface in system_interface DB\n");
+		return;
+	}
+
 	fw_ipc_fire(SG_CMD_CFG_DEL, "network_route_static:9901\n");
 
-	fw_check("REF-IFACE", "create route referencing eth0",
-		 fw_ipc(SG_CMD_CFG_SET,
-			"network_route_static:9901\n"
-			"dst=198.51.100.0/24\n"
-			"gateway=10.0.1.1\n"
-			"device=eth0\n"
-			"distance=10\n"
-			"status=disable\n",
-			&resp, SG_OK), 1);
+	snprintf(payload, sizeof(payload),
+		 "network_route_static:9901\n"
+		 "dst=198.51.100.0/24\n"
+		 "gateway=10.0.1.1\n"
+		 "device=%s\n"
+		 "distance=10\n"
+		 "status=disable\n", test_iface);
+	fw_check("REF-IFACE", "create route referencing interface",
+		 fw_ipc(SG_CMD_CFG_SET, payload, &resp, SG_OK), 1);
 	ipc_resp_free(&resp);
 
-	/* Try to delete system_interface:eth0 → should be blocked
-	 * because the route references it. */
-	int blocked = fw_ipc(SG_CMD_CFG_DEL, "system_interface:eth0\n",
-			     &resp, SG_OK);
-	/* We expect either SG_ERR_ENTRY_NOT_FOUND (lo not in DB),
-	 * SG_ERR_BUILTIN, or SG_ERR_IN_USE — anything but SG_OK */
+	/* Try to delete the interface — should be blocked (route refs it) */
+	snprintf(del_section, sizeof(del_section),
+		 "system_interface:%s\n", test_iface);
+	int blocked = fw_ipc(SG_CMD_CFG_DEL, del_section, &resp, SG_OK);
 	fw_check("REF-IFACE", "delete interface with route ref → blocked",
 		 !blocked ||
 		 resp.status == SG_ERR_IN_USE ||
