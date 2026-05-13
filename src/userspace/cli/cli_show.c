@@ -146,6 +146,19 @@ static void show_entry_keys(const char *type, const char *payload,
 		if (!val[0] && defval[0])
 			snprintf(val, sizeof(val), "%s", defval);
 
+		/* ip is meaningless for dhcp interfaces — the lease address
+		 * lives in the kernel, not the config DB */
+		if (strcmp(key, "ip") == 0 &&
+		    strcmp(type, "system_interface") == 0) {
+			char iface_mode[32] = "";
+			sg_kv_get(payload, "mode", iface_mode, sizeof(iface_mode));
+			if (strcmp(iface_mode, "dhcp") == 0) {
+				if (!knl) break;
+				kp = knl + 1;
+				continue;
+			}
+		}
+
 		/* Mask passwords */
 		if (strcmp(key, "password") == 0) {
 			if (val[0])

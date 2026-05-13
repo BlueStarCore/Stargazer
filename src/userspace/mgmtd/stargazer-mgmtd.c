@@ -5364,6 +5364,36 @@ int main(void)
 	 * Idempotent — runs every boot, handles upgrade migration. */
 	mgmtd_reconcile_config();
 
+	/* Wait for ethernet NICs to appear — the MTK GMAC + DSA subsystem
+	 * probes asynchronously and may not be visible in /sys/class/net by
+	 * the time mgmtd starts.  Poll up to 5 seconds then proceed. */
+	{
+		int ms = 0;
+		while (ms < 5000) {
+			DIR *nd = opendir("/sys/class/net");
+			if (nd) {
+				int found = 0;
+				struct dirent *ne;
+				while ((ne = readdir(nd)) != NULL) {
+					if (ne->d_name[0] == '.' ||
+					    strcmp(ne->d_name, "lo") == 0)
+						continue;
+					if (read_net_type(ne->d_name) == 1) {
+						found = 1;
+						break;
+					}
+				}
+				closedir(nd);
+				if (found) break;
+			}
+			usleep(100000);
+			ms += 100;
+		}
+		if (ms > 0)
+			mgmt_log("INFO",
+				 "waited %dms for ethernet interfaces", ms);
+	}
+
 	/* Discover NICs, create/protect interface entries */
 	mgmtd_sync_interfaces(boot == BOOT_FIRST);
 

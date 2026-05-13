@@ -324,41 +324,22 @@ sg_status_t apply_interface(const char *id, const char *data,
 		if (strcmp(status, "down") != 0)
 			dhcpc_start(id);
 	} else {
-		/* Static mode */
+		/* Static mode: flush then assign.  Flush first avoids stale
+		 * addresses surviving a mode change; a brief IP-less window
+		 * is acceptable since the firewall is already enforcing policy. */
+		const char *a_flush[] = {"ip", "addr", "flush", "dev", id, NULL};
+		free(safe_exec(a_flush));
 		if (ip[0]) {
-			/* Try adding new IP first (allows brief dual-IP state).
-			 * Ignore EEXIST — IP already assigned is OK. */
-			const char *a_add[] = {"ip", "addr", "add", ip, "dev",
-					       id, NULL};
-			char *add_out = safe_exec(a_add);
-			int add_failed = (add_out && add_out[0] &&
-					  !strstr(add_out, "File exists"));
-			free(add_out);
-
-			/* Flush all IPs (including the one we just added) */
-			const char *a_flush[] = {"ip", "addr", "flush", "dev",
-						 id, NULL};
-			free(safe_exec(a_flush));
-
-			/* Re-add desired IP */
-			const char *a_readd[] = {"ip", "addr", "add", ip, "dev",
-						 id, NULL};
-			char *out = safe_exec(a_readd);
-			if (out && out[0] && !strstr(out, "File exists")) {
+			const char *a_add[] = {"ip", "addr", "add", ip,
+					       "dev", id, NULL};
+			char *out = safe_exec(a_add);
+			if (out && out[0]) {
 				snprintf(result, rsize,
-					 "IP %s failed on %s: %s",
-					 ip, id, out);
+					 "IP %s failed on %s: %s", ip, id, out);
 				free(out);
 				return SG_ERR_SYSTEM_FAIL;
 			}
 			free(out);
-
-			/* If initial add failed (invalid CIDR etc), report it */
-			if (add_failed) {
-				snprintf(result, rsize,
-					 "Invalid IP address %s for %s.", ip, id);
-				return SG_ERR_INVALID_VAL;
-			}
 		}
 	}
 
@@ -367,6 +348,21 @@ sg_status_t apply_interface(const char *id, const char *data,
 		snprintf(result, rsize,
 			 "Firewall access rules failed for %s.", id);
 		return SG_ERR_SYSTEM_FAIL;
+	}
+
+	/* DHCP replies (router UDP/67 → client UDP/68) arrive as INPUT on
+	 * this interface and would be dropped by the allowaccess chain's
+	 * default DROP.  Insert an explicit ACCEPT before that DROP so
+	 * udhcpc can receive OFFER/ACK packets. */
+	if (strcmp(mode, "dhcp") == 0) {
+		char dhcp_chain[32];
+		snprintf(dhcp_chain, sizeof(dhcp_chain), "SG_IN_%s", id);
+		const char *dhcp_rule[] = {
+			"iptables", "-I", dhcp_chain, "1",
+			"-p", "udp", "--sport", "67", "--dport", "68",
+			"-j", "ACCEPT", NULL
+		};
+		free(safe_exec(dhcp_rule));
 	}
 
 	/* Signal webd to rebind listeners (allowaccess may have changed).
