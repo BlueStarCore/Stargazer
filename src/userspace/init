@@ -48,15 +48,18 @@ _sg_err()  { _sg_log 3 "$@"; }
 # Run e2fsck before mount if available (ext2 has no journal).
 
 # Helper: create ext2 filesystem with no fsck-required flag.
-# BusyBox mke2fs sets s_max_mnt_count and s_checkinterval to non-zero
+# BusyBox mke2fs sets s_mnt_count and s_max_mnt_count to non-zero
 # defaults, which causes the kernel to warn "mounting unchecked fs".
-# After formatting, patch the superblock to disable these checks:
-#   s_max_mnt_count (offset 0x434, 2 bytes LE) = 0
-#   s_checkinterval (offset 0x448, 4 bytes LE) = 0
+# Patch the superblock to disable periodic fsck:
+#   s_mnt_count     (offset 52 in superblock = byte 1076): 0 — current count
+#   s_max_mnt_count (offset 54 in superblock = byte 1078): 0xFFFF — never trigger
+# Then sync to flush the format to disk before mount (mke2fs does not
+# call fsync; without this a hard reset can leave the partition blank).
 _sg_mkfs() { # $1=label $2=/dev/device
 	mke2fs -L "$1" "$2" 2>/dev/null || return 1
 	printf '\x00\x00' | dd of="$2" bs=1 seek=1076 count=2 conv=notrunc 2>/dev/null
-	printf '\x00\x00\x00\x00' | dd of="$2" bs=1 seek=1096 count=4 conv=notrunc 2>/dev/null
+	printf '\xff\xff' | dd of="$2" bs=1 seek=1078 count=2 conv=notrunc 2>/dev/null
+	sync
 }
 
 # Helper: validate and prepare a partition for use.
@@ -68,6 +71,7 @@ _sg_prepare() {
 	_type=$(_blkid_val TYPE "$_dev")
 	_lbl=$(_blkid_val LABEL "$_dev")
 
+	# Already correct — fast path
 	if [ "$_lbl" = "$_label" ] && [ "$_type" = "ext2" ]; then
 		return 0
 	fi
@@ -81,19 +85,16 @@ _sg_prepare() {
 
 	if [ "$_type" != "ext2" ]; then
 		# Wrong filesystem type (e.g. old OpenWrt squashfs/ext4)
-		_sg_warn "$_dev has type '$_type', expected ext2"
-		_sg_warn "Reformatting $_dev as $_label (old data will be lost)..."
+		_sg_warn "$_dev has type '$_type', expected ext2 — reformatting"
 		_sg_mkfs "$_label" "$_dev"
 		return $?
 	fi
 
-	# ext2 but wrong/missing label — reformat (no tune2fs in busybox)
-	if [ "$_lbl" != "$_label" ]; then
-		_sg_warn "$_dev is ext2 but labeled '$_lbl', expected $_label"
-		_sg_warn "Reformatting $_dev as $_label..."
-		_sg_mkfs "$_label" "$_dev"
-		return $?
-	fi
+	# ext2 with wrong or undetected label — the device path already uniquely
+	# identifies this partition, so trust the type and use it as-is.
+	# Reformatting here would wipe the config DB on any blkid detection
+	# glitch (e.g. label not yet flushed to disk after a hard reset).
+	return 0
 }
 
 # Helper: run e2fsck if available, reformat if unfixable.

@@ -4804,10 +4804,8 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		}
 		send_ok(client_fd, "Shutting down...", NULL);
 		(void)audit_log(user, "system_poweroff", "");
-		/* Close DB so /etc/stargazer can be cleanly unmounted */
 		sg_db_close();
-		/* Give time for response to be sent */
-		usleep(100000);
+		sync();
 		{
 			const char *argv[] = {"/sbin/poweroff", NULL};
 			free(safe_exec(argv));
@@ -4823,9 +4821,8 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		}
 		send_ok(client_fd, "Rebooting...", NULL);
 		(void)audit_log(user, "system_reboot", "");
-		/* Close DB so /etc/stargazer can be cleanly unmounted */
 		sg_db_close();
-		usleep(100000);
+		sync();
 		{
 			const char *argv[] = {"/sbin/reboot", NULL};
 			free(safe_exec(argv));
