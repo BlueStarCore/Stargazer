@@ -18,6 +18,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 /* ── Constants ───────────────────────────────────────────────────────────── */
 
@@ -180,6 +181,20 @@ int handle_history_save(int client_fd, const char *user,
 			const char *payload, const sg_request_hdr_t *hdr);
 int handle_history_load(int client_fd, const char *user,
 			const char *payload, const sg_request_hdr_t *hdr);
+
+/* ── Supervisor helpers (defined in stargazer-mgmtd.c) ───────────────────── */
+
+int   supervisor_get_restart_count(const char *name);
+pid_t supervisor_get_pid(const char *name);
+
+/* ── Carrier monitoring (defined in mgmtd_apply_iface.c) ─────────────────── */
+
+void handle_netlink_link_event(int nl_fd);
+
+/* ── DHCP client diagnostic (defined in stargazer-mgmtd.c) ──────────────── */
+
+int handle_diag_dhcp_client(int client_fd, const char *user,
+			     const char *payload, const sg_request_hdr_t *hdr);
 
 /* ── Log handlers (defined in stargazer-mgmtd.c) ─────────────────────────── */
 

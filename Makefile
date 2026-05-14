@@ -214,6 +214,8 @@ $(BUILD_DIR)/modules/$(MODULE_NAME).ko $(BUILD_DIR)/modules/session.ko $(BUILD_D
 		[ -f $(KERNEL_DIR)/net/netfilter/$$m ] && \
 		cp $(KERNEL_DIR)/net/netfilter/$$m $(BUILD_DIR)/modules/ || true; \
 	done
+	# Copy af_packet.ko — CONFIG_PACKET=m; required for udhcpc PF_PACKET sockets
+	cp $(KERNEL_DIR)/net/packet/af_packet.ko $(BUILD_DIR)/modules/
 	@echo "[2/5] Module ready: $@"
 
 # =============================================================================

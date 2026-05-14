@@ -154,6 +154,7 @@ typedef enum {
 	SG_CMD_LOG_MGMTD        = 673,  /* Read mgmtd daemon log              */
 	SG_CMD_DIAG_STARGAZER_LOG = 674, /* Filtered stargazer init messages   */
 	SG_CMD_DIAG_STORAGE      = 675,  /* Storage mount status and health    */
+	SG_CMD_DIAG_DHCP_CLIENT  = 676,  /* DHCP client status for all/one iface */
 
 	/* DNS/DHCP — Member A (7xx): SG_CMD_DNS_* 700-749, SG_CMD_DHCP_* 750-799 */
 	/* NAT — Member B (8xx): SG_CMD_NAT_* 800-849 */

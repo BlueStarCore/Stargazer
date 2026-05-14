@@ -7,14 +7,21 @@
 
 #define _GNU_SOURCE
 #include "mgmtd_apply.h"
+#include "mgmtd_internal.h"
 #include "sg_db.h"
 
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <net/if.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 
 sg_status_t apply_settings(const char *id, const char *data,
 			   char *result, size_t rsize)
@@ -151,12 +158,73 @@ static int apply_allowaccess(const char *iface, const char *services)
 
 /* ── udhcpc lifecycle (via supervisor) ──────────────────────────────── */
 
-/* Stop udhcpc for this interface via the supervisor */
+/*
+ * Kill any orphan udhcpc processes for this interface by scanning /proc.
+ * Called before starting a new supervised instance to ensure clean state.
+ * Orphans arise when mgmtd is restarted without a clean shutdown.
+ */
+static void dhcpc_kill_orphans(const char *iface)
+{
+	DIR *pd = opendir("/proc");
+	if (!pd)
+		return;
+
+	struct dirent *pe;
+	while ((pe = readdir(pd)) != NULL) {
+		/* Only numeric entries are PIDs */
+		if (pe->d_name[0] < '1' || pe->d_name[0] > '9')
+			continue;
+
+		char cmdpath[280];
+		snprintf(cmdpath, sizeof(cmdpath), "/proc/%s/cmdline",
+			 pe->d_name);
+		int fd = open(cmdpath, O_RDONLY);
+		if (fd < 0)
+			continue;
+
+		/* Read cmdline (NUL-separated argv) */
+		char buf[512];
+		ssize_t n = read(fd, buf, sizeof(buf) - 1);
+		close(fd);
+		if (n <= 0)
+			continue;
+		buf[n] = '\0';
+
+		/* Check: argv[0] contains "udhcpc" */
+		if (!strstr(buf, "udhcpc"))
+			continue;
+
+		/* Scan remaining args for "-i <iface>" */
+		int found_i = 0;
+		for (ssize_t i = 0; i < n; ) {
+			const char *arg = buf + i;
+			size_t alen = strlen(arg);
+			if (strcmp(arg, "-i") == 0)
+				found_i = 1;
+			else if (found_i && strcmp(arg, iface) == 0) {
+				pid_t pid = (pid_t)atoi(pe->d_name);
+				kill(pid, SIGTERM);
+				mgmt_log("INFO",
+					 "dhcpc_stop: killed orphan udhcpc"
+					 " pid %d on %s", (int)pid, iface);
+				break;
+			} else {
+				found_i = 0;
+			}
+			i += (ssize_t)alen + 1;
+			if (i >= n) break;
+		}
+	}
+	closedir(pd);
+}
+
+/* Stop udhcpc for this interface: supervisor + any orphans */
 static void dhcpc_stop(const char *iface)
 {
 	char name[80];
 	snprintf(name, sizeof(name), "udhcpc.%s", iface);
 	supervisor_stop(name);
+	dhcpc_kill_orphans(iface);
 }
 
 /*
@@ -172,7 +240,10 @@ static void dhcpc_start(const char *iface)
 	snprintf(name, sizeof(name), "udhcpc.%s", iface);
 	const char *argv[] = {
 		"/sbin/udhcpc", "-i", iface,
-		"-f",   /* foreground — mgmtd is direct parent */
+		"-f",           /* foreground — mgmtd is direct parent   */
+		"-t", "0",      /* unlimited DISCOVER retries (no exit)  */
+		"-T", "3",      /* 3s per-packet timeout                 */
+		"-A", "20",     /* 20s between retry rounds              */
 		"-s", "/usr/share/udhcpc/default.script",
 		NULL
 	};
@@ -320,9 +391,6 @@ sg_status_t apply_interface(const char *id, const char *data,
 		/* Flush any static IP before starting DHCP */
 		const char *a1[] = {"ip", "addr", "flush", "dev", id, NULL};
 		free(safe_exec(a1));
-		/* Start udhcpc if interface is up */
-		if (strcmp(status, "down") != 0)
-			dhcpc_start(id);
 	} else {
 		/* Static mode: flush then assign.  Flush first avoids stale
 		 * addresses surviving a mode change; a brief IP-less window
@@ -353,7 +421,11 @@ sg_status_t apply_interface(const char *id, const char *data,
 	/* DHCP replies (router UDP/67 → client UDP/68) arrive as INPUT on
 	 * this interface and would be dropped by the allowaccess chain's
 	 * default DROP.  Insert an explicit ACCEPT before that DROP so
-	 * udhcpc can receive OFFER/ACK packets. */
+	 * udhcpc can receive OFFER/ACK packets.
+	 *
+	 * udhcpc is started AFTER this rule is in place — eliminates the
+	 * race where a fast OFFER/ACK could arrive while the chain still
+	 * has only the default DROP. */
 	if (strcmp(mode, "dhcp") == 0) {
 		char dhcp_chain[32];
 		snprintf(dhcp_chain, sizeof(dhcp_chain), "SG_IN_%s", id);
@@ -362,7 +434,14 @@ sg_status_t apply_interface(const char *id, const char *data,
 			"-p", "udp", "--sport", "67", "--dport", "68",
 			"-j", "ACCEPT", NULL
 		};
-		free(safe_exec(dhcp_rule));
+		if (ipt_exec(dhcp_rule) != 0)
+			mgmt_log("ERROR",
+				 "apply_interface: DHCP ACCEPT rule failed for %s"
+				 " — udhcpc replies will be dropped", id);
+
+		/* Start udhcpc now that the ACCEPT rule is installed */
+		if (strcmp(status, "down") != 0)
+			dhcpc_start(id);
 	}
 
 	/* Signal webd to rebind listeners (allowaccess may have changed).
@@ -375,4 +454,79 @@ sg_status_t apply_interface(const char *id, const char *data,
 
 	snprintf(result, rsize, "Interface %s configured (%s).", id, mode);
 	return SG_OK;
+}
+
+/*
+ * handle_netlink_link_event — process one RTM_NEWLINK message.
+ *
+ * When a DHCP interface loses carrier (IFF_LOWER_UP clears):
+ *   - stop udhcpc and flush the stale lease IP immediately
+ * When a DHCP interface gains carrier (IFF_LOWER_UP sets):
+ *   - start udhcpc if not already running
+ */
+void handle_netlink_link_event(int nl_fd)
+{
+	char buf[4096];
+	ssize_t n = recv(nl_fd, buf, sizeof(buf), MSG_DONTWAIT);
+	if (n <= 0)
+		return;
+
+	for (struct nlmsghdr *nh = (struct nlmsghdr *)buf;
+	     NLMSG_OK(nh, (unsigned)n);
+	     nh = NLMSG_NEXT(nh, n)) {
+
+		if (nh->nlmsg_type != RTM_NEWLINK)
+			continue;
+
+		struct ifinfomsg *ifi = NLMSG_DATA(nh);
+		if (ifi->ifi_flags & IFF_LOOPBACK)
+			continue;
+
+		/* Extract interface name */
+		char iface[IFNAMSIZ] = "";
+		struct rtattr *rta = IFLA_RTA(ifi);
+		int rta_len = (int)IFLA_PAYLOAD(nh);
+		for (; RTA_OK(rta, rta_len); rta = RTA_NEXT(rta, rta_len)) {
+			if (rta->rta_type == IFLA_IFNAME) {
+				snprintf(iface, sizeof(iface), "%s",
+					 (char *)RTA_DATA(rta));
+				break;
+			}
+		}
+		if (!iface[0])
+			continue;
+
+		/* Only act on DHCP client interfaces */
+		char *mode = sg_db_get_val("system_interface", iface, "mode");
+		int is_dhcp = mode && strcmp(mode, "dhcp") == 0;
+		free(mode);
+		if (!is_dhcp)
+			continue;
+
+		int carrier_up = (ifi->ifi_flags & IFF_LOWER_UP) != 0;
+
+		if (!carrier_up) {
+			mgmt_log("INFO",
+				 "carrier lost on %s (dhcp) — flushing lease",
+				 iface);
+			dhcpc_stop(iface);
+			const char *flush[] = {
+				"ip", "addr", "flush", "dev", iface, NULL
+			};
+			free(safe_exec(flush));
+			char sf[80];
+			snprintf(sf, sizeof(sf), "/var/run/dhcp-status.%s",
+				 iface);
+			remove(sf);
+		} else {
+			char supname[80];
+			snprintf(supname, sizeof(supname), "udhcpc.%s", iface);
+			if (supervisor_get_pid(supname) <= 0) {
+				mgmt_log("INFO",
+					 "carrier on %s (dhcp) — starting udhcpc",
+					 iface);
+				dhcpc_start(iface);
+			}
+		}
+	}
 }

@@ -43,6 +43,9 @@
 #include <sys/mount.h>
 #include <sys/wait.h>
 #include <poll.h>
+#include <net/if.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 
 #include "stargazer_ipc.h"
 #include "password_policy.h"
@@ -937,6 +940,236 @@ int handle_diag_storage(int client_fd, const char *user,
 	return 0;
 }
 
+/*
+ * handle_diag_dhcp_client — DHCP client status for all or one interface.
+ *
+ * Payload: empty (all DHCP interfaces) or "<iface>" (one interface).
+ *
+ * For each DHCP-mode interface reports:
+ *   - Supervisor status (udhcpc.<iface>): PID, restart count
+ *   - Lease state from /var/run/dhcp-status.<iface>
+ *   - Current kernel-assigned IP from ip addr
+ */
+int handle_diag_dhcp_client(int client_fd, const char *user,
+			     const char *payload,
+			     const sg_request_hdr_t *hdr)
+{
+	(void)hdr;
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "Requires 'monitor' permission");
+		return 0;
+	}
+
+	char *buf = malloc(SG_RESPONSE_MAX);
+	if (!buf) {
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL, "Out of memory");
+		return 0;
+	}
+	size_t pos = 0;
+
+	/* Build list of DHCP-mode interfaces to inspect */
+	char *iface_list[16];
+	int   iface_count = 0;
+
+	/* If caller specified one interface, use it directly */
+	char req_iface[32] = {0};
+	if (payload && payload[0] && sg_is_iface_name(payload)) {
+		size_t plen = strlen(payload);
+		if (plen >= sizeof(req_iface))
+			plen = sizeof(req_iface) - 1;
+		memcpy(req_iface, payload, plen);
+	}
+
+	if (req_iface[0]) {
+		/* Single interface requested */
+		char *mode = sg_db_get_val("system_interface", req_iface, "mode");
+		if (mode && strcmp(mode, "dhcp") == 0)
+			iface_list[iface_count++] = strdup(req_iface);
+		else if (!mode)
+			iface_list[iface_count++] = strdup(req_iface);
+		free(mode);
+	} else {
+		/* All interfaces in DHCP mode */
+		char *list = sg_db_list("system_interface");
+		if (list) {
+			char *p = list;
+			while (*p && iface_count < 16) {
+				char *nl = strchr(p, '\n');
+				size_t len = nl ? (size_t)(nl - p) : strlen(p);
+				if (len > 0 && len < 32) {
+					char iname[32];
+					memcpy(iname, p, len);
+					iname[len] = '\0';
+					char *mode = sg_db_get_val(
+						"system_interface", iname,
+						"mode");
+					if (mode &&
+					    strcmp(mode, "dhcp") == 0)
+						iface_list[iface_count++] =
+							strdup(iname);
+					free(mode);
+				}
+				if (!nl)
+					break;
+				p = nl + 1;
+			}
+			free(list);
+		}
+	}
+
+	if (iface_count == 0) {
+		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+				"No DHCP client interfaces configured.\n");
+		send_ok(client_fd, NULL, buf);
+		free(buf);
+		return 0;
+	}
+
+	for (int i = 0; i < iface_count; i++) {
+		const char *iface = iface_list[i];
+		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+				"Interface: %s\n", iface);
+
+		/* ── Supervisor status ─────────────────────────────── */
+		char sup_name[80];
+		snprintf(sup_name, sizeof(sup_name), "udhcpc.%s", iface);
+		pid_t upid = supervisor_get_pid(sup_name);
+		int   ucnt = supervisor_get_restart_count(sup_name);
+
+		if (upid > 0) {
+			pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+					"  udhcpc:     running (pid %d,"
+					" restarts %d)\n",
+					(int)upid, ucnt);
+		} else if (ucnt == -1) {
+			pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+					"  udhcpc:     NOT running"
+					" (not tracked — restart limit hit"
+					" or never started)\n");
+		} else {
+			pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+					"  udhcpc:     NOT running"
+					" (restarts %d)\n", ucnt);
+		}
+
+		/* ── Orphan check via /proc ─────────────────────────
+		 * Catches processes not tracked by the supervisor
+		 * (e.g., from a previous mgmtd instance). */
+		{
+			DIR *pd = opendir("/proc");
+			if (pd) {
+				struct dirent *pe;
+				while ((pe = readdir(pd)) != NULL) {
+					if (pe->d_name[0] < '1' ||
+					    pe->d_name[0] > '9')
+						continue;
+					char cp[280];
+					snprintf(cp, sizeof(cp),
+						 "/proc/%s/cmdline",
+						 pe->d_name);
+					int cfd = open(cp, O_RDONLY);
+					if (cfd < 0) continue;
+					char cb[512];
+					ssize_t cn = read(cfd, cb,
+							  sizeof(cb) - 1);
+					close(cfd);
+					if (cn <= 0) continue;
+					cb[cn] = '\0';
+					if (!strstr(cb, "udhcpc")) continue;
+					int fi = 0;
+					for (ssize_t ci = 0; ci < cn; ) {
+						const char *arg = cb + ci;
+						size_t al = strlen(arg);
+						if (strcmp(arg, "-i") == 0) {
+							fi = 1;
+						} else if (fi &&
+							   strcmp(arg, iface)
+							   == 0) {
+							pid_t op =
+							  (pid_t)atoi(
+							    pe->d_name);
+							pos += snprintf(
+							  buf + pos,
+							  SG_RESPONSE_MAX - pos,
+							  "  orphan:     "
+							  "pid %d (not"
+							  " supervisor-"
+							  "tracked)\n",
+							  (int)op);
+							break;
+						} else {
+							fi = 0;
+						}
+						ci += (ssize_t)al + 1;
+						if (ci >= cn) break;
+					}
+				}
+				closedir(pd);
+			}
+		}
+
+		/* ── Lease state from status file ─────────────────── */
+		char sf[64];
+		snprintf(sf, sizeof(sf), "/var/run/dhcp-status.%s", iface);
+		FILE *fp = fopen(sf, "r");
+		if (fp) {
+			char line[128];
+			while (fgets(line, sizeof(line), fp)) {
+				size_t llen = strlen(line);
+				while (llen > 0 &&
+				       (line[llen-1] == '\n' ||
+					line[llen-1] == '\r'))
+					line[--llen] = '\0';
+				if (!line[0]) continue;
+				pos += snprintf(buf + pos,
+						SG_RESPONSE_MAX - pos,
+						"  %s\n", line);
+			}
+			fclose(fp);
+		} else {
+			pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+					"  lease:      (no status file)\n");
+		}
+
+		/* ── Kernel-assigned IP ──────────────────────────── */
+		const char *ip_argv[] = {
+			"ip", "-4", "-o", "addr", "show", iface, NULL
+		};
+		char *ipout = safe_exec(ip_argv);
+		if (ipout && ipout[0]) {
+			char *inet_p = strstr(ipout, "inet ");
+			if (inet_p) {
+				inet_p += 5;
+				char *sp = strchr(inet_p, ' ');
+				if (sp) *sp = '\0';
+				pos += snprintf(buf + pos,
+						SG_RESPONSE_MAX - pos,
+						"  ip:         %s\n",
+						inet_p);
+			} else {
+				pos += snprintf(buf + pos,
+						SG_RESPONSE_MAX - pos,
+						"  ip:         (none)\n");
+			}
+		} else {
+			pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+					"  ip:         (none)\n");
+		}
+		free(ipout);
+
+		if (i + 1 < iface_count)
+			pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+					"\n");
+		free(iface_list[i]);
+	}
+
+	send_ok(client_fd, NULL, buf);
+	free(buf);
+	return 0;
+}
+
 /* ── Signal handling ────────────────────────────────────────────────────── */
 
 static void sig_handler(int sig)
@@ -1131,6 +1364,12 @@ pid_t supervisor_get_pid(const char *name)
 	if (e && e->pid > 0)
 		return e->pid;
 	return 0;
+}
+
+int supervisor_get_restart_count(const char *name)
+{
+	child_entry_t *e = sup_find(name);
+	return e ? e->restart_count : -1;
 }
 
 /*
@@ -2027,6 +2266,33 @@ static int read_iface_mtu(const char *name)
 }
 
 /*
+ * Return 1 if the interface has any netdev upper layers (DSA master,
+ * bridge master, bonding master, etc.).  These are system-managed
+ * interfaces that users should not configure directly.
+ *
+ * Linux exposes upper devices as "upper_<name>" symlinks under
+ * /sys/class/net/<iface>/.  A single match is sufficient.
+ */
+static int read_iface_has_upper(const char *name)
+{
+	char path[48];
+	snprintf(path, sizeof(path), "/sys/class/net/%.15s", name);
+	DIR *d = opendir(path);
+	if (!d)
+		return 0;
+	struct dirent *ent;
+	int found = 0;
+	while ((ent = readdir(d)) != NULL) {
+		if (strncmp(ent->d_name, "upper_", 6) == 0) {
+			found = 1;
+			break;
+		}
+	}
+	closedir(d);
+	return found;
+}
+
+/*
  * Query the driver-reported min/max MTU for an interface via netlink
  * (ip -d link show <name>).  Falls back to 68/65535 if unavailable.
  */
@@ -2121,6 +2387,7 @@ static void mgmtd_sync_interfaces(int is_first_boot)
 
 	/* 4. Create/protect entries for each discovered NIC */
 	for (int i = 0; i < nic_count; i++) {
+		int is_dsa_master = read_iface_has_upper(nics[i]);
 		char *existing = sg_db_get("system_interface", nics[i]);
 
 		if (!existing) {
@@ -2130,7 +2397,21 @@ static void mgmtd_sync_interfaces(int is_first_boot)
 				cur_mtu = 1500;
 
 			char seed[256];
-			if (is_first_boot && i == mgmt_idx) {
+			if (is_dsa_master) {
+				/* DSA/bridge master — kept up by mgmtd but hidden
+				 * from the user CLI.  No IP, no DHCP client. */
+				snprintf(seed, sizeof(seed),
+					 "mode=static\n"
+					 "ip=0.0.0.0/0\n"
+					 "status=up\n"
+					 "mtu=%d\n"
+					 "builtin=yes\n"
+					 "system=yes\n", cur_mtu);
+				sg_db_set("system_interface", nics[i], seed);
+				mgmt_log("INFO",
+					 "interface %s: created (DSA master, mtu %d, system)",
+					 nics[i], cur_mtu);
+			} else if (is_first_boot && i == mgmt_idx) {
 				snprintf(seed, sizeof(seed),
 					 "mode=static\n"
 					 "ip=" MGMT_DEFAULT_IP "\n"
@@ -2170,12 +2451,16 @@ static void mgmtd_sync_interfaces(int is_first_boot)
 					 nics[i], cur_mtu);
 			}
 		} else {
-			/* Existing NIC — ensure builtin=yes */
+			/* Existing NIC — ensure builtin=yes and keep system=yes
+			 * consistent with current hardware topology. */
 			sg_db_set_val("system_interface", nics[i],
 				      "builtin", "yes");
+			if (is_dsa_master)
+				sg_db_set_val("system_interface", nics[i],
+					      "system", "yes");
 			free(existing);
-			mgmt_log("INFO", "interface %s: protected (builtin)",
-				 nics[i]);
+			mgmt_log("INFO", "interface %s: protected (builtin%s)",
+				 nics[i], is_dsa_master ? ", system" : "");
 		}
 	}
 
@@ -2283,6 +2568,16 @@ static char *mgmtd_show_interfaces(void)
 		"%-16s %-8s %-21s %s\n", "Name", "Status", "IP", "Description");
 
 	for (int i = 0; i < nic_count; i++) {
+		/* Skip system-managed interfaces (DSA master, etc.) */
+		char *sys_flag = sg_db_get_val("system_interface", nics[i],
+					       "system");
+		int is_sys = sys_flag && strcmp(sys_flag, "yes") == 0;
+		free(sys_flag);
+		if (is_sys) {
+			free(nics[i]);
+			continue;
+		}
+
 		/* Read operstate from sysfs */
 		char state[16] = "unknown";
 		char spath[64];
@@ -2296,6 +2591,8 @@ static char *mgmtd_show_interfaces(void)
 			}
 			fclose(fp);
 		}
+		if (strcmp(state, "lowerlayerdown") == 0)
+			snprintf(state, sizeof(state), "down");
 
 		/* Get IP address via ip command */
 		char ip[32] = "-";
@@ -5227,6 +5524,8 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		return handle_diag_stargazer_log(client_fd, user, payload, hdr);
 	case SG_CMD_DIAG_STORAGE:
 		return handle_diag_storage(client_fd, user, payload, hdr);
+	case SG_CMD_DIAG_DHCP_CLIENT:
+		return handle_diag_dhcp_client(client_fd, user, payload, hdr);
 
 	case SG_CMD_PING:
 		send_ok(client_fd, "pong", NULL);
@@ -5290,6 +5589,29 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 	}
 
 	return rc;
+}
+
+/* ── Carrier monitoring ─────────────────────────────────────────────────── */
+
+static int open_netlink_link_socket(void)
+{
+	int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+	if (fd < 0) {
+		mgmt_log("WARN", "netlink socket: %s — carrier monitoring disabled",
+			 strerror(errno));
+		return -1;
+	}
+	struct sockaddr_nl sa = {
+		.nl_family = AF_NETLINK,
+		.nl_groups = RTMGRP_LINK,
+	};
+	if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		mgmt_log("WARN", "netlink bind: %s — carrier monitoring disabled",
+			 strerror(errno));
+		close(fd);
+		return -1;
+	}
+	return fd;
 }
 
 /* ── Main ───────────────────────────────────────────────────────────────── */
@@ -5443,6 +5765,8 @@ int main(void)
 		return 1;
 	}
 
+	int nl_fd = open_netlink_link_socket();
+
 	/* Start webd under supervision — unconditional (SRC_ALWAYS).
 	 * Must start AFTER socket listen() so webd's bind_listeners()
 	 * can connect to mgmtd and query interface allowaccess config. */
@@ -5469,14 +5793,31 @@ int main(void)
 			reap_children();
 		}
 
-		struct pollfd pfd = { .fd = sfd, .events = POLLIN };
-		int pr = poll(&pfd, 1, 5000);
+		struct pollfd pfds[2];
+		int nfds = 0;
+		pfds[nfds].fd = sfd;
+		pfds[nfds].events = POLLIN;
+		nfds++;
+		if (nl_fd >= 0) {
+			pfds[nfds].fd = nl_fd;
+			pfds[nfds].events = POLLIN;
+			nfds++;
+		}
+
+		int pr = poll(pfds, (nfds_t)nfds, 5000);
 		if (pr < 0) {
 			if (errno == EINTR) continue;
 			mgmt_log("ERROR", "poll: %s", strerror(errno));
 			continue;
 		}
 		if (pr == 0) continue;  /* timeout, loop back for reap */
+
+		/* Carrier events from kernel — process before accepting IPC */
+		if (nl_fd >= 0 && pfds[1].revents & POLLIN)
+			handle_netlink_link_event(nl_fd);
+
+		if (!(pfds[0].revents & POLLIN))
+			continue;
 
 		int cfd = accept(sfd, NULL, NULL);
 		if (cfd < 0) {

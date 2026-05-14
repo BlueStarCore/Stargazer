@@ -489,11 +489,29 @@ static void register_value_completions(const char *key, const char *kind)
 				if (len >= sizeof(id)) len = sizeof(id) - 1;
 				memcpy(id, p, len);
 				id[len] = '\0';
-				snprintf(regpath, sizeof(regpath),
-					 "set %s %s", key, id);
-				snprintf(regdesc, sizeof(regdesc),
-					 "%s (interface)", id);
-				cli_register(regpath, regdesc);
+
+				/* Skip system-managed interfaces */
+				char section[512];
+				snprintf(section, sizeof(section),
+					 "system_interface:%s", id);
+				struct ipc_response chk;
+				int is_sys = 0;
+				if (ipc_send_str(SG_CMD_CFG_GET, section,
+						 &chk) == 0 &&
+				    chk.status == SG_OK && chk.payload) {
+					char sval[8] = "";
+					sg_kv_get(chk.payload, "system",
+						  sval, sizeof(sval));
+					is_sys = (strcmp(sval, "yes") == 0);
+				}
+				ipc_resp_free(&chk);
+				if (!is_sys) {
+					snprintf(regpath, sizeof(regpath),
+						 "set %s %s", key, id);
+					snprintf(regdesc, sizeof(regdesc),
+						 "%s (interface)", id);
+					cli_register(regpath, regdesc);
+				}
 				p += len;
 				if (eol) p++;
 			}
@@ -1319,6 +1337,30 @@ static int context_table(const char *type_name, const char *label)
 				printf("  Expected: %s\n",
 				       sg_reg_entry_id_kind(type_name));
 				continue;
+			}
+			/* Block editing system-managed interfaces */
+			if (strcmp(type_name, "system_interface") == 0) {
+				char section[512];
+				snprintf(section, sizeof(section),
+					 "system_interface:%s", arg);
+				struct ipc_response sysresp;
+				int is_sys = 0;
+				if (ipc_send_str(SG_CMD_CFG_GET, section,
+						 &sysresp) == 0 &&
+				    sysresp.status == SG_OK &&
+				    sysresp.payload) {
+					char sval[8] = "";
+					sg_kv_get(sysresp.payload, "system",
+						  sval, sizeof(sval));
+					is_sys = (strcmp(sval, "yes") == 0);
+				}
+				ipc_resp_free(&sysresp);
+				if (is_sys) {
+					printf("  Error: '%s' is a system-managed"
+					       " interface and cannot be"
+					       " configured.\n", arg);
+					continue;
+				}
 			}
 			int exit_all = 0;
 			context_entry(type_name, label, arg, &exit_all);

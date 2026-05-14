@@ -127,5 +127,9 @@ X("execute diagnose session status",       "Show live session table",           
 X("execute diagnose session stats",        "Show session counters and module status", "monitor",         0,  NULL)
 X("execute diagnose session clear",        "Flush all active sessions",               "admin",           0,  NULL)
 
+X("execute diagnose dhcp",                 "DHCP diagnostics",                        "monitor",         0,  NULL)
+X("execute diagnose dhcp client",          "Show DHCP client status (all interfaces)", "monitor",        1,  cmd_diag_dhcp_client)
+X("execute diagnose dhcp client <iface>",  "Show DHCP client status for one interface", "monitor",      0,  NULL)
+
 X("set netflow",                           "NetFlow exporter configuration",          "admin",           2,  cmd_set_netflow)
 X("set netflow collector",                 "Set collector <ip> <port>",               "admin",           2,  NULL)

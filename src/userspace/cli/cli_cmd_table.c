@@ -1273,6 +1273,30 @@ static int cmd_diag_routes(const char *args, const char *permissions)
 	return 0;
 }
 
+static int cmd_diag_dhcp_client(const char *args, const char *permissions)
+{
+	(void)permissions;
+
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_DIAG_DHCP_CLIENT, args ? args : "", &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+
+	if (resp.status != SG_OK) {
+		print_ipc_error("Failed", &resp);
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	if (resp.payload && resp.payload_len > 0)
+		printf("%s", resp.payload);
+
+	ipc_resp_free(&resp);
+	return 0;
+}
+
 static void print_chunk(const char *data, size_t len)
 {
 	fwrite(data, 1, len, stdout);
