@@ -2273,11 +2273,23 @@ static int read_iface_mtu(const char *name)
  * Linux exposes upper devices as "upper_<name>" symlinks under
  * /sys/class/net/<iface>/.  A single match is sufficient.
  */
+/* Read a single integer from a sysfs file.  Returns -1 on failure. */
+static int read_sysfs_int(const char *path)
+{
+	FILE *f = fopen(path, "r");
+	if (!f)
+		return -1;
+	int val = -1;
+	fscanf(f, "%d", &val);
+	fclose(f);
+	return val;
+}
+
 static int read_iface_has_upper(const char *name)
 {
-	/* Primary: check for upper_* entries in the interface's own sysfs dir.
-	 * This is what older DSA drivers create on the master. */
-	char path[48];
+	/* Method 1: upper_* entries in the interface's own sysfs dir.
+	 * Created by older DSA drivers and bonding/bridge setups. */
+	char path[64];
 	snprintf(path, sizeof(path), "/sys/class/net/%.15s", name);
 	DIR *d = opendir(path);
 	if (d) {
@@ -2291,30 +2303,62 @@ static int read_iface_has_upper(const char *name)
 		closedir(d);
 	}
 
-	/* Fallback: scan all interfaces for a lower_<name> symlink.
-	 * Newer DSA drivers (including MT7988A on BPI-R4) create lower_eth0
-	 * on each slave port but do NOT create upper_* on the master. */
+	/* Method 2: lower_<name> symlink on any other interface.
+	 * Some DSA drivers create lower_* on slaves instead of upper_* on
+	 * the master. */
 	char lower_target[48];
 	snprintf(lower_target, sizeof(lower_target), "lower_%.15s", name);
-
 	DIR *nd = opendir("/sys/class/net");
-	if (!nd)
+	if (nd) {
+		struct dirent *ne;
+		while ((ne = readdir(nd)) != NULL) {
+			if (ne->d_name[0] == '.')
+				continue;
+			if (strcmp(ne->d_name, name) == 0)
+				continue;
+			char lpath[96];
+			snprintf(lpath, sizeof(lpath),
+				 "/sys/class/net/%.31s/%.32s",
+				 ne->d_name, lower_target);
+			struct stat st;
+			if (lstat(lpath, &st) == 0) {
+				closedir(nd);
+				return 1;
+			}
+		}
+		closedir(nd);
+	}
+
+	/* Method 3: iflink/ifindex comparison — guaranteed by the kernel for
+	 * every DSA slave regardless of driver.  A slave's iflink equals the
+	 * master's ifindex.  A non-slave's iflink equals its own ifindex.
+	 * The MT7988A DSA driver on BPI-R4 creates neither upper_* nor
+	 * lower_* symlinks, so this is the only reliable detection path. */
+	char ifidx_path[64];
+	snprintf(ifidx_path, sizeof(ifidx_path),
+		 "/sys/class/net/%.15s/ifindex", name);
+	int master_ifindex = read_sysfs_int(ifidx_path);
+	if (master_ifindex <= 0)
 		return 0;
-	struct dirent *ne;
+
+	DIR *sd = opendir("/sys/class/net");
+	if (!sd)
+		return 0;
+	struct dirent *se;
 	int found = 0;
-	while (!found && (ne = readdir(nd)) != NULL) {
-		if (ne->d_name[0] == '.')
+	while (!found && (se = readdir(sd)) != NULL) {
+		if (se->d_name[0] == '.')
 			continue;
-		if (strcmp(ne->d_name, name) == 0)
+		if (strcmp(se->d_name, name) == 0)
 			continue;
-		char lpath[96];
-		snprintf(lpath, sizeof(lpath), "/sys/class/net/%.31s/%.32s",
-			 ne->d_name, lower_target);
-		struct stat st;
-		if (lstat(lpath, &st) == 0)
+		char iflink_path[64];
+		snprintf(iflink_path, sizeof(iflink_path),
+			 "/sys/class/net/%.31s/iflink", se->d_name);
+		int slave_iflink = read_sysfs_int(iflink_path);
+		if (slave_iflink > 0 && slave_iflink == master_ifindex)
 			found = 1;
 	}
-	closedir(nd);
+	closedir(sd);
 	return found;
 }
 
