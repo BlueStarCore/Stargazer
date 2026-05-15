@@ -968,14 +968,95 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 				return 0;
 			}
 
-			/* POST /api/system/firmware/upgrade — stub */
+			/* POST /api/system/firmware/upgrade — multipart upload */
 			if (nseg >= 3 &&
 			    strcmp(segs[2], "upgrade") == 0 &&
 			    mg_str_eq(hm->method, "POST")) {
-				reply_json(c, 501,
-					   "{\"error\":\"Firmware upload not yet implemented\"}");
+
+				/* Find the "firmware" part in multipart body */
+				struct mg_http_part part;
+				size_t mofs = 0;
+				int found = 0;
+				while ((mofs = mg_http_next_multipart(
+						hm->body, mofs, &part)) > 0) {
+					if (mg_str_eq(part.name, "firmware")) {
+						found = 1;
+						break;
+					}
+				}
+
+				if (!found || part.body.len == 0) {
+					reply_json(c, 400,
+						   "{\"error\":\"No firmware file in upload\"}");
+					return -1;
+				}
+
+				/* Write to staging file */
+				FILE *ufp = fopen("/tmp/sg-fw-upload.tar.gz", "wb");
+				if (!ufp) {
+					reply_json(c, 500,
+						   "{\"error\":\"Cannot create firmware staging file\"}");
+					return -1;
+				}
+				size_t wr = fwrite(part.body.buf, 1,
+						   part.body.len, ufp);
+				int uferr = ferror(ufp);
+				fclose(ufp);
+
+				if (uferr || wr != part.body.len) {
+					reply_json(c, 500,
+						   "{\"error\":\"Failed to write firmware staging file\"}");
+					return -1;
+				}
+
+				/* Dispatch IPC to mgmtd to process staged file */
+				char *upayload = strdup(
+					"path=/tmp/sg-fw-upload.tar.gz\n");
+				if (!upayload) {
+					reply_json(c, 500,
+						   "{\"error\":\"Out of memory\"}");
+					return -1;
+				}
+
+				work_item_t item;
+				memset(&item, 0, sizeof(item));
+				item.conn_id = c->id;
+				item.flow_type = FLOW_FIRMWARE_UPLOAD;
+				snprintf(item.username,
+					 sizeof(item.username),
+					 "%s", sess.username);
+				item.session_tag = sess.ipc_session_tag;
+				item.payload = upayload;
+				item.payload_len = strlen(upayload);
+
+				if (webd_pool_enqueue(&item) != 0) {
+					free(upayload);
+					reply_json(c, 503,
+						   "{\"error\":\"Server busy\"}");
+					return -1;
+				}
+				return 0;
+			}
+		}
+
+		/* GET /api/system/interfaces/live — live kernel operstate overlay */
+		if (strcmp(segs[1], "interfaces") == 0 &&
+		    nseg >= 3 && strcmp(segs[2], "live") == 0 &&
+		    mg_str_eq(hm->method, "GET")) {
+			work_item_t item;
+			memset(&item, 0, sizeof(item));
+			item.conn_id = c->id;
+			item.flow_type = FLOW_IFACE_LIVE;
+			snprintf(item.username, sizeof(item.username),
+				 "%s", sess.username);
+			item.session_tag = sess.ipc_session_tag;
+
+			if (webd_pool_enqueue(&item) != 0) {
+				reply_json(c, 503,
+					   "{\"error\":\"Server busy\"}");
 				return -1;
 			}
+			return 0;
 		}
 
 		/* POST /api/system/reboot */

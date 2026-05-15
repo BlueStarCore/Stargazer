@@ -1131,7 +1131,9 @@
      * by fetchIfaceData() and rendered via renderIfaceRows(). */
     var ifaceData = [];
 
-    /* Fetch real interface data from API → populate ifaceData */
+    /* Fetch real interface data from API → populate ifaceData.
+     * Two-pass: config DB for allowaccess/type, then live kernel
+     * for actual operstate and assigned IP (e.g. DHCP interfaces). */
     function fetchIfaceData() {
         return api('/config/system_interface').then(function (data) {
             if (!data || !data.entries) return;
@@ -1148,6 +1150,32 @@
                     access: accessList
                 };
             });
+            /* Overlay live kernel state (non-fatal if unavailable) */
+            return api('/system/interfaces/live').then(function (live) {
+                if (!live || !live.interfaces) return;
+                var liveMap = {};
+                live.interfaces.forEach(function (iface) {
+                    liveMap[iface.name] = iface;
+                });
+                ifaceData = ifaceData.map(function (iface) {
+                    var li = liveMap[iface.name];
+                    if (!li) return iface;
+                    /* Live IP: real kernel address (DHCP or static).
+                     * Config DB IP: only trust it if it's not the 0.0.0.0/0
+                     * placeholder written when no static address is set. */
+                    var liveIp = (li.ip && li.ip !== '-') ? li.ip : null;
+                    var dbIp   = (iface.ip && iface.ip !== '0.0.0.0/0' &&
+                                  iface.ip !== '-') ? iface.ip : null;
+                    return {
+                        name:   iface.name,
+                        type:   iface.type,
+                        ip:     liveIp || dbIp || '-',
+                        status: li.status ? li.status.toUpperCase() : iface.status,
+                        speed:  iface.speed,
+                        access: iface.access
+                    };
+                });
+            }).catch(function () { /* live overlay is best-effort */ });
         });
     }
 
@@ -3725,7 +3753,11 @@
                                     clearInterval(pollId);
                                     fwInstallBtn.textContent = 'Install Firmware';
                                     fwInstallBtn.disabled = false;
-                                    showToast('Firmware installed', 'success');
+                                    if (prog.error) {
+                                        showToast('Firmware install failed: ' + (prog.message || 'unknown error'), 'error');
+                                    } else {
+                                        showToast('Firmware installed — device is rebooting', 'success');
+                                    }
                                 }
                             })
                             .catch(function () {

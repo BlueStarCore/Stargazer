@@ -36,6 +36,8 @@
 #define FW_STATE_FILE     "/tmp/sg-fw-upgrade.state"
 #define FW_STATE_FILE_TMP "/tmp/sg-fw-upgrade.state.tmp"
 #define FW_CANCEL_FILE    "/tmp/sg-fw-cancel"
+#define FW_DL_FILE        "/tmp/sg-fw-download/firmware.tar.gz"
+#define FW_UPLOAD_FILE    "/tmp/sg-fw-upload.tar.gz"
 
 /*
  * Write firmware upgrade progress to state file atomically.
@@ -274,6 +276,229 @@ int handle_upgrade_status(int client_fd, const char *user,
 	return 0;
 }
 
+/*
+ * fw_child_upgrade_steps — steps 2-6 of the firmware upgrade, run in the
+ * child process after firmware.tar.gz is present at FW_DL_FILE.
+ *
+ * source_label: written to the audit log, e.g. "url=https://..." or
+ *               "source=upload".
+ *
+ * Always exits the child process via _exit(); never returns.
+ */
+static void __attribute__((noreturn))
+fw_child_upgrade_steps(const char *fw_user, const char *source_label)
+{
+	/* Step 2: Extract firmware package */
+	fw_write_state(2, 6, "running", "Extracting firmware package...", "");
+	char *exout = fw_run_cmd("tar -xzf " FW_DL_FILE
+				 " -C /tmp/sg-fw-staged/ 2>&1");
+	if (access("/tmp/sg-fw-staged/manifest.txt", F_OK) != 0) {
+		mgmt_log("ERROR", "firmware extract failed or missing manifest: %s",
+			 exout ? exout : "(no output)");
+		free(exout);
+		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+		fw_write_state(2, 6, "error",
+			       "Invalid firmware package (missing manifest.txt)", "");
+		sg_db_close();
+		_exit(1);
+	}
+	free(exout);
+
+	/* Read manifest */
+	char manifest[2048] = {0};
+	FILE *mf = fopen("/tmp/sg-fw-staged/manifest.txt", "r");
+	if (mf) {
+		size_t rd = fread(manifest, 1, sizeof(manifest) - 1, mf);
+		manifest[rd] = '\0';
+		fclose(mf);
+	}
+
+	char fw_version[64], fit_sha[128];
+	extract_val(manifest, "version", fw_version, sizeof(fw_version));
+	extract_val(manifest, "fit_sha256", fit_sha, sizeof(fit_sha));
+
+	if (!fw_version[0] || !fit_sha[0]) {
+		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+		fw_write_state(2, 6, "error",
+			       "Incomplete manifest (missing version or fit_sha256)", "");
+		sg_db_close();
+		_exit(1);
+	}
+
+	/* Verify stargazer.itb exists */
+	if (access("/tmp/sg-fw-staged/stargazer.itb", F_OK) != 0) {
+		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+		fw_write_state(2, 6, "error",
+			       "Invalid firmware package (missing stargazer.itb)", "");
+		sg_db_close();
+		_exit(1);
+	}
+
+	/* Cancel check: before step 3 */
+	fw_check_cancel();
+
+	/* Step 3: Verify FIT image checksum */
+	fw_write_state(3, 6, "running", "Verifying FIT image checksum...", "");
+	char *fsum = fw_run_cmd("sha256sum /tmp/sg-fw-staged/stargazer.itb 2>/dev/null "
+			     "| cut -d' ' -f1");
+
+	if (fsum) { char *nl = strchr(fsum, '\n'); if (nl) *nl = '\0'; }
+
+	if (!fsum || strcmp(fsum, fit_sha) != 0) {
+		mgmt_log("ERROR", "firmware checksum mismatch: "
+			 "fit=%s (expect %s)",
+			 fsum ? fsum : "null", fit_sha);
+		free(fsum);
+		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+		fw_write_state(3, 6, "error",
+			       "Firmware checksum verification failed", "");
+		sg_db_close();
+		_exit(1);
+	}
+	free(fsum);
+
+	mgmt_log("INFO", "firmware v%s verified, installing...", fw_version);
+
+	/* Cancel check: before step 4 */
+	fw_check_cancel();
+
+	/* Step 4: Find firmware partition via sysfs PARTNAME */
+	fw_write_state(4, 6, "running", "Locating firmware partition...", "");
+	char kpart[64] = {0};
+	{
+		const char *candidates[] = {
+			"mmcblk0p4", "mmcblk1p4", NULL
+		};
+		for (int i = 0; candidates[i]; i++) {
+			char devpath[64];
+			snprintf(devpath, sizeof(devpath),
+				 "/dev/%s", candidates[i]);
+			if (access(devpath, F_OK) != 0)
+				continue;
+			char uevent[128];
+			snprintf(uevent, sizeof(uevent),
+				 "/sys/class/block/%s/uevent",
+				 candidates[i]);
+			FILE *f = fopen(uevent, "r");
+			if (!f)
+				continue;
+			char line[256];
+			while (fgets(line, sizeof(line), f)) {
+				if (strncmp(line, "PARTNAME=", 9) == 0) {
+					char *name = line + 9;
+					size_t nl = strlen(name);
+					if (nl > 0 && name[nl - 1] == '\n')
+						name[nl - 1] = '\0';
+					if (strcmp(name, "firmware") == 0 ||
+					    strcmp(name, "kernel") == 0) {
+						snprintf(kpart, sizeof(kpart),
+							 "%s", devpath);
+					}
+					break;
+				}
+			}
+			fclose(f);
+			if (kpart[0])
+				break;
+		}
+	}
+
+	if (!kpart[0]) {
+		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+		fw_write_state(4, 6, "error",
+			       "Firmware partition not found "
+			       "(expected \"firmware\" or \"kernel\")", "");
+		sg_db_close();
+		_exit(1);
+	}
+
+	mgmt_log("INFO", "firmware partition: %s", kpart);
+
+	/* Last cancel checkpoint — after this we are committed. */
+	fw_check_cancel();
+
+	/* ── Point of no return ── Steps 5 and 6 run to completion ── */
+
+	/* Step 5: Write FIT image raw to kernel partition */
+	fw_write_state(5, 6, "running",
+		       "Writing FIT image to kernel partition...", "");
+
+	char ddcmd[512];
+	snprintf(ddcmd, sizeof(ddcmd),
+		 "dd if=/tmp/sg-fw-staged/stargazer.itb of='%s' bs=512k 2>&1",
+		 kpart);
+	char *ddout = fw_run_cmd(ddcmd);
+	if (ddout)
+		mgmt_log("INFO", "dd output: %s", ddout);
+	free(ddout);
+
+	/* Verify: read back and compare sha256 */
+	{
+		struct stat fit_st;
+		if (stat("/tmp/sg-fw-staged/stargazer.itb", &fit_st) != 0) {
+			fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+			fw_write_state(5, 6, "error", "Cannot stat FIT image", "");
+			sg_db_close();
+			_exit(1);
+		}
+		char vfycmd[512];
+		snprintf(vfycmd, sizeof(vfycmd),
+			 "dd if='%s' bs=512k count=%ld iflag=count_bytes 2>/dev/null "
+			 "| sha256sum | cut -d' ' -f1",
+			 kpart, (long)fit_st.st_size);
+		char *vfysum = fw_run_cmd(vfycmd);
+		if (vfysum) {
+			char *nl = strchr(vfysum, '\n');
+			if (nl) *nl = '\0';
+		}
+		if (!vfysum || strcmp(vfysum, fit_sha) != 0) {
+			mgmt_log("ERROR", "FIT readback verify failed: "
+				 "got=%s expected=%s",
+				 vfysum ? vfysum : "null", fit_sha);
+			free(vfysum);
+			fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+			fw_write_state(5, 6, "error",
+				       "FIT image write verification failed", "");
+			sg_db_close();
+			_exit(1);
+		}
+		free(vfysum);
+	}
+
+	/* Step 6: Sync and finalize */
+	fw_write_state(6, 6, "running", "Syncing...", "");
+	fw_run_cmd_ignore("sync");
+	fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download");
+
+	/* Audit log */
+	char audit_msg[1200];
+	snprintf(audit_msg, sizeof(audit_msg),
+		 "version=%s %s", fw_version, source_label);
+	(void)audit_log(fw_user, "firmware_upgrade", audit_msg);
+
+	mgmt_log("INFO", "firmware v%s installed successfully", fw_version);
+
+	char done_msg[256];
+	snprintf(done_msg, sizeof(done_msg),
+		 "Firmware v%s installed successfully. Rebooting...",
+		 fw_version);
+	fw_write_state(6, 6, "done", done_msg, fw_version);
+
+	/* Stamp integrity flag so new firmware recognizes this as a seeded DB */
+	sg_db_set_val("system_meta", "0", "seeded", "1");
+
+	/* Close DB and back up before reboot */
+	sg_db_close();
+	{
+		const char *cp_argv[] = {"cp", "-f", SG_DB_PATH,
+					 SG_DB_PATH ".pre-upgrade", NULL};
+		free(safe_exec(cp_argv));
+	}
+	usleep(100000);
+	fw_run_cmd_ignore("/sbin/reboot");
+	_exit(0);
+}
+
 int handle_upgrade_start(int client_fd, const char *user, const char *payload, const sg_request_hdr_t *hdr)
 {
 	const char *perms = get_user_permissions(user);
@@ -397,8 +622,6 @@ int handle_upgrade_start(int client_fd, const char *user, const char *payload, c
 		fw_write_state(1, 6, "running", init_msg, "");
 	}
 	mgmt_log("INFO", "firmware upgrade: downloading from %s", url);
-
-	#define FW_DL_FILE "/tmp/sg-fw-download/firmware.tar.gz"
 
 	/* Pre-flight: probe remote file size via HTTP HEAD request.
 	 * Uses wget --spider -S to get Content-Length header.
@@ -593,220 +816,11 @@ int handle_upgrade_start(int client_fd, const char *user, const char *payload, c
 	/* Cancel check: before step 2 */
 	fw_check_cancel();
 
-	/* Step 2: Extract firmware package */
-	fw_write_state(2, 6, "running", "Extracting firmware package...", "");
-	char *exout = fw_run_cmd("tar -xzf /tmp/sg-fw-download/firmware.tar.gz "
-			      "-C /tmp/sg-fw-staged/ 2>&1");
-	if (access("/tmp/sg-fw-staged/manifest.txt", F_OK) != 0) {
-		mgmt_log("ERROR", "firmware extract failed or missing manifest: %s",
-			 exout ? exout : "(no output)");
-		free(exout);
-		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
-		fw_write_state(2, 6, "error",
-			       "Invalid firmware package (missing manifest.txt)", "");
-		sg_db_close();
-		_exit(1);
-	}
-	free(exout);
-
-	/* Read manifest */
-	char manifest[2048] = {0};
-	FILE *mf = fopen("/tmp/sg-fw-staged/manifest.txt", "r");
-	if (mf) {
-		size_t rd = fread(manifest, 1, sizeof(manifest) - 1, mf);
-		manifest[rd] = '\0';
-		fclose(mf);
-	}
-
-	char fw_version[64], fit_sha[128];
-	extract_val(manifest, "version", fw_version, sizeof(fw_version));
-	extract_val(manifest, "fit_sha256", fit_sha, sizeof(fit_sha));
-
-	if (!fw_version[0] || !fit_sha[0]) {
-		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
-		fw_write_state(2, 6, "error",
-			       "Incomplete manifest (missing version or fit_sha256)", "");
-		sg_db_close();
-		_exit(1);
-	}
-
-	/* Verify stargazer.itb exists */
-	if (access("/tmp/sg-fw-staged/stargazer.itb", F_OK) != 0) {
-		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
-		fw_write_state(2, 6, "error",
-			       "Invalid firmware package (missing stargazer.itb)", "");
-		sg_db_close();
-		_exit(1);
-	}
-
-	/* Cancel check: before step 3 */
-	fw_check_cancel();
-
-	/* Step 3: Verify FIT image checksum */
-	fw_write_state(3, 6, "running", "Verifying FIT image checksum...", "");
-	char *fsum = fw_run_cmd("sha256sum /tmp/sg-fw-staged/stargazer.itb 2>/dev/null "
-			     "| cut -d' ' -f1");
-
-	if (fsum) { char *nl = strchr(fsum, '\n'); if (nl) *nl = '\0'; }
-
-	if (!fsum || strcmp(fsum, fit_sha) != 0) {
-		mgmt_log("ERROR", "firmware checksum mismatch: "
-			 "fit=%s (expect %s)",
-			 fsum ? fsum : "null", fit_sha);
-		free(fsum);
-		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
-		fw_write_state(3, 6, "error",
-			       "Firmware checksum verification failed", "");
-		sg_db_close();
-		_exit(1);
-	}
-	free(fsum);
-
-	mgmt_log("INFO", "firmware v%s verified, installing...", fw_version);
-
-	/* Cancel check: before step 4 */
-	fw_check_cancel();
-
-	/* Step 4: Find firmware partition via sysfs PARTNAME (see status path) */
-	fw_write_state(4, 6, "running",
-		       "Locating firmware partition...", "");
-	char kpart[64] = {0};
-	{
-		const char *candidates[] = {
-			"mmcblk0p4", "mmcblk1p4", NULL
-		};
-		for (int i = 0; candidates[i]; i++) {
-			char devpath[64];
-			snprintf(devpath, sizeof(devpath),
-				 "/dev/%s", candidates[i]);
-			if (access(devpath, F_OK) != 0)
-				continue;
-			char uevent[128];
-			snprintf(uevent, sizeof(uevent),
-				 "/sys/class/block/%s/uevent",
-				 candidates[i]);
-			FILE *f = fopen(uevent, "r");
-			if (!f)
-				continue;
-			char line[256];
-			while (fgets(line, sizeof(line), f)) {
-				if (strncmp(line, "PARTNAME=", 9) == 0) {
-					char *name = line + 9;
-					size_t nl = strlen(name);
-					if (nl > 0 && name[nl - 1] == '\n')
-						name[nl - 1] = '\0';
-					if (strcmp(name, "firmware") == 0 ||
-					    strcmp(name, "kernel") == 0) {
-						snprintf(kpart, sizeof(kpart),
-							 "%s", devpath);
-					}
-					break;
-				}
-			}
-			fclose(f);
-			if (kpart[0])
-				break;
-		}
-	}
-
-	if (!kpart[0]) {
-		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
-		fw_write_state(4, 6, "error",
-			       "Firmware partition not found (expected \"firmware\" or \"kernel\")", "");
-		sg_db_close();
-		_exit(1);
-	}
-
-	mgmt_log("INFO", "firmware partition: %s", kpart);
-
-	/* Last cancel checkpoint — partition is identified but not yet
-	 * written.  After this point we are committed. */
-	fw_check_cancel();
-
-	/* ── Point of no return ── Steps 5 and 6 run to completion ── */
-
-	/* Step 5: Write FIT image raw to kernel partition */
-	fw_write_state(5, 6, "running",
-		       "Writing FIT image to kernel partition...", "");
-
-	char ddcmd[512];
-	snprintf(ddcmd, sizeof(ddcmd),
-		 "dd if=/tmp/sg-fw-staged/stargazer.itb of='%s' bs=512k 2>&1",
-		 kpart);
-	char *ddout = fw_run_cmd(ddcmd);
-	if (ddout)
-		mgmt_log("INFO", "dd output: %s", ddout);
-	free(ddout);
-
-	/* Verify: read back and compare sha256 */
-	{
-		struct stat fit_st;
-		if (stat("/tmp/sg-fw-staged/stargazer.itb", &fit_st) != 0) {
-			fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
-			fw_write_state(5, 6, "error",
-				       "Cannot stat FIT image", "");
-			sg_db_close();
-			_exit(1);
-		}
-		char vfycmd[512];
-		snprintf(vfycmd, sizeof(vfycmd),
-			 "dd if='%s' bs=512k count=%ld iflag=count_bytes 2>/dev/null "
-			 "| sha256sum | cut -d' ' -f1",
-			 kpart, (long)fit_st.st_size);
-		char *vfysum = fw_run_cmd(vfycmd);
-		if (vfysum) {
-			char *nl = strchr(vfysum, '\n');
-			if (nl) *nl = '\0';
-		}
-		if (!vfysum || strcmp(vfysum, fit_sha) != 0) {
-			mgmt_log("ERROR", "FIT readback verify failed: "
-				 "got=%s expected=%s",
-				 vfysum ? vfysum : "null", fit_sha);
-			free(vfysum);
-			fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
-			fw_write_state(5, 6, "error",
-				       "FIT image write verification failed", "");
-			sg_db_close();
-			_exit(1);
-		}
-		free(vfysum);
-	}
-
-	/* Step 6: Sync and finalize */
-	fw_write_state(6, 6, "running", "Syncing...", "");
-	fw_run_cmd_ignore("sync");
-
-	/* Cleanup download artifacts */
-	fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download");
-
-	/* Audit log */
-	char audit_msg[1200];
-	snprintf(audit_msg, sizeof(audit_msg),
-		 "version=%s url=%s", fw_version, url);
-	(void)audit_log(fw_user, "firmware_upgrade", audit_msg);
-
-	mgmt_log("INFO", "firmware v%s installed successfully", fw_version);
-
-	char done_msg[256];
-	snprintf(done_msg, sizeof(done_msg),
-		 "Firmware v%s installed successfully. Rebooting...",
-		 fw_version);
-	fw_write_state(6, 6, "done", done_msg, fw_version);
-
-	/* Stamp integrity flag so new firmware recognizes this as a seeded DB */
-	sg_db_set_val("system_meta", "0", "seeded", "1");
-
-	/* Close DB and back up before reboot */
-	sg_db_close();
-	{
-		const char *cp_argv[] = {"cp", "-f", SG_DB_PATH,
-					 SG_DB_PATH ".pre-upgrade",
-					 NULL};
-		free(safe_exec(cp_argv));
-	}
-	usleep(100000);
-	fw_run_cmd_ignore("/sbin/reboot");
-	_exit(0);
+	/* Steps 2-6: extract, verify, locate partition, write, reboot. */
+	char src_label[1100];
+	snprintf(src_label, sizeof(src_label), "url=%s", url);
+	fw_child_upgrade_steps(fw_user, src_label);
+	/* noreturn */
 }
 
 int handle_upgrade_progress(int client_fd, const char *user,
@@ -909,6 +923,123 @@ int handle_upgrade_cancel(int client_fd, const char *user,
 	mgmt_log("INFO", "firmware upgrade cancel requested by %s", user);
 	send_ok(client_fd, NULL, "Cancel requested\n");
 	return 0;
+}
+
+/* ── Upgrade from pre-uploaded file ─────────────────────────────────── */
+
+/*
+ * handle_upgrade_from_file — install firmware already written by webd to
+ * FW_UPLOAD_FILE.  The child moves it to FW_DL_FILE, then runs steps 2-6
+ * via fw_child_upgrade_steps().
+ */
+int handle_upgrade_from_file(int client_fd, const char *user,
+			     const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)hdr;
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "admin")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "Requires 'admin' permission");
+		return 0;
+	}
+
+	/* Validate that the upload path is the expected staging file */
+	char path[256] = {0};
+	if (payload && hdr->payload_len > 0)
+		extract_val(payload, "path", path, sizeof(path));
+	if (strcmp(path, FW_UPLOAD_FILE) != 0) {
+		send_error(client_fd, SG_ERR_INVALID_ARG,
+			   "Invalid firmware path");
+		return 0;
+	}
+
+	if (access(path, F_OK) != 0) {
+		send_error(client_fd, SG_ERR_NOT_FOUND,
+			   "Firmware upload file not found");
+		return 0;
+	}
+
+	/* Check if upgrade already running */
+	{
+		char state_check[256] = {0};
+		FILE *sf = fopen(FW_STATE_FILE, "r");
+		if (sf) {
+			size_t rd = fread(state_check, 1,
+					  sizeof(state_check) - 1, sf);
+			state_check[rd] = '\0';
+			fclose(sf);
+			if (strstr(state_check, "status=running")) {
+				send_error(client_fd, SG_ERR_IN_USE,
+					   "Firmware upgrade already in progress");
+				return 0;
+			}
+		}
+	}
+
+	/* Clear stale cancel flag and reset step log */
+	unlink(FW_CANCEL_FILE);
+	fw_steps_log[0] = '\0';
+	fw_steps_log_len = 0;
+	fw_last_logged_step = -1;
+
+	/* Write initial state and reply immediately */
+	fw_write_state(1, 6, "running",
+		       "Firmware upload complete, preparing installation...", "");
+	send_ok(client_fd, NULL, "Firmware upgrade started\n");
+
+	char fw_user[SG_USERNAME_MAX];
+	snprintf(fw_user, sizeof(fw_user), "%s", user);
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		mgmt_log("ERROR", "firmware upgrade (upload) fork failed: %s",
+			 strerror(errno));
+		fw_write_state(0, 6, "error", "Internal error: fork failed", "");
+		return 0;
+	}
+
+	if (pid > 0)
+		return 0;
+
+	/* ── Child process ─────────────────────────────────────── */
+
+	close(client_fd);
+	if (g_listen_fd >= 0)
+		close(g_listen_fd);
+
+	int logfd = open("/tmp/sg-fw-upgrade.log",
+			 O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (logfd >= 0) {
+		dup2(logfd, STDERR_FILENO);
+		close(logfd);
+	}
+
+	sg_db_close();
+	if (sg_db_open(SG_DB_PATH) != 0)
+		mgmt_log("WARN", "firmware child: failed to reopen db");
+
+	fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+	fw_run_cmd_ignore("mkdir -p /tmp/sg-fw-download /tmp/sg-fw-staged");
+
+	/* Move uploaded file to expected download path */
+	if (rename(FW_UPLOAD_FILE, FW_DL_FILE) != 0) {
+		/* rename fails across filesystems — fall back to cp+rm */
+		char cpcmd[512];
+		snprintf(cpcmd, sizeof(cpcmd),
+			 "cp -f '%s' '%s' && rm -f '%s'",
+			 FW_UPLOAD_FILE, FW_DL_FILE, FW_UPLOAD_FILE);
+		fw_run_cmd_ignore(cpcmd);
+	}
+
+	if (access(FW_DL_FILE, F_OK) != 0) {
+		fw_write_state(1, 6, "error",
+			       "Failed to stage uploaded firmware file", "");
+		sg_db_close();
+		_exit(1);
+	}
+
+	fw_child_upgrade_steps(fw_user, "source=upload");
+	/* noreturn */
 }
 
 /* ── Test setup handler (for selftest suite) ─────────────────────────── */

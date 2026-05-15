@@ -161,6 +161,7 @@ typedef enum {
 
 	/* Firmware upload via IPC (webd → mgmtd) */
 	SG_CMD_UPGRADE_UPLOAD    = 680,  /* Receive firmware data via IPC   */
+	SG_CMD_UPGRADE_FROM_FILE = 681,  /* Install pre-uploaded firmware file */
 
 	/* Keepalive / ping (9xx) */
 	SG_CMD_PING          = 900,

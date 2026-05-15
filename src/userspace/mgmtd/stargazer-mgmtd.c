@@ -5139,6 +5139,8 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		return handle_upgrade_progress(client_fd, user, payload, hdr);
 	case SG_CMD_UPGRADE_CANCEL:
 		return handle_upgrade_cancel(client_fd, user, payload, hdr);
+	case SG_CMD_UPGRADE_FROM_FILE:
+		return handle_upgrade_from_file(client_fd, user, payload, hdr);
 
 	case SG_CMD_SHOW_STATUS: {
 		char status_buf[512];

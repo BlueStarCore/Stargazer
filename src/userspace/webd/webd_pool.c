@@ -1442,19 +1442,149 @@ static void flow_firmware_progress(work_item_t *item)
 
 	if (total < 1) total = 1;
 	int percent = step * 100 / total;
-	int done = (strcmp(status_str, "success") == 0 ||
-		    strcmp(status_str, "error") == 0);
+	int done    = (strcmp(status_str, "done") == 0 ||
+		       strcmp(status_str, "error") == 0);
+	int is_err  = (strcmp(status_str, "error") == 0);
 
 	char *esc_msg = json_escape(message);
+	char *esc_sts = json_escape(status_str);
 	char *json = malloc(512);
 	if (json)
 		snprintf(json, 512,
-			 "{\"percent\":%d,\"done\":%s,\"message\":\"%s\"}",
+			 "{\"percent\":%d,\"done\":%s,\"error\":%s,"
+			 "\"status\":\"%s\",\"message\":\"%s\"}",
 			 percent, done ? "true" : "false",
+			 is_err ? "true" : "false",
+			 esc_sts ? esc_sts : "",
 			 esc_msg ? esc_msg : "");
 	free(esc_msg);
+	free(esc_sts);
 	send_result(item->conn_id, 200, json, json ? strlen(json) : 0);
 	webd_ipc_resp_free(&resp);
+}
+
+static void flow_iface_live(work_item_t *item)
+{
+	/* Call SG_CMD_SHOW_IFACES and parse the fixed-width text table into
+	 * a JSON array so the web UI can overlay live operstate on the
+	 * config-DB interface list. */
+	webd_ipc_response_t resp;
+	if (webd_ipc_send(SG_CMD_SHOW_IFACES, item->username,
+			  item->session_tag, "", &resp) != 0) {
+		char *json = json_error("Backend unavailable", NULL);
+		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
+		return;
+	}
+	if (resp.status != SG_OK) {
+		send_ipc_error(item->conn_id, resp.status, resp.extra);
+		webd_ipc_resp_free(&resp);
+		return;
+	}
+
+	/* Parse "Name             Status   IP                    Description"
+	 * table — skip header line, then split each row on whitespace. */
+	size_t cap = 512, len = 0;
+	char *json = malloc(cap);
+	if (!json) {
+		webd_ipc_resp_free(&resp);
+		char *j = json_error("Out of memory", NULL);
+		send_result(item->conn_id, 500, j, j ? strlen(j) : 0);
+		return;
+	}
+
+#define IL_APP(s, n) do { \
+	while (len + (n) >= cap) { \
+		cap *= 2; \
+		char *tmp = realloc(json, cap); \
+		if (!tmp) { free(json); json = NULL; goto il_done; } \
+		json = tmp; \
+	} \
+	memcpy(json + len, (s), (n)); \
+	len += (n); \
+} while (0)
+
+	IL_APP("{\"interfaces\":[", 16);
+
+	int first = 1;
+	int header_skipped = 0;
+	const char *p = resp.payload ? resp.payload : "";
+	while (*p) {
+		const char *nl = strchr(p, '\n');
+		size_t llen = nl ? (size_t)(nl - p) : strlen(p);
+
+		/* Skip the header row (starts with "Name") */
+		if (!header_skipped) {
+			header_skipped = 1;
+			p = nl ? nl + 1 : p + llen;
+			continue;
+		}
+		if (llen == 0) { p = nl ? nl + 1 : p + llen; continue; }
+
+		/* Parse: name(16) status(8) ip(21) ... — split on spaces */
+		char row[256];
+		if (llen >= sizeof(row)) llen = sizeof(row) - 1;
+		memcpy(row, p, llen);
+		row[llen] = '\0';
+
+		char name[32] = "", status[16] = "", ip[32] = "-";
+		sscanf(row, "%31s %15s %31s", name, status, ip);
+
+		if (!name[0]) { p = nl ? nl + 1 : p + llen; continue; }
+
+		/* Normalise lowerlayerdown → down */
+		if (strcmp(status, "lowerlayerdown") == 0)
+			snprintf(status, sizeof(status), "down");
+
+		char *en = json_escape(name);
+		char *es = json_escape(status);
+		char *ei = json_escape(ip);
+		if (!en || !es || !ei) { free(en); free(es); free(ei); goto il_done; }
+
+		char frag[256];
+		int fn = snprintf(frag, sizeof(frag),
+				  "%s{\"name\":\"%s\",\"status\":\"%s\",\"ip\":\"%s\"}",
+				  first ? "" : ",", en, es, ei);
+		free(en); free(es); free(ei);
+		if (fn > 0) IL_APP(frag, (size_t)fn);
+		first = 0;
+
+		p = nl ? nl + 1 : p + llen;
+	}
+
+	IL_APP("]}", 2);
+	IL_APP("\0", 1);
+
+il_done:
+	webd_ipc_resp_free(&resp);
+#undef IL_APP
+
+	if (json)
+		send_result(item->conn_id, 200, json, len > 0 ? len - 1 : 0);
+	else {
+		char *j = json_error("Out of memory", NULL);
+		send_result(item->conn_id, 500, j, j ? strlen(j) : 0);
+	}
+}
+
+static void flow_firmware_upload(work_item_t *item)
+{
+	/* item->payload = "path=/tmp/sg-fw-upload.tar.gz\n" */
+	webd_ipc_response_t resp;
+	if (webd_ipc_send(SG_CMD_UPGRADE_FROM_FILE, item->username,
+			  item->session_tag,
+			  item->payload ? item->payload : "", &resp) != 0) {
+		char *json = json_error("Backend unavailable", NULL);
+		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
+		return;
+	}
+	if (resp.status != SG_OK) {
+		send_ipc_error(item->conn_id, resp.status, resp.extra);
+		webd_ipc_resp_free(&resp);
+		return;
+	}
+	webd_ipc_resp_free(&resp);
+	char *json = strdup("{\"ok\":true}");
+	send_result(item->conn_id, 200, json, json ? strlen(json) : 0);
 }
 
 static void flow_reboot(work_item_t *item)
@@ -1565,8 +1695,10 @@ static void *worker_fn(void *arg)
 		case FLOW_RES_DISK:     flow_res_disk(&item);        break;
 		case FLOW_RES_PROCTOP:  flow_res_proctop(&item);     break;
 		case FLOW_ADMIN_CREATE: flow_admin_create(&item);    break;
-		case FLOW_CONFIG_MOVE:  flow_simple(&item);          break;
-		default:                 flow_simple(&item);          break;
+		case FLOW_CONFIG_MOVE:    flow_simple(&item);           break;
+		case FLOW_IFACE_LIVE:     flow_iface_live(&item);      break;
+		case FLOW_FIRMWARE_UPLOAD: flow_firmware_upload(&item); break;
+		default:                  flow_simple(&item);           break;
 		}
 
 		free(item.payload);

@@ -16,7 +16,8 @@ BUILD_DIR    ?= ../../../build/webd
 MG_CFLAGS    := -Wall -Os -static -I. \
                 -DMG_ENABLE_LINES=0 -DMG_ENABLE_SSI=0 \
                 -DMG_ENABLE_DIRLIST=0 \
-                -DMG_TLS=MG_TLS_BUILTIN
+                -DMG_TLS=MG_TLS_BUILTIN \
+                -DMG_MAX_RECV_SIZE=67108864
 
 SRCS := stargazer-webd.c webd_api.c webd_ipc.c webd_pool.c \
         webd_session.c webd_sandbox.c $(COMMON_DIR)/sg_validate.c

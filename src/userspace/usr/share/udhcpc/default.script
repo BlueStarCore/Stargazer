@@ -70,6 +70,14 @@ case "$1" in
 		ip link set "$interface" up
 		write_status "deconfig"
 		logger -t udhcpc "deconfig: iface=$interface"
+
+		# Tell webd to drop the listener — the IP is gone so the bound
+		# socket is invalid. rebind_listeners() will find no address and
+		# create no listener for this interface.
+		if [ -f /run/stargazer-webd.pid ]; then
+			_wpid=$(cat /run/stargazer-webd.pid 2>/dev/null)
+			[ -n "$_wpid" ] && kill -HUP "$_wpid" 2>/dev/null
+		fi
 		;;
 
 	bound|renew)
@@ -137,6 +145,13 @@ case "$1" in
 
 		write_status "$1"
 		logger -t udhcpc "$1: ip=$ip/${mask:-24} router=${router:-none} iface=$interface"
+
+		# Tell webd to rebind HTTP listeners — it queries the live kernel
+		# IP (SIOCGIFADDR) so it will now find and bind $ip on $interface.
+		if [ -f /run/stargazer-webd.pid ]; then
+			_wpid=$(cat /run/stargazer-webd.pid 2>/dev/null)
+			[ -n "$_wpid" ] && kill -HUP "$_wpid" 2>/dev/null
+		fi
 		;;
 
 	leasefail|nak)

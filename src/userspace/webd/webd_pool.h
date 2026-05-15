@@ -36,6 +36,8 @@
 #define FLOW_RES_PROCTOP    15
 #define FLOW_ADMIN_CREATE   16
 #define FLOW_CONFIG_MOVE    17
+#define FLOW_IFACE_LIVE     18
+#define FLOW_FIRMWARE_UPLOAD 19
 
 typedef struct {
 	unsigned long   conn_id;        /* Mongoose connection ID */

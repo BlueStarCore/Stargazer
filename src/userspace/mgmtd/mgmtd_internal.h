@@ -119,6 +119,8 @@ int handle_upgrade_cancel(int client_fd, const char *user,
 			  const char *payload, const sg_request_hdr_t *hdr);
 int handle_upgrade_test_setup(int client_fd, const char *user,
 			      const char *payload, const sg_request_hdr_t *hdr);
+int handle_upgrade_from_file(int client_fd, const char *user,
+			     const char *payload, const sg_request_hdr_t *hdr);
 
 /* ── Network diagnostic handlers (defined in mgmtd_network.c) ────────────── */
 
