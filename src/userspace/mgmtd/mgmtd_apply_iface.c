@@ -23,6 +23,12 @@
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 
+/* IFF_LOWER_UP (0x10000) is in <linux/if.h>, which conflicts with <net/if.h>
+ * on glibc systems.  Define it directly — it is a stable kernel ABI constant. */
+#ifndef IFF_LOWER_UP
+#define IFF_LOWER_UP 0x10000
+#endif
+
 sg_status_t apply_settings(const char *id, const char *data,
 			   char *result, size_t rsize)
 {
@@ -295,12 +301,14 @@ sg_status_t apply_interface(const char *id, const char *data,
 {
 	char mode[VALBUFSZ], ip[VALBUFSZ], status[VALBUFSZ];
 	char mtu[VALBUFSZ], desc[VALBUFSZ], allowaccess[VALBUFSZ];
+	char sys_flag[VALBUFSZ];
 	extract_val(data, "mode", mode, sizeof(mode));
 	extract_val(data, "ip", ip, sizeof(ip));
 	extract_val(data, "status", status, sizeof(status));
 	extract_val(data, "mtu", mtu, sizeof(mtu));
 	extract_val(data, "description", desc, sizeof(desc));
 	extract_val(data, "allowaccess", allowaccess, sizeof(allowaccess));
+	extract_val(data, "system", sys_flag, sizeof(sys_flag));
 
 	/* Default mode to static if not set */
 	if (!mode[0])
@@ -359,8 +367,19 @@ sg_status_t apply_interface(const char *id, const char *data,
 	/* Always stop existing udhcpc first — mode may have changed */
 	dhcpc_stop(id);
 
-	/* Link state */
-	if (strcmp(status, "up") == 0) {
+	/* Link state.
+	 * DSA master interfaces (system=yes) must never go admin-down:
+	 * bringing the master down makes all slave ports lowerlayerdown,
+	 * causing the kernel operstate to diverge from the configured state
+	 * of every downstream port.  Always force them admin-up. */
+	if (strcmp(sys_flag, "yes") == 0) {
+		const char *a[] = {"ip", "link", "set", id, "up", NULL};
+		char *out = safe_exec(a);
+		if (out && out[0])
+			mgmt_log("WARN", "ip link set %s up (system iface): %s",
+				 id, out);
+		free(out);
+	} else if (strcmp(status, "up") == 0) {
 		const char *a[] = {"ip", "link", "set", id, "up", NULL};
 		char *out = safe_exec(a);
 		if (out && out[0])

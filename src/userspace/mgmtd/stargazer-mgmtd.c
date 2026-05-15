@@ -2452,12 +2452,19 @@ static void mgmtd_sync_interfaces(int is_first_boot)
 			}
 		} else {
 			/* Existing NIC — ensure builtin=yes and keep system=yes
-			 * consistent with current hardware topology. */
+			 * consistent with current hardware topology.
+			 * Also force status=up for DSA masters: if the DB ever
+			 * records status=down for the master, replay brings all
+			 * slave ports to lowerlayerdown and the kernel operstate
+			 * diverges from every downstream port's configured state. */
 			sg_db_set_val("system_interface", nics[i],
 				      "builtin", "yes");
-			if (is_dsa_master)
+			if (is_dsa_master) {
 				sg_db_set_val("system_interface", nics[i],
 					      "system", "yes");
+				sg_db_set_val("system_interface", nics[i],
+					      "status", "up");
+			}
 			free(existing);
 			mgmt_log("INFO", "interface %s: protected (builtin%s)",
 				 nics[i], is_dsa_master ? ", system" : "");
