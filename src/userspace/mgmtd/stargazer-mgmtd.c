@@ -2275,20 +2275,46 @@ static int read_iface_mtu(const char *name)
  */
 static int read_iface_has_upper(const char *name)
 {
+	/* Primary: check for upper_* entries in the interface's own sysfs dir.
+	 * This is what older DSA drivers create on the master. */
 	char path[48];
 	snprintf(path, sizeof(path), "/sys/class/net/%.15s", name);
 	DIR *d = opendir(path);
-	if (!d)
-		return 0;
-	struct dirent *ent;
-	int found = 0;
-	while ((ent = readdir(d)) != NULL) {
-		if (strncmp(ent->d_name, "upper_", 6) == 0) {
-			found = 1;
-			break;
+	if (d) {
+		struct dirent *ent;
+		while ((ent = readdir(d)) != NULL) {
+			if (strncmp(ent->d_name, "upper_", 6) == 0) {
+				closedir(d);
+				return 1;
+			}
 		}
+		closedir(d);
 	}
-	closedir(d);
+
+	/* Fallback: scan all interfaces for a lower_<name> symlink.
+	 * Newer DSA drivers (including MT7988A on BPI-R4) create lower_eth0
+	 * on each slave port but do NOT create upper_* on the master. */
+	char lower_target[48];
+	snprintf(lower_target, sizeof(lower_target), "lower_%.15s", name);
+
+	DIR *nd = opendir("/sys/class/net");
+	if (!nd)
+		return 0;
+	struct dirent *ne;
+	int found = 0;
+	while (!found && (ne = readdir(nd)) != NULL) {
+		if (ne->d_name[0] == '.')
+			continue;
+		if (strcmp(ne->d_name, name) == 0)
+			continue;
+		char lpath[96];
+		snprintf(lpath, sizeof(lpath), "/sys/class/net/%.31s/%.32s",
+			 ne->d_name, lower_target);
+		struct stat st;
+		if (lstat(lpath, &st) == 0)
+			found = 1;
+	}
+	closedir(nd);
 	return found;
 }
 

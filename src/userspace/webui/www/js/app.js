@@ -1137,7 +1137,9 @@
     function fetchIfaceData() {
         return api('/config/system_interface').then(function (data) {
             if (!data || !data.entries) return;
-            ifaceData = data.entries.map(function (e) {
+            ifaceData = data.entries
+                .filter(function (e) { return e.system !== 'yes'; })
+                .map(function (e) {
                 var accessList = e.allowaccess
                     ? e.allowaccess.split(' ').map(function (s) { return s.toUpperCase(); })
                     : [];
