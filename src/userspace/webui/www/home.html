@@ -491,7 +491,7 @@
                     <div class="form-section"><span class="modal-title-text">NEW DHCP POOL</span><button class="modal-close" type="button" aria-label="Close" data-toggle-form="form-dhcp">&#10005;</button></div>
                     <div class="modal-body">
                         <div class="form-grid">
-                            <div class="form-row" data-key="name"><label class="form-label">Pool Name</label><input class="form-input" type="text" placeholder="e.g. SERVER-Pool" maxlength="64"></div>
+                            <div class="form-row" data-key="id"><label class="form-label">Pool Name</label><input class="form-input" type="text" placeholder="e.g. SERVER-Pool" maxlength="64" pattern="[a-zA-Z0-9._-]+" title="Letters, numbers, hyphens, underscores, or dots only"></div>
                             <div class="form-row" data-key="interface"><label class="form-label">Interface</label><select class="form-input iface-select"></select></div>
                             <div class="form-row" data-key="start-ip"><label class="form-label">Range Start</label><input class="form-input" type="text" placeholder="192.168.1.100" maxlength="15" pattern="[0-9.]+" title="e.g. 192.168.1.100"></div>
                             <div class="form-row" data-key="end-ip"><label class="form-label">Range End</label><input class="form-input" type="text" placeholder="192.168.1.200" maxlength="15" pattern="[0-9.]+" title="e.g. 192.168.1.200"></div>
@@ -773,8 +773,8 @@
                     <div class="form-row"><label class="form-label">Installed</label><span class="form-value" data-fw="installed">Unknown</span></div>
                     <div class="form-row"><label class="form-label">Boot Device</label><span class="form-value">eMMC (mmcblk0)</span></div>
                     <div class="form-section">UPGRADE</div>
-                    <div class="form-row"><label class="form-label">Upload File</label><label class="file-upload"><input type="file" accept=".gz" class="file-upload-input"><span class="file-upload-btn">Choose File</span><span class="file-upload-name">No file selected</span></label></div>
-                    <div class="form-actions"><button class="btn btn-primary">Install Firmware</button></div>
+                    <div class="form-row"><label class="form-label">Upload File</label><label class="file-upload"><input type="file" accept=".tar.gz,.gz" class="file-upload-input"><span class="file-upload-btn">Choose File</span><span class="file-upload-name">No file selected</span></label></div>
+                    <div class="form-actions"><button type="button" class="btn btn-primary">Install Firmware</button></div>
                     <div class="form-section">SYSTEM</div>
                     <div class="form-row">
                         <label class="form-label">Restart Device</label>

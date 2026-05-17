@@ -494,7 +494,9 @@ fw_child_upgrade_steps(const char *fw_user, const char *source_label)
 					 SG_DB_PATH ".pre-upgrade", NULL};
 		free(safe_exec(cp_argv));
 	}
-	usleep(100000);
+	/* 5 s: give the 2 s JS polling at least two ticks to read done=true
+	 * before the process dies and connections start failing. */
+	usleep(5000000);
 	fw_run_cmd_ignore("/sbin/reboot");
 	_exit(0);
 }
@@ -840,12 +842,13 @@ int handle_upgrade_progress(int client_fd, const char *user,
 	state[rd] = '\0';
 	fclose(sf);
 
-	/* If terminal state (done/error/cancelled), clean up the file */
+	/* Send response first, then clean up terminal state files.
+	 * If we delete before sending and the device reboots during the
+	 * write, the client never sees done=true. */
+	send_ok(client_fd, NULL, state);
 	if (strstr(state, "status=done") || strstr(state, "status=error") ||
 	    strstr(state, "status=cancelled"))
 		unlink(FW_STATE_FILE);
-
-	send_ok(client_fd, NULL, state);
 	return 0;
 }
 

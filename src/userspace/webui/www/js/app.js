@@ -359,6 +359,9 @@
         return fetch(url, options)
             .then(function (res) {
                 if (res.status === 401) {
+                    /* Suppress redirect if we deliberately triggered a reboot
+                     * (firmware upgrade) — the caller handles the transition. */
+                    if (window.__sg_fwRebooting) return null;
                     window.location.href = 'login.html';
                     return;
                 }
@@ -1172,7 +1175,10 @@
                         name:   iface.name,
                         type:   iface.type,
                         ip:     liveIp || dbIp || '-',
-                        status: li.status ? li.status.toUpperCase() : iface.status,
+                        /* Status comes from DB admin state — physical
+                         * carrier (operstate) is a diagnostic detail
+                         * and should not override user config intent. */
+                        status: iface.status,
                         speed:  iface.speed,
                         access: iface.access
                     };
@@ -3446,9 +3452,30 @@
                     return;
                 }
             } else {
-                /* numeric-id types: name is descriptive only.  Always
-                 * overwrite payload.id with a fresh numeric value. */
-                payload.id = nextNumericId();
+                /* For types that have a 'name' schema field (e.g. firewall_policy),
+                 * validate that the user provided a name before submitting. */
+                var hasNameField = config.fields.some(function (f) {
+                    return f.key === 'name' && !f.editDisabled;
+                });
+                if (hasNameField) {
+                    if (!payload.name) {
+                        showToast('Name is required', 'error');
+                        return;
+                    }
+                    if (!/^[a-zA-Z0-9._-]+$/.test(payload.name)) {
+                        showToast('Name must contain only letters, numbers, hyphens, underscores, or dots', 'error');
+                        return;
+                    }
+                }
+                /* Numeric-id types auto-assign; user-named types (e.g.
+                 * network_dhcp-server) carry their name in payload.id
+                 * already — only assign a numeric id when none was given. */
+                if (!payload.id) {
+                    payload.id = nextNumericId();
+                } else if (!/^[a-zA-Z0-9._-]+$/.test(payload.id)) {
+                    showToast('Name must contain only letters, numbers, hyphens, underscores, or dots', 'error');
+                    return;
+                }
             }
         }
 
@@ -3738,6 +3765,7 @@
                      * leaks the interval until reload.  Errors clear
                      * the interval too. */
                     var ticks = 0;
+                    var wasInstalling = false;
                     var pollId = setInterval(function () {
                         if (++ticks > 900) {
                             clearInterval(pollId);
@@ -3751,21 +3779,44 @@
                                 if (!prog) { clearInterval(pollId); return; }
                                 fwInstallBtn.textContent =
                                     'Installing... ' + (prog.percent || 0) + '%';
+                                if (!prog.done && !prog.error) wasInstalling = true;
                                 if (prog.percent >= 100 || prog.done) {
                                     clearInterval(pollId);
-                                    fwInstallBtn.textContent = 'Install Firmware';
-                                    fwInstallBtn.disabled = false;
                                     if (prog.error) {
+                                        fwInstallBtn.textContent = 'Install Firmware';
+                                        fwInstallBtn.disabled = false;
                                         showToast('Firmware install failed: ' + (prog.message || 'unknown error'), 'error');
                                     } else {
-                                        showToast('Firmware installed — device is rebooting', 'success');
+                                        /* Take ownership of the reboot transition.
+                                         * Block keepalive and api() from firing a
+                                         * spurious "session expired" when webd
+                                         * restarts with an empty session store. */
+                                        window.__sg_fwRebooting = true;
+                                        if (typeof window.__sg_stopKeepalive === 'function')
+                                            window.__sg_stopKeepalive();
+                                        fwInstallBtn.textContent = 'Rebooting…';
+                                        fwInstallBtn.disabled = true;
+                                        showToast('Firmware installed — device is rebooting. Redirecting to login…', 'success');
+                                        setTimeout(function () { window.location.href = 'login.html'; }, 5000);
                                     }
                                 }
                             })
                             .catch(function () {
                                 clearInterval(pollId);
-                                fwInstallBtn.textContent = 'Install Firmware';
-                                fwInstallBtn.disabled = false;
+                                if (wasInstalling) {
+                                    /* Network error after progress started — device rebooted
+                                     * before JS saw done=true.  Own the transition cleanly. */
+                                    window.__sg_fwRebooting = true;
+                                    if (typeof window.__sg_stopKeepalive === 'function')
+                                        window.__sg_stopKeepalive();
+                                    fwInstallBtn.textContent = 'Rebooting…';
+                                    fwInstallBtn.disabled = true;
+                                    showToast('Device is rebooting — redirecting to login…', 'success');
+                                    setTimeout(function () { window.location.href = 'login.html'; }, 5000);
+                                } else {
+                                    fwInstallBtn.textContent = 'Install Firmware';
+                                    fwInstallBtn.disabled = false;
+                                }
                             });
                     }, 2000);
                 })
@@ -3833,6 +3884,9 @@
         fetch(API_BASE + '/auth/whoami')
             .then(function (res) {
                 if (res.status === 401) {
+                    /* Firmware reboot in progress — the firmware handler owns
+                     * the redirect, don't fire a spurious "session expired". */
+                    if (window.__sg_fwRebooting) return null;
                     showToast('Session expired — redirecting to login', 'error');
                     setTimeout(function () {
                         window.location.href = 'login.html';
@@ -4032,8 +4086,9 @@
     function populateIfaceSelects() {
         return cachedApi('/config/system_interface').then(function (data) {
             if (!data || !data.entries) return;
+            var userIfaces = data.entries.filter(function (e) { return e.system !== 'yes'; });
             document.querySelectorAll('.iface-select').forEach(function (sel) {
-                populateSelectFrom(sel, data.entries, 'any');
+                populateSelectFrom(sel, userIfaces, 'any');
             });
         });
     }

@@ -592,6 +592,19 @@ static void flow_config_list(work_item_t *item)
 			continue;
 		}
 
+		/* For system_interface, skip system-managed entries (DSA master).
+		 * These have system=yes in the DB and must never appear in
+		 * user-facing config lists or dropdown selects. */
+		if (strcmp(type, "system_interface") == 0 &&
+		    entry_resp.payload) {
+			const char *kv = entry_resp.payload;
+			if (strncmp(kv, "system=yes", 10) == 0 ||
+			    strstr(kv, "\nsystem=yes")) {
+				webd_ipc_resp_free(&entry_resp);
+				continue;
+			}
+		}
+
 		/* Apply search filter — check both entry ID and kv data */
 		if (search && search[0]) {
 			int match = 0;
@@ -819,7 +832,10 @@ static void flow_config_update(work_item_t *item)
 	}
 	webd_ipc_resp_free(&get_resp);
 
-	/* Append new kv, skipping name= and id= routing keys */
+	/* Append new kv, skipping id= (routing key — section identifier,
+	 * not a config field).  name= is a real schema field for all types
+	 * (required for firewall_policy, firewall_address, firewall_service)
+	 * and must NOT be stripped here. */
 	if (item->payload) {
 		const char *p = item->payload;
 		while (*p) {
@@ -827,8 +843,7 @@ static void flow_config_update(work_item_t *item)
 			size_t ll = nl ? (size_t)(nl - p) : strlen(p);
 			if (ll > 0) {
 				int is_routing =
-					(ll > 5 && strncmp(p, "name=", 5) == 0) ||
-					(ll > 3 && strncmp(p, "id=",   3) == 0);
+					(ll > 3 && strncmp(p, "id=", 3) == 0);
 				if (!is_routing) {
 					while (mlen + ll + 1 >= merge_cap) {
 						merge_cap *= 2;
@@ -1503,7 +1518,7 @@ static void flow_iface_live(work_item_t *item)
 	len += (n); \
 } while (0)
 
-	IL_APP("{\"interfaces\":[", 16);
+	IL_APP("{\"interfaces\":[", 15);
 
 	int first = 1;
 	int header_skipped = 0;

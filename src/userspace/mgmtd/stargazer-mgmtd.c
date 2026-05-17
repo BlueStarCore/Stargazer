@@ -2645,31 +2645,30 @@ static char *mgmtd_show_interfaces(void)
 		"%-16s %-8s %-21s %s\n", "Name", "Status", "IP", "Description");
 
 	for (int i = 0; i < nic_count; i++) {
-		/* Skip system-managed interfaces (DSA master, etc.) */
-		char *sys_flag = sg_db_get_val("system_interface", nics[i],
-					       "system");
-		int is_sys = sys_flag && strcmp(sys_flag, "yes") == 0;
-		free(sys_flag);
+		/* Skip system-managed interfaces (DSA master, etc.).
+		 * Prefer the live sysfs check over the DB flag: the DB entry
+		 * may predate the system=yes field being written. */
+		int is_sys = read_iface_has_upper(nics[i]);
+		if (!is_sys) {
+			char *sys_flag = sg_db_get_val("system_interface", nics[i],
+						       "system");
+			is_sys = sys_flag && strcmp(sys_flag, "yes") == 0;
+			free(sys_flag);
+		}
 		if (is_sys) {
 			free(nics[i]);
 			continue;
 		}
 
-		/* Read operstate from sysfs */
-		char state[16] = "unknown";
-		char spath[64];
-		snprintf(spath, sizeof(spath), "/sys/class/net/%.15s/operstate",
-			 nics[i]);
-		FILE *fp = fopen(spath, "r");
-		if (fp) {
-			if (fgets(state, sizeof(state), fp)) {
-				char *nl = strchr(state, '\n');
-				if (nl) *nl = '\0';
-			}
-			fclose(fp);
-		}
-		if (strcmp(state, "lowerlayerdown") == 0)
-			snprintf(state, sizeof(state), "down");
+		/* Read admin state from config DB (what the user configured).
+		 * Sysfs operstate reflects physical carrier and is shown by
+		 * diagnose tools; "show interfaces" reflects config intent. */
+		char *db_status = sg_db_get_val("system_interface", nics[i],
+						"status");
+		char state[16];
+		snprintf(state, sizeof(state), "%s",
+			 (db_status && db_status[0]) ? db_status : "up");
+		free(db_status);
 
 		/* Get IP address via ip command */
 		char ip[32] = "-";
@@ -5806,6 +5805,13 @@ int main(void)
 	 * iptables rules, routes, interfaces all consistent with the DB.
 	 * This may take several seconds on large configs. */
 	mgmtd_replay_config();
+
+	/* Re-sync after replay: DSA slave interfaces are now registered by the
+	 * kernel (the master had to come up first), so read_iface_has_upper()
+	 * can now correctly identify the DSA master and write system=yes to its
+	 * DB entry.  This is a no-op on all subsequent boots once the flag is
+	 * persisted. */
+	mgmtd_sync_interfaces(0);
 
 	mgmt_log("INFO", "config replay complete");
 
