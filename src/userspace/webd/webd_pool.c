@@ -1668,6 +1668,158 @@ static void flow_whoami(work_item_t *item)
 	webd_ipc_resp_free(&resp);
 }
 
+/* Helper: extract value of "key=value" from a space-delimited line.
+ * Copies into dst (len bytes), returns dst or "" if not found. */
+static const char *kv_extract(const char *line, const char *key,
+			       char *dst, size_t len)
+{
+	dst[0] = '\0';
+	size_t klen = strlen(key);
+	const char *p = line;
+	while (*p) {
+		if (strncmp(p, key, klen) == 0 && p[klen] == '=') {
+			p += klen + 1;
+			size_t i = 0;
+			while (*p && *p != ' ' && *p != '\n' && i + 1 < len)
+				dst[i++] = *p++;
+			dst[i] = '\0';
+			return dst;
+		}
+		/* advance to next word */
+		while (*p && *p != ' ' && *p != '\n') p++;
+		while (*p == ' ') p++;
+	}
+	return dst;
+}
+
+static void flow_monitor_sessions(work_item_t *item)
+{
+	/* Call SG_CMD_SHOW_SESSIONS; parse the procfs text into JSON. */
+	webd_ipc_response_t resp;
+	if (webd_ipc_send(SG_CMD_SHOW_SESSIONS, item->username,
+			  item->session_tag, "", &resp) != 0) {
+		char *json = json_error("Backend unavailable", NULL);
+		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
+		return;
+	}
+	if (resp.status != SG_OK) {
+		/* module not loaded → return empty result, not an error */
+		const char *empty =
+			"{\"active\":0,\"created\":0,"
+			"\"expired\":0,\"invalid\":0,"
+			"\"loaded\":false,\"sessions\":[]}";
+		char *j = strdup(empty);
+		send_result(item->conn_id, 200, j, j ? strlen(j) : 0);
+		webd_ipc_resp_free(&resp);
+		return;
+	}
+
+	const char *text = resp.payload ? resp.payload : "";
+
+	/* Parse header line counters:
+	 * "# Stargazer sessions  active=N created=N expired=N invalid=N" */
+	long long active = 0, created = 0, expired_cnt = 0, invalid = 0;
+	const char *hdr = strstr(text, "active=");
+	if (hdr) {
+		char tmp[32];
+		kv_extract(hdr, "active",  tmp, sizeof(tmp)); active = strtoll(tmp, NULL, 10);
+		kv_extract(hdr, "created", tmp, sizeof(tmp)); created = strtoll(tmp, NULL, 10);
+		kv_extract(hdr, "expired", tmp, sizeof(tmp)); expired_cnt = strtoll(tmp, NULL, 10);
+		kv_extract(hdr, "invalid", tmp, sizeof(tmp)); invalid = strtoll(tmp, NULL, 10);
+	}
+
+	/* Build JSON output */
+	size_t cap = 8192, pos = 0;
+	char *json = malloc(cap);
+	if (!json) {
+		webd_ipc_resp_free(&resp);
+		char *j = json_error("Out of memory", NULL);
+		send_result(item->conn_id, 500, j, j ? strlen(j) : 0);
+		return;
+	}
+
+#define SJ_APP(s, n) do { \
+	while (pos + (n) + 1 >= cap) { \
+		cap *= 2; char *_t = realloc(json, cap); \
+		if (!_t) { free(json); webd_ipc_resp_free(&resp); \
+			char *_j = json_error("Out of memory", NULL); \
+			send_result(item->conn_id, 500, _j, _j ? strlen(_j) : 0); \
+			return; } \
+		json = _t; } \
+	memcpy(json + pos, (s), (n)); pos += (n); \
+} while (0)
+
+	char hbuf[128];
+	int hlen = snprintf(hbuf, sizeof(hbuf),
+		"{\"active\":%lld,\"created\":%lld,"
+		"\"expired\":%lld,\"invalid\":%lld,"
+		"\"loaded\":true,\"sessions\":[",
+		active, created, expired_cnt, invalid);
+	if (hlen > 0) SJ_APP(hbuf, (size_t)hlen);
+
+	/* Parse session rows — skip lines starting with '#' */
+	int first = 1;
+	const char *p = text;
+	while (*p) {
+		const char *nl = strchr(p, '\n');
+		size_t ll = nl ? (size_t)(nl - p) : strlen(p);
+
+		if (ll == 0 || p[0] == '#') {
+			p = nl ? nl + 1 : p + ll;
+			continue;
+		}
+
+		/* Copy line for kv_extract */
+		char line[512];
+		size_t cp = ll < sizeof(line) - 1 ? ll : sizeof(line) - 1;
+		memcpy(line, p, cp);
+		line[cp] = '\0';
+
+		char proto[8], src[48], dst[48], id_s[16];
+		char pkts[32], bytes[32], age[24], exp_ms[24];
+		char ml[8], flags[12], tcp_st[8];
+
+		kv_extract(line, "proto",     proto,  sizeof(proto));
+		kv_extract(line, "src",       src,    sizeof(src));
+		kv_extract(line, "dst",       dst,    sizeof(dst));
+		kv_extract(line, "id",        id_s,   sizeof(id_s));
+		kv_extract(line, "pkts",      pkts,   sizeof(pkts));
+		kv_extract(line, "bytes",     bytes,  sizeof(bytes));
+		kv_extract(line, "age_ms",    age,    sizeof(age));
+		kv_extract(line, "expire_ms", exp_ms, sizeof(exp_ms));
+		kv_extract(line, "ml",        ml,     sizeof(ml));
+		kv_extract(line, "flags",     flags,  sizeof(flags));
+		kv_extract(line, "tcp_state", tcp_st, sizeof(tcp_st));
+
+		if (!proto[0]) {
+			p = nl ? nl + 1 : p + ll;
+			continue;
+		}
+
+		if (!first) SJ_APP(",", 1);
+		first = 0;
+
+		char entry[512];
+		int elen = snprintf(entry, sizeof(entry),
+			"{\"proto\":\"%s\",\"src\":\"%s\",\"dst\":\"%s\","
+			"\"id\":\"%s\",\"pkts\":\"%s\",\"bytes\":\"%s\","
+			"\"age_ms\":\"%s\",\"expire_ms\":\"%s\","
+			"\"ml\":\"%s\",\"flags\":\"%s\",\"tcp_state\":\"%s\"}",
+			proto, src, dst, id_s, pkts, bytes,
+			age, exp_ms, ml, flags, tcp_st);
+		if (elen > 0 && (size_t)elen < sizeof(entry))
+			SJ_APP(entry, (size_t)elen);
+
+		p = nl ? nl + 1 : p + ll;
+	}
+
+	SJ_APP("]}", 2);
+	json[pos] = '\0';
+
+	send_result(item->conn_id, 200, json, pos);
+	webd_ipc_resp_free(&resp);
+}
+
 static void flow_monitor_dhcp(work_item_t *item)
 {
 	/* Call SG_CMD_DIAG_DHCP_LEASES; mgmtd returns JSON directly. */
@@ -1727,7 +1879,8 @@ static void *worker_fn(void *arg)
 
 		/* Dispatch by flow type */
 		switch (item.flow_type) {
-		case FLOW_MONITOR_DHCP:   flow_monitor_dhcp(&item);    break;
+		case FLOW_MONITOR_DHCP:     flow_monitor_dhcp(&item);     break;
+		case FLOW_MONITOR_SESSIONS: flow_monitor_sessions(&item); break;
 		case FLOW_LOGIN:         flow_login(&item);           break;
 		case FLOW_CONFIG_LIST:   flow_config_list(&item);     break;
 		case FLOW_CONFIG_CREATE: flow_config_create(&item);   break;

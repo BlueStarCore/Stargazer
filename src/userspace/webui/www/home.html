@@ -787,14 +787,27 @@
             <div id="page-fw-sessions" class="page" style="display:none">
                 <div class="page-header">
                     <h1 class="page-title">SESSIONS</h1>
-                    <div class="widget-search"><input type="text" placeholder="Filter sessions..."></div>
+                    <div class="widget-search"><input type="text" id="sess-search" placeholder="Filter sessions..."></div>
                 </div>
                 <div id="session-summary" class="session-summary">Active: <strong>--</strong> / max: <strong>--</strong></div>
                 <table class="data-table">
                     <thead><tr><th>PROTO</th><th>SOURCE</th><th>DESTINATION</th><th>POLICY</th><th>DURATION</th><th>BYTES</th><th>STATE</th></tr></thead>
-                    <tbody>
+                    <tbody id="sess-tbody">
                     </tbody>
                 </table>
+                <div class="rf-pager">
+                    <span class="rf-pager-info" id="sess-pager-info"></span>
+                    <div class="rf-pager-controls">
+                        <select class="rf-page-size" id="sess-page-size">
+                            <option value="10">10 / page</option>
+                            <option value="25" selected>25 / page</option>
+                            <option value="50">50 / page</option>
+                        </select>
+                        <button class="btn rf-btn" id="sess-prev" aria-label="Previous page">&#9664;</button>
+                        <span class="rf-page-num" id="sess-page-num"></span>
+                        <button class="btn rf-btn" id="sess-next" aria-label="Next page">&#9654;</button>
+                    </div>
+                </div>
             </div>
 
 

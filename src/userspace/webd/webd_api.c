@@ -1098,6 +1098,27 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 		return -1;
 	}
 
+	/* ── /api/monitor/sessions ──────────────────────────────────── */
+	if (strcmp(segs[0], "monitor") == 0 && nseg == 2 &&
+	    strcmp(segs[1], "sessions") == 0 &&
+	    mg_str_eq(hm->method, "GET")) {
+
+		work_item_t item;
+		memset(&item, 0, sizeof(item));
+		item.conn_id = c->id;
+		item.ipc_cmd = SG_CMD_SHOW_SESSIONS;
+		item.flow_type = FLOW_MONITOR_SESSIONS;
+		snprintf(item.username, sizeof(item.username),
+			 "%s", sess.username);
+		item.session_tag = sess.ipc_session_tag;
+
+		if (webd_pool_enqueue(&item) != 0) {
+			reply_json(c, 503, "{\"error\":\"Server busy\"}");
+			return -1;
+		}
+		return 0;
+	}
+
 	/* ── /api/monitor/dhcp-leases ───────────────────────────────── */
 	if (strcmp(segs[0], "monitor") == 0 && nseg == 2 &&
 	    strcmp(segs[1], "dhcp-leases") == 0 &&

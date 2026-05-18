@@ -292,6 +292,7 @@
             promises.push(renderDhcpLeases());
             if (pageEl) resetPageFilters(pageEl);
         }
+        else if (page === 'fw-sessions') { promises.push(renderSessions()); }
         else if (pageEl) {
             var table = pageEl.querySelector('table[data-entity]');
             if (table) promises.push(loadEntityPage(table.dataset.entity, table));
@@ -4092,6 +4093,151 @@
             var tbody = document.getElementById('dhcp-leases-tbody');
             if (tbody) tbody.appendChild(buildEmptyRow(6));
         });
+    }
+
+    var TCP_STATES = ['NONE','SYN_SENT','SYN_RECV','ESTABLISHED',
+                      'FIN_WAIT','CLOSE_WAIT','LAST_ACK',
+                      'TIME_WAIT','CLOSE','SYN_SENT2'];
+    var PROTO_NAMES = { '6': 'TCP', '17': 'UDP', '1': 'ICMP' };
+
+    var sessionData = [];
+    var sessState = { page: 0, pageSize: 25, search: '' };
+
+    function renderSessions() {
+        return api('/monitor/sessions').then(function (data) {
+            var summaryEl = document.getElementById('session-summary');
+            if (summaryEl) {
+                if (!data || !data.loaded) {
+                    summaryEl.innerHTML = '<span style="color:var(--status-disabled)">Session module not loaded</span>';
+                } else {
+                    summaryEl.innerHTML =
+                        'Active: <strong>' + (data.active || 0) + '</strong>' +
+                        ' &nbsp; Created: <strong>' + (data.created || 0) + '</strong>' +
+                        ' &nbsp; Expired: <strong>' + (data.expired || 0) + '</strong>';
+                }
+            }
+            sessionData = (data && data.sessions) || [];
+            sessState.page = 0;
+            renderSessionRows();
+        }).catch(function () {
+            sessionData = [];
+            renderSessionRows();
+        });
+    }
+
+    function renderSessionRows() {
+        var tbody = document.getElementById('sess-tbody');
+        var info = document.getElementById('sess-pager-info');
+        var pageNum = document.getElementById('sess-page-num');
+        var prevBtn = document.getElementById('sess-prev');
+        var nextBtn = document.getElementById('sess-next');
+        if (!tbody) return;
+
+        var filtered = sessionData;
+        if (sessState.search) {
+            var q = sessState.search.toLowerCase();
+            filtered = sessionData.filter(function (s) {
+                return (s.src || '').toLowerCase().indexOf(q) !== -1 ||
+                       (s.dst || '').toLowerCase().indexOf(q) !== -1 ||
+                       (PROTO_NAMES[s.proto] || s.proto || '').toLowerCase().indexOf(q) !== -1;
+            });
+        }
+
+        var total = filtered.length;
+        var totalPages = Math.max(1, Math.ceil(total / sessState.pageSize));
+        if (sessState.page >= totalPages) sessState.page = totalPages - 1;
+        if (sessState.page < 0) sessState.page = 0;
+
+        var start = sessState.page * sessState.pageSize;
+        var end = Math.min(start + sessState.pageSize, total);
+        var page = filtered.slice(start, end);
+
+        tbody.innerHTML = '';
+        if (page.length === 0) {
+            tbody.appendChild(buildEmptyRow(7));
+        } else {
+            var frag = document.createDocumentFragment();
+            page.forEach(function (s) {
+                var protoName = PROTO_NAMES[s.proto] || ('P' + s.proto);
+
+                var flagNum = parseInt(s.flags, 16) || 0;
+                var blocked = (flagNum & 0x02) !== 0;
+                var stateStr;
+                if (blocked) {
+                    stateStr = 'BLOCKED';
+                } else if (s.proto === '6' && s.tcp_state) {
+                    var idx = parseInt(s.tcp_state, 10);
+                    stateStr = TCP_STATES[idx] || ('ST' + idx);
+                } else {
+                    stateStr = 'ACTIVE';
+                }
+
+                var ageMs = parseInt(s.age_ms, 10) || 0;
+                var durStr = formatDuration(Math.floor(ageMs / 1000));
+
+                var bytesStr = '-';
+                if (s.bytes) {
+                    var parts = s.bytes.split('/');
+                    var total2 = (parseInt(parts[0], 10) || 0) +
+                                 (parseInt(parts[1], 10) || 0);
+                    bytesStr = formatBytes(total2);
+                }
+
+                var tr = document.createElement('tr');
+                tr.appendChild(makeTd(protoName));
+                tr.appendChild(makeTd(s.src || ''));
+                tr.appendChild(makeTd(s.dst || ''));
+                tr.appendChild(makeTd('-'));
+                tr.appendChild(makeTd(durStr));
+                tr.appendChild(makeTd(bytesStr));
+
+                var stateTd = document.createElement('td');
+                var cls = blocked ? 'status-dot disabled' :
+                          (stateStr === 'ESTABLISHED' ? 'status-dot up' : 'status-dot warn');
+                stateTd.appendChild(makeSpan(cls, null));
+                stateTd.appendChild(document.createTextNode(stateStr));
+                tr.appendChild(stateTd);
+
+                frag.appendChild(tr);
+            });
+            tbody.appendChild(frag);
+        }
+
+        if (info) info.textContent = total === 0 ? 'No sessions' :
+            'Showing ' + (total === 0 ? 0 : start + 1) + '–' + end + ' of ' + total;
+        if (pageNum) pageNum.textContent = totalPages === 0 ? '0 / 0' : (sessState.page + 1) + ' / ' + totalPages;
+        if (prevBtn) prevBtn.disabled = sessState.page === 0;
+        if (nextBtn) nextBtn.disabled = sessState.page >= totalPages - 1;
+    }
+
+    /* Bind session pager controls */
+    var sessPrev = document.getElementById('sess-prev');
+    var sessNext = document.getElementById('sess-next');
+    var sessPageSize = document.getElementById('sess-page-size');
+    var sessSearchInput = document.getElementById('sess-search');
+
+    if (sessPrev) sessPrev.addEventListener('click', function () {
+        if (sessState.page > 0) { sessState.page--; renderSessionRows(); }
+    });
+    if (sessNext) sessNext.addEventListener('click', function () {
+        sessState.page++;
+        renderSessionRows();
+    });
+    if (sessPageSize) sessPageSize.addEventListener('change', function () {
+        sessState.pageSize = parseInt(this.value, 10);
+        sessState.page = 0;
+        renderSessionRows();
+    });
+    if (sessSearchInput) sessSearchInput.addEventListener('input', debounce(function () {
+        sessState.search = sessSearchInput.value;
+        sessState.page = 0;
+        renderSessionRows();
+    }, 150));
+
+    function formatBytes(n) {
+        if (n < 1024) return n + ' B';
+        if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+        return (n / (1024 * 1024)).toFixed(1) + ' MB';
     }
 
     function renderNetworkOverview() {
