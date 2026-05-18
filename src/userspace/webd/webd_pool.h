@@ -38,6 +38,7 @@
 #define FLOW_CONFIG_MOVE    17
 #define FLOW_IFACE_LIVE     18
 #define FLOW_FIRMWARE_UPLOAD 19
+#define FLOW_MONITOR_DHCP    20
 
 typedef struct {
 	unsigned long   conn_id;        /* Mongoose connection ID */

@@ -18,10 +18,12 @@
 #include "mgmtd_internal.h"
 #include "mgmtd_apply.h"
 
+#include <arpa/inet.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2071,5 +2073,187 @@ int handle_diag_ntp(int client_fd, const char *user,
 	buf_appendf(resp, sizeof(resp), &pos, "time=%s\n", ts);
 
 	send_ok(client_fd, NULL, pos > 0 ? resp : NULL);
+	return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * handle_diag_dhcp_leases — active leases from all udhcpd pools.
+ *
+ * Reads each pool's binary lease file at /var/run/udhcpd-<id>.leases.
+ * File layout (from busybox udhcpd):
+ *   [int64_t written_at, big-endian]
+ *   [struct dyn_lease × N, PACKED, 34 bytes each]:
+ *     uint32_t expires  — seconds remaining from written_at, htonl
+ *     uint32_t lease_nip — IP in network byte order
+ *     uint8_t  lease_mac[6]
+ *     char     hostname[20]
+ *
+ * Returns JSON: {"leases":[{"pool":"..","ip":"..","mac":"..","hostname":"..","expires":<unix>}]}
+ * ─────────────────────────────────────────────────────────────────────────
+ */
+int handle_diag_dhcp_leases(int client_fd, const char *user,
+			     const char *payload,
+			     const sg_request_hdr_t *hdr)
+{
+	(void)payload;
+	(void)hdr;
+
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "Requires 'monitor' permission");
+		return 0;
+	}
+
+	/* udhcpd dyn_lease struct (PACKED, 36 bytes — matches busybox dhcpd.h) */
+	struct __attribute__((packed)) dyn_lease {
+		uint32_t expires;
+		uint32_t lease_nip;
+		uint8_t  lease_mac[6];
+		char     hostname[20];
+		uint8_t  pad[2];
+	};
+
+	size_t cap = 4096;
+	char *json = malloc(cap);
+	if (!json) {
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL, "Out of memory");
+		return 0;
+	}
+	size_t pos = 0;
+	int first = 1;
+
+#define LEASE_JA(s, n) do { \
+	while (pos + (n) + 1 >= cap) { \
+		cap *= 2; \
+		char *_t = realloc(json, cap); \
+		if (!_t) { free(json); \
+			send_error(client_fd, SG_ERR_SYSTEM_FAIL, "Out of memory"); \
+			return 0; } \
+		json = _t; \
+	} \
+	memcpy(json + pos, (s), (n)); \
+	pos += (n); \
+} while (0)
+
+	LEASE_JA("{\"leases\":[", 11);
+
+	/* Enumerate all DHCP server pools */
+	char *pool_list = sg_db_list("network_dhcp-server");
+	if (pool_list) {
+		char *p = pool_list;
+		while (*p) {
+			char *nl = strchr(p, '\n');
+			size_t plen = nl ? (size_t)(nl - p) : strlen(p);
+			if (plen == 0) {
+				if (!nl) break;
+				p = nl + 1;
+				continue;
+			}
+			char pool_id[64];
+			if (plen >= sizeof(pool_id))
+				plen = sizeof(pool_id) - 1;
+			memcpy(pool_id, p, plen);
+			pool_id[plen] = '\0';
+
+			char lease_path[128];
+			snprintf(lease_path, sizeof(lease_path),
+				 "/var/run/udhcpd-%s.leases", pool_id);
+
+			FILE *lf = fopen(lease_path, "rb");
+			if (!lf) {
+				if (!nl) break;
+				p = nl + 1;
+				continue;
+			}
+
+			int64_t written_at_be;
+			if (fread(&written_at_be, sizeof(written_at_be), 1, lf) != 1) {
+				fclose(lf);
+				if (!nl) break;
+				p = nl + 1;
+				continue;
+			}
+			/* Big-endian to host */
+			uint8_t *wb = (uint8_t *)&written_at_be;
+			int64_t written_at = ((int64_t)wb[0] << 56) |
+					     ((int64_t)wb[1] << 48) |
+					     ((int64_t)wb[2] << 40) |
+					     ((int64_t)wb[3] << 32) |
+					     ((int64_t)wb[4] << 24) |
+					     ((int64_t)wb[5] << 16) |
+					     ((int64_t)wb[6] <<  8) |
+					     ((int64_t)wb[7]);
+
+			/* Reject files written more than 12 hours ago (sanity check) */
+			time_t now = time(NULL);
+			int64_t age = (int64_t)now - written_at;
+			if (age < 0 || age > 12 * 3600) {
+				fclose(lf);
+				if (!nl) break;
+				p = nl + 1;
+				continue;
+			}
+
+			struct dyn_lease rec;
+			while (fread(&rec, sizeof(rec), 1, lf) == 1) {
+				if (rec.lease_nip == 0)
+					continue;
+
+				/* seconds-remaining stored as htonl relative to written_at */
+				uint32_t rel = ntohl(rec.expires);
+				int64_t abs_exp = written_at + (int64_t)rel;
+				if (abs_exp < (int64_t)now)
+					continue;
+
+				struct in_addr ia;
+				ia.s_addr = rec.lease_nip;
+				char ip_str[INET_ADDRSTRLEN];
+				inet_ntop(AF_INET, &ia, ip_str, sizeof(ip_str));
+
+				char mac_str[24];
+				snprintf(mac_str, sizeof(mac_str),
+					 "%02x:%02x:%02x:%02x:%02x:%02x",
+					 rec.lease_mac[0], rec.lease_mac[1],
+					 rec.lease_mac[2], rec.lease_mac[3],
+					 rec.lease_mac[4], rec.lease_mac[5]);
+
+				char hostname[21];
+				memcpy(hostname, rec.hostname, 20);
+				hostname[20] = '\0';
+				/* Scrub non-printable bytes from hostname */
+				for (int i = 0; i < 20; i++)
+					if ((unsigned char)hostname[i] < 0x20)
+						hostname[i] = '\0';
+
+				if (!first)
+					LEASE_JA(",", 1);
+				first = 0;
+
+				char entry[256];
+				int elen = snprintf(entry, sizeof(entry),
+					"{\"pool\":\"%s\","
+					"\"ip\":\"%s\","
+					"\"mac\":\"%s\","
+					"\"hostname\":\"%s\","
+					"\"expires\":%lld}",
+					pool_id, ip_str, mac_str, hostname,
+					(long long)abs_exp);
+				if (elen > 0 && (size_t)elen < sizeof(entry))
+					LEASE_JA(entry, (size_t)elen);
+			}
+			fclose(lf);
+
+			if (!nl) break;
+			p = nl + 1;
+		}
+		free(pool_list);
+	}
+
+	LEASE_JA("]}", 2);
+	json[pos] = '\0';
+
+	send_ok(client_fd, NULL, json);
+	free(json);
 	return 0;
 }

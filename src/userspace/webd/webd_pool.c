@@ -1668,6 +1668,39 @@ static void flow_whoami(work_item_t *item)
 	webd_ipc_resp_free(&resp);
 }
 
+static void flow_monitor_dhcp(work_item_t *item)
+{
+	/* Call SG_CMD_DIAG_DHCP_LEASES; mgmtd returns JSON directly. */
+	webd_ipc_response_t resp;
+	if (webd_ipc_send(SG_CMD_DIAG_DHCP_LEASES, item->username,
+			  item->session_tag, "", &resp) != 0) {
+		char *json = json_error("Backend unavailable", NULL);
+		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
+		return;
+	}
+	if (resp.status != SG_OK) {
+		send_ipc_error(item->conn_id, resp.status, resp.extra);
+		webd_ipc_resp_free(&resp);
+		return;
+	}
+
+	if (resp.payload && resp.payload_len > 0) {
+		char *json = malloc(resp.payload_len + 1);
+		if (json) {
+			memcpy(json, resp.payload, resp.payload_len);
+			json[resp.payload_len] = '\0';
+			send_result(item->conn_id, 200, json, resp.payload_len);
+		} else {
+			char *j = json_error("Out of memory", NULL);
+			send_result(item->conn_id, 500, j, j ? strlen(j) : 0);
+		}
+	} else {
+		char *json = strdup("{\"leases\":[]}");
+		send_result(item->conn_id, 200, json, json ? strlen(json) : 0);
+	}
+	webd_ipc_resp_free(&resp);
+}
+
 /* ── Worker thread entry point ───────────────────────────────────────── */
 
 static void *worker_fn(void *arg)
@@ -1694,6 +1727,7 @@ static void *worker_fn(void *arg)
 
 		/* Dispatch by flow type */
 		switch (item.flow_type) {
+		case FLOW_MONITOR_DHCP:   flow_monitor_dhcp(&item);    break;
 		case FLOW_LOGIN:         flow_login(&item);           break;
 		case FLOW_CONFIG_LIST:   flow_config_list(&item);     break;
 		case FLOW_CONFIG_CREATE: flow_config_create(&item);   break;

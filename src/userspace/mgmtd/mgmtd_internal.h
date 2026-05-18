@@ -198,6 +198,11 @@ void handle_netlink_link_event(int nl_fd);
 int handle_diag_dhcp_client(int client_fd, const char *user,
 			     const char *payload, const sg_request_hdr_t *hdr);
 
+/* ── DHCP server lease list (defined in mgmtd_diag.c) ───────────────────── */
+
+int handle_diag_dhcp_leases(int client_fd, const char *user,
+			     const char *payload, const sg_request_hdr_t *hdr);
+
 /* ── Log handlers (defined in stargazer-mgmtd.c) ─────────────────────────── */
 
 int handle_log_audit(int client_fd, const char *user,

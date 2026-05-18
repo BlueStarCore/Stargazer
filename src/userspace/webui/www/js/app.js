@@ -286,6 +286,12 @@
         else if (page === 'sys-settings') { promises.push(loadSettingsPage(pageEl, 'system')); }
         else if (page === 'sys-password') { promises.push(loadSettingsPage(pageEl, 'password-policy')); }
         else if (page === 'sys-firmware') { promises.push(loadFirmwareInfo()); }
+        else if (page === 'dhcp') {
+            var dhcpTable = pageEl ? pageEl.querySelector('table[data-entity="dhcp"]') : null;
+            if (dhcpTable) promises.push(loadEntityPage('dhcp', dhcpTable));
+            promises.push(renderDhcpLeases());
+            if (pageEl) resetPageFilters(pageEl);
+        }
         else if (pageEl) {
             var table = pageEl.querySelector('table[data-entity]');
             if (table) promises.push(loadEntityPage(table.dataset.entity, table));
@@ -2902,6 +2908,18 @@
 
     /* Build the empty-state row shown when an entity has no entries.
      * Uses a CSS class instead of inline style. */
+    function formatDuration(secs) {
+        secs = Math.floor(secs);
+        var h = Math.floor(secs / 3600);
+        var m = Math.floor((secs % 3600) / 60);
+        var s = secs % 60;
+        if (h > 0)
+            return h + 'h ' + m + 'm';
+        if (m > 0)
+            return m + 'm ' + s + 's';
+        return s + 's';
+    }
+
     function buildEmptyRow(colCount) {
         var tr = document.createElement('tr');
         var td = document.createElement('td');
@@ -4037,6 +4055,43 @@
             frag.appendChild(tr);
         });
         tbody.appendChild(frag);
+    }
+
+    function renderDhcpLeases() {
+        return api('/monitor/dhcp-leases').then(function (data) {
+            var tbody = document.getElementById('dhcp-leases-tbody');
+            if (!tbody) return;
+            tbody.innerHTML = '';
+            var leases = (data && data.leases) || [];
+            if (leases.length === 0) {
+                tbody.appendChild(buildEmptyRow(6));
+                return;
+            }
+            var now = Math.floor(Date.now() / 1000);
+            var frag = document.createDocumentFragment();
+            leases.forEach(function (l) {
+                var expires = l.expires || 0;
+                var remaining = expires - now;
+                var expStr = expires
+                    ? new Date(expires * 1000).toLocaleString()
+                    : '-';
+                var remStr = remaining > 0
+                    ? formatDuration(remaining)
+                    : 'Expired';
+                var tr = document.createElement('tr');
+                tr.appendChild(makeTd(l.pool || ''));
+                tr.appendChild(makeTd(l.ip || ''));
+                tr.appendChild(makeTd(l.mac || ''));
+                tr.appendChild(makeTd(l.hostname || ''));
+                tr.appendChild(makeTd(expStr));
+                tr.appendChild(makeTd(remStr));
+                frag.appendChild(tr);
+            });
+            tbody.appendChild(frag);
+        }).catch(function () {
+            var tbody = document.getElementById('dhcp-leases-tbody');
+            if (tbody) tbody.appendChild(buildEmptyRow(6));
+        });
     }
 
     function renderNetworkOverview() {

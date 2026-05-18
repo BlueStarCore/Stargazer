@@ -510,9 +510,9 @@
                 <!-- Active Leases in scrollable box (top) -->
                 <div class="page-header"><h2 class="page-title">ACTIVE LEASES</h2><div class="widget-search"><input type="text" placeholder="Filter leases..." class="table-filter" data-target="dhcp-leases"></div></div>
                 <div class="scroll-box">
-                    <table class="data-table table-borderless">
-                        <thead><tr><th>POOL</th><th>IP ADDRESS</th><th>MAC ADDRESS</th><th>HOSTNAME</th><th>LEASE START</th><th>EXPIRES</th><th>REMAINING</th></tr></thead>
-                        <tbody>
+                    <table class="data-table table-borderless" id="tbl-dhcp-leases">
+                        <thead><tr><th>POOL</th><th>IP ADDRESS</th><th>MAC ADDRESS</th><th>HOSTNAME</th><th>EXPIRES</th><th>REMAINING</th></tr></thead>
+                        <tbody id="dhcp-leases-tbody">
                         </tbody>
                     </table>
                 </div>

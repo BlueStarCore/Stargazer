@@ -5604,6 +5604,8 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		return handle_diag_storage(client_fd, user, payload, hdr);
 	case SG_CMD_DIAG_DHCP_CLIENT:
 		return handle_diag_dhcp_client(client_fd, user, payload, hdr);
+	case SG_CMD_DIAG_DHCP_LEASES:
+		return handle_diag_dhcp_leases(client_fd, user, payload, hdr);
 
 	case SG_CMD_PING:
 		send_ok(client_fd, "pong", NULL);
