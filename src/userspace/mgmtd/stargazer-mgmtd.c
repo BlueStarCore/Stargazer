@@ -2942,6 +2942,79 @@ static int scrub_config_entry(const char *type, const char *id,
  */
 static int g_replaying = 1;
 
+/*
+ * replay_routes_only - flush and re-apply all static routes from the DB.
+ *
+ * Called after a DHCP lease is obtained on a WAN interface so that static
+ * routes whose gateway became reachable only after the lease are installed.
+ * Uses the same flush+apply pattern as mgmtd_replay_config().
+ */
+static void replay_routes_only(void)
+{
+	char result[512];
+	flush_static_routes();
+
+	char *list = sg_db_list("network_route_static");
+	if (!list)
+		return;
+
+	const char *p = list;
+	while (*p) {
+		const char *eol = strchr(p, '\n');
+		size_t len = eol ? (size_t)(eol - p) : strlen(p);
+		if (len == 0) { p++; continue; }
+
+		char id[256];
+		if (len >= sizeof(id)) len = sizeof(id) - 1;
+		memcpy(id, p, len);
+		id[len] = '\0';
+
+		char *data = sg_db_get("network_route_static", id);
+		if (data) {
+			sg_status_t rc = apply_config("network_route_static", id,
+						      data, result, sizeof(result));
+			fprintf(stderr, "[mgmtd] dhcp-route %s %s: %s\n",
+				rc == SG_OK ? "OK" : "FAIL", id, result);
+			free(data);
+		}
+		p = eol ? eol + 1 : p + len;
+	}
+	free(list);
+}
+
+static int handle_dhcp_lease_event(int client_fd, const char *user,
+				   const char *payload,
+				   const sg_request_hdr_t *hdr)
+{
+	(void)user; (void)hdr;
+	char iface[IFNAMSIZ], action[16];
+	extract_val(payload, "iface",  iface,  sizeof(iface));
+	extract_val(payload, "action", action, sizeof(action));
+
+	if (!sg_is_iface_name(iface)) {
+		send_error(client_fd, SG_ERR_INVALID_VAL,
+			   "Invalid interface name");
+		return 0;
+	}
+
+	if (strcmp(action, "bound") == 0 || strcmp(action, "renew") == 0) {
+		fprintf(stderr,
+			"[mgmtd] dhcp-lease %s on %s — re-applying static routes\n",
+			action, iface);
+		replay_routes_only();
+		send_ok(client_fd, NULL, "Routes re-applied\n");
+	} else if (strcmp(action, "deconfig") == 0) {
+		/* WAN IP gone — static routes referencing the former gateway
+		 * are now unreachable and must be removed.  They will be
+		 * re-installed on the next bound/renew. */
+		flush_static_routes();
+		send_ok(client_fd, NULL, "routes flushed\n");
+	} else {
+		send_error(client_fd, SG_ERR_INVALID_VAL, "Unknown action");
+	}
+	return 0;
+}
+
 static void mgmtd_replay_config(void)
 {
 	char result[512];
@@ -4203,6 +4276,7 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 	    cmd != SG_CMD_AUTH_LOGIN &&
 	    cmd != SG_CMD_AUTH_CHANGE_PW &&
 	    cmd != SG_CMD_AUTH_LOGIN_OK &&
+	    cmd != SG_CMD_DHCP_LEASE_EVENT &&   /* udhcpc runs as root, no session */
 	    strcmp(user, "__webd") != 0) {
 		if (!session_tag_validate(user, hdr->session_tag)) {
 			send_error(client_fd, SG_ERR_SESSION_EXPIRED,
@@ -5217,6 +5291,9 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		return handle_upgrade_cancel(client_fd, user, payload, hdr);
 	case SG_CMD_UPGRADE_FROM_FILE:
 		return handle_upgrade_from_file(client_fd, user, payload, hdr);
+
+	case SG_CMD_DHCP_LEASE_EVENT:
+		return handle_dhcp_lease_event(client_fd, user, payload, hdr);
 
 	case SG_CMD_SHOW_STATUS: {
 		char status_buf[512];

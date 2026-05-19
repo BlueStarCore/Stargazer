@@ -38,7 +38,7 @@ NIC → kernel → NF_INET_FORWARD hook (pkt_forward.ko)
               is_valid_ipv4()          invalid IP header → NF_DROP (pkts_dropped++)
                       │ ok
                       ▼
-              extract_key()            malformed L4 header → NF_ACCEPT untracked
+              extract_key()            malformed L4 header → NF_DROP (pkts_dropped++, pr_warn_ratelimited)
                       │ ok
                       ▼
               tcp_is_syn = tcph->syn   (safe: extract_key pulled TCP header)

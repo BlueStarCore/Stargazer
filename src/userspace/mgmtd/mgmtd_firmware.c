@@ -661,7 +661,26 @@ int handle_upgrade_start(int client_fd, const char *user, const char *payload, c
 				}
 				hbuf[hused] = '\0';
 				close(hp[0]);
-				waitpid(hpid, NULL, 0);
+				/* Kill wget --spider if it outlived the read
+				 * timeout (slow server, no -T support in this
+				 * BusyBox build).  Without this, waitpid blocks
+				 * indefinitely, freezing the firmware child and
+				 * preventing any further state file updates. */
+				kill(hpid, SIGTERM);
+				/* Wait up to 1s for SIGTERM, then force-kill */
+				{
+					int k, reaped = 0;
+					for (k = 0; k < 10 && !reaped; k++) {
+						if (waitpid(hpid, NULL, WNOHANG) != 0)
+							reaped = 1;
+						else
+							usleep(100000);
+					}
+					if (!reaped) {
+						kill(hpid, SIGKILL);
+						waitpid(hpid, NULL, 0);
+					}
+				}
 				/* Parse Content-Length (case-insensitive) */
 				const char *scan = hbuf;
 				while (*scan) {
@@ -727,7 +746,7 @@ int handle_upgrade_start(int client_fd, const char *user, const char *payload, c
 	} else {
 		dl_pid = fork();
 		if (dl_pid == 0) {
-			execlp("wget", "wget", "-O", FW_DL_FILE,
+			execlp("wget", "wget", "-T", "30", "-O", FW_DL_FILE,
 			       url, NULL);
 			_exit(127);
 		}

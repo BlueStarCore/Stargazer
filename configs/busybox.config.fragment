@@ -1,5 +1,5 @@
 #
-# Stargazer NGFW — BusyBox applet whitelist (49 applets)
+# Stargazer NGFW — BusyBox applet whitelist (51 applets)
 #
 # This fragment is appended to the output of `make allnoconfig` and then
 # `make oldconfig` is run to resolve dependencies. It is the SINGLE source
@@ -84,6 +84,16 @@ CONFIG_FEATURE_TFTP_BLOCKSIZE=y
 
 # `logger` — syslog from shell (udhcpc default.script)
 CONFIG_LOGGER=y
+
+# `tar` — firmware package extraction (mgmtd_firmware.c: fw_child_upgrade_steps)
+# FEATURE_TAR_GZIP: required for -z (gzip) support on .tar.gz firmware packages
+# FEATURE_TAR_LONG_OPTIONS: required for --strip-components (reserved for future
+#   firmware package formats that wrap content in a subdirectory)
+CONFIG_TAR=y
+CONFIG_FEATURE_TAR_GZIP=y
+CONFIG_FEATURE_TAR_LONG_OPTIONS=y
+CONFIG_FEATURE_TAR_GNU_EXTENSIONS=y
+CONFIG_FEATURE_TAR_CREATE=y
 
 # ── Filesystem & block (10) ─────────────────────────────────────────────────
 # `mount` — init mount of /proc /sys /dev /tmp + sgdata/sglogs partitions

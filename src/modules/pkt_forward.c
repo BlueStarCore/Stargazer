@@ -18,6 +18,7 @@
 #include <linux/tcp.h>
 #include <linux/skbuff.h>
 #include <linux/rcupdate.h>
+#include <net/netfilter/ipv4/nf_defrag_ipv4.h>
 
 #include "session.h"
 
@@ -66,9 +67,15 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 	}
 
 	if (extract_key(skb, &key) != 0) {
-		/* Header malformed; count as forwarded, skip session bookkeeping */
-		atomic64_inc(&pkts_forwarded);
-		return NF_ACCEPT;
+		/* Genuinely malformed L4 header — defrag runs at PRE_ROUTING so
+		 * any NOTRACK non-first fragment that defrag skips also lands here.
+		 * Either way there is no usable 5-tuple; drop rather than forward
+		 * untracked and bypass policy. */
+		pr_warn_ratelimited("pkt_forward: dropping unresolvable packet "
+				    "(src=%pI4 proto=%u)\n",
+				    &ip_hdr(skb)->saddr, ip_hdr(skb)->protocol);
+		atomic64_inc(&pkts_dropped);
+		return NF_DROP;
 	}
 
 	/* extract_key() already pulled the TCP header — safe to read directly */
@@ -167,15 +174,25 @@ static const struct nf_hook_ops nf_forward_ops = {
 	.hook     = forward_hook,
 	.pf       = NFPROTO_IPV4,
 	.hooknum  = NF_INET_FORWARD,
-	.priority = NF_IP_PRI_FIRST,
+	/* Defrag registers on PRE_ROUTING; by the time any FORWARD hook fires
+	 * fragments are already reassembled regardless of priority here.
+	 * The value (-399) just places us before conntrack (-200) and filter (0). */
+	.priority = NF_IP_PRI_CONNTRACK_DEFRAG + 1,
 };
 
 static int __init pkt_forward_init(void)
 {
 	int ret;
 
+	ret = nf_defrag_ipv4_enable(&init_net);
+	if (ret < 0) {
+		pr_err("pkt_forward: failed to enable IPv4 defrag (%d)\n", ret);
+		return ret;
+	}
+
 	ret = nf_register_net_hook(&init_net, &nf_forward_ops);
 	if (ret < 0) {
+		nf_defrag_ipv4_disable(&init_net);
 		pr_err("pkt_forward: hook registration failed (%d)\n", ret);
 		return ret;
 	}
@@ -187,6 +204,7 @@ static int __init pkt_forward_init(void)
 static void __exit pkt_forward_exit(void)
 {
 	nf_unregister_net_hook(&init_net, &nf_forward_ops);
+	nf_defrag_ipv4_disable(&init_net);
 	pr_info("pkt_forward: unloaded (fwd=%lld drop=%lld block=%lld)\n",
 		atomic64_read(&pkts_forwarded),
 		atomic64_read(&pkts_dropped),
@@ -200,4 +218,4 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Stargazer Team");
 MODULE_DESCRIPTION("Packet forwarding module for BPI-R4 NGFW");
 MODULE_VERSION(PKT_FWD_VERSION);
-MODULE_SOFTDEP("pre: session");
+MODULE_SOFTDEP("pre: session nf_defrag_ipv4");

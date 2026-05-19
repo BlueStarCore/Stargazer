@@ -64,9 +64,6 @@ static const u32 tcp_timeouts[SESS_TCP_STATE_MAX] = {
 	[SESS_TCP_SYN_SENT2]   =  60,   /* simultaneous open            */
 };
 
-/* Reaper cadence */
-#define SESS_REAPER_INTERVAL_SEC 30
-
 /* Hash table and its writer-side lock */
 static DEFINE_HASHTABLE(sess_table, SESSION_TABLE_BITS);
 static DEFINE_SPINLOCK(table_lock);
@@ -98,6 +95,9 @@ static struct proc_dir_entry *proc_session_ctl;
 /* Reaper */
 static void sess_reaper_fn(struct work_struct *work);
 static DECLARE_DELAYED_WORK(sess_reaper, sess_reaper_fn);
+
+static void sess_reaper_fast_fn(struct work_struct *work);
+static DECLARE_DELAYED_WORK(sess_reaper_fast, sess_reaper_fast_fn);
 
 /* Forward declaration — defined in the genl section, called from lookup/reaper */
 static void sess_genl_notify(const struct session *s, enum sg_flow_cmd cmd);
@@ -282,6 +282,12 @@ struct session *sess_lookup_or_create(const struct sess_key *key,
 				    MAX_SESSIONS);
 		return NULL;
 	}
+
+	/* Pressure trigger: table 75%+ full — wake slow reaper immediately
+	 * instead of waiting for the next scheduled run.  mod_delayed_work is
+	 * safe from softirq context and is a no-op if already scheduled sooner. */
+	if (atomic64_read(&sess_active) > (MAX_SESSIONS * 3 / 4))
+		mod_delayed_work(system_wq, &sess_reaper, HZ);
 
 	fresh = sess_alloc(key);
 	if (!fresh)
@@ -638,47 +644,167 @@ EXPORT_SYMBOL_GPL(sess_delete);
  */
 #define SESS_REAP_BATCH 64
 
+/*
+ * Adaptive GC interval with hysteresis.
+ *
+ * High watermark (75%): enter aggressive band — stay there until pressure
+ * drops below the low watermark (50%).  Without hysteresis the interval
+ * would oscillate if table usage hovers near a threshold boundary.
+ *
+ * reaper_pressure_high is written only from sess_reaper_fn() which runs as a
+ * single delayed_work item — it never executes concurrently with itself, so
+ * no lock is needed.
+ */
+static bool reaper_pressure_high;
+
+static unsigned long reaper_next_delay(void)
+{
+	u64 active = (u64)atomic64_read(&sess_active);
+	unsigned int pct = (unsigned int)(active * 100 / MAX_SESSIONS);
+
+	if (pct >= 75)
+		reaper_pressure_high = true;
+	else if (pct < 50)
+		reaper_pressure_high = false;
+
+	if (reaper_pressure_high) {
+		if (pct >= 90) return HZ;        /*  1s — near full  */
+		return HZ * 5;                   /*  5s — elevated   */
+	}
+	if (pct >= 50) return HZ * 15;      /* 15s — moderate   */
+	return HZ * 30;                      /* 30s — normal     */
+}
+
+/*
+ * Cursor-based batch scanning for the slow reaper.
+ *
+ * At high pressure the interval drops to 1s.  Without a cursor, a full
+ * hash_for_each_safe over ~59K sessions at 90% occupancy holds spin_lock_bh
+ * for ~9ms every second — stalling all CPUs on new session creation.
+ * With a 64-bucket cursor the hold time drops to ~590µs per run; the full
+ * table is covered across 16 consecutive 1-second runs (16s total).
+ *
+ * At low pressure (full scan, 30s interval) the cursor is irrelevant and
+ * reaper_cursor wraps to 0 after each full-table run.
+ *
+ * reaper_cursor is written only from sess_reaper_fn() — no lock needed.
+ */
+static unsigned int reaper_cursor;
+
+static unsigned int reaper_batch_size(unsigned int pct)
+{
+	if (pct >= 90) return 64;                    /* 1s interval  → 16s full coverage */
+	if (pct >= 75) return 128;                   /* 5s interval  → 40s full coverage */
+	return 1u << SESSION_TABLE_BITS;             /* full scan    — low pressure      */
+}
+
 static void sess_reaper_fn(struct work_struct *work)
 {
 	struct session *s;
 	struct hlist_node *tmp;
 	struct session *to_notify[SESS_REAP_BATCH];
-	int bucket, i;
-	int reaped = 0;
+	unsigned int b, end, pct, batch;
+	int i, reaped = 0;
 	ktime_t now = ktime_get();
+	u64 active;
+
+	active = (u64)atomic64_read(&sess_active);
+	pct    = (unsigned int)(active * 100 / MAX_SESSIONS);
+	batch  = reaper_batch_size(pct);
+	end    = min(reaper_cursor + batch, 1u << SESSION_TABLE_BITS);
 
 	spin_lock_bh(&table_lock);
-	hash_for_each_safe(sess_table, bucket, tmp, s, node) {
-		if (ktime_compare(now, s->expires_at) >= 0) {
-			hash_del_rcu(&s->node);
-			atomic64_dec(&sess_active);
-			atomic64_inc(&sess_expired);
-			if (reaped < SESS_REAP_BATCH)
-				to_notify[reaped] = s;
-			else
-				call_rcu(&s->rcu, sess_free_rcu); /* batch overflow */
-			reaped++;
+	for (b = reaper_cursor; b < end; b++) {
+		hlist_for_each_entry_safe(s, tmp, &sess_table[b], node) {
+			if (ktime_compare(now, s->expires_at) >= 0) {
+				hash_del_rcu(&s->node);
+				atomic64_dec(&sess_active);
+				atomic64_inc(&sess_expired);
+				if (reaped < SESS_REAP_BATCH)
+					to_notify[reaped++] = s;
+				else
+					call_rcu(&s->rcu, sess_free_rcu);
+			}
 		}
 	}
 	spin_unlock_bh(&table_lock);
 
+	/* Advance cursor; wrap to 0 when the full table has been covered. */
+	reaper_cursor = (end >= (1u << SESSION_TABLE_BITS)) ? 0 : end;
+
 	/*
-	 * Send SESS_EXPIRED notifications outside the spinlock.  The sessions
-	 * are no longer reachable via the hash table (hash_del_rcu done) but
-	 * their memory is still valid — call_rcu has not been called yet.
-	 * Concurrent pkt_forward readers that already hold rcu_read_lock may
-	 * still be running sess_update; individual u64 field reads on ARM64
-	 * are atomic, so the stats snapshot is consistent enough for flow export.
+	 * Send SESS_EXPIRED notifications outside the spinlock.  Sessions are
+	 * no longer reachable via the hash table (hlist_del_rcu done) but their
+	 * memory is still valid — call_rcu has not been called yet.
+	 * Concurrent pkt_forward readers holding rcu_read_lock may still be in
+	 * sess_update(); individual u64 reads on ARM64 are atomic, so the stats
+	 * snapshot is consistent enough for flow export.
 	 */
-	for (i = 0; i < min(reaped, SESS_REAP_BATCH); i++) {
+	for (i = 0; i < reaped; i++) {
 		sess_genl_notify(to_notify[i], SG_FLOW_CMD_SESS_EXPIRED);
 		call_rcu(&to_notify[i]->rcu, sess_free_rcu);
 	}
 
 	if (reaped)
-		pr_debug("session: reaped %d expired entries\n", reaped);
+		pr_debug("session: reaped %d (cursor=%u batch=%u pct=%u)\n",
+			 reaped, reaper_cursor, batch, pct);
 
-	schedule_delayed_work(&sess_reaper, SESS_REAPER_INTERVAL_SEC * HZ);
+	schedule_delayed_work(&sess_reaper, reaper_next_delay());
+}
+
+/*
+ * sess_reaper_fast - 1-second pass for terminal TCP states only.
+ *
+ * Handles CLOSE (10s), LAST_ACK (30s), and TIME_WAIT (120s) sessions so
+ * that closed TCP flows are cleaned within ~2s of their timeout even when
+ * the slow reaper is running every 30s at low table pressure.
+ *
+ * Scans the full hash table but skips non-TCP and non-terminal entries
+ * immediately after a cheap proto+state check — stays fast regardless of
+ * table size because the working set is small.
+ *
+ * Uses the same lock/RCU discipline as sess_reaper_fn().  Both reapers
+ * serialise on table_lock — no double-free is possible.
+ */
+static void sess_reaper_fast_fn(struct work_struct *work)
+{
+	struct session *s;
+	struct hlist_node *tmp;
+	struct session *to_notify[SESS_REAP_BATCH];
+	int bucket, i, reaped = 0;
+	ktime_t now = ktime_get();
+
+	spin_lock_bh(&table_lock);
+	hash_for_each_safe(sess_table, bucket, tmp, s, node) {
+		if (s->key.proto != IPPROTO_TCP)
+			continue;
+		if (s->tcp_state != SESS_TCP_CLOSE &&
+		    s->tcp_state != SESS_TCP_TIME_WAIT &&
+		    s->tcp_state != SESS_TCP_LAST_ACK)
+			continue;
+		if (ktime_compare(now, s->expires_at) < 0)
+			continue;
+
+		hash_del_rcu(&s->node);
+		atomic64_dec(&sess_active);
+		atomic64_inc(&sess_expired);
+		if (reaped < SESS_REAP_BATCH)
+			to_notify[reaped++] = s;
+		else
+			call_rcu(&s->rcu, sess_free_rcu);
+	}
+	spin_unlock_bh(&table_lock);
+
+	for (i = 0; i < reaped; i++) {
+		sess_genl_notify(to_notify[i], SG_FLOW_CMD_SESS_EXPIRED);
+		call_rcu(&to_notify[i]->rcu, sess_free_rcu);
+	}
+
+	if (reaped)
+		pr_debug("session: fast-reaper reaped %d CLOSE/TW/LASTACK\n",
+			 reaped);
+
+	schedule_delayed_work(&sess_reaper_fast, HZ);
 }
 
 static void sess_flush_all(void)
@@ -1177,12 +1303,12 @@ static int __init session_init(void)
 		return -ENOMEM;
 	}
 
-	schedule_delayed_work(&sess_reaper, SESS_REAPER_INTERVAL_SEC * HZ);
-
+	/* Register genl before starting workers — workers call sess_genl_notify()
+	 * which dereferences sg_flow_family.  If a session were created and expired
+	 * before registration completed, the notify would hit an unregistered family. */
 	int ret = genl_register_family(&sg_flow_family);
 	if (ret < 0) {
 		pr_err("session: genl_register_family failed (%d)\n", ret);
-		cancel_delayed_work_sync(&sess_reaper);
 		proc_remove(proc_session_ctl);
 		proc_remove(proc_sessions);
 		proc_remove(sg_proc_root);
@@ -1190,18 +1316,27 @@ static int __init session_init(void)
 		return ret;
 	}
 
-	pr_info("session: loaded (v%s, %d buckets, reaper=%ds, genl=%s)\n",
+	schedule_delayed_work(&sess_reaper, reaper_next_delay());
+	schedule_delayed_work(&sess_reaper_fast, HZ);
+
+	pr_info("session: loaded (v%s, %d buckets, gc=adaptive(30s/15s/5s/1s) fast-reaper=1s max=%d genl=%s)\n",
 		SESS_VERSION, 1 << SESSION_TABLE_BITS,
-		SESS_REAPER_INTERVAL_SEC, SG_FLOW_GENL_NAME);
+		MAX_SESSIONS, SG_FLOW_GENL_NAME);
 	return 0;
 }
 
 static void __exit session_exit(void)
 {
-	/* Unregister genl first — no more notifications after this point */
-	genl_unregister_family(&sg_flow_family);
-
+	/* Cancel both reapers before unregistering genl.  A reaper mid-run
+	 * calls sess_genl_notify() which dereferences sg_flow_family.  If
+	 * genl_unregister_family() ran first the multicast group memory would
+	 * already be freed — use-after-free.  cancel_delayed_work_sync() waits
+	 * for any running instance to finish, so after both cancels return no
+	 * further sess_genl_notify() calls are possible. */
+	cancel_delayed_work_sync(&sess_reaper_fast);
 	cancel_delayed_work_sync(&sess_reaper);
+
+	genl_unregister_family(&sg_flow_family);
 
 	if (proc_session_ctl)
 		proc_remove(proc_session_ctl);

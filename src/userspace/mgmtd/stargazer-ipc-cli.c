@@ -189,7 +189,10 @@ static int cmd_needs_tag(int cmd)
 	return cmd != (int)SG_CMD_SESSION_TAG_NEW &&
 	       cmd != (int)SG_CMD_SESSION_TAG_DEL &&
 	       cmd != (int)SG_CMD_WHOAMI &&
-	       cmd != (int)SG_CMD_DEBUG_FETCH;
+	       cmd != (int)SG_CMD_DEBUG_FETCH &&
+	       cmd != (int)SG_CMD_HISTORY_SAVE &&
+	       cmd != (int)SG_CMD_HISTORY_LOAD &&
+	       cmd != (int)SG_CMD_DHCP_LEASE_EVENT;
 }
 
 /* Release a session tag (best-effort, ignores errors) */

@@ -152,6 +152,11 @@ case "$1" in
 			_wpid=$(cat /run/stargazer-webd.pid 2>/dev/null)
 			[ -n "$_wpid" ] && kill -HUP "$_wpid" 2>/dev/null
 		fi
+
+		# Notify mgmtd to re-apply static routes — they may have failed at
+		# boot because the WAN IP/gateway was not yet available.
+		/sbin/stargazer-ipc-cli 682 "iface=$interface action=$1" \
+			>/dev/null 2>&1 || true
 		;;
 
 	leasefail|nak)
