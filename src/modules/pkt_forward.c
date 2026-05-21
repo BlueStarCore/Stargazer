@@ -114,16 +114,11 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 
 	if (!s) {
 		rcu_read_unlock();
-		if (key.proto == IPPROTO_TCP) {
-			/* Non-SYN with no session: stateful drop.
-			 * SYN with table full: drop rather than forward untracked —
-			 * an untracked session bypasses all policy enforcement. */
-			atomic64_inc(&pkts_dropped);
-			return NF_DROP;
-		}
-		/* Non-TCP table full: forward untracked */
-		atomic64_inc(&pkts_forwarded);
-		return NF_ACCEPT;
+		/* No session: drop.
+		 * TCP non-SYN: mid-stream packet with no matching flow.
+		 * TCP SYN / UDP / ICMP: session table full or kmalloc failed. */
+		atomic64_inc(&pkts_dropped);
+		return NF_DROP;
 	}
 
 	/* Record ingress/egress interface (set-once on the first packet).

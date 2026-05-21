@@ -31,8 +31,19 @@ validation are hardcoded, not configurable.
 
 ## How a packet flows through Phase 2
 
+IPv4 fragments are reassembled by `nf_defrag_ipv4` at `NF_INET_PRE_ROUTING`
+(priority -400) before the FORWARD hook fires.  `pkt_forward.ko` depends on
+this via `MODULE_SOFTDEP("pre: nf_defrag_ipv4")` and enables it explicitly
+with `nf_defrag_ipv4_enable(&init_net)` at module load.
+
 ```
-NIC → kernel → NF_INET_FORWARD hook (pkt_forward.ko)
+NIC → kernel → NF_INET_PRE_ROUTING
+                      │
+                      ▼
+              nf_defrag_ipv4           reassemble fragments (priority -400)
+                      │ complete packet
+                      ▼
+              NF_INET_FORWARD hook (pkt_forward.ko, priority -399)
                       │
                       ▼
               is_valid_ipv4()          invalid IP header → NF_DROP (pkts_dropped++)
@@ -52,8 +63,8 @@ NIC → kernel → NF_INET_FORWARD hook (pkt_forward.ko)
                       │
                       ▼
               s == NULL?
-              ├── TCP → NF_DROP (pkts_dropped++)
-              └── non-TCP → NF_ACCEPT untracked (UDP/ICMP ok without session)
+              └── ALL protocols → NF_DROP (pkts_dropped++)
+                  (TCP non-SYN: no matching flow; all others: table full or OOM)
                       │
                       ▼ s != NULL
               record ifindex_in/out on first packet (WRITE_ONCE, set-once)
@@ -124,12 +135,54 @@ non-SYN TCP so mid-stream injected packets have no session to match.
 
 ### Expiry and reaper
 
-Sessions have a `expires_at` timestamp. A delayed work (`sess_reaper`) runs
-every 30 seconds under `table_lock`, removes expired entries, and schedules
-itself again. Freed sessions go through `call_rcu()` so readers holding
-`rcu_read_lock()` always see a valid pointer.
+Sessions have an `expires_at` timestamp. Two delayed-work reapers run
+concurrently and both serialise on `table_lock`.
 
-Non-TCP timeouts are fixed: UDP 180s, ICMP 60s, other 300s.
+#### Slow reaper (`sess_reaper`) — adaptive interval
+
+Scans a cursor-bounded slice of the hash table on each run, advances the
+cursor, and reschedules itself at an interval chosen by `reaper_next_delay()`
+based on current table occupancy:
+
+| Occupancy | Interval | Buckets per run | Full-table coverage |
+|---|---|---|---|
+| < 50% | 30 s | 1024 (full scan) | 30 s |
+| 50–74% | 15 s | 1024 (full scan) | 15 s |
+| 75–89% | 5 s | 128 buckets | 40 s |
+| ≥ 90% | 1 s | 64 buckets | 16 s |
+
+**Hysteresis:** once occupancy crosses 75% the reaper enters the aggressive
+band (`reaper_pressure_high = true`) and stays there until occupancy drops
+below 50%.  This prevents interval oscillation when the table hovers near a
+threshold boundary.
+
+**Cursor-based batch scanning** at high pressure limits the `spin_lock_bh` hold
+time to 64 buckets per run (1/16 of the table) instead of a full 1024-bucket
+scan.  Full coverage is still achieved across 16 consecutive 1-second runs.
+
+**Pressure trigger:** `sess_lookup_or_create()` calls `mod_delayed_work` to
+wake the slow reaper immediately when `sess_active > 75% × MAX_SESSIONS`,
+instead of waiting for the next scheduled run.
+
+#### Fast reaper (`sess_reaper_fast`) — fixed 1 s
+
+Runs every second and scans the full table, but skips any session that is not
+TCP or is not in a terminal state (`CLOSE`, `TIME_WAIT`, `LAST_ACK`).  Because
+the working set is small the scan is cheap regardless of table size.
+
+This reduces the cleanup latency for closed TCP flows from up to 150 s (slow
+reaper at 30 s interval × possible misses) to at most ~2 s after the session
+timeout fires.
+
+Both reapers remove entries with `hash_del_rcu()`, decrement `sess_active`,
+and call `call_rcu()` to free the memory after all RCU readers have quiesced.
+`SESS_EXPIRED` genl notifications are sent outside the spinlock.
+
+`session_exit()` cancels both reapers with `cancel_delayed_work_sync()` before
+calling `genl_unregister_family()` to ensure no reaper call is in-flight
+against the multicast group at unload time.
+
+Non-TCP timeouts are fixed: UDP 180 s, ICMP 60 s, other 300 s.
 TCP timeouts are per-state:
 
 | State | Timeout |
@@ -302,7 +355,7 @@ run in full mode.
 ```
 pkt_forward: unloaded (fwd=N drop=N block=N)
 ```
-- `fwd` — packets accepted and forwarded (includes untracked non-TCP).
+- `fwd` — packets accepted and forwarded (all tracked; no untracked path exists).
 - `drop` — packets dropped: invalid IP, malformed TCP, non-SYN without session,
   table full (TCP), TCP state machine rejections (RST injection, SYN into ESTABLISHED).
 - `block` — packets dropped because `SESS_BLOCKED` was set by policy/ML.
