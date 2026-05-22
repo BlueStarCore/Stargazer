@@ -32,7 +32,7 @@
 
 #include "session.h"
 
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("GPL v2");
 MODULE_DESCRIPTION("Self-test for Stargazer session tracking (session.ko)");
 MODULE_SOFTDEP("pre: session");
 

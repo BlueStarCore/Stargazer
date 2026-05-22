@@ -5645,11 +5645,7 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		return handle_session_clear(client_fd, user, payload, hdr);
 	case SG_CMD_SESSION_STATS:
 		return handle_session_stats(client_fd, user, payload, hdr);
-	case SG_CMD_NETFLOW_STATUS:
-		return handle_netflow_status(client_fd, user, payload, hdr);
-	case SG_CMD_NETFLOW_SET:
-		return handle_netflow_set(client_fd, user, payload, hdr);
-	case SG_CMD_SHOW_SESSIONS:
+case SG_CMD_SHOW_SESSIONS:
 		return handle_show_sessions(client_fd, user, payload, hdr);
 	case SG_CMD_SHOW_BOOT_CONFIG:
 		return handle_show_boot_config(client_fd, user, payload, hdr);

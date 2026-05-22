@@ -137,9 +137,6 @@ typedef enum {
 	SG_CMD_DIAG_SESSION      = 654,  /* Session table status + inject test */
 	SG_CMD_SESSION_CLEAR     = 655,  /* Flush all active sessions          */
 	SG_CMD_SESSION_STATS     = 656,  /* Parsed session counters + status   */
-	SG_CMD_NETFLOW_STATUS    = 657,  /* NetFlow exporter stats + status    */
-	SG_CMD_NETFLOW_SET       = 658,  /* Set collector IP:port, enable flag */
-
 	/* Debug state (66x) */
 	SG_CMD_DEBUG_STATE_GET   = 660,  /* Read debug conf key=value pairs    */
 	SG_CMD_DEBUG_STATE_SET   = 661,  /* Atomic write debug conf            */

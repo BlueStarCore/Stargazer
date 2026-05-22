@@ -732,13 +732,16 @@ void sess_update(struct session *s, struct sk_buff *skb, int dir)
 	spin_unlock(&s->lock);
 
 	/*
-	 * LRU touch: move this session to the tail (most-recently-used) on
-	 * every packet.  lru_lock is separate from table_lock so the packet
-	 * path never blocks on the GC's incremental bucket scan.
-	 * list_move_tail is six pointer writes — ~10 ns on Cortex-A53.
+	 * LRU touch: move this session to the tail (most-recently-used).
+	 * Guard with list_empty: the reaper calls list_del_init() before
+	 * call_rcu(), leaving lru_node self-linked.  If sess_update() runs
+	 * in the RCU window after eviction, list_empty() returns true and
+	 * we skip the touch — preventing re-insertion of a to-be-freed
+	 * session back into sess_lru (which would cause a double call_rcu).
 	 */
 	spin_lock_bh(&lru_lock);
-	list_move_tail(&s->lru_node, &sess_lru);
+	if (!list_empty(&s->lru_node))
+		list_move_tail(&s->lru_node, &sess_lru);
 	spin_unlock_bh(&lru_lock);
 }
 EXPORT_SYMBOL_GPL(sess_update);

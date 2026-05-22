@@ -20,7 +20,6 @@ X("logout",                                 "Logout from CLI",                  
 X("show",                                   "Show system information",                 "monitor",         0,  NULL)
 X("show status",                            "Module and system status",                "monitor",         0,  cmd_show_status)
 X("show sessions",                          "Active session table",                    "monitor",         0,  cmd_show_sessions)
-X("show netflow",                           "NetFlow exporter status and counters",    "monitor",         0,  cmd_show_netflow)
 X("show stats",                             "Packet statistics",                       "monitor",         0,  cmd_show_stats)
 X("show interfaces",                        "Network interfaces",                      "monitor",         0,  cmd_show_interfaces)
 X("show routes",                            "Routing table",                           "monitor",         0,  cmd_show_routes)
@@ -131,5 +130,3 @@ X("execute diagnose dhcp",                 "DHCP diagnostics",                  
 X("execute diagnose dhcp client",          "Show DHCP client status (all interfaces)", "monitor",        1,  cmd_diag_dhcp_client)
 X("execute diagnose dhcp client <iface>",  "Show DHCP client status for one interface", "monitor",      0,  NULL)
 
-X("set netflow",                           "NetFlow exporter configuration",          "admin",           2,  cmd_set_netflow)
-X("set netflow collector",                 "Set collector <ip> <port>",               "admin",           2,  NULL)
