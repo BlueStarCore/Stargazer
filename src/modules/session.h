@@ -97,6 +97,7 @@ struct sess_stats {
  */
 struct session {
 	struct hlist_node	node;
+	struct list_head	lru_node;	/* LRU list: head=oldest, tail=newest */
 	struct sess_key		key;
 	u32			id;
 	u16			flags;

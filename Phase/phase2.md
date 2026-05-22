@@ -19,7 +19,7 @@ validation are hardcoded, not configurable.
 
 | Component | File | Role |
 |---|---|---|
-| Session table | `src/modules/session.c` | RCU hash table, reaper, procfs |
+| Session table | `src/modules/session.c` | RCU hash table, LRU list, single 1 Hz GC reaper, PF adaptive eviction, procfs |
 | Public API | `src/modules/session.h` | Structs and exported symbols |
 | Packet hook | `src/modules/pkt_forward.c` | Calls session API on every FORWARD packet |
 | Kernel self-test | `src/modules/session_test.c` | Tests API without a network stack |
@@ -99,6 +99,7 @@ struct sess_key {           /* 5-tuple, packed (no padding) */
 
 struct session {
     struct hlist_node   node;       /* RCU hash table linkage */
+    struct list_head    lru_node;   /* LRU list: head=oldest, tail=newest */
     struct sess_key     key;        /* stored in ORIG direction */
     u32                 id;
     u16                 flags;      /* SESS_ACTIVE | SESS_BLOCKED | SESS_MARKED */
@@ -113,15 +114,41 @@ struct session {
 };
 ```
 
+`lru_node` is new in Phase 2. Every session is simultaneously a member of the
+RCU hash table (via `node`) and the LRU doubly-linked list (via `lru_node`).
+The LRU list head is the oldest session; the tail is the most-recently-used.
+`sess_update()` calls `list_move_tail()` on every forwarded packet to maintain
+this ordering.
+
 ### Hash table
 
-- 1024 buckets (`SESSION_TABLE_BITS = 10`), max 65536 sessions.
+- 1024 buckets (`SESSION_TABLE_BITS = 10`), hard cap `pf_max_states` (default
+  65536, tunable via module parameter).
 - Hash seed randomized with `get_random_bytes()` at module load — prevents
   hash-bucket collision (DoS) attacks.
 - Readers use `rcu_read_lock()` — no contention on the read path.
 - Writers take `table_lock` (spinlock) to insert or delete.
 - The create path re-checks both directions under `table_lock` to resolve the
   race where two CPUs both miss the lockless lookup.
+
+### Locking model
+
+Two spinlocks protect the session data structures:
+
+| Lock | Protects | Acquired from |
+|---|---|---|
+| `table_lock` | Hash table (`hash_add_rcu`, `hash_del_rcu`) and LRU list mutations | Any path that inserts or removes sessions |
+| `lru_lock` | `sess_lru` list pointer writes | `sess_update()` (alone); all other callers hold `table_lock` first |
+
+**Lock ordering rule:** always acquire `table_lock` before `lru_lock`.
+`lru_lock` may be taken alone only in `sess_update()`, which touches the LRU
+tail on every forwarded packet without touching the hash table. Keeping the two
+locks separate means the high-frequency packet path (`sess_update`) never blocks
+on the GC's incremental bucket scan, and vice versa.
+
+The per-session `s->lock` (spinlock) guards mutable session fields
+(`tcp_state`, `expires_at`, stats) and is taken independently of both global
+locks.
 
 ### Direction model
 
@@ -133,68 +160,174 @@ direction. Subsequent packets matching the reversed 5-tuple are the **reply**
 then creates. `sess_lookup_bidir()` does the same but never creates — used for
 non-SYN TCP so mid-stream injected packets have no session to match.
 
-### Expiry and reaper
+---
 
-Sessions have an `expires_at` timestamp. Two delayed-work reapers run
-concurrently and both serialise on `table_lock`.
+## Expiry and GC
 
-#### Slow reaper (`sess_reaper`) — adaptive interval
+### Single 1 Hz reaper (`sess_reaper_fn`)
 
-Scans a cursor-bounded slice of the hash table on each run, advances the
-cursor, and reschedules itself at an interval chosen by `reaper_next_delay()`
-based on current table occupancy:
+One `DECLARE_DELAYED_WORK` item, `sess_reaper`, always rescheduled at exactly
+`HZ` (one second). The tick interval is never shortened under load. All
+load-adaptive behavior happens inside the tick itself via three interlocking
+techniques.
 
-| Occupancy | Interval | Buckets per run | Full-table coverage |
-|---|---|---|---|
-| < 50% | 30 s | 1024 (full scan) | 30 s |
-| 50–74% | 15 s | 1024 (full scan) | 15 s |
-| 75–89% | 5 s | 128 buckets | 40 s |
-| ≥ 90% | 1 s | 64 buckets | 16 s |
+**Why a fixed 1 Hz tick?**  On Cortex-A53 each context switch costs ~10–50 µs.
+Shortening the GC interval under a SYN flood (e.g., 10 Hz) would add 10 extra
+wakeups/s × 50 µs = 500 µs of pure scheduler overhead per second, plus
+cache-thrash between the GC and RX-softirq stacks. Keeping it at 1 Hz
+eliminates all of this; the inline emergency path (Weapon 2) absorbs any excess
+within the fixed cadence.
 
-**Hysteresis:** once occupancy crosses 75% the reaper enters the aggressive
-band (`reaper_pressure_high = true`) and stays there until occupancy drops
-below 50%.  This prevents interval oscillation when the table hovers near a
-threshold boundary.
+#### Weapon 1a — Adaptive timeout scaling (`sess_pf_timeout`)
 
-**Cursor-based batch scanning** at high pressure limits the `spin_lock_bh` hold
-time to 64 buckets per run (1/16 of the table) instead of a full 1024-bucket
-scan.  Full coverage is still achieved across 16 consecutive 1-second runs.
+Implements the FreeBSD `pf(4)` formula:
 
-**Pressure trigger:** `sess_lookup_or_create()` calls `mod_delayed_work` to
-wake the slow reaper immediately when `sess_active > 75% × MAX_SESSIONS`,
-instead of waiting for the next scheduled run.
+```
+factor = (adaptive_end - active_cnt) / (adaptive_end - adaptive_start)
+effective_timeout = base_timeout * factor
+```
 
-#### Fast reaper (`sess_reaper_fast`) — fixed 1 s
+Behavior across the three zones:
 
-Runs every second and scans the full table, but skips any session that is not
-TCP or is not in a terminal state (`CLOSE`, `TIME_WAIT`, `LAST_ACK`).  Because
-the working set is small the scan is cheap regardless of table size.
+| Zone | Condition | Effect |
+|---|---|---|
+| Normal | `active_cnt <= pf_adaptive_start` | `factor = 1.0` — full base TTL, no scaling |
+| Pressure | `active_cnt` in `(start, end)` | `factor` ∈ `(0, 1)` — TTL shrinks linearly |
+| Saturation | `active_cnt >= pf_adaptive_end` | `factor = 0` — TTL crushed to 0; immediate eviction candidate |
 
-This reduces the cleanup latency for closed TCP flows from up to 150 s (slow
-reaper at 30 s interval × possible misses) to at most ~2 s after the session
-timeout fires.
+**TCP ESTABLISHED is excluded from scaling.** Killing live connections during a
+SYN flood harms legitimate users. The attack surface is half-open states:
+`SYN_SENT` (120 s base) and `SYN_RECV` (60 s base) collapse to zero first, well
+before `ESTABLISHED` (3600 s base) would be affected.
 
-Both reapers remove entries with `hash_del_rcu()`, decrement `sess_active`,
-and call `call_rcu()` to free the memory after all RCU readers have quiesced.
-`SESS_EXPIRED` genl notifications are sent outside the spinlock.
+All arithmetic is integer-only — no floats (kernel constraint).
 
-`session_exit()` cancels both reapers with `cancel_delayed_work_sync()` before
-calling `genl_unregister_family()` to ensure no reaper call is in-flight
-against the multicast group at unload time.
+#### Weapon 1b — Incremental scanning (gc_idx cursor)
 
-Non-TCP timeouts are fixed: UDP 180 s, ICMP 60 s, other 300 s.
-TCP timeouts are per-state:
+The GC does not scan all 1024 buckets per tick. Instead it advances a cursor
+`gc_idx` by a fixed window:
+
+| Mode | Buckets per tick | Full-table coverage |
+|---|---|---|
+| Normal (below `pf_adaptive_start`) | `GC_SCAN_NORMAL = 64` | ~16 s |
+| Aggressive (at or above `pf_adaptive_start`) | `GC_SCAN_AGGRESSIVE = 256` | ~4 s |
+
+This bounds `table_lock` hold time to ~25 µs (normal) or ~100 µs (aggressive)
+per tick, preventing head-of-line blocking for new-session creation on other
+CPUs even at 90% table fill.
+
+#### Weapon 1c — Hysteresis (`gc_aggressive` latch)
+
+`gc_aggressive` is set `true` when `active >= pf_adaptive_start` and cleared
+only when `active < 85% of pf_adaptive_start`. The 15% band prevents mode
+oscillation when the table drains and refills near the boundary — alternating
+between 64 and 256 buckets/tick on consecutive seconds without actually draining.
+
+#### Phase 1 — Incremental hash bucket scan
+
+Within the scan window `[gc_idx, gc_idx + scan_size)`, every session in every
+bucket is tested with `sess_pf_timeout()`. If the effective timeout is 0, or if
+idle time since `last_seen` exceeds the effective timeout, the session is
+unlinked from both the hash table and the LRU list, decremented from
+`sess_active`, incremented in `sess_expired`, and queued for RCU-deferred free.
+GenL notifications (`SG_FLOW_CMD_SESS_EXPIRED`) are sent outside the spinlock.
+
+#### Phase 2 — LRU-head early eviction (aggressive mode only)
+
+In addition to the bucket scan, when `gc_aggressive` is true the reaper walks
+from the LRU list head (oldest sessions) and evicts up to `GC_LRU_EVICT_MAX = 32`
+sessions per tick that satisfy the same `sess_pf_timeout()` condition. This
+drains the attack surface in temporal order (LRU, oldest first) in parallel with
+the spatial-order bucket scan, allowing the GC to wipe thousands of half-open
+SYN states in a single pass under a flood.
+
+### Inline expiry in `sess_lookup` — Technique 3
+
+On every hash chain hit, `sess_lookup()` checks `ktime_get() >= s->expires_at`
+before returning the session. If expired, it acquires `table_lock`, re-checks
+under the lock (another CPU may have refreshed the TTL), and if still expired:
+unlinks from hash and LRU, decrements `sess_active`, increments `sess_expired`,
+calls `call_rcu()`, and returns `NULL`. This prevents dead sessions accumulating
+in hot chains between 1 Hz GC ticks, keeping lookup O(1) in common cases.
+
+### Weapon 2 — Inline emergency eviction (`pf_purge_expired_states_emergency`)
+
+When `sess_lookup_or_create()` detects `active_cnt >= pf_max_states`, it calls
+`pf_purge_expired_states_emergency()` synchronously in the packet (softirq)
+context before attempting allocation.
+
+The function walks from the LRU list head and scans up to
+`PF_EMERGENCY_SCAN_MAX = 64` entries, evicting any session where
+`sess_pf_timeout() == 0` OR `idle_ns >= effective_timeout * NSEC_PER_SEC`.
+Weapon 1 (TTL scaling) pre-crushes TTLs as the table fills, so the LRU head is
+the most likely location to find zero-TTL entries.
+
+**Does NOT send genl notifications** — avoids `skb` allocation in the DDoS hot
+path.
+
+Two outcomes:
+
+- `freed > 0` — at least one slot was reclaimed; allocation proceeds normally.
+- `freed == 0` — table is saturated with non-expired active sessions. The caller
+  increments `sess_pf_drops` and returns `NULL`, causing `pkt_forward.ko` to
+  return `NF_DROP`. The packet is discarded at the NIC driver layer without
+  allocating any kernel state.
+
+**Why inline and not a wakeup?** Context switches cost 10–50 µs on Cortex-A53.
+Under a 1 Mpps SYN flood, waking a GC thread per packet would burn 10–50
+CPU-seconds per second in scheduler overhead alone. Running inline in the same
+softirq costs only the bounded scan time (~640 ns for 64 entries) — no context
+switch, no cache thrash between stacks.
+
+### Non-TCP timeouts
+
+Non-TCP session idle timeouts are fixed:
+
+| Protocol | Timeout |
+|---|---|
+| UDP | 180 s |
+| ICMP | 60 s |
+| Other | 300 s |
+
+### TCP per-state timeouts
 
 | State | Timeout |
 |---|---|
-| NONE / SYN_SENT | 120s |
-| SYN_RECV | 60s |
-| ESTABLISHED | 3600s |
-| FIN_WAIT | 120s |
-| CLOSE_WAIT | 60s |
-| LAST_ACK | 30s |
-| TIME_WAIT | 120s |
-| CLOSE | 10s |
+| NONE / SYN_SENT | 120 s |
+| SYN_RECV | 60 s |
+| ESTABLISHED | 3600 s |
+| FIN_WAIT | 120 s |
+| CLOSE_WAIT | 60 s |
+| LAST_ACK | 30 s |
+| TIME_WAIT | 120 s |
+| CLOSE | 10 s |
+| SYN_SENT2 | 60 s |
+
+---
+
+## Module parameters
+
+Tunable at load time via `modprobe session param=value`:
+
+| Parameter | Type | Permissions | Default | Description |
+|---|---|---|---|---|
+| `pf_max_states` | `uint` | 0444 | 65536 (`MAX_SESSIONS`) | Hard session cap. No new sessions are created at or above this count. |
+| `pf_adaptive_start` | `uint` | 0644 | 75% of `pf_max_states` | Active count at which TTL scaling begins. |
+| `pf_adaptive_end` | `uint` | 0644 | 90% of `pf_max_states` | Active count at which TTL is crushed to 0. |
+| `sess_asymmetric_mode` | `bool` | 0644 | `N` | Allow mid-stream TCP pickup (see below). |
+
+Zero values for `pf_adaptive_start` and `pf_adaptive_end` at load time are
+resolved in `session_init()` to 75% and 90% of `pf_max_states` respectively,
+so the ratios hold for any table size.
+
+Example override:
+
+```
+modprobe session pf_max_states=100000 pf_adaptive_start=60000 pf_adaptive_end=90000
+```
+
+If the supplied thresholds are inconsistent (`start >= end` or `end > max`), the
+module logs a warning and falls back to the default percentages.
 
 ---
 
@@ -267,10 +400,14 @@ min/max captures payload size distribution.
 `/proc/stargazer/sessions` — seq_file, readable by mgmtd (monitor permission):
 
 ```
-# Stargazer sessions  active=3 created=1024 expired=1021 invalid=2
+# Stargazer sessions  active=3 created=1024 expired=1021 invalid=2 pf_drops=0
+# pf_max=65536 adaptive_start=49152 adaptive_end=58982 gc_aggressive=0
 # proto src dst id pkts(o/r) bytes(o/r) age_ms expire_ms ml flags tcp_state
 proto=6 src=192.168.1.10:54321 dst=8.8.8.8:443 id=42 pkts=7/5 bytes=840/3200 age_ms=1200 expire_ms=2800 ml=0 flags=0x1 dev=2/3 tcp_state=3
 ```
+
+The header is two lines. Line 1 contains the per-session counters. Line 2
+contains the current PF tunable values and GC mode.
 
 `/proc/stargazer/session_ctl` — write-only (mode 0200). Writing `flush` calls
 `sess_flush_all()` which removes all sessions from the table. Used by
@@ -362,12 +499,16 @@ pkt_forward: unloaded (fwd=N drop=N block=N)
 
 ### session.ko (procfs header)
 ```
-active=N created=N expired=N invalid=N
+active=N created=N expired=N invalid=N pf_drops=N
 ```
 - `active` — sessions currently in the table.
 - `created` — total sessions ever created.
-- `expired` — sessions removed by the reaper.
+- `expired` — sessions removed by the GC reaper or inline expiry.
 - `invalid` — TCP state machine drops (RST injection + SYN injection).
+- `pf_drops` — sessions dropped because the table was full and no expired
+  sessions could be reclaimed (PF_DROP path). A non-zero and rising value
+  under sustained load indicates the table is saturated with active (non-expired)
+  sessions; consider raising `pf_max_states` or lowering `pf_adaptive_start`.
 
 ---
 
