@@ -144,7 +144,11 @@ int extract_key(struct sk_buff *skb, struct sess_key *key);
 
 struct session *sess_lookup(const struct sess_key *key);
 
-/* Bidirectional lookup only — never creates. Returns NULL if not found. */
+/*
+ * Bidirectional lookup only — never creates. Returns NULL if not found.
+ * Caller must hold rcu_read_lock() across the call and any subsequent
+ * dereference of the returned pointer.
+ */
 struct session *sess_lookup_bidir(const struct sess_key *key, int *dir_out);
 
 struct session *sess_lookup_or_create(const struct sess_key *key,

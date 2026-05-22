@@ -209,7 +209,7 @@ static void __exit pkt_forward_exit(void)
 module_init(pkt_forward_init);
 module_exit(pkt_forward_exit);
 
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Stargazer Team");
 MODULE_DESCRIPTION("Packet forwarding module for BPI-R4 NGFW");
 MODULE_VERSION(PKT_FWD_VERSION);

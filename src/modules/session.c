@@ -275,7 +275,7 @@ struct session *sess_lookup(const struct sess_key *key)
 			 * refreshed expires_at between the lockless test above
 			 * and this point.
 			 */
-			if (ktime_compare(ktime_get(), s->expires_at) >= 0) {
+			if (ktime_compare(ktime_get(), READ_ONCE(s->expires_at)) >= 0) {
 				hash_del_rcu(&s->node);
 				spin_lock(&lru_lock);	/* BH already off */
 				list_del_init(&s->lru_node);
@@ -432,9 +432,12 @@ struct session *sess_lookup_or_create(const struct sess_key *key,
 	/* Re-check both directions under the writer lock to handle the race
 	 * where another CPU inserted a matching session between our lockless
 	 * lookups and this point.  Use non-RCU walker inside the writer lock.
+	 * Also verify the found session has not already expired — adaptive TTL
+	 * scaling can crush TTLs to 0, and the GC may not have run yet.
 	 */
 	hash_for_each_possible(sess_table, s, node, hash) {
-		if (sess_key_eq(&s->key, key)) {
+		if (sess_key_eq(&s->key, key) &&
+		    ktime_compare(ktime_get(), READ_ONCE(s->expires_at)) < 0) {
 			spin_unlock_bh(&table_lock);
 			kfree(fresh);
 			*dir_out = SESS_DIR_ORIG;
@@ -445,7 +448,8 @@ struct session *sess_lookup_or_create(const struct sess_key *key,
 		u32 rhash = sess_hash(&rkey);
 
 		hash_for_each_possible(sess_table, s, node, rhash) {
-			if (sess_key_eq(&s->key, &rkey)) {
+			if (sess_key_eq(&s->key, &rkey) &&
+			    ktime_compare(ktime_get(), READ_ONCE(s->expires_at)) < 0) {
 				spin_unlock_bh(&table_lock);
 				kfree(fresh);
 				*dir_out = SESS_DIR_REPLY;
@@ -764,13 +768,22 @@ static void sess_free_rcu(struct rcu_head *head)
 void sess_delete(struct session *s)
 {
 	spin_lock_bh(&table_lock);
+	/*
+	 * Guard against being called on a session already removed by the GC
+	 * reaper or inline expiry.  hlist_unhashed() is safe to test under
+	 * table_lock: only code holding table_lock calls hash_del_rcu().
+	 */
+	if (hlist_unhashed(&s->node)) {
+		spin_unlock_bh(&table_lock);
+		return;
+	}
 	hash_del_rcu(&s->node);
 	spin_lock(&lru_lock);		/* BH already disabled by table_lock */
 	list_del_init(&s->lru_node);
 	spin_unlock(&lru_lock);
+	atomic64_dec(&sess_active);	/* inside table_lock: no window of inflated count */
 	spin_unlock_bh(&table_lock);
 
-	atomic64_dec(&sess_active);
 	call_rcu(&s->rcu, sess_free_rcu);
 }
 EXPORT_SYMBOL_GPL(sess_delete);
@@ -1503,7 +1516,7 @@ static int sess_seq_show(struct seq_file *seq, void *v)
 			atomic64_read(&pkts_invalid),
 			atomic64_read(&sess_pf_drops),
 			pf_max_states, pf_adaptive_start, pf_adaptive_end,
-			gc_aggressive);
+			READ_ONCE(gc_aggressive));
 		seq_puts(seq,
 			"# proto src dst id pkts(o/r) bytes(o/r) age_ms expire_ms ml flags tcp_state\n");
 		return 0;
@@ -1640,12 +1653,9 @@ static void __exit session_exit(void)
 
 	genl_unregister_family(&sg_flow_family);
 
-	if (proc_session_ctl)
-		proc_remove(proc_session_ctl);
-	if (proc_sessions)
-		proc_remove(proc_sessions);
-	if (sg_proc_root)
-		proc_remove(sg_proc_root);
+	proc_remove(proc_session_ctl);
+	proc_remove(proc_sessions);
+	proc_remove(sg_proc_root);
 
 	sess_flush_all();
 	rcu_barrier(); /* wait for all call_rcu() frees before module memory unloads */
@@ -1658,7 +1668,7 @@ static void __exit session_exit(void)
 module_init(session_init);
 module_exit(session_exit);
 
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Stargazer Team");
 MODULE_DESCRIPTION("Session tracking for Stargazer NGFW");
 MODULE_VERSION(SESS_VERSION);
