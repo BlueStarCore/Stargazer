@@ -788,12 +788,6 @@ void sess_delete(struct session *s)
 }
 EXPORT_SYMBOL_GPL(sess_delete);
 
-/*
- * Maximum sessions held for out-of-lock genl notification per GC cycle.
- * 64 × 8 bytes = 512 bytes on stack — within the 1024-byte kernel limit.
- * Sessions beyond this limit are freed immediately without notification.
- */
-#define SESS_REAP_BATCH 64
 
 /*
  * sess_base_timeout - Protocol / TCP-state idle timeout in seconds.
@@ -969,9 +963,9 @@ static void sess_reaper_fn(struct work_struct *work)
 {
 	struct session    *s;
 	struct hlist_node *tmp;
-	struct session    *to_notify[SESS_REAP_BATCH];
+	LIST_HEAD(notify_list);		/* pending notify — reuses s->lru_node */
 	unsigned int       b, end, scan_size;
-	int                i, reaped = 0;
+	int                reaped = 0;
 	ktime_t            now    = ktime_get();
 	u64                active;
 
@@ -1019,10 +1013,14 @@ static void sess_reaper_fn(struct work_struct *work)
 			list_del_init(&s->lru_node);
 			atomic64_dec(&sess_active);
 			atomic64_inc(&sess_expired);
-			if (reaped < SESS_REAP_BATCH)
-				to_notify[reaped++] = s;
-			else
-				call_rcu(&s->rcu, sess_free_rcu);
+			/*
+			 * Reuse lru_node as the pending-notify list node.
+			 * lru_node is detached (list_del_init made it self-
+			 * referential) so it is safe to relink into notify_list.
+			 * Notifications are sent after both spinlocks are dropped.
+			 */
+			list_add_tail(&s->lru_node, &notify_list);
+			reaped++;
 		}
 	}
 
@@ -1056,10 +1054,8 @@ static void sess_reaper_fn(struct work_struct *work)
 			list_del_init(&lru_s->lru_node);
 			atomic64_dec(&sess_active);
 			atomic64_inc(&sess_expired);
-			if (reaped < SESS_REAP_BATCH)
-				to_notify[reaped++] = lru_s;
-			else
-				call_rcu(&lru_s->rcu, sess_free_rcu);
+			list_add_tail(&lru_s->lru_node, &notify_list);
+			reaped++;
 		}
 	}
 
@@ -1069,13 +1065,23 @@ static void sess_reaper_fn(struct work_struct *work)
 	gc_idx = (end >= (1u << SESSION_TABLE_BITS)) ? 0 : end;
 
 	/*
-	 * Notifications outside the spinlock — memory still valid because RCU
-	 * grace period has not started (current rcu_read_lock holders may still
-	 * be in flight).
+	 * Drain the pending-notify list outside the spinlock.
+	 *
+	 * Memory is still valid: call_rcu() schedules kfree() for after the
+	 * current RCU grace period, so every session pointer here remains
+	 * dereferenceable until all current rcu_read_lock holders exit.
+	 *
+	 * lru_node is reused as the list linkage — no extra allocation needed.
+	 * No upper bound: every reaped session gets a genl notification.
 	 */
-	for (i = 0; i < reaped; i++) {
-		sess_genl_notify(to_notify[i], SG_FLOW_CMD_SESS_EXPIRED);
-		call_rcu(&to_notify[i]->rcu, sess_free_rcu);
+	{
+		struct session *ns, *ns_tmp;
+
+		list_for_each_entry_safe(ns, ns_tmp, &notify_list, lru_node) {
+			list_del_init(&ns->lru_node);
+			sess_genl_notify(ns, SG_FLOW_CMD_SESS_EXPIRED);
+			call_rcu(&ns->rcu, sess_free_rcu);
+		}
 	}
 
 	if (reaped)
