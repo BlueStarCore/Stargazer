@@ -3059,6 +3059,7 @@ static void mgmtd_replay_config(void)
 		"system_admin-profile",  /* must be before system_admin */
 		"system_admin",          /* depends on profiles */
 		"system_interface",      /* IP + allowaccess INPUT rules */
+		"system_dos-policy",     /* WAN DoS protection via pkt_forward.ko */
 		"network_route_static",  /* flush proto static first */
 		"firewall_address",      /* data-only: before firewall/NAT rebuild */
 		"firewall_service",      /* data-only: before firewall/NAT rebuild */
@@ -3315,6 +3316,9 @@ static sg_status_t apply_config(const char *type, const char *id,
 
 	if (strcmp(type, "system_ntp") == 0)
 		return apply_ntp(id, data, result, rsize);
+
+	if (strcmp(type, "system_dos-policy") == 0)
+		return apply_dos_policy(id, data, result, rsize);
 
 	/* ── Inline handlers (tightly coupled to monolith statics) ───── */
 	if (strcmp(type, "system_admin-profile") == 0) {

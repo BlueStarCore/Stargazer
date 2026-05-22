@@ -475,6 +475,100 @@ sg_status_t apply_interface(const char *id, const char *data,
 	return SG_OK;
 }
 
+sg_status_t apply_dos_policy(const char *id, const char *data,
+			     char *result, size_t rsize)
+{
+	char iface[VALBUFSZ], status[VALBUFSZ];
+	char syn_thr[VALBUFSZ], syn_burst[VALBUFSZ];
+	char udp_thr[VALBUFSZ], udp_burst[VALBUFSZ];
+	char icmp_thr[VALBUFSZ], icmp_burst[VALBUFSZ];
+	char block_dur[VALBUFSZ];
+
+	extract_val(data, "interface",            iface,      sizeof(iface));
+	extract_val(data, "status",               status,     sizeof(status));
+	extract_val(data, "syn-flood-threshold",  syn_thr,    sizeof(syn_thr));
+	extract_val(data, "syn-flood-burst",      syn_burst,  sizeof(syn_burst));
+	extract_val(data, "udp-flood-threshold",  udp_thr,    sizeof(udp_thr));
+	extract_val(data, "udp-flood-burst",      udp_burst,  sizeof(udp_burst));
+	extract_val(data, "icmp-flood-threshold", icmp_thr,   sizeof(icmp_thr));
+	extract_val(data, "icmp-flood-burst",     icmp_burst, sizeof(icmp_burst));
+	extract_val(data, "block-duration",       block_dur,  sizeof(block_dur));
+
+	if (!iface[0]) {
+		snprintf(result, rsize, "'interface' not set.");
+		return SG_ERR_MISSING_ARG;
+	}
+	if (!sg_is_iface_name(iface)) {
+		snprintf(result, rsize, "Invalid interface '%s'.", iface);
+		return SG_ERR_INVALID_VAL;
+	}
+
+	/* Disabled: write 0 to wan_ifindex to stop WAN-side enforcement */
+	if (strcmp(status, "disable") == 0) {
+		FILE *fp = fopen("/sys/module/pkt_forward/parameters/wan_ifindex", "w");
+		if (fp) { fprintf(fp, "0\n"); fclose(fp); }
+		snprintf(result, rsize, "DoS policy '%s' disabled.", id);
+		return SG_OK;
+	}
+
+	/* Resolve interface index */
+	char ifindex_path[256];
+	snprintf(ifindex_path, sizeof(ifindex_path),
+		 "/sys/class/net/%s/ifindex", iface);
+	FILE *ifp = fopen(ifindex_path, "r");
+	if (!ifp) {
+		snprintf(result, rsize,
+			 "DoS policy '%s': interface '%s' not present.", id, iface);
+		return SG_ERR_NOT_FOUND;
+	}
+	char ifindex_str[16] = "0";
+	if (fgets(ifindex_str, sizeof(ifindex_str), ifp))
+		ifindex_str[strcspn(ifindex_str, "\n")] = '\0';
+	fclose(ifp);
+
+	/* Write module params via sysfs; graceful if pkt_forward not loaded */
+	struct { const char *param; const char *val; } params[] = {
+		{ "wan_ifindex",     ifindex_str                      },
+		{ "syn_flood_thr",   syn_thr[0]   ? syn_thr   : "200"  },
+		{ "syn_flood_burst", syn_burst[0] ? syn_burst  : "400"  },
+		{ "udp_flood_thr",   udp_thr[0]   ? udp_thr   : "1000" },
+		{ "udp_flood_burst", udp_burst[0] ? udp_burst  : "2000" },
+		{ "icmp_flood_thr",  icmp_thr[0]  ? icmp_thr  : "100"  },
+		{ "icmp_flood_burst",icmp_burst[0]? icmp_burst : "200"  },
+		{ "src_block_dur",   block_dur[0] ? block_dur  : "30"   },
+		{ NULL, NULL }
+	};
+
+	int written = 0, total = 0;
+	for (int i = 0; params[i].param; i++) {
+		total++;
+		char path[128];
+		snprintf(path, sizeof(path),
+			 "/sys/module/pkt_forward/parameters/%s", params[i].param);
+		FILE *fp = fopen(path, "w");
+		if (!fp)
+			continue;
+		fprintf(fp, "%s\n", params[i].val);
+		fclose(fp);
+		written++;
+	}
+
+	if (written == 0) {
+		snprintf(result, rsize,
+			 "DoS policy '%s' saved (pkt_forward not loaded; params apply on module load).",
+			 id);
+	} else if (written < total) {
+		snprintf(result, rsize,
+			 "DoS policy '%s' partially applied on %s (%d/%d params written).",
+			 id, iface, written, total);
+		return SG_ERR_SYSTEM_FAIL;
+	} else {
+		snprintf(result, rsize, "DoS policy '%s' applied on %s (ifindex=%s).",
+			 id, iface, ifindex_str);
+	}
+	return SG_OK;
+}
+
 /*
  * handle_netlink_link_event — process one RTM_NEWLINK message.
  *

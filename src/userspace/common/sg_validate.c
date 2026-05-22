@@ -36,6 +36,7 @@ static const sg_type_info_t type_table[] = {
 	{ "system_password-policy", CFG_SINGLE, "admin",     "Configure global password policy"    },
 	{ "system_admin-profile",   CFG_TABLE,  "admin",     "Configure admin permission profiles" },
 	{ "system_admin",           CFG_TABLE,  "admin",     "Configure admin accounts"            },
+	{ "system_dos-policy",      CFG_TABLE,  "configure", "Configure per-interface DoS protection" },
 	{ NULL, 0, NULL, NULL }
 };
 
@@ -144,6 +145,17 @@ static const struct field_entry field_table[] = {
 	{ "system_admin", "password",                 "password-interactive",     1, NULL,     "Account password"                    },
 	{ "system_admin", "enforce-change-password",  "enum:enable,disable",     0, "enable", "Force password change on first login" },
 	{ "system_admin", "enforce-password-policy",  "enum:enable,disable",     0, "enable", "Apply password policy rules"         },
+
+	/* system_dos-policy */
+	{ "system_dos-policy", "interface",            "ref-iface:system_interface", 0, NULL,    "WAN interface to protect"               },
+	{ "system_dos-policy", "status",               "enum:enable,disable",        0, "enable","Enable or disable DoS protection"       },
+	{ "system_dos-policy", "syn-flood-threshold",  "uint:1:65535",               1, "200",   "SYN flood rate limit (packets/second)"  },
+	{ "system_dos-policy", "syn-flood-burst",      "uint:1:65535",               1, "400",   "SYN flood token bucket burst size"      },
+	{ "system_dos-policy", "udp-flood-threshold",  "uint:1:65535",               1, "1000",  "UDP flood rate limit (packets/second)"  },
+	{ "system_dos-policy", "udp-flood-burst",      "uint:1:65535",               1, "2000",  "UDP flood token bucket burst size"      },
+	{ "system_dos-policy", "icmp-flood-threshold", "uint:1:65535",               1, "100",   "ICMP flood rate limit (packets/second)" },
+	{ "system_dos-policy", "icmp-flood-burst",     "uint:1:65535",               1, "200",   "ICMP flood token bucket burst size"     },
+	{ "system_dos-policy", "block-duration",       "uint:1:3600",                1, "30",    "Source block duration (seconds)"        },
 
 	{ NULL, NULL, NULL, 0, NULL, NULL }
 };

@@ -771,6 +771,8 @@ static int cmd_diag_session(const char *args, const char *permissions)
 		}
 		const char *p = resp.payload ? resp.payload : "";
 		long long active = 0, created = 0, expired = 0, invalid = 0;
+		long long halfopen = 0, rejected_halfopen = 0;
+		long long syn_dropped = 0, udp_dropped = 0, icmp_dropped = 0;
 		int sess_loaded = 0, pkt_fwd_loaded = 0;
 		const char *kv;
 		kv = strstr(p, "session_loaded=");
@@ -785,6 +787,16 @@ static int cmd_diag_session(const char *args, const char *permissions)
 		if (kv) expired = strtoll(kv + 8, NULL, 10);
 		kv = strstr(p, "invalid=");
 		if (kv) invalid = strtoll(kv + 8, NULL, 10);
+		kv = strstr(p, "\nhalfopen=");
+		if (kv) halfopen = strtoll(kv + 10, NULL, 10);
+		kv = strstr(p, "rejected_halfopen=");
+		if (kv) rejected_halfopen = strtoll(kv + 18, NULL, 10);
+		kv = strstr(p, "syn_flood_dropped=");
+		if (kv) syn_dropped = strtoll(kv + 18, NULL, 10);
+		kv = strstr(p, "udp_flood_dropped=");
+		if (kv) udp_dropped = strtoll(kv + 18, NULL, 10);
+		kv = strstr(p, "icmp_flood_dropped=");
+		if (kv) icmp_dropped = strtoll(kv + 19, NULL, 10);
 
 		printf("  === Session Statistics ===\n");
 		printf("  session.ko     : %s\n", sess_loaded    ? C_GREEN "loaded" C_NC : C_RED "not loaded" C_NC);
@@ -793,6 +805,13 @@ static int cmd_diag_session(const char *args, const char *permissions)
 		printf("  Created        : %lld\n", created);
 		printf("  Expired        : %lld\n", expired);
 		printf("  Invalid (drops): %lld\n", invalid);
+		printf("  Half-open TCP  : %lld\n", halfopen);
+		printf("  Rejected (cap) : %lld\n", rejected_halfopen);
+		if (pkt_fwd_loaded) {
+			printf("  SYN flood drops: %lld\n", syn_dropped);
+			printf("  UDP flood drops: %lld\n", udp_dropped);
+			printf("  ICMP flood drops:%lld\n", icmp_dropped);
+		}
 		ipc_resp_free(&resp);
 		return 0;
 	}

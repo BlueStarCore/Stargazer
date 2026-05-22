@@ -1486,8 +1486,9 @@ int handle_session_stats(int client_fd, const char *user,
 	int session_loaded = (n >= 0);
 	int pkt_fwd_loaded = (access("/sys/module/pkt_forward", F_OK) == 0);
 
-	/* Parse counters from the first line of the procfs header */
+	/* Parse counters from the procfs header lines */
 	long long active = 0, created = 0, expired = 0, invalid = 0;
+	long long halfopen = 0, rejected_halfopen = 0;
 	if (session_loaded) {
 		const char *p = proc_buf;
 		const char *kv;
@@ -1500,18 +1501,46 @@ int handle_session_stats(int client_fd, const char *user,
 		if (kv) expired = strtoll(kv + 8, NULL, 10);
 		kv = strstr(p, "invalid=");
 		if (kv) invalid = strtoll(kv + 8, NULL, 10);
+		kv = strstr(p, "halfopen=");
+		if (kv) halfopen = strtoll(kv + 9, NULL, 10);
+		kv = strstr(p, "rejected_halfopen=");
+		if (kv) rejected_halfopen = strtoll(kv + 18, NULL, 10);
 	}
 
-	char resp[512];
+	/* Read pkt_forward flood counters from its own procfs file */
+	long long syn_dropped = 0, udp_dropped = 0, icmp_dropped = 0;
+	if (pkt_fwd_loaded) {
+		char pf_buf[512];
+		ssize_t pf_n = read_small_file("/proc/stargazer/pkt_forward_stats",
+					       pf_buf, sizeof(pf_buf));
+		if (pf_n > 0) {
+			const char *kv;
+			kv = strstr(pf_buf, "pkts_syn_dropped=");
+			if (kv) syn_dropped  = strtoll(kv + 17, NULL, 10);
+			kv = strstr(pf_buf, "pkts_udp_dropped=");
+			if (kv) udp_dropped  = strtoll(kv + 17, NULL, 10);
+			kv = strstr(pf_buf, "pkts_icmp_dropped=");
+			if (kv) icmp_dropped = strtoll(kv + 18, NULL, 10);
+		}
+	}
+
+	char resp[768];
 	snprintf(resp, sizeof(resp),
 		 "session_loaded=%d\n"
 		 "pkt_forward_loaded=%d\n"
 		 "active=%lld\n"
 		 "created=%lld\n"
 		 "expired=%lld\n"
-		 "invalid=%lld\n",
+		 "invalid=%lld\n"
+		 "halfopen=%lld\n"
+		 "rejected_halfopen=%lld\n"
+		 "syn_flood_dropped=%lld\n"
+		 "udp_flood_dropped=%lld\n"
+		 "icmp_flood_dropped=%lld\n",
 		 session_loaded, pkt_fwd_loaded,
-		 active, created, expired, invalid);
+		 active, created, expired, invalid,
+		 halfopen, rejected_halfopen,
+		 syn_dropped, udp_dropped, icmp_dropped);
 
 	send_ok(client_fd, NULL, resp);
 	return 0;

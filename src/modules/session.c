@@ -131,12 +131,31 @@ MODULE_PARM_DESC(pf_adaptive_start, "Begin TTL scaling above this count (default
 MODULE_PARM_DESC(pf_adaptive_end,   "TTL crushed to 0 at this count (default: 90% of max)");
 
 /* Counters */
-static atomic_t   next_id        = ATOMIC_INIT(1);
-static atomic64_t sess_created   = ATOMIC64_INIT(0);
-static atomic64_t sess_active    = ATOMIC64_INIT(0);
-static atomic64_t sess_expired   = ATOMIC64_INIT(0);
-static atomic64_t pkts_invalid   = ATOMIC64_INIT(0); /* TCP state-machine drops */
-static atomic64_t sess_pf_drops  = ATOMIC64_INIT(0); /* PF_DROP: table full + no eviction */
+static atomic_t   next_id              = ATOMIC_INIT(1);
+static atomic64_t sess_created         = ATOMIC64_INIT(0);
+static atomic64_t sess_active          = ATOMIC64_INIT(0);
+static atomic64_t sess_expired         = ATOMIC64_INIT(0);
+static atomic64_t pkts_invalid         = ATOMIC64_INIT(0); /* TCP state-machine drops */
+static atomic64_t sess_pf_drops        = ATOMIC64_INIT(0); /* PF_DROP: table full + no eviction */
+static atomic64_t sess_halfopen        = ATOMIC64_INIT(0); /* current half-open TCP sessions */
+static atomic64_t sess_rejected_halfopen = ATOMIC64_INIT(0); /* dropped: half-open cap exceeded */
+
+/*
+ * Half-open TCP session cap — prevents SYN flood from filling the table.
+ * Counts sessions in SYN_SENT, SYN_RECV, or SYN_SENT2 state.
+ * Primary defense is the adaptive TTL (short base TTL + PF scaling);
+ * this is a hard backstop.
+ */
+static unsigned int max_halfopen = 1024;
+module_param(max_halfopen, uint, 0644);
+MODULE_PARM_DESC(max_halfopen, "Max concurrent half-open TCP sessions (default: 1024)");
+
+static inline bool sess_is_halfopen(u8 state)
+{
+	return state == SESS_TCP_SYN_SENT  ||
+	       state == SESS_TCP_SYN_RECV  ||
+	       state == SESS_TCP_SYN_SENT2;
+}
 
 /* procfs handles */
 struct proc_dir_entry *sg_proc_root;
@@ -395,6 +414,18 @@ struct session *sess_lookup_or_create(const struct sess_key *key,
 	 * (~640 ns for PF_EMERGENCY_SCAN_MAX=64 entries) — no context switch,
 	 * no cache thrash between stacks.
 	 */
+	/*
+	 * Half-open cap: reject new TCP sessions when SYN_SENT/SYN_RECV/SYN_SENT2
+	 * count reaches max_halfopen.  Checked before the table-full path so the
+	 * caller gets a specific drop rather than a generic PF_DROP.
+	 * Non-TCP and asymmetric-mode pickups are not subject to this limit.
+	 */
+	if (key->proto == IPPROTO_TCP &&
+	    atomic64_read(&sess_halfopen) >= (s64)max_halfopen) {
+		atomic64_inc(&sess_rejected_halfopen);
+		return NULL;
+	}
+
 	if (atomic64_read(&sess_active) >= (s64)pf_max_states) {
 		if (pf_purge_expired_states_emergency() == 0) {
 			atomic64_inc(&sess_pf_drops);
@@ -421,6 +452,17 @@ struct session *sess_lookup_or_create(const struct sess_key *key,
 		spin_unlock_bh(&table_lock);
 		kfree(fresh);
 		atomic64_inc(&sess_pf_drops);
+		return NULL;
+	}
+
+	/* Re-check half-open cap under the writer lock — same rationale as
+	 * the pf_max_states re-check above: the lockless gate is a fast-path
+	 * hint only; multiple CPUs can pass it simultaneously. */
+	if (key->proto == IPPROTO_TCP &&
+	    atomic64_read(&sess_halfopen) >= (s64)max_halfopen) {
+		spin_unlock_bh(&table_lock);
+		kfree(fresh);
+		atomic64_inc(&sess_rejected_halfopen);
 		return NULL;
 	}
 
@@ -686,8 +728,17 @@ apply:
 		s->tcp_win[dir].win     = win;
 	}
 
-	if (new_state != s->tcp_state)
+	if (new_state != s->tcp_state) {
+		bool was_half = sess_is_halfopen(s->tcp_state);
+		bool now_half = sess_is_halfopen(new_state);
+
+		if (!was_half && now_half)
+			atomic64_inc(&sess_halfopen);
+		else if (was_half && !now_half)
+			atomic64_dec(&sess_halfopen);
+
 		WRITE_ONCE(s->tcp_state, new_state);
+	}
 
 	s->expires_at = ktime_add_ns(ktime_get(),
 		(u64)tcp_timeouts[new_state] * NSEC_PER_SEC);
@@ -753,6 +804,12 @@ EXPORT_SYMBOL_GPL(sess_update);
 static void sess_free_rcu(struct rcu_head *head)
 {
 	struct session *s = container_of(head, struct session, rcu);
+
+	/* If the reaper evicted a session that never completed its handshake,
+	 * correct the half-open counter so it doesn't leak upward over time. */
+	if (s->key.proto == IPPROTO_TCP &&
+	    sess_is_halfopen(READ_ONCE(s->tcp_state)))
+		atomic64_dec(&sess_halfopen);
 
 	kfree(s);
 }
@@ -1190,6 +1247,17 @@ struct session *sess_icmp_error_lookup(struct sk_buff *skb, int *dir_out)
 		memcpy(&key.dst_port, inner_l4 + 2, sizeof(__be16));
 	}
 
+	/*
+	 * Validate that the outer ICMP packet was delivered to the same host
+	 * that sent the triggering packet.  A legitimate ICMP error is always
+	 * addressed to the originator of the packet that caused the error, so
+	 * outer dst_ip must equal the embedded src_ip.  Any mismatch means the
+	 * ICMP packet is forged — drop it rather than letting an attacker
+	 * manipulate sessions for flows they are not a party to.
+	 */
+	if (iph->daddr != key.src_ip)
+		return NULL;
+
 	/* The embedded header is in ORIG direction; the error arrived as REPLY.
 	 * sess_lookup_bidir() handles both directions correctly. */
 	return sess_lookup_bidir(&key, dir_out);
@@ -1288,6 +1356,7 @@ static int sess_seq_show(struct seq_file *seq, void *v)
 		seq_printf(seq,
 			"# Stargazer sessions  active=%lld created=%lld"
 			" expired=%lld invalid=%lld pf_drops=%lld\n"
+			"# halfopen=%lld rejected_halfopen=%lld max_halfopen=%u\n"
 			"# pf_max=%u adaptive_start=%u adaptive_end=%u"
 			" gc_aggressive=%d\n",
 			atomic64_read(&sess_active),
@@ -1295,6 +1364,9 @@ static int sess_seq_show(struct seq_file *seq, void *v)
 			atomic64_read(&sess_expired),
 			atomic64_read(&pkts_invalid),
 			atomic64_read(&sess_pf_drops),
+			atomic64_read(&sess_halfopen),
+			atomic64_read(&sess_rejected_halfopen),
+			max_halfopen,
 			pf_max_states, pf_adaptive_start, pf_adaptive_end,
 			READ_ONCE(gc_aggressive));
 		seq_puts(seq,
