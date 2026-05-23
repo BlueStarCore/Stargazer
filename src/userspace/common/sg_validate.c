@@ -106,10 +106,19 @@ static const struct field_entry field_table[] = {
 	{ "system_ntp", "server", "safe-id", 0, "pool.ntp.org", "NTP server address or hostname" },
 
 	/* system_session-ttl — global session idle timeouts */
-	{ "system_session-ttl", "udp",          "uint:10:3600",  0, "180",  "UDP session idle timeout (seconds)"              },
-	{ "system_session-ttl", "tcp-halfopen", "uint:10:600",   0, "120",  "TCP half-open (SYN/SYN-ACK) timeout (seconds)"  },
-	{ "system_session-ttl", "tcp-established", "uint:60:86400", 0, "3600", "TCP established session idle timeout (seconds)" },
-	{ "system_session-ttl", "icmp",         "uint:5:300",    0, "60",   "ICMP session idle timeout (seconds)"            },
+	{ "system_session-ttl", "tcp-none",        "uint:10:600",   0, "120",  "TCP pre-handshake timeout (seconds)"            },
+	{ "system_session-ttl", "tcp-syn-sent",    "uint:10:600",   0, "120",  "TCP SYN_SENT half-open timeout (seconds)"       },
+	{ "system_session-ttl", "tcp-syn-recv",    "uint:5:300",    0, "60",   "TCP SYN_RECV timeout (seconds)"                 },
+	{ "system_session-ttl", "tcp-established", "uint:60:86400", 0, "3600", "TCP ESTABLISHED idle timeout (seconds)"         },
+	{ "system_session-ttl", "tcp-fin-wait",    "uint:10:600",   0, "120",  "TCP FIN_WAIT timeout (seconds)"                 },
+	{ "system_session-ttl", "tcp-close-wait",  "uint:5:300",    0, "60",   "TCP CLOSE_WAIT timeout (seconds)"               },
+	{ "system_session-ttl", "tcp-last-ack",    "uint:5:120",    0, "30",   "TCP LAST_ACK timeout (seconds)"                 },
+	{ "system_session-ttl", "tcp-time-wait",   "uint:10:600",   0, "120",  "TCP TIME_WAIT timeout (seconds)"                },
+	{ "system_session-ttl", "tcp-close",       "uint:1:60",     0, "10",   "TCP CLOSE (RST) cleanup timeout (seconds)"      },
+	{ "system_session-ttl", "tcp-syn-sent2",   "uint:5:300",    0, "60",   "TCP simultaneous-open timeout (seconds)"        },
+	{ "system_session-ttl", "udp",             "uint:10:3600",  0, "180",  "UDP session idle timeout (seconds)"             },
+	{ "system_session-ttl", "icmp",            "uint:5:300",    0, "60",   "ICMP session idle timeout (seconds)"            },
+	{ "system_session-ttl", "other",           "uint:10:3600",  0, "300",  "Other protocol timeout — GRE, ESP, etc. (seconds)" },
 
 	/* firewall_policy */
 	{ "firewall_policy", "name",     "safe-id",                         0, NULL,     "Policy name"                },

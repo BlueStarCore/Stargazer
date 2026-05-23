@@ -42,9 +42,6 @@
 #define SESSION_TABLE_BITS	10		/* 2^10 = 1024 buckets */
 #define MAX_SESSIONS		65536
 
-/* Non-configurable other-protocol timeout */
-#define SESS_TIMEOUT_OTHER_SEC	300
-
 /*
  * GC scan parameters.
  *
@@ -59,19 +56,7 @@
 #define GC_LRU_EVICT_MAX      32   /* max LRU-head evictions per GC tick       */
 #define PF_EMERGENCY_SCAN_MAX 64   /* max LRU entries in inline emergency path */
 
-/* Per-state TCP timeouts (seconds) — indexed by SESS_TCP_* constants */
-static const u32 tcp_timeouts[SESS_TCP_STATE_MAX] = {
-	[SESS_TCP_NONE]        = 120,   /* before handshake completes   */
-	[SESS_TCP_SYN_SENT]    = 120,   /* half-open; scanner bait      */
-	[SESS_TCP_SYN_RECV]    =  60,   /* SYN-ACK sent, waiting ACK    */
-	[SESS_TCP_ESTABLISHED] = 3600,  /* live connection              */
-	[SESS_TCP_FIN_WAIT]    = 120,   /* graceful close in progress   */
-	[SESS_TCP_CLOSE_WAIT]  =  60,
-	[SESS_TCP_LAST_ACK]    =  30,
-	[SESS_TCP_TIME_WAIT]   = 120,   /* RFC 793 2MSL                 */
-	[SESS_TCP_CLOSE]       =  10,   /* RST — clean up fast          */
-	[SESS_TCP_SYN_SENT2]   =  60,   /* simultaneous open            */
-};
+/* All session idle timeouts — configurable at runtime via sysfs */
 
 /* Hash table and its writer-side lock */
 static DEFINE_HASHTABLE(sess_table, SESSION_TABLE_BITS);
@@ -166,23 +151,48 @@ module_param(zero_win_timeout, uint, 0644);
 MODULE_PARM_DESC(zero_win_timeout,
 	"Seconds TCP window=0 before accelerated session teardown (0=disabled, default: 60)");
 
-/* Configurable session idle timeouts (seconds) */
-static unsigned int sess_timeout_udp      = 180;
-static unsigned int sess_timeout_icmp     = 60;
-static unsigned int sess_timeout_tcp_est  = 3600;
-static unsigned int sess_timeout_halfopen = 120;
-module_param(sess_timeout_udp,      uint, 0644);
-module_param(sess_timeout_icmp,     uint, 0644);
-module_param(sess_timeout_tcp_est,  uint, 0644);
-module_param(sess_timeout_halfopen, uint, 0644);
-MODULE_PARM_DESC(sess_timeout_udp,
-	"UDP session idle timeout in seconds (default: 180)");
-MODULE_PARM_DESC(sess_timeout_icmp,
-	"ICMP session idle timeout in seconds (default: 60)");
-MODULE_PARM_DESC(sess_timeout_tcp_est,
-	"TCP ESTABLISHED idle timeout in seconds (default: 3600)");
-MODULE_PARM_DESC(sess_timeout_halfopen,
-	"TCP half-open (SYN/SYN-ACK) timeout in seconds (default: 120)");
+/* TCP per-state timeouts */
+static unsigned int sess_tt_tcp_none       = 120;
+static unsigned int sess_tt_tcp_syn_sent   = 120;
+static unsigned int sess_tt_tcp_syn_recv   =  60;
+static unsigned int sess_tt_tcp_est        = 3600;
+static unsigned int sess_tt_tcp_fin_wait   = 120;
+static unsigned int sess_tt_tcp_close_wait =  60;
+static unsigned int sess_tt_tcp_last_ack   =  30;
+static unsigned int sess_tt_tcp_time_wait  = 120;
+static unsigned int sess_tt_tcp_close      =  10;
+static unsigned int sess_tt_tcp_syn_sent2  =  60;
+module_param(sess_tt_tcp_none,       uint, 0644);
+module_param(sess_tt_tcp_syn_sent,   uint, 0644);
+module_param(sess_tt_tcp_syn_recv,   uint, 0644);
+module_param(sess_tt_tcp_est,        uint, 0644);
+module_param(sess_tt_tcp_fin_wait,   uint, 0644);
+module_param(sess_tt_tcp_close_wait, uint, 0644);
+module_param(sess_tt_tcp_last_ack,   uint, 0644);
+module_param(sess_tt_tcp_time_wait,  uint, 0644);
+module_param(sess_tt_tcp_close,      uint, 0644);
+module_param(sess_tt_tcp_syn_sent2,  uint, 0644);
+MODULE_PARM_DESC(sess_tt_tcp_none,       "TCP pre-handshake timeout seconds (default: 120)");
+MODULE_PARM_DESC(sess_tt_tcp_syn_sent,   "TCP SYN_SENT (half-open) timeout seconds (default: 120)");
+MODULE_PARM_DESC(sess_tt_tcp_syn_recv,   "TCP SYN_RECV timeout seconds (default: 60)");
+MODULE_PARM_DESC(sess_tt_tcp_est,        "TCP ESTABLISHED idle timeout seconds (default: 3600)");
+MODULE_PARM_DESC(sess_tt_tcp_fin_wait,   "TCP FIN_WAIT timeout seconds (default: 120)");
+MODULE_PARM_DESC(sess_tt_tcp_close_wait, "TCP CLOSE_WAIT timeout seconds (default: 60)");
+MODULE_PARM_DESC(sess_tt_tcp_last_ack,   "TCP LAST_ACK timeout seconds (default: 30)");
+MODULE_PARM_DESC(sess_tt_tcp_time_wait,  "TCP TIME_WAIT timeout seconds (default: 120)");
+MODULE_PARM_DESC(sess_tt_tcp_close,      "TCP CLOSE (RST) timeout seconds (default: 10)");
+MODULE_PARM_DESC(sess_tt_tcp_syn_sent2,  "TCP simultaneous-open timeout seconds (default: 60)");
+
+/* Non-TCP protocol timeouts */
+static unsigned int sess_tt_udp   = 180;
+static unsigned int sess_tt_icmp  =  60;
+static unsigned int sess_tt_other = 300;
+module_param(sess_tt_udp,   uint, 0644);
+module_param(sess_tt_icmp,  uint, 0644);
+module_param(sess_tt_other, uint, 0644);
+MODULE_PARM_DESC(sess_tt_udp,   "UDP session idle timeout seconds (default: 180)");
+MODULE_PARM_DESC(sess_tt_icmp,  "ICMP session idle timeout seconds (default: 60)");
+MODULE_PARM_DESC(sess_tt_other, "Other protocol session timeout seconds (default: 300)");
 
 /* Per-source established session tracker (lock-free approximate, 4096 slots) */
 #define SRC_EST_SLOTS 4096U
@@ -281,25 +291,30 @@ static inline void sess_reverse_key(struct sess_key *r,
 	r->proto    = k->proto;
 }
 
-/* Per-TCP-state timeout — reads configurable params for the two user-tunable
- * states; falls back to the hardcoded array for close/fin/time-wait states
- * that don't need user control. */
 static inline u32 tcp_state_timeout(u8 state)
 {
-	if (state == SESS_TCP_ESTABLISHED)
-		return READ_ONCE(sess_timeout_tcp_est);
-	if (state == SESS_TCP_NONE || state == SESS_TCP_SYN_SENT)
-		return READ_ONCE(sess_timeout_halfopen);
-	return tcp_timeouts[state];
+	switch (state) {
+	case SESS_TCP_NONE:        return READ_ONCE(sess_tt_tcp_none);
+	case SESS_TCP_SYN_SENT:    return READ_ONCE(sess_tt_tcp_syn_sent);
+	case SESS_TCP_SYN_RECV:    return READ_ONCE(sess_tt_tcp_syn_recv);
+	case SESS_TCP_ESTABLISHED: return READ_ONCE(sess_tt_tcp_est);
+	case SESS_TCP_FIN_WAIT:    return READ_ONCE(sess_tt_tcp_fin_wait);
+	case SESS_TCP_CLOSE_WAIT:  return READ_ONCE(sess_tt_tcp_close_wait);
+	case SESS_TCP_LAST_ACK:    return READ_ONCE(sess_tt_tcp_last_ack);
+	case SESS_TCP_TIME_WAIT:   return READ_ONCE(sess_tt_tcp_time_wait);
+	case SESS_TCP_CLOSE:       return READ_ONCE(sess_tt_tcp_close);
+	case SESS_TCP_SYN_SENT2:   return READ_ONCE(sess_tt_tcp_syn_sent2);
+	default:                   return READ_ONCE(sess_tt_tcp_none);
+	}
 }
 
 static inline u32 sess_timeout_for_proto(u8 proto)
 {
 	switch (proto) {
-	case IPPROTO_TCP:  return READ_ONCE(sess_timeout_halfopen);
-	case IPPROTO_UDP:  return READ_ONCE(sess_timeout_udp);
-	case IPPROTO_ICMP: return READ_ONCE(sess_timeout_icmp);
-	default:           return SESS_TIMEOUT_OTHER_SEC;
+	case IPPROTO_TCP:  return READ_ONCE(sess_tt_tcp_none);
+	case IPPROTO_UDP:  return READ_ONCE(sess_tt_udp);
+	case IPPROTO_ICMP: return READ_ONCE(sess_tt_icmp);
+	default:           return READ_ONCE(sess_tt_other);
 	}
 }
 

@@ -3599,7 +3599,7 @@
             { configType: 'system_settings',   fields: ['hostname', 'ip-forward', 'timezone'] },
             { configType: 'system_ntp',        fields: ['server'] },
             { configType: 'network_dns',       fields: ['primary', 'secondary'] },
-            { configType: 'system_session-ttl', fields: ['udp', 'tcp-halfopen', 'tcp-established', 'icmp'] }
+            { configType: 'system_session-ttl', fields: ['tcp-none', 'tcp-syn-sent', 'tcp-syn-recv', 'tcp-established', 'tcp-fin-wait', 'tcp-close-wait', 'tcp-last-ack', 'tcp-time-wait', 'tcp-close', 'tcp-syn-sent2', 'udp', 'icmp', 'other'] }
         ],
         'password-policy': [
             { configType: 'system_password-policy',
