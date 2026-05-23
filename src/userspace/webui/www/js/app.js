@@ -3596,9 +3596,10 @@
      * Field keys must match data-key attributes on the .form-row. */
     var SETTINGS_MAP = {
         'system': [
-            { configType: 'system_settings', fields: ['hostname', 'ip-forward', 'timezone'] },
-            { configType: 'system_ntp',      fields: ['server'] },
-            { configType: 'network_dns',     fields: ['primary', 'secondary'] }
+            { configType: 'system_settings',   fields: ['hostname', 'ip-forward', 'timezone'] },
+            { configType: 'system_ntp',        fields: ['server'] },
+            { configType: 'network_dns',       fields: ['primary', 'secondary'] },
+            { configType: 'system_session-ttl', fields: ['udp', 'tcp-halfopen', 'tcp-established', 'icmp'] }
         ],
         'password-policy': [
             { configType: 'system_password-policy',
@@ -3651,7 +3652,7 @@
 
     /* Single-type configs use id "0" (not a table with entries) */
     var SINGLE_CONFIGS = ['system_settings', 'system_ntp', 'network_dns',
-                          'system_password-policy'];
+                          'system_password-policy', 'system_session-ttl'];
 
     function settingsLoad(card, settingsName) {
         var maps = SETTINGS_MAP[settingsName];

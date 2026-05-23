@@ -134,4 +134,7 @@ sg_status_t apply_ntp(const char *id, const char *data,
 sg_status_t apply_dos_policy(const char *id, const char *data,
 			     char *result, size_t rsize);
 
+sg_status_t apply_session_ttl(const char *id, const char *data,
+			      char *result, size_t rsize);
+
 #endif /* MGMTD_APPLY_H */

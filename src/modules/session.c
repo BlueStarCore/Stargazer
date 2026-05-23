@@ -42,9 +42,7 @@
 #define SESSION_TABLE_BITS	10		/* 2^10 = 1024 buckets */
 #define MAX_SESSIONS		65536
 
-/* Non-TCP idle timeouts */
-#define SESS_TIMEOUT_UDP_SEC	180
-#define SESS_TIMEOUT_ICMP_SEC	60
+/* Non-configurable other-protocol timeout */
 #define SESS_TIMEOUT_OTHER_SEC	300
 
 /*
@@ -168,6 +166,24 @@ module_param(zero_win_timeout, uint, 0644);
 MODULE_PARM_DESC(zero_win_timeout,
 	"Seconds TCP window=0 before accelerated session teardown (0=disabled, default: 60)");
 
+/* Configurable session idle timeouts (seconds) */
+static unsigned int sess_timeout_udp      = 180;
+static unsigned int sess_timeout_icmp     = 60;
+static unsigned int sess_timeout_tcp_est  = 3600;
+static unsigned int sess_timeout_halfopen = 120;
+module_param(sess_timeout_udp,      uint, 0644);
+module_param(sess_timeout_icmp,     uint, 0644);
+module_param(sess_timeout_tcp_est,  uint, 0644);
+module_param(sess_timeout_halfopen, uint, 0644);
+MODULE_PARM_DESC(sess_timeout_udp,
+	"UDP session idle timeout in seconds (default: 180)");
+MODULE_PARM_DESC(sess_timeout_icmp,
+	"ICMP session idle timeout in seconds (default: 60)");
+MODULE_PARM_DESC(sess_timeout_tcp_est,
+	"TCP ESTABLISHED idle timeout in seconds (default: 3600)");
+MODULE_PARM_DESC(sess_timeout_halfopen,
+	"TCP half-open (SYN/SYN-ACK) timeout in seconds (default: 120)");
+
 /* Per-source established session tracker (lock-free approximate, 4096 slots) */
 #define SRC_EST_SLOTS 4096U
 
@@ -265,12 +281,24 @@ static inline void sess_reverse_key(struct sess_key *r,
 	r->proto    = k->proto;
 }
 
+/* Per-TCP-state timeout — reads configurable params for the two user-tunable
+ * states; falls back to the hardcoded array for close/fin/time-wait states
+ * that don't need user control. */
+static inline u32 tcp_state_timeout(u8 state)
+{
+	if (state == SESS_TCP_ESTABLISHED)
+		return READ_ONCE(sess_timeout_tcp_est);
+	if (state == SESS_TCP_NONE || state == SESS_TCP_SYN_SENT)
+		return READ_ONCE(sess_timeout_halfopen);
+	return tcp_timeouts[state];
+}
+
 static inline u32 sess_timeout_for_proto(u8 proto)
 {
 	switch (proto) {
-	case IPPROTO_TCP:  return tcp_timeouts[SESS_TCP_NONE]; /* pre-handshake baseline */
-	case IPPROTO_UDP:  return SESS_TIMEOUT_UDP_SEC;
-	case IPPROTO_ICMP: return SESS_TIMEOUT_ICMP_SEC;
+	case IPPROTO_TCP:  return READ_ONCE(sess_timeout_halfopen);
+	case IPPROTO_UDP:  return READ_ONCE(sess_timeout_udp);
+	case IPPROTO_ICMP: return READ_ONCE(sess_timeout_icmp);
 	default:           return SESS_TIMEOUT_OTHER_SEC;
 	}
 }
@@ -822,7 +850,7 @@ apply:
 	}
 
 	s->expires_at = ktime_add_ns(ktime_get(),
-		(u64)tcp_timeouts[new_state] * NSEC_PER_SEC);
+		(u64)tcp_state_timeout(new_state) * NSEC_PER_SEC);
 
 	/* Zero-window zombie protection: if a side continuously advertises
 	 * window=0, crush the session TTL to 5 s after zero_win_timeout seconds.
@@ -957,7 +985,7 @@ EXPORT_SYMBOL_GPL(sess_delete);
 static inline u32 sess_base_timeout(const struct session *s)
 {
 	if (s->key.proto == IPPROTO_TCP)
-		return tcp_timeouts[READ_ONCE(s->tcp_state)];
+		return tcp_state_timeout(READ_ONCE(s->tcp_state));
 	return sess_timeout_for_proto(s->key.proto);
 }
 

@@ -3026,6 +3026,7 @@ static void mgmtd_replay_config(void)
 		"system_password-policy", /* load before admin auth checks */
 		"network_dns",            /* write /etc/resolv.conf */
 		"system_ntp",             /* write /etc/ntp.conf */
+		"system_session-ttl",     /* session idle timeouts → session.ko */
 		NULL
 	};
 	for (int i = 0; single_types[i]; i++) {
@@ -3319,6 +3320,9 @@ static sg_status_t apply_config(const char *type, const char *id,
 
 	if (strcmp(type, "system_dos-policy") == 0)
 		return apply_dos_policy(id, data, result, rsize);
+
+	if (strcmp(type, "system_session-ttl") == 0)
+		return apply_session_ttl(id, data, result, rsize);
 
 	/* ── Inline handlers (tightly coupled to monolith statics) ───── */
 	if (strcmp(type, "system_admin-profile") == 0) {

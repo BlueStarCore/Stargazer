@@ -28,6 +28,7 @@ static const sg_type_info_t type_table[] = {
 	{ "network_dns",            CFG_SINGLE, "configure", "Configure DNS settings"              },
 	{ "network_dhcp-server",    CFG_TABLE,  "configure", "Configure DHCP server pools"         },
 	{ "system_settings",        CFG_SINGLE, "configure", "System general settings"              },
+	{ "system_session-ttl",    CFG_SINGLE, "configure", "Session idle timeout settings"        },
 	{ "system_interface",       CFG_TABLE,  "configure", "Configure network interfaces"        },
 	{ "system_ntp",             CFG_SINGLE, "configure", "Configure NTP time sync"             },
 	{ "firewall_policy",        CFG_TABLE,  "configure", "Configure firewall policies"         },
@@ -103,6 +104,12 @@ static const struct field_entry field_table[] = {
 
 	/* system_ntp — always on, no status field */
 	{ "system_ntp", "server", "safe-id", 0, "pool.ntp.org", "NTP server address or hostname" },
+
+	/* system_session-ttl — global session idle timeouts */
+	{ "system_session-ttl", "udp",          "uint:10:3600",  0, "180",  "UDP session idle timeout (seconds)"              },
+	{ "system_session-ttl", "tcp-halfopen", "uint:10:600",   0, "120",  "TCP half-open (SYN/SYN-ACK) timeout (seconds)"  },
+	{ "system_session-ttl", "tcp-established", "uint:60:86400", 0, "3600", "TCP established session idle timeout (seconds)" },
+	{ "system_session-ttl", "icmp",         "uint:5:300",    0, "60",   "ICMP session idle timeout (seconds)"            },
 
 	/* firewall_policy */
 	{ "firewall_policy", "name",     "safe-id",                         0, NULL,     "Policy name"                },

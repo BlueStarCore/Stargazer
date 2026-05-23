@@ -738,3 +738,32 @@ void handle_netlink_link_event(int nl_fd)
 		}
 	}
 }
+
+/* ── apply_session_ttl ──────────────────────────────────────────────────── */
+
+sg_status_t apply_session_ttl(const char *id, const char *data,
+			      char *result, size_t rsize)
+{
+	(void)id;
+
+	char udp[VALBUFSZ], tcp_ho[VALBUFSZ], tcp_est[VALBUFSZ], icmp[VALBUFSZ];
+	extract_val(data, "udp",             udp,     sizeof(udp));
+	extract_val(data, "tcp-halfopen",   tcp_ho,  sizeof(tcp_ho));
+	extract_val(data, "tcp-established", tcp_est, sizeof(tcp_est));
+	extract_val(data, "icmp",           icmp,    sizeof(icmp));
+
+	write_sysfs_param("session", "sess_timeout_udp",
+			  udp[0]     ? udp     : "180");
+	write_sysfs_param("session", "sess_timeout_halfopen",
+			  tcp_ho[0]  ? tcp_ho  : "120");
+	write_sysfs_param("session", "sess_timeout_tcp_est",
+			  tcp_est[0] ? tcp_est : "3600");
+	write_sysfs_param("session", "sess_timeout_icmp",
+			  icmp[0]    ? icmp    : "60");
+
+	snprintf(result, rsize,
+		 "Session timeouts: udp=%s tcp-halfopen=%s tcp-established=%s icmp=%s",
+		 udp[0] ? udp : "180", tcp_ho[0] ? tcp_ho : "120",
+		 tcp_est[0] ? tcp_est : "3600", icmp[0] ? icmp : "60");
+	return SG_OK;
+}
