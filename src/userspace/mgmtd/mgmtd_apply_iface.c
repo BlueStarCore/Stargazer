@@ -507,7 +507,6 @@ sg_status_t apply_dos_policy(const char *id, const char *data,
 	char pkt_thr[VALBUFSZ],  pkt_burst[VALBUFSZ];
 	char icmp_err_thr[VALBUFSZ], icmp_err_burst[VALBUFSZ];
 	char scan_thr[VALBUFSZ], scan_win[VALBUFSZ];
-	char max_sess[VALBUFSZ];
 
 	extract_val(data, "interface",             iface,          sizeof(iface));
 	extract_val(data, "status",                status,         sizeof(status));
@@ -531,7 +530,6 @@ sg_status_t apply_dos_policy(const char *id, const char *data,
 	extract_val(data, "icmp-err-burst",        icmp_err_burst, sizeof(icmp_err_burst));
 	extract_val(data, "scan-threshold",        scan_thr,       sizeof(scan_thr));
 	extract_val(data, "scan-window",           scan_win,       sizeof(scan_win));
-	extract_val(data, "max-sessions",          max_sess,       sizeof(max_sess));
 
 	if (!iface[0]) {
 		snprintf(result, rsize, "'interface' not set.");
@@ -556,7 +554,6 @@ sg_status_t apply_dos_policy(const char *id, const char *data,
 		 * must not fire globally when the DoS policy is turned off. */
 		write_sysfs_param("session", "max_est_per_src",  "0");
 		write_sysfs_param("session", "zero_win_timeout", "0");
-		write_sysfs_param("session", "pf_max_states",    "65536");
 		snprintf(result, rsize, "DoS policy '%s' disabled.", id);
 		return SG_OK;
 	}
@@ -612,14 +609,18 @@ sg_status_t apply_dos_policy(const char *id, const char *data,
 	if (zero_win[0])
 		write_sysfs_param("session", "zero_win_timeout", zero_win);
 
-	/* Session ceiling — write before adaptive-timeout so thresholds are
-	 * computed against the new max, not the old value. */
-	const char *max_states_str = max_sess[0] ? max_sess : "65536";
-	write_sysfs_param("session", "pf_max_states", max_states_str);
-
+	/* Adaptive timeout: read the actual pf_max_states from sysfs so the
+	 * computed thresholds are correct regardless of the configured table size. */
 	if (strcmp(adaptive_to, "disable") == 0 ||
 	    strcmp(adaptive_to, "enable")  == 0) {
-		unsigned int max_states = (unsigned int)strtoul(max_states_str, NULL, 10);
+		unsigned int max_states = 65536;
+		FILE *mfp = fopen("/sys/module/session/parameters/pf_max_states", "r");
+		if (mfp) {
+			char ms_buf[16];
+			if (fgets(ms_buf, sizeof(ms_buf), mfp))
+				max_states = (unsigned int)strtoul(ms_buf, NULL, 10);
+			fclose(mfp);
+		}
 		if (max_states == 0)
 			max_states = 65536;
 

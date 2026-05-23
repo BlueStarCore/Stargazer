@@ -185,7 +185,6 @@ static const struct field_entry field_table[] = {
 	{ "system_dos-policy", "icmp-err-burst",        "uint:1:20000",        1, "100",   "ICMP error rate burst capacity"                                    },
 	{ "system_dos-policy", "scan-threshold",        "uint:0:32",           1, "20",    "Port scan: unique dst ports per window before block (0=disabled)"  },
 	{ "system_dos-policy", "scan-window",           "uint:1:60",           1, "10",    "Port scan: bloom filter window duration in seconds"                },
-	{ "system_dos-policy", "max-sessions",          "uint:1000:65536",     1, "65536", "Hard session ceiling; new sessions refused above this count"       },
 
 	{ NULL, NULL, NULL, 0, NULL, NULL }
 };
