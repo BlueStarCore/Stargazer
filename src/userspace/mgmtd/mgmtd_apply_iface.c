@@ -490,9 +490,21 @@ static int write_sysfs_param(const char *module, const char *param,
 	return 0;
 }
 
-/* Read the current protected_ifmask, set or clear bit for ifindex, write back. */
-static void update_protected_ifmask(unsigned int ifindex, int set)
+/*
+ * Read the current protected_ifmask, set or clear bit for ifindex, write back.
+ * Safe to call concurrently only if the caller serialises — mgmtd is
+ * single-threaded so the read-modify-write is not subject to a TOCTOU race.
+ * Returns 0 on success, -1 if ifindex is out of range.
+ */
+static int update_protected_ifmask(unsigned int ifindex, int set)
 {
+	/* unsigned long is 64 bits on ARM64; shifting by >= 64 is undefined. */
+	if (ifindex >= (unsigned int)(sizeof(unsigned long) * 8)) {
+		mgmt_log("ERROR",
+			 "update_protected_ifmask: ifindex %u exceeds bitmask width",
+			 ifindex);
+		return -1;
+	}
 	unsigned long mask = 0;
 	FILE *fp = fopen("/sys/module/pkt_forward/parameters/protected_ifmask", "r");
 	if (fp) {
@@ -506,6 +518,7 @@ static void update_protected_ifmask(unsigned int ifindex, int set)
 	char val[32];
 	snprintf(val, sizeof(val), "%lu", mask);
 	write_sysfs_param("pkt_forward", "protected_ifmask", val);
+	return 0;
 }
 
 sg_status_t apply_dos_policy(const char *id, const char *data,
@@ -575,10 +588,29 @@ sg_status_t apply_dos_policy(const char *id, const char *data,
 		snprintf(dis_path, sizeof(dis_path),
 			 "/sys/class/net/%s/ifindex", iface);
 		FILE *dis_fp = fopen(dis_path, "r");
-		if (dis_fp) { fscanf(dis_fp, "%u", &dis_idx); fclose(dis_fp); }
-		if (dis_idx > 0)
-			update_protected_ifmask(dis_idx, 0);
-		/* Reset session.ko caps only when no interface remains protected. */
+		if (!dis_fp) {
+			/*
+			 * Interface no longer exists — cannot determine the ifindex,
+			 * so the protection bit cannot be cleared from the kernel mask.
+			 * Report the problem; operator must reload the module or
+			 * re-enable then disable the policy once the interface exists.
+			 */
+			mgmt_log("WARN",
+				 "DoS policy '%s': interface '%s' not found; "
+				 "kernel protection bit may remain set.", id, iface);
+			snprintf(result, rsize,
+				 "Warning: interface '%s' not found; "
+				 "kernel protection bit may remain set.", iface);
+			return SG_ERR_NOT_FOUND;
+		}
+		fscanf(dis_fp, "%u", &dis_idx);
+		fclose(dis_fp);
+		update_protected_ifmask(dis_idx, 0);
+		/*
+		 * Reset session.ko caps only when no interface remains protected.
+		 * These caps are global (not per-interface); with multiple policies
+		 * active the most-recently-applied value is in effect.
+		 */
 		unsigned long remaining = 0;
 		FILE *mfp = fopen(
 			"/sys/module/pkt_forward/parameters/protected_ifmask", "r");
@@ -607,7 +639,13 @@ sg_status_t apply_dos_policy(const char *id, const char *data,
 	fclose(ifp);
 
 	/* Set this interface's bit in the protected mask. */
-	update_protected_ifmask((unsigned int)strtoul(ifindex_str, NULL, 10), 1);
+	unsigned int this_ifindex = (unsigned int)strtoul(ifindex_str, NULL, 10);
+	if (update_protected_ifmask(this_ifindex, 1) != 0) {
+		snprintf(result, rsize,
+			 "DoS policy '%s': ifindex %u exceeds bitmask width; "
+			 "too many interfaces.", id, this_ifindex);
+		return SG_ERR_INVALID_VAL;
+	}
 
 	/* Write pkt_forward.ko module params via sysfs */
 	struct { const char *param; const char *val; } pf_params[] = {

@@ -668,8 +668,8 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 	}
 
 	/*
-	 * is_protected is evaluated once and reused below so the ifindex comparison
-	 * is not repeated for every branch.  When wan_ifindex == 0 the entire
+	 * is_protected is evaluated once and reused below so the bitmask check
+	 * is not repeated for every branch.  When protected_ifmask == 0 the entire
 	 * DoS subsystem is disabled with a single branch.
 	 */
 	{
