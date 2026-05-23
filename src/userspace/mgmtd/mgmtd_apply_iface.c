@@ -547,9 +547,13 @@ sg_status_t apply_dos_policy(const char *id, const char *data,
 	};
 	free(safe_exec(rpf_del));  /* ignore error — rule may not exist */
 
-	/* Disabled: write 0 to wan_ifindex to stop WAN-side enforcement */
+	/* Disabled: clear all enforcement parameters so no protection fires */
 	if (strcmp(status, "disable") == 0) {
-		write_sysfs_param("pkt_forward", "wan_ifindex", "0");
+		write_sysfs_param("pkt_forward", "wan_ifindex",  "0");
+		/* Reset session.ko caps to unlimited — they are not WAN-scoped and
+		 * must not fire globally when the DoS policy is turned off. */
+		write_sysfs_param("session", "max_est_per_src",  "0");
+		write_sysfs_param("session", "zero_win_timeout", "0");
 		snprintf(result, rsize, "DoS policy '%s' disabled.", id);
 		return SG_OK;
 	}
