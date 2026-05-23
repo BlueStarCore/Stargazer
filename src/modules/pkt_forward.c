@@ -55,8 +55,8 @@ static atomic64_t pkts_scan_dropped         = ATOMIC64_INIT(0); /* port scan    
  *   - Shared block list remembers violators for src_block_dur seconds so
  *     subsequent packets are rejected at the top of forward_hook() before
  *     touching the session table.
- *   - All rate checks are WAN-interface-scoped (wan_ifindex) so LAN traffic
- *     is never rate-limited.
+ *   - Rate checks apply to every interface whose ifindex bit is set in
+ *     protected_ifmask, so protection is not limited to a single WAN port.
  *
  * Lock-free approximate hash arrays: collisions cause a slot to be taken
  * over by the displacing IP, which loses block/rate state and gets a fresh
@@ -121,10 +121,13 @@ static u32 dos_hash_seed;
 
 /* --- Module params -------------------------------------------------------- */
 
-static unsigned int wan_ifindex;
-module_param(wan_ifindex, uint, 0644);
-MODULE_PARM_DESC(wan_ifindex,
-	"WAN interface ifindex for DoS protection (0 = disabled)");
+/* Bitmask of protected interface ifindices.
+ * Bit N = 1 means packets arriving on ifindex N are subject to DoS checks.
+ * Supports up to BITS_PER_LONG interfaces (64 on ARM64). */
+static unsigned long protected_ifmask;
+module_param(protected_ifmask, ulong, 0644);
+MODULE_PARM_DESC(protected_ifmask,
+	"Bitmask of protected ifindices; bit N protects ifindex N (0 = disabled)");
 
 static unsigned int syn_flood_thr   = 200;
 static unsigned int syn_flood_burst = 400;
@@ -632,7 +635,7 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 	struct session *s;
 	int dir = SESS_DIR_ORIG;
 	bool tcp_is_syn = false;
-	bool is_wan;
+	bool is_protected;
 
 	/* [1] IPv4 + L4 validation */
 	if (!is_valid_ipv4(skb)) {
@@ -665,21 +668,24 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 	}
 
 	/*
-	 * is_wan is evaluated once and reused below so the ifindex comparison
+	 * is_protected is evaluated once and reused below so the ifindex comparison
 	 * is not repeated for every branch.  When wan_ifindex == 0 the entire
 	 * DoS subsystem is disabled with a single branch.
 	 */
-	is_wan = wan_ifindex != 0 && state->in != NULL &&
-		 (unsigned int)state->in->ifindex == wan_ifindex;
+	{
+		unsigned int idx = state->in ? (unsigned int)state->in->ifindex : 0;
+		is_protected = idx < BITS_PER_LONG &&
+			       (READ_ONCE(protected_ifmask) >> idx) & 1UL;
+	}
 
 	/* [3] Block list: O(1) reject before any session table access */
-	if (is_wan && src_block_check(key.src_ip)) {
+	if (is_protected && src_block_check(key.src_ip)) {
 		atomic64_inc(&pkts_dropped);
 		return NF_DROP;
 	}
 
 	/* [4] ICMP error rate limiter: caps flood of crafted ICMP errors */
-	if (is_wan && icmp_err_thr && icmp_is_error(skb) &&
+	if (is_protected && icmp_err_thr && icmp_is_error(skb) &&
 	    src_rate_check(icmp_err_rate, key.src_ip,
 			   icmp_err_thr, icmp_err_burst)) {
 		src_block_add(key.src_ip);
@@ -689,7 +695,7 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 	}
 
 	/* [5] Per-source aggregate packet rate: ACK flood / data flood */
-	if (is_wan && pkt_flood_thr &&
+	if (is_protected && pkt_flood_thr &&
 	    src_rate_check(pkt_rate, key.src_ip,
 			   pkt_flood_thr, pkt_flood_burst)) {
 		src_block_add(key.src_ip);
@@ -699,7 +705,7 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 	}
 
 	/* [6–8] SYN-specific WAN defenses */
-	if (is_wan && tcp_is_syn) {
+	if (is_protected && tcp_is_syn) {
 		/* [6] Global SYN cap: distributed SYN flood from many sources */
 		if (global_syn_thr && global_syn_check()) {
 			atomic64_inc(&pkts_dropped);
@@ -737,7 +743,7 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 
 	} else if (key.proto == IPPROTO_TCP) {
 		/* tcp_is_syn == true: new TCP session */
-		if (is_wan && src_dos_check(key.src_ip, IPPROTO_TCP)) {
+		if (is_protected && src_dos_check(key.src_ip, IPPROTO_TCP)) {
 			rcu_read_unlock();
 			atomic64_inc(&pkts_dropped);
 			return NF_DROP;
@@ -755,7 +761,7 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 		if (!s) {
 			s = sess_lookup_bidir(&key, &dir);
 			if (!s) {
-				if (is_wan && src_dos_check(key.src_ip, IPPROTO_ICMP)) {
+				if (is_protected && src_dos_check(key.src_ip, IPPROTO_ICMP)) {
 					rcu_read_unlock();
 					atomic64_inc(&pkts_dropped);
 					return NF_DROP;
@@ -772,12 +778,12 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 		 */
 		s = sess_lookup_bidir(&key, &dir);
 		if (!s) {
-			if (is_wan && src_dos_check(key.src_ip, key.proto)) {
+			if (is_protected && src_dos_check(key.src_ip, key.proto)) {
 				rcu_read_unlock();
 				atomic64_inc(&pkts_dropped);
 				return NF_DROP;
 			}
-			if (is_wan && key.proto == IPPROTO_UDP &&
+			if (is_protected && key.proto == IPPROTO_UDP &&
 			    global_udp_thr && global_udp_check()) {
 				rcu_read_unlock();
 				atomic64_inc(&pkts_dropped);
@@ -852,7 +858,7 @@ static int pf_stats_show(struct seq_file *m, void *v)
 		"pkts_pkt_rate_dropped=%lld\n"
 		"pkts_icmp_err_dropped=%lld\n"
 		"pkts_scan_dropped=%lld\n"
-		"wan_ifindex=%u\n",
+		"protected_ifmask=%lu\n",
 		atomic64_read(&pkts_forwarded),
 		atomic64_read(&pkts_dropped),
 		atomic64_read(&pkts_blocked),
@@ -866,7 +872,7 @@ static int pf_stats_show(struct seq_file *m, void *v)
 		atomic64_read(&pkts_pkt_rate_dropped),
 		atomic64_read(&pkts_icmp_err_dropped),
 		atomic64_read(&pkts_scan_dropped),
-		wan_ifindex);
+		READ_ONCE(protected_ifmask));
 	return 0;
 }
 
@@ -929,7 +935,7 @@ static int __init pkt_forward_init(void)
 		" global_syn=%u/%u pktrate=%u/%u"
 		" icmp_err=%u/%u scan=%u/%us\n",
 		PKT_FWD_VERSION,
-		wan_ifindex ? "on" : "off",
+		READ_ONCE(protected_ifmask) ? "on" : "off",
 		syn_flood_thr,   syn_flood_burst,
 		udp_flood_thr,   udp_flood_burst,
 		icmp_flood_thr,  icmp_flood_burst,

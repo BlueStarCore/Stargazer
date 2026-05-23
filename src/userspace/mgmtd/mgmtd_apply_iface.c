@@ -490,6 +490,24 @@ static int write_sysfs_param(const char *module, const char *param,
 	return 0;
 }
 
+/* Read the current protected_ifmask, set or clear bit for ifindex, write back. */
+static void update_protected_ifmask(unsigned int ifindex, int set)
+{
+	unsigned long mask = 0;
+	FILE *fp = fopen("/sys/module/pkt_forward/parameters/protected_ifmask", "r");
+	if (fp) {
+		fscanf(fp, "%lu", &mask);
+		fclose(fp);
+	}
+	if (set)
+		mask |=  (1UL << ifindex);
+	else
+		mask &= ~(1UL << ifindex);
+	char val[32];
+	snprintf(val, sizeof(val), "%lu", mask);
+	write_sysfs_param("pkt_forward", "protected_ifmask", val);
+}
+
 sg_status_t apply_dos_policy(const char *id, const char *data,
 			     char *result, size_t rsize)
 {
@@ -550,13 +568,25 @@ sg_status_t apply_dos_policy(const char *id, const char *data,
 	};
 	free(safe_exec(rpf_del));  /* ignore error — rule may not exist */
 
-	/* Disabled: clear all enforcement parameters so no protection fires */
+	/* Disabled: clear this interface's bit from the protected mask. */
 	if (strcmp(status, "disable") == 0) {
-		write_sysfs_param("pkt_forward", "wan_ifindex",  "0");
-		/* Reset session.ko caps to unlimited — they are not WAN-scoped and
-		 * must not fire globally when the DoS policy is turned off. */
-		write_sysfs_param("session", "max_est_per_src",  "0");
-		write_sysfs_param("session", "zero_win_timeout", "0");
+		char dis_path[256];
+		unsigned int dis_idx = 0;
+		snprintf(dis_path, sizeof(dis_path),
+			 "/sys/class/net/%s/ifindex", iface);
+		FILE *dis_fp = fopen(dis_path, "r");
+		if (dis_fp) { fscanf(dis_fp, "%u", &dis_idx); fclose(dis_fp); }
+		if (dis_idx > 0)
+			update_protected_ifmask(dis_idx, 0);
+		/* Reset session.ko caps only when no interface remains protected. */
+		unsigned long remaining = 0;
+		FILE *mfp = fopen(
+			"/sys/module/pkt_forward/parameters/protected_ifmask", "r");
+		if (mfp) { fscanf(mfp, "%lu", &remaining); fclose(mfp); }
+		if (remaining == 0) {
+			write_sysfs_param("session", "max_est_per_src",  "0");
+			write_sysfs_param("session", "zero_win_timeout", "0");
+		}
 		snprintf(result, rsize, "DoS policy '%s' disabled.", id);
 		return SG_OK;
 	}
@@ -576,9 +606,11 @@ sg_status_t apply_dos_policy(const char *id, const char *data,
 		ifindex_str[strcspn(ifindex_str, "\n")] = '\0';
 	fclose(ifp);
 
+	/* Set this interface's bit in the protected mask. */
+	update_protected_ifmask((unsigned int)strtoul(ifindex_str, NULL, 10), 1);
+
 	/* Write pkt_forward.ko module params via sysfs */
 	struct { const char *param; const char *val; } pf_params[] = {
-		{ "wan_ifindex",          ifindex_str                              },
 		{ "syn_flood_thr",        syn_thr[0]       ? syn_thr       : "200"   },
 		{ "syn_flood_burst",      syn_burst[0]     ? syn_burst     : "400"   },
 		{ "udp_flood_thr",        udp_thr[0]       ? udp_thr       : "1000"  },
