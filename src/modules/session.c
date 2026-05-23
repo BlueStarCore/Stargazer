@@ -665,8 +665,10 @@ unsigned int sess_tcp_check(struct session *s, struct sk_buff *skb, int dir)
 	u16 win;
 
 	iph = ip_hdr(skb);
-	if (!pskb_may_pull(skb, iph->ihl * 4 + sizeof(struct tcphdr)))
-		return NF_ACCEPT;
+	if (!pskb_may_pull(skb, iph->ihl * 4 + sizeof(struct tcphdr))) {
+		atomic64_inc(&pkts_invalid);
+		return NF_DROP;
+	}
 
 	/* Re-fetch after pull — pskb_may_pull may reallocate the skb head */
 	iph  = ip_hdr(skb);
@@ -822,19 +824,27 @@ apply:
 	s->expires_at = ktime_add_ns(ktime_get(),
 		(u64)tcp_timeouts[new_state] * NSEC_PER_SEC);
 
-	/* Zero-window zombie protection: if the advertised window stays at zero
-	 * for longer than zero_win_timeout seconds, crush the session TTL to 5 s
-	 * so the reaper sweeps it quickly rather than letting it idle for 3600 s. */
+	/* Zero-window zombie protection: if a side continuously advertises
+	 * window=0, crush the session TTL to 5 s after zero_win_timeout seconds.
+	 *
+	 * Track which direction set zero_win_since so that only a non-zero
+	 * window from THAT direction resets the timer.  Packets from the other
+	 * direction (the sender, with its own non-zero window) must not reset
+	 * the timer or an attacker controlling the sender side could keep the
+	 * zombie alive indefinitely. */
 	if (zero_win_timeout && new_state == SESS_TCP_ESTABLISHED) {
 		if (win == 0) {
-			if (!s->zero_win_since)
+			if (!s->zero_win_since) {
 				s->zero_win_since = ktime_get();
-			else if (ktime_to_ns(ktime_sub(ktime_get(),
-						       s->zero_win_since)) >
-				 (s64)zero_win_timeout * NSEC_PER_SEC)
+				s->zero_win_dir   = (u8)dir;
+			} else if (ktime_to_ns(ktime_sub(ktime_get(),
+							 s->zero_win_since)) >
+				   (s64)zero_win_timeout * NSEC_PER_SEC) {
 				s->expires_at = ktime_add_ns(ktime_get(),
 							     5LL * NSEC_PER_SEC);
-		} else {
+			}
+		} else if (s->zero_win_since && (u8)dir == s->zero_win_dir) {
+			/* The receiver advertises non-zero window: connection can recover */
 			s->zero_win_since = 0;
 		}
 	}

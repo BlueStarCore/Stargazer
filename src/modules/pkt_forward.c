@@ -107,6 +107,7 @@ static struct {
 	s32           tokens;
 	unsigned long last_ts;
 } global_syn_bucket;
+static DEFINE_SPINLOCK(global_syn_lock);
 
 static u32 dos_hash_seed;
 
@@ -309,8 +310,15 @@ static bool is_ip_anomaly(struct sk_buff *skb)
 
 	/* IP source routing options (LSRR=131, SSRR=137) — used to bypass ACLs */
 	if (iph->ihl > 5) {
-		const u8 *opt    = (const u8 *)iph + sizeof(struct iphdr);
-		int       optlen = iph->ihl * 4 - (int)sizeof(struct iphdr);
+		const u8 *opt;
+		int       optlen;
+
+		/* Pull the full IP header including options into linear data */
+		if (!pskb_may_pull(skb, (unsigned int)iph->ihl * 4))
+			return false; /* can't verify options; pass through */
+		iph    = ip_hdr(skb); /* re-fetch after potential realloc */
+		opt    = (const u8 *)iph + sizeof(struct iphdr);
+		optlen = iph->ihl * 4 - (int)sizeof(struct iphdr);
 		int       i      = 0;
 
 		while (i < optlen) {
@@ -457,6 +465,9 @@ static bool global_syn_check(void)
 	unsigned long now  = jiffies;
 	unsigned long elapsed;
 	s32           refill;
+	bool          drop;
+
+	spin_lock(&global_syn_lock);
 
 	elapsed = now - global_syn_bucket.last_ts;
 	if (elapsed) {
@@ -471,10 +482,16 @@ static bool global_syn_check(void)
 
 	if (global_syn_bucket.tokens > 0) {
 		global_syn_bucket.tokens--;
-		return false;
+		drop = false;
+	} else {
+		drop = true;
 	}
-	atomic64_inc(&pkts_global_syn_dropped);
-	return true;
+
+	spin_unlock(&global_syn_lock);
+
+	if (drop)
+		atomic64_inc(&pkts_global_syn_dropped);
+	return drop;
 }
 
 /*
@@ -742,17 +759,6 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 
 	/* [12] Stats update */
 	sess_update(s, skb, dir);
-
-	if (net_ratelimit()) {
-		struct iphdr *iph = ip_hdr(skb);
-
-		pr_debug("[%s->%s] %pI4 -> %pI4 proto=%u len=%u dir=%s\n",
-			 state->in  ? state->in->name  : "?",
-			 state->out ? state->out->name : "?",
-			 &iph->saddr, &iph->daddr,
-			 iph->protocol, ntohs(iph->tot_len),
-			 dir == SESS_DIR_ORIG ? "orig" : "reply");
-	}
 
 	rcu_read_unlock();
 	atomic64_inc(&pkts_forwarded);

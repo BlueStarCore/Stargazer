@@ -1501,8 +1501,8 @@ int handle_session_stats(int client_fd, const char *user,
 		if (kv) expired = strtoll(kv + 8, NULL, 10);
 		kv = strstr(p, "invalid=");
 		if (kv) invalid = strtoll(kv + 8, NULL, 10);
-		kv = strstr(p, "halfopen=");
-		if (kv) halfopen = strtoll(kv + 9, NULL, 10);
+		kv = strstr(p, "# halfopen=");
+		if (kv) halfopen = strtoll(kv + 11, NULL, 10);
 		kv = strstr(p, "rejected_halfopen=");
 		if (kv) rejected_halfopen = strtoll(kv + 18, NULL, 10);
 	}

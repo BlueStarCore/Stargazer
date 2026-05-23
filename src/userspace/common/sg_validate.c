@@ -167,6 +167,8 @@ static const struct field_entry field_table[] = {
 	{ "system_dos-policy", "pkt-rate-burst",        "uint:1:2000000",      1, "20000", "Per-source aggregate packet rate burst"                            },
 	{ "system_dos-policy", "icmp-err-threshold",    "uint:0:10000",        1, "50",    "ICMP error message rate limit per source, msgs/s (0=disabled)"     },
 	{ "system_dos-policy", "icmp-err-burst",        "uint:1:20000",        1, "100",   "ICMP error rate burst capacity"                                    },
+	{ "system_dos-policy", "scan-threshold",        "uint:0:32",           1, "20",    "Port scan: unique dst ports per window before block (0=disabled)"  },
+	{ "system_dos-policy", "scan-window",           "uint:1:60",           1, "10",    "Port scan: bloom filter window duration in seconds"                },
 
 	{ NULL, NULL, NULL, 0, NULL, NULL }
 };

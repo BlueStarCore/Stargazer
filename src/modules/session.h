@@ -102,7 +102,7 @@ struct session {
 	u32			id;
 	u16			flags;
 	u8			tcp_state;	/* SESS_TCP_* — see sess_tcp_check() */
-	u8			_rsv;
+	u8			zero_win_dir;	/* dir that last set zero_win_since */
 	struct sess_tcp_win	tcp_win[2];	/* [SESS_DIR_ORIG/REPLY] RST validation */
 	u32			ifindex_in;	/* ingress interface at session creation */
 	u32			ifindex_out;	/* egress interface at session creation */

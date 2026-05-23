@@ -506,6 +506,7 @@ sg_status_t apply_dos_policy(const char *id, const char *data,
 	char zero_win[VALBUFSZ];
 	char pkt_thr[VALBUFSZ],  pkt_burst[VALBUFSZ];
 	char icmp_err_thr[VALBUFSZ], icmp_err_burst[VALBUFSZ];
+	char scan_thr[VALBUFSZ], scan_win[VALBUFSZ];
 
 	extract_val(data, "interface",             iface,          sizeof(iface));
 	extract_val(data, "status",                status,         sizeof(status));
@@ -527,6 +528,8 @@ sg_status_t apply_dos_policy(const char *id, const char *data,
 	extract_val(data, "pkt-rate-burst",        pkt_burst,      sizeof(pkt_burst));
 	extract_val(data, "icmp-err-threshold",    icmp_err_thr,   sizeof(icmp_err_thr));
 	extract_val(data, "icmp-err-burst",        icmp_err_burst, sizeof(icmp_err_burst));
+	extract_val(data, "scan-threshold",        scan_thr,       sizeof(scan_thr));
+	extract_val(data, "scan-window",           scan_win,       sizeof(scan_win));
 
 	if (!iface[0]) {
 		snprintf(result, rsize, "'interface' not set.");
@@ -583,6 +586,8 @@ sg_status_t apply_dos_policy(const char *id, const char *data,
 		{ "pkt_flood_burst",      pkt_burst[0]     ? pkt_burst     : "20000" },
 		{ "icmp_err_thr",         icmp_err_thr[0]  ? icmp_err_thr  : "50"    },
 		{ "icmp_err_burst",       icmp_err_burst[0]? icmp_err_burst: "100"   },
+		{ "scan_threshold",       scan_thr[0]      ? scan_thr      : "20"    },
+		{ "scan_window",          scan_win[0]      ? scan_win      : "10"    },
 		{ NULL, NULL }
 	};
 
@@ -600,12 +605,32 @@ sg_status_t apply_dos_policy(const char *id, const char *data,
 	if (zero_win[0])
 		write_sysfs_param("session", "zero_win_timeout", zero_win);
 
-	/* Adaptive timeout: disable by setting pf_adaptive_start high enough
-	 * that the scaling range is never entered (active <= 65535 = always). */
-	if (strcmp(adaptive_to, "disable") == 0)
-		write_sysfs_param("session", "pf_adaptive_start", "65535");
-	else if (strcmp(adaptive_to, "enable") == 0)
-		write_sysfs_param("session", "pf_adaptive_start", "49152"); /* 75% of 65536 */
+	/* Adaptive timeout: read the actual pf_max_states from sysfs so the
+	 * computed thresholds are correct regardless of the configured table size. */
+	if (strcmp(adaptive_to, "disable") == 0 ||
+	    strcmp(adaptive_to, "enable")  == 0) {
+		unsigned int max_states = 65536;
+		FILE *mfp = fopen("/sys/module/session/parameters/pf_max_states", "r");
+		if (mfp) {
+			char ms_buf[16];
+			if (fgets(ms_buf, sizeof(ms_buf), mfp))
+				max_states = (unsigned int)strtoul(ms_buf, NULL, 10);
+			fclose(mfp);
+		}
+		if (max_states == 0)
+			max_states = 65536;
+
+		char thresh_str[16];
+		if (strcmp(adaptive_to, "disable") == 0) {
+			/* Disable: set start = max so the scaling band is never entered */
+			snprintf(thresh_str, sizeof(thresh_str), "%u", max_states);
+		} else {
+			/* Enable: restore default 75%-of-max start */
+			snprintf(thresh_str, sizeof(thresh_str), "%u",
+				 max_states * 3 / 4);
+		}
+		write_sysfs_param("session", "pf_adaptive_start", thresh_str);
+	}
 
 	/* Anti-spoofing: rpfilter drops packets whose source IP has no reverse
 	 * route via the ingress interface (RFC 3704 / BCP38 uRPF lite). */
