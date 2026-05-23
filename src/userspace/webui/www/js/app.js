@@ -286,6 +286,33 @@
         else if (page === 'sys-settings') { promises.push(loadSettingsPage(pageEl, 'system')); }
         else if (page === 'sys-password') { promises.push(loadSettingsPage(pageEl, 'password-policy')); }
         else if (page === 'sys-firmware') { promises.push(loadFirmwareInfo()); }
+        else if (page === 'interfaces') {
+            var ifTable = pageEl ? pageEl.querySelector('table[data-entity]') : null;
+            var ifLoad = ifTable ? loadEntityPage(ifTable.dataset.entity, ifTable) : Promise.resolve();
+            if (pageEl) resetPageFilters(pageEl);
+            /* Overlay live kernel IPs after config data renders — DHCP
+             * interfaces store 0.0.0.0/0 in the DB; live data has the
+             * actual assigned address. */
+            var ifLive = ifLoad.then(function () {
+                return api('/system/interfaces/live').then(function (live) {
+                    if (!live || !live.interfaces || !ifTable) return;
+                    var liveMap = {};
+                    live.interfaces.forEach(function (iface) {
+                        liveMap[iface.name] = iface;
+                    });
+                    ifTable.querySelectorAll('tbody tr').forEach(function (tr) {
+                        var name = tr.dataset.rowId;
+                        var li = liveMap[name];
+                        if (!li) return;
+                        var liveIp = (li.ip && li.ip !== '-') ? li.ip : null;
+                        if (!liveIp) return;
+                        var ipCell = tr.querySelector('td[data-key="ip"]');
+                        if (ipCell) ipCell.textContent = liveIp;
+                    });
+                }).catch(function () {}); /* live overlay is best-effort */
+            });
+            promises.push(ifLive);
+        }
         else if (page === 'dhcp') {
             var dhcpTable = pageEl ? pageEl.querySelector('table[data-entity="dhcp"]') : null;
             if (dhcpTable) promises.push(loadEntityPage('dhcp', dhcpTable));
@@ -3020,6 +3047,7 @@
                     tr.appendChild(buildStatusCell(val, config.statusLabels));
                 } else {
                     var td = document.createElement('td');
+                    td.dataset.key = f.key;
                     td.textContent = val;
                     tr.appendChild(td);
                 }
