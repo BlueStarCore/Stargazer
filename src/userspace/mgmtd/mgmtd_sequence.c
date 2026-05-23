@@ -260,3 +260,30 @@ int seq_rotate(const char *type, int old_seq, int new_seq,
 	free(entries);
 	return rotated;
 }
+
+/* ── seq_insert_at ──────────────────────────────────────────────────── */
+
+int seq_insert_at(const char *type, int target_seq, const char *exclude_id)
+{
+	struct seq_entry *entries = NULL;
+	int n = collect_seq_range(type, target_seq, 9999, exclude_id, &entries);
+
+	if (n <= 0) {
+		free(entries);
+		return 0;
+	}
+
+	/* Shift highest first to avoid intermediate collisions */
+	qsort(entries, (size_t)n, sizeof(entries[0]), seq_cmp_desc);
+
+	int shifted = 0;
+	for (int i = 0; i < n; i++) {
+		char val[16];
+		snprintf(val, sizeof(val), "%d", entries[i].seq + 1);
+		if (sg_db_set_val(type, entries[i].id, "sequence", val) == 0)
+			shifted++;
+	}
+
+	free(entries);
+	return shifted;
+}

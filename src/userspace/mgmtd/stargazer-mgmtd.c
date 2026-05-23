@@ -4639,6 +4639,43 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			seq_auto_assign(db_type, clean, sizeof(clean));
 		}
 
+		/* Auto-reorder sequences so "set sequence N" always wins.
+		 *
+		 * New entry with explicit sequence: shift all entries at
+		 * >= N up by 1 to make room (seq_auto_assign already ran
+		 * and skipped the key, so the explicit value is preserved).
+		 *
+		 * Existing entry changing sequence: rotate the affected
+		 * range so no collisions occur without inflating numbers. */
+		if (seq_type_is_orderable(db_type)) {
+			char new_seq_str[VALBUFSZ];
+			extract_val(clean, "sequence", new_seq_str,
+				    sizeof(new_seq_str));
+			if (new_seq_str[0]) {
+				int new_seq = atoi(new_seq_str);
+				if (new_seq > 0) {
+					if (is_new_entry) {
+						seq_insert_at(db_type, new_seq,
+							      db_id);
+					} else {
+						char old_seq_str[VALBUFSZ];
+						extract_val(existing,
+							    "sequence",
+							    old_seq_str,
+							    sizeof(old_seq_str));
+						int old_seq = old_seq_str[0]
+							? atoi(old_seq_str) : 0;
+						if (old_seq > 0 &&
+						    old_seq != new_seq)
+							seq_rotate(db_type,
+								   old_seq,
+								   new_seq,
+								   db_id);
+					}
+				}
+			}
+		}
+
 		/* Firewall/NAT types: persist first, then atomic rebuild.
 		 * The rebuild reads ALL entries from DB, so the new data
 		 * must be in the DB before we can generate the chain.

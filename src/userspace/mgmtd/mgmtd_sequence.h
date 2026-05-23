@@ -61,4 +61,11 @@ int seq_rotate(const char *type, int old_seq, int new_seq,
  */
 int seq_get_max(const char *type);
 
+/*
+ * Shift all non-builtin entries with sequence >= target_seq up by 1
+ * to make room for a new entry being inserted at target_seq.
+ * Skips exclude_id.  Returns number of entries shifted.
+ */
+int seq_insert_at(const char *type, int target_seq, const char *exclude_id);
+
 #endif /* MGMTD_SEQUENCE_H */
