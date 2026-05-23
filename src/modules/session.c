@@ -106,7 +106,7 @@ EXPORT_SYMBOL_GPL(sess_asymmetric_mode);
 static unsigned int pf_max_states     = MAX_SESSIONS;
 static unsigned int pf_adaptive_start;  /* resolved in init to 75% of max */
 static unsigned int pf_adaptive_end;    /* resolved in init to 90% of max */
-module_param(pf_max_states,     uint, 0444);
+module_param(pf_max_states,     uint, 0644);
 module_param(pf_adaptive_start, uint, 0644);
 module_param(pf_adaptive_end,   uint, 0644);
 MODULE_PARM_DESC(pf_max_states,     "Hard session table cap (default: MAX_SESSIONS)");
