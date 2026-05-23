@@ -110,6 +110,7 @@ struct session {
 	struct sess_stats	stats;
 	s32			ml_score;	/* fixed-point score × 1000 */
 	ktime_t			expires_at;
+	ktime_t			zero_win_since;	/* when TCP window=0 began (0=not active) */
 	spinlock_t		lock;
 	struct rcu_head		rcu;
 };
@@ -181,5 +182,14 @@ void sess_delete(struct session *s);
  * matching session exists.
  */
 struct session *sess_icmp_error_lookup(struct sk_buff *skb, int *dir_out);
+
+/* True if a TCP state is half-open (handshake not complete).
+ * Used by pkt_forward.ko to track per-source half-open counts. */
+static inline bool sess_tcp_is_halfopen(u8 state)
+{
+	return state == SESS_TCP_SYN_SENT  ||
+	       state == SESS_TCP_SYN_RECV  ||
+	       state == SESS_TCP_SYN_SENT2;
+}
 
 #endif /* _STARGAZER_SESSION_H */

@@ -150,6 +150,67 @@ static unsigned int max_halfopen = 1024;
 module_param(max_halfopen, uint, 0644);
 MODULE_PARM_DESC(max_halfopen, "Max concurrent half-open TCP sessions (default: 1024)");
 
+/*
+ * Per-source established session cap — prevents a single IP from consuming
+ * the entire session table with ESTABLISHED connections.
+ */
+static unsigned int max_est_per_src = 64;
+module_param(max_est_per_src, uint, 0644);
+MODULE_PARM_DESC(max_est_per_src,
+	"Max ESTABLISHED sessions per source IP (0=disabled, default: 64)");
+
+/*
+ * Zero-window zombie protection — accelerates teardown of sessions where
+ * TCP window stays at zero for longer than this threshold.
+ */
+static unsigned int zero_win_timeout = 60;
+module_param(zero_win_timeout, uint, 0644);
+MODULE_PARM_DESC(zero_win_timeout,
+	"Seconds TCP window=0 before accelerated session teardown (0=disabled, default: 60)");
+
+/* Per-source established session tracker (lock-free approximate, 4096 slots) */
+#define SRC_EST_SLOTS 4096U
+
+struct src_est_slot {
+	__be32  ip;
+	u32     count;   /* ESTABLISHED sessions currently active from this src */
+};
+
+static struct src_est_slot src_est_table[SRC_EST_SLOTS];
+static u32 est_hash_seed;
+
+static inline u32 src_est_idx(__be32 ip)
+{
+	return jhash_1word((__force u32)ip, est_hash_seed) % SRC_EST_SLOTS;
+}
+
+/* Increment per-src established count. Returns true if cap exceeded. */
+static bool src_est_check_and_inc(__be32 ip)
+{
+	struct src_est_slot *sl = &src_est_table[src_est_idx(ip)];
+
+	if (sl->ip != ip) {
+		sl->ip    = ip;
+		sl->count = 1;
+		return false;
+	}
+	if (max_est_per_src && sl->count >= max_est_per_src)
+		return true;
+	sl->count++;
+	return false;
+}
+
+/* Decrement per-src established count (called on session teardown). */
+static void src_est_dec(__be32 ip)
+{
+	struct src_est_slot *sl = &src_est_table[src_est_idx(ip)];
+
+	if (sl->ip == ip && sl->count > 0)
+		sl->count--;
+}
+
+static atomic64_t sess_est_src_drops = ATOMIC64_INIT(0); /* per-src est cap hits */
+
 static inline bool sess_is_halfopen(u8 state)
 {
 	return state == SESS_TCP_SYN_SENT  ||
@@ -728,6 +789,19 @@ apply:
 		s->tcp_win[dir].win     = win;
 	}
 
+	/* Per-source ESTABLISHED cap — checked before any state side-effects.
+	 * If the cap is hit we drop the completing ACK so the connection never
+	 * leaves SYN_RECV; the session will expire on its normal half-open TTL. */
+	if (new_state == SESS_TCP_ESTABLISHED &&
+	    s->tcp_state != SESS_TCP_ESTABLISHED) {
+		if (src_est_check_and_inc(s->key.src_ip)) {
+			atomic64_inc(&sess_est_src_drops);
+			spin_unlock(&s->lock);
+			atomic64_inc(&pkts_invalid);
+			return NF_DROP;
+		}
+	}
+
 	if (new_state != s->tcp_state) {
 		bool was_half = sess_is_halfopen(s->tcp_state);
 		bool now_half = sess_is_halfopen(new_state);
@@ -737,11 +811,33 @@ apply:
 		else if (was_half && !now_half)
 			atomic64_dec(&sess_halfopen);
 
+		/* Decrement per-src established count whenever we leave ESTABLISHED
+		 * (FIN, RST, or any other state transition out of ESTABLISHED). */
+		if (s->tcp_state == SESS_TCP_ESTABLISHED)
+			src_est_dec(s->key.src_ip);
+
 		WRITE_ONCE(s->tcp_state, new_state);
 	}
 
 	s->expires_at = ktime_add_ns(ktime_get(),
 		(u64)tcp_timeouts[new_state] * NSEC_PER_SEC);
+
+	/* Zero-window zombie protection: if the advertised window stays at zero
+	 * for longer than zero_win_timeout seconds, crush the session TTL to 5 s
+	 * so the reaper sweeps it quickly rather than letting it idle for 3600 s. */
+	if (zero_win_timeout && new_state == SESS_TCP_ESTABLISHED) {
+		if (win == 0) {
+			if (!s->zero_win_since)
+				s->zero_win_since = ktime_get();
+			else if (ktime_to_ns(ktime_sub(ktime_get(),
+						       s->zero_win_since)) >
+				 (s64)zero_win_timeout * NSEC_PER_SEC)
+				s->expires_at = ktime_add_ns(ktime_get(),
+							     5LL * NSEC_PER_SEC);
+		} else {
+			s->zero_win_since = 0;
+		}
+	}
 
 	spin_unlock(&s->lock);
 	return NF_ACCEPT;
@@ -805,11 +901,18 @@ static void sess_free_rcu(struct rcu_head *head)
 {
 	struct session *s = container_of(head, struct session, rcu);
 
-	/* If the reaper evicted a session that never completed its handshake,
-	 * correct the half-open counter so it doesn't leak upward over time. */
-	if (s->key.proto == IPPROTO_TCP &&
-	    sess_is_halfopen(READ_ONCE(s->tcp_state)))
-		atomic64_dec(&sess_halfopen);
+	if (s->key.proto == IPPROTO_TCP) {
+		u8 state = READ_ONCE(s->tcp_state);
+
+		/* Correct half-open counter for sessions evicted mid-handshake. */
+		if (sess_is_halfopen(state))
+			atomic64_dec(&sess_halfopen);
+
+		/* Correct per-src established count for sessions reaped by GC
+		 * while still ESTABLISHED (no FIN/RST was ever seen). */
+		if (state == SESS_TCP_ESTABLISHED)
+			src_est_dec(s->key.src_ip);
+	}
 
 	kfree(s);
 }
@@ -1357,6 +1460,8 @@ static int sess_seq_show(struct seq_file *seq, void *v)
 			"# Stargazer sessions  active=%lld created=%lld"
 			" expired=%lld invalid=%lld pf_drops=%lld\n"
 			"# halfopen=%lld rejected_halfopen=%lld max_halfopen=%u\n"
+			"# est_src_drops=%lld max_est_per_src=%u"
+			" zero_win_timeout=%u\n"
 			"# pf_max=%u adaptive_start=%u adaptive_end=%u"
 			" gc_aggressive=%d\n",
 			atomic64_read(&sess_active),
@@ -1367,6 +1472,8 @@ static int sess_seq_show(struct seq_file *seq, void *v)
 			atomic64_read(&sess_halfopen),
 			atomic64_read(&sess_rejected_halfopen),
 			max_halfopen,
+			atomic64_read(&sess_est_src_drops),
+			max_est_per_src, zero_win_timeout,
 			pf_max_states, pf_adaptive_start, pf_adaptive_end,
 			READ_ONCE(gc_aggressive));
 		seq_puts(seq,
@@ -1428,6 +1535,7 @@ static int __init session_init(void)
 {
 	hash_init(sess_table);
 	get_random_bytes(&sess_hash_rnd, sizeof(sess_hash_rnd));
+	get_random_bytes(&est_hash_seed, sizeof(est_hash_seed));
 
 	/* Clamp and resolve PF adaptive thresholds.
 	 * pf_max_states must not exceed the compile-time hash table capacity.

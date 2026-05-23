@@ -155,7 +155,18 @@ static const struct field_entry field_table[] = {
 	{ "system_dos-policy", "udp-flood-burst",      "uint:1:65535",               1, "2000",  "UDP flood token bucket burst size"      },
 	{ "system_dos-policy", "icmp-flood-threshold", "uint:1:65535",               1, "100",   "ICMP flood rate limit (packets/second)" },
 	{ "system_dos-policy", "icmp-flood-burst",     "uint:1:65535",               1, "200",   "ICMP flood token bucket burst size"     },
-	{ "system_dos-policy", "block-duration",       "uint:1:3600",                1, "30",    "Source block duration (seconds)"        },
+	{ "system_dos-policy", "block-duration",        "uint:1:3600",         1, "30",    "Source block duration (seconds)"                              },
+	{ "system_dos-policy", "halfopen-per-src",      "uint:0:1024",         1, "10",    "Max half-open TCP sessions per source in 120s window (0=disabled)" },
+	{ "system_dos-policy", "global-syn-threshold",  "uint:0:100000",       1, "5000",  "Global SYN rate cap, SYNs/s (0=disabled)"                         },
+	{ "system_dos-policy", "global-syn-burst",      "uint:1:200000",       1, "10000", "Global SYN burst bucket capacity"                                  },
+	{ "system_dos-policy", "anti-spoofing",         "enum:enable,disable", 1, "enable","Drop spoofed packets with no reverse route (rpfilter)"             },
+	{ "system_dos-policy", "per-src-session-limit", "uint:0:1000",         1, "64",    "Max established sessions per source IP (0=disabled)"               },
+	{ "system_dos-policy", "adaptive-timeout",      "enum:enable,disable", 1, "enable","Shrink idle TTLs under high session table load"                    },
+	{ "system_dos-policy", "zero-window-timeout",   "uint:0:300",          1, "60",    "Seconds TCP window=0 before accelerated teardown (0=disabled)"     },
+	{ "system_dos-policy", "pkt-rate-threshold",    "uint:0:1000000",      1, "10000", "Per-source aggregate packet rate cap, pkts/s (0=disabled)"         },
+	{ "system_dos-policy", "pkt-rate-burst",        "uint:1:2000000",      1, "20000", "Per-source aggregate packet rate burst"                            },
+	{ "system_dos-policy", "icmp-err-threshold",    "uint:0:10000",        1, "50",    "ICMP error message rate limit per source, msgs/s (0=disabled)"     },
+	{ "system_dos-policy", "icmp-err-burst",        "uint:1:20000",        1, "100",   "ICMP error rate burst capacity"                                    },
 
 	{ NULL, NULL, NULL, 0, NULL, NULL }
 };

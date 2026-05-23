@@ -121,7 +121,7 @@ X("execute diagnose nat policy",           "Show kernel NAT table rules",       
 
 X("execute diagnose routes",               "Show routing table",                       "admin",           0,  cmd_diag_routes)
 
-X("execute diagnose session",              "Session table diagnostics",               "monitor",         0,  cmd_diag_session)
+X("execute diagnose session",              "Session table diagnostics",               "monitor",         1,  cmd_diag_session)
 X("execute diagnose session status",       "Show live session table",                 "monitor",         0,  NULL)
 X("execute diagnose session stats",        "Show session counters and module status", "monitor",         0,  NULL)
 X("execute diagnose session clear",        "Flush all active sessions",               "admin",           0,  NULL)

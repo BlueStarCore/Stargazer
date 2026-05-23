@@ -475,24 +475,58 @@ sg_status_t apply_interface(const char *id, const char *data,
 	return SG_OK;
 }
 
+/* Write a single value to a sysfs module parameter file. Returns 0 on success. */
+static int write_sysfs_param(const char *module, const char *param,
+			     const char *val)
+{
+	char path[160];
+	snprintf(path, sizeof(path),
+		 "/sys/module/%s/parameters/%s", module, param);
+	FILE *fp = fopen(path, "w");
+	if (!fp)
+		return -1;
+	fprintf(fp, "%s\n", val);
+	fclose(fp);
+	return 0;
+}
+
 sg_status_t apply_dos_policy(const char *id, const char *data,
 			     char *result, size_t rsize)
 {
 	char iface[VALBUFSZ], status[VALBUFSZ];
-	char syn_thr[VALBUFSZ], syn_burst[VALBUFSZ];
-	char udp_thr[VALBUFSZ], udp_burst[VALBUFSZ];
+	char syn_thr[VALBUFSZ],  syn_burst[VALBUFSZ];
+	char udp_thr[VALBUFSZ],  udp_burst[VALBUFSZ];
 	char icmp_thr[VALBUFSZ], icmp_burst[VALBUFSZ];
 	char block_dur[VALBUFSZ];
+	char halfopen_src[VALBUFSZ];
+	char gsyn_thr[VALBUFSZ],  gsyn_burst[VALBUFSZ];
+	char anti_spoof[VALBUFSZ];
+	char per_src_limit[VALBUFSZ];
+	char adaptive_to[VALBUFSZ];
+	char zero_win[VALBUFSZ];
+	char pkt_thr[VALBUFSZ],  pkt_burst[VALBUFSZ];
+	char icmp_err_thr[VALBUFSZ], icmp_err_burst[VALBUFSZ];
 
-	extract_val(data, "interface",            iface,      sizeof(iface));
-	extract_val(data, "status",               status,     sizeof(status));
-	extract_val(data, "syn-flood-threshold",  syn_thr,    sizeof(syn_thr));
-	extract_val(data, "syn-flood-burst",      syn_burst,  sizeof(syn_burst));
-	extract_val(data, "udp-flood-threshold",  udp_thr,    sizeof(udp_thr));
-	extract_val(data, "udp-flood-burst",      udp_burst,  sizeof(udp_burst));
-	extract_val(data, "icmp-flood-threshold", icmp_thr,   sizeof(icmp_thr));
-	extract_val(data, "icmp-flood-burst",     icmp_burst, sizeof(icmp_burst));
-	extract_val(data, "block-duration",       block_dur,  sizeof(block_dur));
+	extract_val(data, "interface",             iface,          sizeof(iface));
+	extract_val(data, "status",                status,         sizeof(status));
+	extract_val(data, "syn-flood-threshold",   syn_thr,        sizeof(syn_thr));
+	extract_val(data, "syn-flood-burst",       syn_burst,      sizeof(syn_burst));
+	extract_val(data, "udp-flood-threshold",   udp_thr,        sizeof(udp_thr));
+	extract_val(data, "udp-flood-burst",       udp_burst,      sizeof(udp_burst));
+	extract_val(data, "icmp-flood-threshold",  icmp_thr,       sizeof(icmp_thr));
+	extract_val(data, "icmp-flood-burst",      icmp_burst,     sizeof(icmp_burst));
+	extract_val(data, "block-duration",        block_dur,      sizeof(block_dur));
+	extract_val(data, "halfopen-per-src",      halfopen_src,   sizeof(halfopen_src));
+	extract_val(data, "global-syn-threshold",  gsyn_thr,       sizeof(gsyn_thr));
+	extract_val(data, "global-syn-burst",      gsyn_burst,     sizeof(gsyn_burst));
+	extract_val(data, "anti-spoofing",         anti_spoof,     sizeof(anti_spoof));
+	extract_val(data, "per-src-session-limit", per_src_limit,  sizeof(per_src_limit));
+	extract_val(data, "adaptive-timeout",      adaptive_to,    sizeof(adaptive_to));
+	extract_val(data, "zero-window-timeout",   zero_win,       sizeof(zero_win));
+	extract_val(data, "pkt-rate-threshold",    pkt_thr,        sizeof(pkt_thr));
+	extract_val(data, "pkt-rate-burst",        pkt_burst,      sizeof(pkt_burst));
+	extract_val(data, "icmp-err-threshold",    icmp_err_thr,   sizeof(icmp_err_thr));
+	extract_val(data, "icmp-err-burst",        icmp_err_burst, sizeof(icmp_err_burst));
 
 	if (!iface[0]) {
 		snprintf(result, rsize, "'interface' not set.");
@@ -503,10 +537,16 @@ sg_status_t apply_dos_policy(const char *id, const char *data,
 		return SG_ERR_INVALID_VAL;
 	}
 
+	/* Remove any existing rpfilter rule for this interface before re-applying */
+	const char *rpf_del[] = {
+		"iptables", "-t", "raw", "-D", "PREROUTING",
+		"-i", iface, "-m", "rpfilter", "--invert", "-j", "DROP", NULL
+	};
+	free(safe_exec(rpf_del));  /* ignore error — rule may not exist */
+
 	/* Disabled: write 0 to wan_ifindex to stop WAN-side enforcement */
 	if (strcmp(status, "disable") == 0) {
-		FILE *fp = fopen("/sys/module/pkt_forward/parameters/wan_ifindex", "w");
-		if (fp) { fprintf(fp, "0\n"); fclose(fp); }
+		write_sysfs_param("pkt_forward", "wan_ifindex", "0");
 		snprintf(result, rsize, "DoS policy '%s' disabled.", id);
 		return SG_OK;
 	}
@@ -526,31 +566,57 @@ sg_status_t apply_dos_policy(const char *id, const char *data,
 		ifindex_str[strcspn(ifindex_str, "\n")] = '\0';
 	fclose(ifp);
 
-	/* Write module params via sysfs; graceful if pkt_forward not loaded */
-	struct { const char *param; const char *val; } params[] = {
-		{ "wan_ifindex",     ifindex_str                      },
-		{ "syn_flood_thr",   syn_thr[0]   ? syn_thr   : "200"  },
-		{ "syn_flood_burst", syn_burst[0] ? syn_burst  : "400"  },
-		{ "udp_flood_thr",   udp_thr[0]   ? udp_thr   : "1000" },
-		{ "udp_flood_burst", udp_burst[0] ? udp_burst  : "2000" },
-		{ "icmp_flood_thr",  icmp_thr[0]  ? icmp_thr  : "100"  },
-		{ "icmp_flood_burst",icmp_burst[0]? icmp_burst : "200"  },
-		{ "src_block_dur",   block_dur[0] ? block_dur  : "30"   },
+	/* Write pkt_forward.ko module params via sysfs */
+	struct { const char *param; const char *val; } pf_params[] = {
+		{ "wan_ifindex",          ifindex_str                              },
+		{ "syn_flood_thr",        syn_thr[0]       ? syn_thr       : "200"   },
+		{ "syn_flood_burst",      syn_burst[0]     ? syn_burst     : "400"   },
+		{ "udp_flood_thr",        udp_thr[0]       ? udp_thr       : "1000"  },
+		{ "udp_flood_burst",      udp_burst[0]     ? udp_burst     : "2000"  },
+		{ "icmp_flood_thr",       icmp_thr[0]      ? icmp_thr      : "100"   },
+		{ "icmp_flood_burst",     icmp_burst[0]    ? icmp_burst    : "200"   },
+		{ "src_block_dur",        block_dur[0]     ? block_dur     : "30"    },
+		{ "max_halfopen_per_src", halfopen_src[0]  ? halfopen_src  : "10"    },
+		{ "global_syn_thr",       gsyn_thr[0]      ? gsyn_thr      : "5000"  },
+		{ "global_syn_burst",     gsyn_burst[0]    ? gsyn_burst    : "10000" },
+		{ "pkt_flood_thr",        pkt_thr[0]       ? pkt_thr       : "10000" },
+		{ "pkt_flood_burst",      pkt_burst[0]     ? pkt_burst     : "20000" },
+		{ "icmp_err_thr",         icmp_err_thr[0]  ? icmp_err_thr  : "50"    },
+		{ "icmp_err_burst",       icmp_err_burst[0]? icmp_err_burst: "100"   },
 		{ NULL, NULL }
 	};
 
 	int written = 0, total = 0;
-	for (int i = 0; params[i].param; i++) {
+	for (int i = 0; pf_params[i].param; i++) {
 		total++;
-		char path[128];
-		snprintf(path, sizeof(path),
-			 "/sys/module/pkt_forward/parameters/%s", params[i].param);
-		FILE *fp = fopen(path, "w");
-		if (!fp)
-			continue;
-		fprintf(fp, "%s\n", params[i].val);
-		fclose(fp);
-		written++;
+		if (write_sysfs_param("pkt_forward", pf_params[i].param,
+				      pf_params[i].val) == 0)
+			written++;
+	}
+
+	/* Write session.ko module params via sysfs */
+	if (per_src_limit[0])
+		write_sysfs_param("session", "max_est_per_src", per_src_limit);
+	if (zero_win[0])
+		write_sysfs_param("session", "zero_win_timeout", zero_win);
+
+	/* Adaptive timeout: disable by setting pf_adaptive_start high enough
+	 * that the scaling range is never entered (active <= 65535 = always). */
+	if (strcmp(adaptive_to, "disable") == 0)
+		write_sysfs_param("session", "pf_adaptive_start", "65535");
+	else if (strcmp(adaptive_to, "enable") == 0)
+		write_sysfs_param("session", "pf_adaptive_start", "49152"); /* 75% of 65536 */
+
+	/* Anti-spoofing: rpfilter drops packets whose source IP has no reverse
+	 * route via the ingress interface (RFC 3704 / BCP38 uRPF lite). */
+	if (strcmp(anti_spoof, "enable") == 0) {
+		const char *rpf_add[] = {
+			"iptables", "-t", "raw", "-A", "PREROUTING",
+			"-i", iface, "-m", "rpfilter", "--invert", "-j", "DROP", NULL
+		};
+		if (ipt_exec(rpf_add) != 0)
+			mgmt_log("ERROR",
+				 "apply_dos_policy: rpfilter rule failed for %s", iface);
 	}
 
 	if (written == 0) {
