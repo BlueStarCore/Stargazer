@@ -313,8 +313,10 @@ if [ -x /sbin/stargazer-mgmtd ]; then
 	echo "[stargazer] Starting management daemon..."
 	_ready=/run/mgmtd-ready
 	mkfifo "$_ready" 2>/dev/null
+	_mgmtd_log=/tmp/mgmtd.log
+	[ -d /etc/stargazer/logs ] && _mgmtd_log=/etc/stargazer/logs/mgmtd.log
 	(while true; do
-		/sbin/stargazer-mgmtd
+		/sbin/stargazer-mgmtd >>"$_mgmtd_log" 2>&1
 		[ -f /tmp/stargazer-shutdown ] && break
 		sleep 2
 	done) &
