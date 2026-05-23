@@ -42,6 +42,7 @@ static atomic64_t pkts_icmp_dropped         = ATOMIC64_INIT(0); /* per-src ICMP 
 static atomic64_t pkts_anomaly_dropped      = ATOMIC64_INIT(0); /* L3/L4 anomaly          */
 static atomic64_t pkts_halfopen_src_dropped = ATOMIC64_INIT(0); /* per-src half-open cap  */
 static atomic64_t pkts_global_syn_dropped   = ATOMIC64_INIT(0); /* global SYN cap         */
+static atomic64_t pkts_global_udp_dropped   = ATOMIC64_INIT(0); /* global UDP cap         */
 static atomic64_t pkts_pkt_rate_dropped     = ATOMIC64_INIT(0); /* per-src aggregate rate */
 static atomic64_t pkts_icmp_err_dropped     = ATOMIC64_INIT(0); /* ICMP error rate        */
 static atomic64_t pkts_scan_dropped         = ATOMIC64_INIT(0); /* port scan              */
@@ -109,6 +110,13 @@ static struct {
 } global_syn_bucket;
 static DEFINE_SPINLOCK(global_syn_lock);
 
+/* Global UDP token bucket — caps total UDP new-session rate across all sources */
+static struct {
+	s32           tokens;
+	unsigned long last_ts;
+} global_udp_bucket;
+static DEFINE_SPINLOCK(global_udp_lock);
+
 static u32 dos_hash_seed;
 
 /* --- Module params -------------------------------------------------------- */
@@ -163,6 +171,15 @@ MODULE_PARM_DESC(global_syn_thr,
 	"Global SYN new-session rate cap, SYNs/s (0=disabled, default: 5000)");
 MODULE_PARM_DESC(global_syn_burst,
 	"Global SYN burst capacity (default: 10000)");
+
+static unsigned int global_udp_thr   = 5000;
+static unsigned int global_udp_burst = 10000;
+module_param(global_udp_thr,   uint, 0644);
+module_param(global_udp_burst, uint, 0644);
+MODULE_PARM_DESC(global_udp_thr,
+	"Global UDP new-session rate cap, sessions/s (0=disabled, default: 5000)");
+MODULE_PARM_DESC(global_udp_burst,
+	"Global UDP burst capacity (default: 10000)");
 
 static unsigned int pkt_flood_thr   = 10000;
 static unsigned int pkt_flood_burst = 20000;
@@ -495,6 +512,50 @@ static bool global_syn_check(void)
 }
 
 /*
+ * global_udp_check - Single shared token bucket for all WAN UDP new sessions.
+ *
+ * Per-source UDP rate limits stop single-source floods but cannot stop a
+ * distributed flood where each source stays under its individual threshold.
+ * This cap bounds the total rate of new UDP session creation regardless of
+ * how many source IPs are involved.
+ * Returns true (drop) when the global bucket is empty.
+ * Does NOT block individual sources — the source is not necessarily at fault.
+ */
+static bool global_udp_check(void)
+{
+	unsigned long now  = jiffies;
+	unsigned long elapsed;
+	s32           refill;
+	bool          drop;
+
+	spin_lock(&global_udp_lock);
+
+	elapsed = now - global_udp_bucket.last_ts;
+	if (elapsed) {
+		refill = (s32)min_t(u64,
+				    (u64)elapsed * global_udp_thr / HZ,
+				    (u64)global_udp_burst);
+		global_udp_bucket.tokens = min(
+			global_udp_bucket.tokens + refill,
+			(s32)global_udp_burst);
+		global_udp_bucket.last_ts = now;
+	}
+
+	if (global_udp_bucket.tokens > 0) {
+		global_udp_bucket.tokens--;
+		drop = false;
+	} else {
+		drop = true;
+	}
+
+	spin_unlock(&global_udp_lock);
+
+	if (drop)
+		atomic64_inc(&pkts_global_udp_dropped);
+	return drop;
+}
+
+/*
  * src_scan_check - Port scan detection via 32-bit bloom filter.
  *
  * Each unique (dst_port, dst_ip) pair from a source hashes to one bit of a
@@ -716,6 +777,12 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 				atomic64_inc(&pkts_dropped);
 				return NF_DROP;
 			}
+			if (is_wan && key.proto == IPPROTO_UDP &&
+			    global_udp_thr && global_udp_check()) {
+				rcu_read_unlock();
+				atomic64_inc(&pkts_dropped);
+				return NF_DROP;
+			}
 			s = sess_lookup_or_create(&key, &dir);
 		}
 	}
@@ -781,6 +848,7 @@ static int pf_stats_show(struct seq_file *m, void *v)
 		"pkts_anomaly_dropped=%lld\n"
 		"pkts_halfopen_src_dropped=%lld\n"
 		"pkts_global_syn_dropped=%lld\n"
+		"pkts_global_udp_dropped=%lld\n"
 		"pkts_pkt_rate_dropped=%lld\n"
 		"pkts_icmp_err_dropped=%lld\n"
 		"pkts_scan_dropped=%lld\n"
@@ -794,6 +862,7 @@ static int pf_stats_show(struct seq_file *m, void *v)
 		atomic64_read(&pkts_anomaly_dropped),
 		atomic64_read(&pkts_halfopen_src_dropped),
 		atomic64_read(&pkts_global_syn_dropped),
+		atomic64_read(&pkts_global_udp_dropped),
 		atomic64_read(&pkts_pkt_rate_dropped),
 		atomic64_read(&pkts_icmp_err_dropped),
 		atomic64_read(&pkts_scan_dropped),
@@ -831,6 +900,9 @@ static int __init pkt_forward_init(void)
 
 	global_syn_bucket.tokens  = (s32)global_syn_burst;
 	global_syn_bucket.last_ts = jiffies;
+
+	global_udp_bucket.tokens  = (s32)global_udp_burst;
+	global_udp_bucket.last_ts = jiffies;
 
 	ret = nf_defrag_ipv4_enable(&init_net);
 	if (ret < 0) {

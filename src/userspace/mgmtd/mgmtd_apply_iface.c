@@ -500,6 +500,7 @@ sg_status_t apply_dos_policy(const char *id, const char *data,
 	char block_dur[VALBUFSZ];
 	char halfopen_src[VALBUFSZ];
 	char gsyn_thr[VALBUFSZ],  gsyn_burst[VALBUFSZ];
+	char gudp_thr[VALBUFSZ],  gudp_burst[VALBUFSZ];
 	char anti_spoof[VALBUFSZ];
 	char per_src_limit[VALBUFSZ];
 	char adaptive_to[VALBUFSZ];
@@ -520,6 +521,8 @@ sg_status_t apply_dos_policy(const char *id, const char *data,
 	extract_val(data, "halfopen-per-src",      halfopen_src,   sizeof(halfopen_src));
 	extract_val(data, "global-syn-threshold",  gsyn_thr,       sizeof(gsyn_thr));
 	extract_val(data, "global-syn-burst",      gsyn_burst,     sizeof(gsyn_burst));
+	extract_val(data, "global-udp-threshold",  gudp_thr,       sizeof(gudp_thr));
+	extract_val(data, "global-udp-burst",      gudp_burst,     sizeof(gudp_burst));
 	extract_val(data, "anti-spoofing",         anti_spoof,     sizeof(anti_spoof));
 	extract_val(data, "per-src-session-limit", per_src_limit,  sizeof(per_src_limit));
 	extract_val(data, "adaptive-timeout",      adaptive_to,    sizeof(adaptive_to));
@@ -586,6 +589,8 @@ sg_status_t apply_dos_policy(const char *id, const char *data,
 		{ "max_halfopen_per_src", halfopen_src[0]  ? halfopen_src  : "10"    },
 		{ "global_syn_thr",       gsyn_thr[0]      ? gsyn_thr      : "5000"  },
 		{ "global_syn_burst",     gsyn_burst[0]    ? gsyn_burst    : "10000" },
+		{ "global_udp_thr",       gudp_thr[0]      ? gudp_thr      : "5000"  },
+		{ "global_udp_burst",     gudp_burst[0]    ? gudp_burst    : "10000" },
 		{ "pkt_flood_thr",        pkt_thr[0]       ? pkt_thr       : "10000" },
 		{ "pkt_flood_burst",      pkt_burst[0]     ? pkt_burst     : "20000" },
 		{ "icmp_err_thr",         icmp_err_thr[0]  ? icmp_err_thr  : "50"    },

@@ -175,6 +175,8 @@ static const struct field_entry field_table[] = {
 	{ "system_dos-policy", "halfopen-per-src",      "uint:0:1024",         1, "10",    "Max half-open TCP sessions per source in 120s window (0=disabled)" },
 	{ "system_dos-policy", "global-syn-threshold",  "uint:0:100000",       1, "5000",  "Global SYN rate cap, SYNs/s (0=disabled)"                         },
 	{ "system_dos-policy", "global-syn-burst",      "uint:1:200000",       1, "10000", "Global SYN burst bucket capacity"                                  },
+	{ "system_dos-policy", "global-udp-threshold",  "uint:0:100000",       1, "5000",  "Global UDP new-session rate cap, sessions/s (0=disabled)"          },
+	{ "system_dos-policy", "global-udp-burst",      "uint:1:200000",       1, "10000", "Global UDP burst bucket capacity"                                  },
 	{ "system_dos-policy", "anti-spoofing",         "enum:enable,disable", 1, "enable","Drop spoofed packets with no reverse route (rpfilter)"             },
 	{ "system_dos-policy", "per-src-session-limit", "uint:0:1000",         1, "64",    "Max established sessions per source IP (0=disabled)"               },
 	{ "system_dos-policy", "adaptive-timeout",      "enum:enable,disable", 1, "enable","Shrink idle TTLs under high session table load"                    },
