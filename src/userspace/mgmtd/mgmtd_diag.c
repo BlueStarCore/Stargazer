@@ -1630,6 +1630,73 @@ int handle_session_clear(int client_fd, const char *user,
 	return 0;
 }
 
+/* ── SG_CMD_SESSION_GC_INTERVAL (657) ──────────────────────────────────── */
+
+int handle_session_gc_interval(int client_fd, const char *user,
+				const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)hdr;
+
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "admin")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "admin permission required");
+		return 0;
+	}
+
+	/* Read current value first */
+	char cur_buf[32];
+	ssize_t n = read_small_file(
+		"/sys/module/session/parameters/gc_sweep_interval",
+		cur_buf, sizeof(cur_buf));
+	long cur_val = (n > 0) ? strtol(cur_buf, NULL, 10) : -1;
+
+	/* GET: no payload or empty payload */
+	if (!payload || !payload[0]) {
+		char resp[64];
+		if (cur_val < 0) {
+			send_error(client_fd, SG_ERR_NOT_FOUND,
+				   "session module not loaded");
+			return 0;
+		}
+		snprintf(resp, sizeof(resp), "gc_sweep_interval=%ld\n", cur_val);
+		send_ok(client_fd, NULL, resp);
+		return 0;
+	}
+
+	/* SET: payload is the new interval in seconds */
+	char *end;
+	long val = strtol(payload, &end, 10);
+	if (*end != '\0' || val < 5 || val > 3600) {
+		send_error(client_fd, SG_ERR_INVALID_VAL,
+			   "gc_sweep_interval must be 5..3600 seconds");
+		return 0;
+	}
+
+	int fd = open("/sys/module/session/parameters/gc_sweep_interval",
+		      O_WRONLY);
+	if (fd < 0) {
+		send_error(client_fd, SG_ERR_NOT_FOUND,
+			   "session module not loaded");
+		return 0;
+	}
+
+	char wbuf[32];
+	int wlen = snprintf(wbuf, sizeof(wbuf), "%ld\n", val);
+	ssize_t w = write(fd, wbuf, (size_t)wlen);
+	close(fd);
+	if (w < 0) {
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL,
+			   "failed to write gc_sweep_interval");
+		return 0;
+	}
+
+	char resp[64];
+	snprintf(resp, sizeof(resp), "gc_sweep_interval=%ld\n", val);
+	send_ok(client_fd, NULL, resp);
+	return 0;
+}
+
 /* ── SG_CMD_SHOW_BOOT_CONFIG (651) ─────────────────────────────────────── */
 
 int handle_show_boot_config(int client_fd, const char *user,

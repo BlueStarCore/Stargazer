@@ -873,7 +873,51 @@ static int cmd_diag_session(const char *args, const char *permissions)
 	}
 
 	printf("  Unknown subcommand: %s\n", sub);
-	printf("  Usage: execute diagnose session [status|stats|clear]\n");
+	printf("  Usage: execute diagnose session [status|stats|clear|gc-interval]\n");
+	return 0;
+}
+
+static int cmd_diag_session_gc_interval(const char *args, const char *permissions)
+{
+	(void)permissions;
+
+	struct ipc_response resp = {0};
+	const char *val_str = args;
+	int rc;
+
+	while (val_str && *val_str == ' ')
+		val_str++;
+
+	if (!val_str || !*val_str) {
+		/* GET: show current value */
+		rc = ipc_send_str(SG_CMD_SESSION_GC_INTERVAL, "", &resp);
+		if (rc != 0 || resp.status != SG_OK) {
+			print_ipc_error("Error", &resp);
+			ipc_resp_free(&resp);
+			return 0;
+		}
+		const char *p = resp.payload ? resp.payload : "";
+		long val = 0;
+		const char *kv = strstr(p, "gc_sweep_interval=");
+		if (kv) val = strtol(kv + 18, NULL, 10);
+		printf("  GC sweep interval : %ld seconds\n", val);
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	/* SET: send new interval */
+	rc = ipc_send_str(SG_CMD_SESSION_GC_INTERVAL, val_str, &resp);
+	if (rc != 0 || resp.status != SG_OK) {
+		print_ipc_error("Error", &resp);
+		ipc_resp_free(&resp);
+		return 0;
+	}
+	const char *p = resp.payload ? resp.payload : "";
+	long val = 0;
+	const char *kv = strstr(p, "gc_sweep_interval=");
+	if (kv) val = strtol(kv + 18, NULL, 10);
+	printf("  GC sweep interval set to %ld seconds.\n", val);
+	ipc_resp_free(&resp);
 	return 0;
 }
 

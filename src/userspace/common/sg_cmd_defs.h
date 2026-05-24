@@ -125,6 +125,7 @@ X("execute diagnose session",              "Session table diagnostics",         
 X("execute diagnose session status",       "Show live session table",                 "monitor",         0,  NULL)
 X("execute diagnose session stats",        "Show session counters and module status", "monitor",         0,  NULL)
 X("execute diagnose session clear",        "Flush all active sessions",               "admin",           0,  NULL)
+X("execute diagnose session gc-interval",  "Set GC sweep interval (5-3600 seconds)",  "admin",           1,  cmd_diag_session_gc_interval)
 
 X("execute diagnose dhcp",                 "DHCP diagnostics",                        "monitor",         0,  NULL)
 X("execute diagnose dhcp client",          "Show DHCP client status (all interfaces)", "monitor",        1,  cmd_diag_dhcp_client)

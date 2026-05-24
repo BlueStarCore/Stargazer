@@ -91,7 +91,7 @@ struct sess_stats {
 /*
  * Session entry.
  *
- * Lifetime: allocated under spin_lock(table_lock), freed via call_rcu().
+ * Lifetime: allocated under the per-bucket spinlock, freed via call_rcu().
  * Pointers handed back to callers are valid ONLY inside an RCU read-side
  * critical section. Dereferencing after rcu_read_unlock() is undefined.
  */

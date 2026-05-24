@@ -39,40 +39,49 @@
 #endif
 
 /* Hash table sizing */
-#define SESSION_TABLE_BITS	10		/* 2^10 = 1024 buckets */
+#define SESSION_TABLE_BITS	16		/* 2^16 = 65536 buckets */
+#define SESSION_TABLE_SIZE	(1 << SESSION_TABLE_BITS)
 #define MAX_SESSIONS		65536
 
 /*
- * GC scan parameters.
+ * GC sweep design — FreeBSD pf style, continuous 10 Hz cursor.
  *
- * SCAN_NORMAL covers the full 1024-bucket table in ~16 ticks (16 s).
- * SCAN_AGGRESSIVE covers it in ~4 ticks when above pf_adaptive_start.
- * LRU_EVICT_MAX caps the LRU-head sweep per tick to bound lock hold time.
- * EMERGENCY_SCAN_MAX caps the inline eviction scan in the packet create path
- * to prevent NIC-driver stalls under DDoS (bounded worst-case latency).
+ * At 10 Hz with gc_sweep_interval seconds per full sweep:
+ *   buckets_per_run = SESSION_TABLE_SIZE / (gc_sweep_interval × 10)
+ *
+ * Default 16 s normal → 65536/160 = 409 buckets/run.
+ * Aggressive (4×)     → 1638 buckets/run → full table in 4 s.
+ *
+ * The reaper runs continuously — there is no sleep between sweeps.
+ * When the cursor wraps to 0 it immediately starts the next sweep.
+ * This matches FreeBSD pf's pf_purge_thread which runs at hz/10 with
+ * a cursor (V_pf_purge_idx) that wraps around the hash table.
+ *
+ * Per-bucket spinlocks: only the one bucket currently being scanned is
+ * locked, so the data-plane lookup path is never stalled by GC except
+ * for the ~75 ns it takes to scan a single bucket.
+ *
+ * EMERGENCY_SCAN_MAX caps the inline emergency eviction scan started from
+ * the packet create path to prevent NIC-driver stalls under DDoS.
  */
-#define GC_SCAN_NORMAL        64   /* buckets/tick at normal pressure          */
-#define GC_SCAN_AGGRESSIVE   256   /* buckets/tick above pf_adaptive_start     */
-#define GC_LRU_EVICT_MAX      32   /* max LRU-head evictions per GC tick       */
 #define PF_EMERGENCY_SCAN_MAX 64   /* max LRU entries in inline emergency path */
 
-/* All session idle timeouts — configurable at runtime via sysfs */
-
-/* Hash table and its writer-side lock */
+/* Hash table — one spinlock per bucket, never a global table lock */
 static DEFINE_HASHTABLE(sess_table, SESSION_TABLE_BITS);
-static DEFINE_SPINLOCK(table_lock);
+static spinlock_t bucket_locks[SESSION_TABLE_SIZE];
 
 /*
  * LRU list: head = oldest session, tail = most-recently-used.
  *
- * lru_lock is intentionally separate from table_lock.  sess_update()
- * fires on every forwarded packet and moves the session to the LRU tail;
- * if it shared table_lock it would serialize against the GC's bucket
- * scan on every packet.  With a dedicated lru_lock, the packet path and
- * the GC path never block each other.
+ * lru_lock is separate from bucket_locks: sess_update() fires on every
+ * forwarded packet and moves the session to the LRU tail; sharing a
+ * bucket lock would serialize the hot packet path against GC.
  *
- * Lock ordering rule: always acquire table_lock before lru_lock.
- * When only lru_lock is needed (sess_update), take it alone.
+ * Lock ordering (strict, never violated):
+ *   bucket_locks[b]  →  lru_lock  →  session->lock
+ * When two bucket locks are held simultaneously (create path), always
+ * acquire the lower-indexed bucket first to prevent AB/BA deadlock.
+ * lru_lock alone (sess_update hot path) is taken without bucket_locks.
  */
 static DEFINE_SPINLOCK(lru_lock);
 static LIST_HEAD(sess_lru);
@@ -112,6 +121,17 @@ module_param(pf_adaptive_end,   uint, 0644);
 MODULE_PARM_DESC(pf_max_states,     "Hard session table cap (default: MAX_SESSIONS)");
 MODULE_PARM_DESC(pf_adaptive_start, "Begin TTL scaling above this count (default: 75% of max)");
 MODULE_PARM_DESC(pf_adaptive_end,   "TTL crushed to 0 at this count (default: 90% of max)");
+
+/*
+ * GC sweep interval — how many seconds to complete one full table scan.
+ * At 10 Hz: buckets_per_run = SESSION_TABLE_SIZE / (gc_sweep_interval * 10)
+ * Aggressive mode sweeps 4× faster.  Range: 5..3600 seconds.
+ * Can be changed at runtime: echo 8 > /sys/module/session/parameters/gc_sweep_interval
+ */
+static unsigned int gc_sweep_interval = 16;
+module_param(gc_sweep_interval, uint, 0644);
+MODULE_PARM_DESC(gc_sweep_interval,
+	"Seconds for GC to sweep full table (default: 16, range: 5-3600)");
 
 /* Counters */
 static atomic_t   next_id              = ATOMIC_INIT(1);
@@ -291,6 +311,47 @@ static inline void sess_reverse_key(struct sess_key *r,
 	r->proto    = k->proto;
 }
 
+/* Map a raw jhash value to the bucket index used by DEFINE_HASHTABLE. */
+static inline u32 sess_bucket_idx(u32 hash)
+{
+	return hash_min(hash, SESSION_TABLE_BITS);
+}
+
+/*
+ * lock_two_buckets / unlock_two_buckets — acquire/release two bucket locks
+ * in ascending index order to prevent AB/BA deadlock.
+ *
+ * The lower-indexed bucket is always locked with spin_lock_bh() (which
+ * disables BH on the local CPU).  The higher-indexed bucket uses plain
+ * spin_lock() because BH is already off.  When b1 == b2, only one lock
+ * is taken.  Unlock is the mirror image.
+ */
+static inline void lock_two_buckets(u32 b1, u32 b2)
+{
+	if (b1 == b2) {
+		spin_lock_bh(&bucket_locks[b1]);
+	} else if (b1 < b2) {
+		spin_lock_bh(&bucket_locks[b1]);
+		spin_lock(&bucket_locks[b2]);
+	} else {
+		spin_lock_bh(&bucket_locks[b2]);
+		spin_lock(&bucket_locks[b1]);
+	}
+}
+
+static inline void unlock_two_buckets(u32 b1, u32 b2)
+{
+	if (b1 == b2) {
+		spin_unlock_bh(&bucket_locks[b1]);
+	} else if (b1 < b2) {
+		spin_unlock(&bucket_locks[b2]);
+		spin_unlock_bh(&bucket_locks[b1]);
+	} else {
+		spin_unlock(&bucket_locks[b1]);
+		spin_unlock_bh(&bucket_locks[b2]);
+	}
+}
+
 static inline u32 tcp_state_timeout(u8 state)
 {
 	switch (state) {
@@ -383,14 +444,16 @@ struct session *sess_lookup(const struct sess_key *key)
 		 * piling up in hot buckets and degrading lookup from O(1)
 		 * toward O(k) between GC passes.
 		 *
-		 * Acquiring table_lock inside rcu_read_lock() is legal: RCU
-		 * read-side critical sections can nest with spinlocks.
+		 * Acquiring bucket_locks[bucket] inside rcu_read_lock() is legal:
+		 * RCU read-side critical sections can nest with spinlocks.
 		 * hash_del_rcu() and call_rcu() are also safe inside RCU.
 		 */
 		if (ktime_compare(ktime_get(), READ_ONCE(s->expires_at)) >= 0) {
-			spin_lock_bh(&table_lock);
+			u32 bucket = sess_bucket_idx(hash);
+
+			spin_lock_bh(&bucket_locks[bucket]);
 			/*
-			 * Re-check under the writer lock: another CPU may have
+			 * Re-check under the bucket lock: another CPU may have
 			 * refreshed expires_at between the lockless test above
 			 * and this point.
 			 */
@@ -401,11 +464,11 @@ struct session *sess_lookup(const struct sess_key *key)
 				spin_unlock(&lru_lock);
 				atomic64_dec(&sess_active);
 				atomic64_inc(&sess_expired);
-				spin_unlock_bh(&table_lock);
+				spin_unlock_bh(&bucket_locks[bucket]);
 				call_rcu(&s->rcu, sess_free_rcu);
 				return NULL;
 			}
-			spin_unlock_bh(&table_lock);
+			spin_unlock_bh(&bucket_locks[bucket]);
 		}
 		return s;
 	}
@@ -467,7 +530,7 @@ static struct session *sess_alloc(const struct sess_key *key)
  * Tries the key as-is (original direction), then reversed (reply
  * direction), then atomically inserts a new session. The race where
  * two CPUs both miss and try to create is resolved by re-checking
- * both directions under table_lock.
+ * both directions under both bucket locks (locked in index order).
  *
  * Returns: session pointer + dir, or NULL on allocation failure /
  * table full. Pointer is valid only inside RCU read-side CS.
@@ -546,66 +609,71 @@ struct session *sess_lookup_or_create(const struct sess_key *key,
 	if (!fresh)
 		return NULL;
 
-	hash = sess_hash(key);
-
-	spin_lock_bh(&table_lock);
-
-	/* Re-check capacity under the writer lock — another CPU may have filled
-	 * the table between the lockless gate above and this point. */
-	if (atomic64_read(&sess_active) >= (s64)pf_max_states) {
-		spin_unlock_bh(&table_lock);
-		kfree(fresh);
-		atomic64_inc(&sess_pf_drops);
-		return NULL;
-	}
-
-	/* Re-check half-open cap under the writer lock — same rationale as
-	 * the pf_max_states re-check above: the lockless gate is a fast-path
-	 * hint only; multiple CPUs can pass it simultaneously. */
-	if (key->proto == IPPROTO_TCP &&
-	    atomic64_read(&sess_halfopen) >= (s64)max_halfopen) {
-		spin_unlock_bh(&table_lock);
-		kfree(fresh);
-		atomic64_inc(&sess_rejected_halfopen);
-		return NULL;
-	}
-
-	/* Re-check both directions under the writer lock to handle the race
-	 * where another CPU inserted a matching session between our lockless
-	 * lookups and this point.  Use non-RCU walker inside the writer lock.
-	 * Also verify the found session has not already expired — adaptive TTL
-	 * scaling can crush TTLs to 0, and the GC may not have run yet.
-	 */
-	hash_for_each_possible(sess_table, s, node, hash) {
-		if (sess_key_eq(&s->key, key) &&
-		    ktime_compare(ktime_get(), READ_ONCE(s->expires_at)) < 0) {
-			spin_unlock_bh(&table_lock);
-			kfree(fresh);
-			*dir_out = SESS_DIR_ORIG;
-			return s;
-		}
-	}
+	hash  = sess_hash(key);
 	{
 		u32 rhash = sess_hash(&rkey);
+		u32 ob    = sess_bucket_idx(hash);
+		u32 rb    = sess_bucket_idx(rhash);
 
+		/*
+		 * Lock both buckets in ascending index order (lower first) to
+		 * prevent AB/BA deadlock with any concurrent create for the
+		 * reverse direction.  When ob == rb (hash collision between orig
+		 * and reply keys), only one lock is taken.
+		 */
+		lock_two_buckets(ob, rb);
+
+		/* Re-check capacity — another CPU may have filled the table
+		 * between the lockless gate above and this point. */
+		if (atomic64_read(&sess_active) >= (s64)pf_max_states) {
+			unlock_two_buckets(ob, rb);
+			kfree(fresh);
+			atomic64_inc(&sess_pf_drops);
+			return NULL;
+		}
+
+		/* Re-check half-open cap — multiple CPUs can pass the lockless
+		 * gate simultaneously; the definitive check is here. */
+		if (key->proto == IPPROTO_TCP &&
+		    atomic64_read(&sess_halfopen) >= (s64)max_halfopen) {
+			unlock_two_buckets(ob, rb);
+			kfree(fresh);
+			atomic64_inc(&sess_rejected_halfopen);
+			return NULL;
+		}
+
+		/* Re-check both directions under the bucket locks to handle the
+		 * race where another CPU inserted a matching session between our
+		 * lockless lookups and this point.  Also verify not expired —
+		 * adaptive TTL scaling can crush TTLs to 0 between lookups. */
+		hash_for_each_possible(sess_table, s, node, hash) {
+			if (sess_key_eq(&s->key, key) &&
+			    ktime_compare(ktime_get(), READ_ONCE(s->expires_at)) < 0) {
+				unlock_two_buckets(ob, rb);
+				kfree(fresh);
+				*dir_out = SESS_DIR_ORIG;
+				return s;
+			}
+		}
 		hash_for_each_possible(sess_table, s, node, rhash) {
 			if (sess_key_eq(&s->key, &rkey) &&
 			    ktime_compare(ktime_get(), READ_ONCE(s->expires_at)) < 0) {
-				spin_unlock_bh(&table_lock);
+				unlock_two_buckets(ob, rb);
 				kfree(fresh);
 				*dir_out = SESS_DIR_REPLY;
 				return s;
 			}
 		}
+
+		hash_add_rcu(sess_table, &fresh->node, hash);
+		atomic64_inc(&sess_created);
+		atomic64_inc(&sess_active);
+		/* Link into LRU tail: bucket lock → lru_lock ordering (BH already off). */
+		spin_lock(&lru_lock);
+		list_add_tail(&fresh->lru_node, &sess_lru);
+		spin_unlock(&lru_lock);
+		unlock_two_buckets(ob, rb);
 	}
-	hash_add_rcu(sess_table, &fresh->node, hash);
-	atomic64_inc(&sess_created);
-	atomic64_inc(&sess_active);
-	/* Link into LRU tail while table_lock is already held (lock order: table → lru). */
-	spin_lock(&lru_lock);
-	list_add_tail(&fresh->lru_node, &sess_lru);
-	spin_unlock(&lru_lock);
-	spin_unlock_bh(&table_lock);
 	*dir_out = SESS_DIR_ORIG;
 	return fresh;
 }
@@ -972,22 +1040,24 @@ static void sess_free_rcu(struct rcu_head *head)
 
 void sess_delete(struct session *s)
 {
-	spin_lock_bh(&table_lock);
+	u32 bucket = sess_bucket_idx(sess_hash(&s->key));
+
+	spin_lock_bh(&bucket_locks[bucket]);
 	/*
 	 * Guard against being called on a session already removed by the GC
-	 * reaper or inline expiry.  hlist_unhashed() is safe to test under
-	 * table_lock: only code holding table_lock calls hash_del_rcu().
+	 * reaper or inline expiry.  hlist_unhashed() is safe under the bucket
+	 * lock: only code holding that bucket's lock calls hash_del_rcu().
 	 */
 	if (hlist_unhashed(&s->node)) {
-		spin_unlock_bh(&table_lock);
+		spin_unlock_bh(&bucket_locks[bucket]);
 		return;
 	}
 	hash_del_rcu(&s->node);
-	spin_lock(&lru_lock);		/* BH already disabled by table_lock */
+	spin_lock(&lru_lock);		/* BH already off; bucket → lru order */
 	list_del_init(&s->lru_node);
 	spin_unlock(&lru_lock);
-	atomic64_dec(&sess_active);	/* inside table_lock: no window of inflated count */
-	spin_unlock_bh(&table_lock);
+	atomic64_dec(&sess_active);
+	spin_unlock_bh(&bucket_locks[bucket]);
 
 	call_rcu(&s->rcu, sess_free_rcu);
 }
@@ -1073,32 +1143,44 @@ static u32 sess_pf_timeout(const struct session *s, u64 active_cnt)
  * │    the packet is discarded before any state is allocated.              │
  * └─────────────────────────────────────────────────────────────────────────┘
  *
- * Safe to call from softirq context, including inside rcu_read_lock():
- * spin_lock_bh() and call_rcu() are both valid inside an RCU read-side CS.
- * Must be called outside table_lock.
+ * Safe to call from softirq context.  Must be called inside rcu_read_lock()
+ * (the caller's netfilter hook provides this) so that session pointers
+ * collected in phase 1 remain valid through phase 2.
+ * Must not be called while holding any bucket_locks[] entry.
  * Returns the number of sessions freed (0 = table saturated → PF_DROP).
  */
 static int pf_purge_expired_states_emergency(void)
 {
-	struct session *lru_s, *lru_tmp;
-	ktime_t now        = ktime_get();
-	u64  active_cnt    = (u64)atomic64_read(&sess_active);
-	int  freed         = 0;
-	int  scanned       = 0;
+	struct session *candidates[PF_EMERGENCY_SCAN_MAX];
+	struct session *lru_s;
+	ktime_t now;
 
-	spin_lock_bh(&table_lock);
-	spin_lock(&lru_lock);		/* BH already off; table → lru order */
+	/* Phase 1 collects raw session pointers without holding any lock that
+	 * prevents kfree().  The caller's rcu_read_lock() is the only thing
+	 * keeping those pointers valid through phase 2.  Catch any future call
+	 * site that forgets this contract before it becomes a use-after-free. */
+	WARN_ON_ONCE(!rcu_read_lock_held());
+
+	now       = ktime_get();
+	u64  active_cnt   = (u64)atomic64_read(&sess_active);
+	int  ncand        = 0;
+	int  freed        = 0;
+	int  scanned      = 0;
+	int  i;
 
 	/*
-	 * Walk from the LRU head (oldest sessions).  Weapon 1 has been crushing
-	 * TTLs as the table fills; the head is the most likely place to find
-	 * sessions with eff == 0 or large idle_ns.
+	 * Phase 1: collect eviction candidates from the LRU head.
 	 *
-	 * We cap at PF_EMERGENCY_SCAN_MAX to bound worst-case latency: even at
-	 * line-rate SYN flood, 64 pointer comparisons ≈ 640 ns on Cortex-A53 —
-	 * negligible compared to a context switch.
+	 * Weapon 1 has been crushing TTLs as the table fills; the LRU head
+	 * holds the oldest (most-idle) sessions and is the most likely place
+	 * to find eff==0 entries.  We hold only lru_lock here — no bucket
+	 * locks — so the lock ordering rule is not involved.
+	 *
+	 * The pointers collected here are protected by the caller's outer
+	 * rcu_read_lock(): kfree() cannot run until that critical section ends.
 	 */
-	list_for_each_entry_safe(lru_s, lru_tmp, &sess_lru, lru_node) {
+	spin_lock_bh(&lru_lock);
+	list_for_each_entry(lru_s, &sess_lru, lru_node) {
 		u32 eff;
 		s64 idle_ns;
 
@@ -1109,66 +1191,77 @@ static int pf_purge_expired_states_emergency(void)
 		idle_ns = ktime_to_ns(ktime_sub(now,
 				READ_ONCE(lru_s->stats.last_seen)));
 
-		/*
-		 * Two eviction conditions — both use Weapon 1's output:
-		 *  1. eff == 0: TTL was crushed to zero by the scaling formula;
-		 *     any idle duration qualifies, even idle_ns == 0.
-		 *  2. idle_ns >= eff * NSEC_PER_SEC: TTL not yet zero but the
-		 *     scaled timeout has already elapsed since last packet.
-		 */
 		if (eff != 0 && idle_ns < (s64)eff * NSEC_PER_SEC)
 			continue;
 
+		candidates[ncand++] = lru_s;
+	}
+	spin_unlock_bh(&lru_lock);
+
+	/*
+	 * Phase 2: delete each candidate.
+	 *
+	 * For each session: acquire its bucket lock, verify it is still in the
+	 * hash table (hlist_unhashed guards against double-delete if the GC
+	 * reaper already evicted it between phases), remove from hash, then
+	 * remove from LRU.  We hold at most one lock at a time — no combined
+	 * bucket+lru hold — which preserves the ordering rule.
+	 */
+	for (i = 0; i < ncand; i++) {
+		u32 bucket;
+
+		lru_s  = candidates[i];
+		bucket = sess_bucket_idx(sess_hash(&lru_s->key));
+
+		spin_lock_bh(&bucket_locks[bucket]);
+		if (hlist_unhashed(&lru_s->node)) {
+			/* GC already evicted this session on another CPU */
+			spin_unlock_bh(&bucket_locks[bucket]);
+			continue;
+		}
 		hash_del_rcu(&lru_s->node);
+		spin_unlock_bh(&bucket_locks[bucket]);
+
+		spin_lock_bh(&lru_lock);
 		list_del_init(&lru_s->lru_node);
+		spin_unlock_bh(&lru_lock);
+
 		atomic64_dec(&sess_active);
 		atomic64_inc(&sess_expired);
 		call_rcu(&lru_s->rcu, sess_free_rcu);
 		freed++;
 	}
 
-	spin_unlock(&lru_lock);
-	spin_unlock_bh(&table_lock);
-
 	return freed;
 }
 
 /*
- * sess_reaper_fn — Single 1 Hz GC.  The GC tick is NEVER shortened under
- * load.  Keeping it at a fixed 1 Hz eliminates context-switch pressure:
- * the scheduler wakes this workqueue exactly once per second regardless of
- * traffic rate, so the CPU does not burn interrupt/context-switch overhead
- * responding to load spikes.  All load-adaptive behaviour is inside the tick.
+ * sess_reaper_fn — Continuous 10 Hz GC with per-bucket locking.
  *
- * Three interlocking techniques:
+ * Runs at HZ/10 (10 times per second).  Like FreeBSD pf's pf_purge_thread,
+ * the cursor (gc_idx) advances by scan_size buckets per run and wraps to 0
+ * when it reaches the end — there is no sleep between sweeps.
  *
- * Weapon 1a — Adaptive Timeout Scaling (sess_pf_timeout):
- *   Shrinks idle TTLs linearly from full (below adaptive_start) down to 0
- *   (at adaptive_end).  Half-open TCP entries (SYN_SENT/SYN_RECV) — the
- *   primary SYN-flood attack surface — collapse toward 0 first because their
- *   base TTLs (60-120 s) are much shorter than ESTABLISHED (3600 s).
- *   Result: the 1 Hz sweep can wipe thousands of stale half-open states in
- *   a single pass without touching any established connection.
+ * scan_size is computed from gc_sweep_interval (configurable):
+ *   scan_size = SESSION_TABLE_SIZE / (gc_sweep_interval × 10)
+ * This guarantees one full table sweep in exactly gc_sweep_interval seconds.
+ * Aggressive mode sweeps 4× faster (same ratio as the old 1 Hz design).
  *
- * Weapon 1b — Incremental scanning (gc_idx cursor):
- *   Scans a fixed window per tick.  table_lock hold time is bounded to
- *   ~25 µs (NORMAL) or ~100 µs (AGGRESSIVE) — no head-of-line blocking
- *   for new-session creation on other CPUs even at 90% table fill.
+ * Per-bucket locking: only one bucket_locks[b] spinlock is held at a time.
+ * The data-plane lookup path is blocked for ≤~75 ns per forwarded packet
+ * (single-bucket scan time), not for the entire GC run.
  *
- * Weapon 1c — Hysteresis (gc_aggressive latch):
- *   Mode is set ON at pf_adaptive_start and cleared only at 85% of it.
- *   Prevents mode oscillation when the count hovers near the boundary,
- *   which would otherwise alternate between 64 and 256 buckets/tick on
- *   consecutive seconds — wasted work without actually draining.
- *
- * Weapon 2 (pf_purge_expired_states_emergency) is the on-demand partner:
- *   called from the packet creation path when current >= pf_max_states.
+ * Weapons 1a and 1c are unchanged (adaptive TTL + hysteresis).
+ * Weapon 2 (pf_purge_expired_states_emergency) is the on-demand partner
+ * called from the packet creation path when active >= pf_max_states.
  */
 static void sess_reaper_fn(struct work_struct *work)
 {
 	struct session    *s;
 	struct hlist_node *tmp;
-	unsigned int       b, end, scan_size;
+	unsigned int       b, end;
+	unsigned int       scan_size;
+	unsigned int       interval;
 	int                reaped = 0;
 	ktime_t            now    = ktime_get();
 	u64                active;
@@ -1178,34 +1271,36 @@ static void sess_reaper_fn(struct work_struct *work)
 	/*
 	 * Hysteresis — Weapon 1c.
 	 * Enter aggressive mode at pf_adaptive_start; stay until the count
-	 * drops to 85% of that threshold.  The 15% band prevents oscillation
-	 * when the table drains and refills near the boundary.
+	 * drops to 85% of that threshold to prevent mode oscillation.
 	 */
 	if (active >= (u64)pf_adaptive_start)
 		gc_aggressive = true;
-	else if (active < (u64)pf_adaptive_start * 17 / 20)  /* ~85% */
+	else if (active < (u64)pf_adaptive_start * 17 / 20)
 		gc_aggressive = false;
 
 	/*
-	 * Incremental scan window — Weapon 1b.
-	 * NORMAL  → 64 buckets/tick → full table in 16 s (normal pressure).
-	 * AGGRESSIVE → 256 buckets/tick → full table in 4 s (under attack).
+	 * Dynamic scan window — FreeBSD pf formula.
+	 * normal:     SESSION_TABLE_SIZE / (interval × 10)  → full sweep in interval s
+	 * aggressive: 4× normal                             → full sweep in interval/4 s
 	 */
-	scan_size = gc_aggressive ? GC_SCAN_AGGRESSIVE : GC_SCAN_NORMAL;
-	end       = min(gc_idx + scan_size, 1u << SESSION_TABLE_BITS);
+	interval  = READ_ONCE(gc_sweep_interval);
+	if (interval < 1)
+		interval = 1;
+	scan_size = max(1u, SESSION_TABLE_SIZE / (interval * 10));
+	if (gc_aggressive)
+		scan_size = min(scan_size * 4, (unsigned int)SESSION_TABLE_SIZE);
 
-	spin_lock_bh(&table_lock);
-	spin_lock(&lru_lock);	/* BH already disabled; obeys table → lru order */
+	end = min(gc_idx + scan_size, (unsigned int)SESSION_TABLE_SIZE);
 
-	/* ── Phase 1: Incremental hash bucket scan ──────────────────── */
+	/*
+	 * Bucket scan — lock one bucket at a time.
+	 * Weapon 1a: use the PF adaptive formula (sess_pf_timeout) instead of
+	 * raw expires_at.  When active >= pf_adaptive_end, eff==0 and all
+	 * non-ESTABLISHED sessions are reaped regardless of idle time.
+	 */
 	for (b = gc_idx; b < end; b++) {
+		spin_lock_bh(&bucket_locks[b]);
 		hlist_for_each_entry_safe(s, tmp, &sess_table[b], node) {
-			/*
-			 * Weapon 1a: use the PF adaptive formula instead of the
-			 * raw expires_at.  When active >= pf_adaptive_end, eff == 0
-			 * and every idle_ns >= 0, so all non-ESTABLISHED sessions
-			 * in this bucket are reaped in a single pass.
-			 */
 			u32 eff     = sess_pf_timeout(s, active);
 			s64 idle_ns = ktime_to_ns(
 				ktime_sub(now, READ_ONCE(s->stats.last_seen)));
@@ -1214,90 +1309,51 @@ static void sess_reaper_fn(struct work_struct *work)
 				continue;
 
 			hash_del_rcu(&s->node);
+			spin_lock(&lru_lock);	/* BH already off; bucket → lru order */
 			list_del_init(&s->lru_node);
+			spin_unlock(&lru_lock);
 			atomic64_dec(&sess_active);
 			atomic64_inc(&sess_expired);
 			call_rcu(&s->rcu, sess_free_rcu);
 			reaped++;
 		}
+		spin_unlock_bh(&bucket_locks[b]);
 	}
 
-	/*
-	 * Phase 2: LRU-head early eviction (aggressive mode only).
-	 *
-	 * Directly targets the oldest sessions (LRU head) without waiting for
-	 * the scan cursor to reach their buckets.  Combined with the TTL
-	 * scaling in Phase 1, this drains the attack surface in both
-	 * temporal order (LRU) and spatial order (bucket window) simultaneously.
-	 */
-	if (gc_aggressive) {
-		struct session *lru_s, *lru_tmp;
-		int lru_cnt = 0;
-
-		list_for_each_entry_safe(lru_s, lru_tmp, &sess_lru, lru_node) {
-			u32 eff;
-			s64 idle_ns;
-
-			if (lru_cnt++ >= GC_LRU_EVICT_MAX)
-				break;
-
-			eff     = sess_pf_timeout(lru_s, active);
-			idle_ns = ktime_to_ns(
-				ktime_sub(now, READ_ONCE(lru_s->stats.last_seen)));
-
-			if (eff != 0 && idle_ns < (s64)eff * NSEC_PER_SEC)
-				continue;
-
-			hash_del_rcu(&lru_s->node);
-			list_del_init(&lru_s->lru_node);
-			atomic64_dec(&sess_active);
-			atomic64_inc(&sess_expired);
-			call_rcu(&lru_s->rcu, sess_free_rcu);
-			reaped++;
-		}
-	}
-
-	spin_unlock(&lru_lock);
-	spin_unlock_bh(&table_lock);
-
-	gc_idx = (end >= (1u << SESSION_TABLE_BITS)) ? 0 : end;
+	gc_idx = (end >= (unsigned int)SESSION_TABLE_SIZE) ? 0 : end;
 
 	if (reaped)
-		pr_debug("session: gc reaped=%d idx=%u active=%llu agg=%d\n",
-			 reaped, gc_idx, active, gc_aggressive);
+		pr_debug("session: gc reaped=%d idx=%u active=%llu agg=%d scan=%u\n",
+			 reaped, gc_idx, active, gc_aggressive, scan_size);
 
-	/*
-	 * Always reschedule at exactly HZ (1 second).
-	 *
-	 * Context-switch meltdown prevention: never shorten this delay under
-	 * load.  On a Cortex-A53 @ 1.8 GHz, each forced context switch costs
-	 * ~10-50 µs.  A naive "wake GC faster when table is full" scheme at
-	 * 10 Hz under a 1 Mpps SYN flood = 10 extra wakeups/s × 50 µs = 500 µs
-	 * of scheduler overhead per second — plus cache-thrash from switching
-	 * between the GC stack and the RX-softirq stack.  One wakeup per second
-	 * eliminates all of this: Weapon 1 (TTL scaling) and Weapon 2 (inline
-	 * emergency eviction) absorb the load within the fixed tick cadence.
-	 */
-	schedule_delayed_work(&sess_reaper, HZ);
+	/* Reschedule at HZ/10 — continuous, no idle gap between sweeps */
+	schedule_delayed_work(&sess_reaper, HZ / 10);
 }
 
 static void sess_flush_all(void)
 {
 	struct session *s;
 	struct hlist_node *tmp;
-	int bucket;
+	unsigned int b;
 
-	spin_lock_bh(&table_lock);
-	spin_lock(&lru_lock);		/* BH already disabled by table_lock */
-	hash_for_each_safe(sess_table, bucket, tmp, s, node) {
-		hash_del_rcu(&s->node);
-		list_del_init(&s->lru_node);
-		atomic64_dec(&sess_active);
-		call_rcu(&s->rcu, sess_free_rcu);
+	/*
+	 * Lock one bucket at a time to keep the flush from blocking the data
+	 * plane for the full duration.  Each bucket lock is held only for the
+	 * duration of scanning that bucket (same pattern as the GC reaper).
+	 */
+	for (b = 0; b < SESSION_TABLE_SIZE; b++) {
+		spin_lock_bh(&bucket_locks[b]);
+		hlist_for_each_entry_safe(s, tmp, &sess_table[b], node) {
+			hash_del_rcu(&s->node);
+			spin_lock(&lru_lock);	/* BH already off; bucket → lru order */
+			list_del_init(&s->lru_node);
+			spin_unlock(&lru_lock);
+			atomic64_dec(&sess_active);
+			call_rcu(&s->rcu, sess_free_rcu);
+		}
+		spin_unlock_bh(&bucket_locks[b]);
 	}
-	spin_unlock(&lru_lock);
-	spin_unlock_bh(&table_lock);
-	/* Caller calls rcu_barrier() if it needs to wait for all frees to complete.
+	/* Caller calls rcu_barrier() if it needs to wait for all frees.
 	 * session_exit() does; the runtime flush path (sess_ctl_write) does not. */
 }
 
@@ -1516,7 +1572,7 @@ static int sess_seq_show(struct seq_file *seq, void *v)
 			"# est_src_drops=%lld max_est_per_src=%u"
 			" zero_win_timeout=%u\n"
 			"# pf_max=%u adaptive_start=%u adaptive_end=%u"
-			" gc_aggressive=%d\n",
+			" gc_sweep_interval=%u gc_aggressive=%d\n",
 			atomic64_read(&sess_active),
 			atomic64_read(&sess_created),
 			atomic64_read(&sess_expired),
@@ -1528,7 +1584,7 @@ static int sess_seq_show(struct seq_file *seq, void *v)
 			atomic64_read(&sess_est_src_drops),
 			max_est_per_src, zero_win_timeout,
 			pf_max_states, pf_adaptive_start, pf_adaptive_end,
-			READ_ONCE(gc_aggressive));
+			READ_ONCE(gc_sweep_interval), READ_ONCE(gc_aggressive));
 		seq_puts(seq,
 			"# proto src dst id pkts(o/r) bytes(o/r) age_ms expire_ms ml flags tcp_state\n");
 		return 0;
@@ -1586,9 +1642,20 @@ static const struct proc_ops sess_proc_ops = {
 
 static int __init session_init(void)
 {
+	unsigned int i;
+
+	for (i = 0; i < SESSION_TABLE_SIZE; i++)
+		spin_lock_init(&bucket_locks[i]);
+
 	hash_init(sess_table);
 	get_random_bytes(&sess_hash_rnd, sizeof(sess_hash_rnd));
 	get_random_bytes(&est_hash_seed, sizeof(est_hash_seed));
+
+	/* Clamp gc_sweep_interval to a sane range */
+	if (gc_sweep_interval < 5)
+		gc_sweep_interval = 5;
+	if (gc_sweep_interval > 3600)
+		gc_sweep_interval = 3600;
 
 	/* Clamp and resolve PF adaptive thresholds.
 	 * pf_max_states must not exceed the compile-time hash table capacity.
@@ -1632,12 +1699,16 @@ static int __init session_init(void)
 		return -ENOMEM;
 	}
 
-	schedule_delayed_work(&sess_reaper, HZ);
+	schedule_delayed_work(&sess_reaper, HZ / 10);
 
-	pr_info("session: loaded v%s buckets=%d gc=1Hz(norm=%d/agg=%d)"
+	pr_info("session: loaded v%s buckets=%d locks=%d"
+		" gc=10Hz sweep=%us(norm=%u/agg=%u buckets/run)"
 		" pf_max=%u adaptive=%u/%u lru=yes\n",
-		SESS_VERSION, 1 << SESSION_TABLE_BITS,
-		GC_SCAN_NORMAL, GC_SCAN_AGGRESSIVE,
+		SESS_VERSION, SESSION_TABLE_SIZE, SESSION_TABLE_SIZE,
+		gc_sweep_interval,
+		SESSION_TABLE_SIZE / (gc_sweep_interval * 10),
+		min(SESSION_TABLE_SIZE / (gc_sweep_interval * 10) * 4,
+		    (unsigned int)SESSION_TABLE_SIZE),
 		pf_max_states, pf_adaptive_start, pf_adaptive_end);
 	return 0;
 }
