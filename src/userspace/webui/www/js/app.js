@@ -4130,7 +4130,7 @@
     var PROTO_NAMES = { '6': 'TCP', '17': 'UDP', '1': 'ICMP' };
 
     var sessionData = [];
-    var sessState = { page: 0, pageSize: 25, search: '' };
+    var sessState = { page: 0, pageSize: 25, search: '', proto: '', state: '' };
 
     function renderSessions() {
         return api('/monitor/sessions').then(function (data) {
@@ -4147,6 +4147,12 @@
             }
             sessionData = (data && data.sessions) || [];
             sessState.page = 0;
+            sessState.proto = '';
+            sessState.state = '';
+            var fp = document.getElementById('sess-filter-proto');
+            var fs = document.getElementById('sess-filter-state');
+            if (fp) fp.value = '';
+            if (fs) fs.value = '';
             renderSessionRows();
         }).catch(function () {
             sessionData = [];
@@ -4163,12 +4169,33 @@
         if (!tbody) return;
 
         var filtered = sessionData;
+
+        if (sessState.proto) {
+            filtered = filtered.filter(function (s) { return s.proto === sessState.proto; });
+        }
+
+        if (sessState.state) {
+            filtered = filtered.filter(function (s) {
+                var flagNum = parseInt(s.flags, 16) || 0;
+                var blocked = (flagNum & 0x02) !== 0;
+                var st;
+                if (blocked) {
+                    st = 'BLOCKED';
+                } else if (s.proto === '6' && s.tcp_state != null && s.tcp_state !== '') {
+                    var idx = parseInt(s.tcp_state, 10);
+                    st = TCP_STATES[idx] || ('ST' + idx);
+                } else {
+                    st = 'ACTIVE';
+                }
+                return st === sessState.state;
+            });
+        }
+
         if (sessState.search) {
             var q = sessState.search.toLowerCase();
-            filtered = sessionData.filter(function (s) {
+            filtered = filtered.filter(function (s) {
                 return (s.src || '').toLowerCase().indexOf(q) !== -1 ||
-                       (s.dst || '').toLowerCase().indexOf(q) !== -1 ||
-                       (PROTO_NAMES[s.proto] || s.proto || '').toLowerCase().indexOf(q) !== -1;
+                       (s.dst || '').toLowerCase().indexOf(q) !== -1;
             });
         }
 
@@ -4194,7 +4221,7 @@
                 var stateStr;
                 if (blocked) {
                     stateStr = 'BLOCKED';
-                } else if (s.proto === '6' && s.tcp_state) {
+                } else if (s.proto === '6' && s.tcp_state != null && s.tcp_state !== '') {
                     var idx = parseInt(s.tcp_state, 10);
                     stateStr = TCP_STATES[idx] || ('ST' + idx);
                 } else {
@@ -4262,6 +4289,33 @@
         sessState.page = 0;
         renderSessionRows();
     }, 150));
+
+    var sessFilterProto = document.getElementById('sess-filter-proto');
+    var sessFilterState = document.getElementById('sess-filter-state');
+    var sessFilterClear = document.getElementById('sess-filter-clear');
+
+    if (sessFilterProto) sessFilterProto.addEventListener('change', function () {
+        sessState.proto = this.value;
+        sessState.page = 0;
+        renderSessionRows();
+    });
+
+    if (sessFilterState) sessFilterState.addEventListener('change', function () {
+        sessState.state = this.value;
+        sessState.page = 0;
+        renderSessionRows();
+    });
+
+    if (sessFilterClear) sessFilterClear.addEventListener('click', function () {
+        sessState.search = '';
+        sessState.proto = '';
+        sessState.state = '';
+        sessState.page = 0;
+        if (sessSearchInput) sessSearchInput.value = '';
+        if (sessFilterProto) sessFilterProto.value = '';
+        if (sessFilterState) sessFilterState.value = '';
+        renderSessionRows();
+    });
 
     function formatBytes(n) {
         if (n < 1024) return n + ' B';

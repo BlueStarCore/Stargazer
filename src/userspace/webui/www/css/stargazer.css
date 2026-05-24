@@ -686,6 +686,12 @@ html, body {
     margin-bottom: 16px;
 }
 
+.filter-label {
+    font-size: 12px;
+    color: var(--gray-text-mid);
+    white-space: nowrap;
+}
+
 .btn {
     display: inline-flex;
     align-items: center;

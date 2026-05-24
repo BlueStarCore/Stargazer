@@ -802,7 +802,32 @@
             <div id="page-fw-sessions" class="page" style="display:none">
                 <div class="page-header">
                     <h1 class="page-title">SESSIONS</h1>
-                    <div class="widget-search"><input type="text" id="sess-search" placeholder="Filter sessions..."></div>
+                    <div class="widget-search"><input type="text" id="sess-search" placeholder="Search src / dst / port..."></div>
+                </div>
+                <div class="toolbar">
+                    <span class="filter-label">Protocol</span>
+                    <select class="rf-page-size" id="sess-filter-proto">
+                        <option value="">All</option>
+                        <option value="6">TCP</option>
+                        <option value="17">UDP</option>
+                        <option value="1">ICMP</option>
+                    </select>
+                    <span class="filter-label">State</span>
+                    <select class="rf-page-size" id="sess-filter-state">
+                        <option value="">All</option>
+                        <option value="ESTABLISHED">ESTABLISHED</option>
+                        <option value="SYN_SENT">SYN_SENT</option>
+                        <option value="SYN_RECV">SYN_RECV</option>
+                        <option value="FIN_WAIT">FIN_WAIT</option>
+                        <option value="CLOSE_WAIT">CLOSE_WAIT</option>
+                        <option value="LAST_ACK">LAST_ACK</option>
+                        <option value="TIME_WAIT">TIME_WAIT</option>
+                        <option value="CLOSE">CLOSE</option>
+                        <option value="SYN_SENT2">SYN_SENT2</option>
+                        <option value="ACTIVE">ACTIVE</option>
+                        <option value="BLOCKED">BLOCKED</option>
+                    </select>
+                    <button class="btn rf-btn" id="sess-filter-clear" style="margin-left:auto">Clear filters</button>
                 </div>
                 <div id="session-summary" class="session-summary">Active: <strong>--</strong> / max: <strong>--</strong></div>
                 <table class="data-table">

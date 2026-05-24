@@ -26,7 +26,7 @@
  *   dstintf  — destination interface ("any" → omit -o)
  *   srcaddr  — source CIDR ("all"/"any" → omit -s)
  *   dstaddr  — destination CIDR ("all"/"any" → omit -d)
- *   action   — "accept"/"allow" → ACCEPT; "deny"/"drop" → DROP
+ *   action   — "accept"/"allow" → ACCEPT; "deny" → REJECT; "drop" → DROP
  *   status   — "disable" → skip rule entirely
  *   sequence — priority (higher = checked first)
  */
@@ -137,6 +137,8 @@ static const char *action_to_target(const char *action)
 {
 	if (strcmp(action, "accept") == 0 || strcmp(action, "allow") == 0)
 		return "ACCEPT";
+	if (strcmp(action, "deny") == 0)
+		return "REJECT";
 	return "DROP";
 }
 
@@ -222,8 +224,10 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 			}
 
 			/* Resolve service object */
+			char svc_proto[VALBUFSZ];
+			svc_proto[0] = '\0';
 			{
-				char svc_proto[VALBUFSZ], svc_port[VALBUFSZ];
+				char svc_port[VALBUFSZ];
 				int svc_rc = resolve_service(service,
 					svc_proto, sizeof(svc_proto),
 					svc_port, sizeof(svc_port));
@@ -239,7 +243,16 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 				}
 			}
 
-			dbuf_printf(&buf, " -j %s\n", target);
+			/*
+			 * deny → REJECT: send TCP RST for TCP sessions so the
+			 * sender fails immediately; use ICMP port-unreachable
+			 * for everything else (iptables REJECT default).
+			 */
+			if (strcmp(target, "REJECT") == 0 &&
+			    strcmp(svc_proto, "tcp") == 0)
+				dbuf_printf(&buf, " -j REJECT --reject-with tcp-reset\n");
+			else
+				dbuf_printf(&buf, " -j %s\n", target);
 			rule_count++;
 		skip_rule:
 			;

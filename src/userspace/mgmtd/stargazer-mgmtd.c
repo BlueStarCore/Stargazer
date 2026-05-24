@@ -1997,13 +1997,13 @@ static void mgmtd_reconcile_config(void)
 			  "dstintf=any\n"
 			  "srcaddr=all\n"
 			  "dstaddr=all\n"
-			  "action=deny\n"
+			  "action=drop\n"
 			  "service=all\n"
 			  "status=enable\n"
 			  "sequence=1\n"
 			  "builtin=yes\n"
 			  "immutable=yes\n"
-			  "comment=Default deny all traffic\n" },
+			  "comment=Default drop all traffic\n" },
 			{ NULL, NULL, NULL }
 		};
 
