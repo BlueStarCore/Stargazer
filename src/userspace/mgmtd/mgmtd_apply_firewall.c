@@ -311,6 +311,13 @@ sg_status_t validate_firewall_policy(const char *id, const char *data,
 		return SG_ERR_MISSING_ARG;
 	}
 
+	if (strcmp(action, "accept") != 0 && strcmp(action, "allow") != 0 &&
+	    strcmp(action, "deny")   != 0 && strcmp(action, "drop")  != 0) {
+		snprintf(result, rsize, "Invalid action '%s' (accept/deny/drop)",
+			 action);
+		return SG_ERR_INVALID_VAL;
+	}
+
 	if (srcintf[0] && strcmp(srcintf, "any") != 0 &&
 	    !sg_is_iface_name(srcintf)) {
 		snprintf(result, rsize, "Invalid srcintf '%s'", srcintf);

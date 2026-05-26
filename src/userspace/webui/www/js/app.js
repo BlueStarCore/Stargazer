@@ -4147,12 +4147,6 @@
             }
             sessionData = (data && data.sessions) || [];
             sessState.page = 0;
-            sessState.proto = '';
-            sessState.state = '';
-            var fp = document.getElementById('sess-filter-proto');
-            var fs = document.getElementById('sess-filter-state');
-            if (fp) fp.value = '';
-            if (fs) fs.value = '';
             renderSessionRows();
         }).catch(function () {
             sessionData = [];
@@ -4195,7 +4189,8 @@
             var q = sessState.search.toLowerCase();
             filtered = filtered.filter(function (s) {
                 return (s.src || '').toLowerCase().indexOf(q) !== -1 ||
-                       (s.dst || '').toLowerCase().indexOf(q) !== -1;
+                       (s.dst || '').toLowerCase().indexOf(q) !== -1 ||
+                       (PROTO_NAMES[s.proto] || s.proto || '').toLowerCase().indexOf(q) !== -1;
             });
         }
 
