@@ -4753,9 +4753,9 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 							need_nat_rebuild = 1;
 						char amsg[512];
 						snprintf(amsg, sizeof(amsg),
-							 "OK %s:%.64s "
+							 "OK %.32s:%.32s "
 							 "(rename cascade "
-							 "%.64s:%.64s→%.64s)"
+							 "%.32s:%.32s->%.32s)"
 							 ": %.32s updated",
 							 et, eid, db_type,
 							 db_id, new_name,
