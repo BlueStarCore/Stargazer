@@ -32,6 +32,15 @@
 #define PKT_FWD_VERSION "unknown"
 #endif
 
+/*
+ * Packets belonging to SESS_DIRTY sessions are tagged with this skb->mark bit
+ * so the iptables ESTABLISHED,RELATED rule (which has ! --mark 0x80) skips
+ * them, forcing a full policy re-evaluation on the first post-rebuild packet.
+ * The post_filter_hook clears the bit and the SESS_DIRTY flag after iptables
+ * accepts the packet, returning the session to the fast path.
+ */
+#define STARGAZER_DIRTY_MARK	0x00000080u
+
 /* Counters (atomic for SMP) */
 static atomic64_t pkts_forwarded            = ATOMIC64_INIT(0);
 static atomic64_t pkts_dropped              = ATOMIC64_INIT(0);
@@ -819,6 +828,11 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 		return NF_DROP;
 	}
 
+	/* [10b] SESS_DIRTY: policy was rebuilt — tag packet so the iptables
+	 * ESTABLISHED,RELATED rule skips it and policy rules re-evaluate it. */
+	if (READ_ONCE(s->flags) & SESS_DIRTY)
+		skb->mark |= STARGAZER_DIRTY_MARK;
+
 	/* [11] TCP state machine */
 	if (key.proto == IPPROTO_TCP) {
 		unsigned int verdict = sess_tcp_check(s, skb, dir);
@@ -898,6 +912,48 @@ static const struct nf_hook_ops nf_forward_ops = {
 	.priority = NF_IP_PRI_CONNTRACK_DEFRAG + 1,
 };
 
+/*
+ * post_filter_hook — clears SESS_DIRTY after iptables has accepted a packet.
+ *
+ * Runs at NF_IP_PRI_FILTER + 1, so it only fires when iptables accepted the
+ * packet (NF_DROP from iptables stops traversal; this hook is never reached).
+ * It checks the STARGAZER_DIRTY_MARK bit set by forward_hook() to avoid a
+ * session lookup on every non-dirty packet.
+ */
+static unsigned int post_filter_hook(void *priv, struct sk_buff *skb,
+				     const struct nf_hook_state *state)
+{
+	struct sess_key key;
+	struct session *s;
+	int dir;
+
+	if (!(skb->mark & STARGAZER_DIRTY_MARK))
+		return NF_ACCEPT;
+
+	skb->mark &= ~STARGAZER_DIRTY_MARK;
+
+	if (extract_key(skb, &key) != 0)
+		return NF_ACCEPT;
+
+	rcu_read_lock();
+	s = sess_lookup_bidir(&key, &dir);
+	if (s) {
+		spin_lock(&s->lock);
+		s->flags &= ~SESS_DIRTY;
+		spin_unlock(&s->lock);
+	}
+	rcu_read_unlock();
+
+	return NF_ACCEPT;
+}
+
+static const struct nf_hook_ops nf_post_filter_ops = {
+	.hook     = post_filter_hook,
+	.pf       = NFPROTO_IPV4,
+	.hooknum  = NF_INET_FORWARD,
+	.priority = NF_IP_PRI_FILTER + 1,
+};
+
 static int __init pkt_forward_init(void)
 {
 	int ret;
@@ -919,7 +975,15 @@ static int __init pkt_forward_init(void)
 	ret = nf_register_net_hook(&init_net, &nf_forward_ops);
 	if (ret < 0) {
 		nf_defrag_ipv4_disable(&init_net);
-		pr_err("pkt_forward: hook registration failed (%d)\n", ret);
+		pr_err("pkt_forward: forward hook registration failed (%d)\n", ret);
+		return ret;
+	}
+
+	ret = nf_register_net_hook(&init_net, &nf_post_filter_ops);
+	if (ret < 0) {
+		nf_unregister_net_hook(&init_net, &nf_forward_ops);
+		nf_defrag_ipv4_disable(&init_net);
+		pr_err("pkt_forward: post-filter hook registration failed (%d)\n", ret);
 		return ret;
 	}
 
@@ -949,6 +1013,7 @@ static int __init pkt_forward_init(void)
 
 static void __exit pkt_forward_exit(void)
 {
+	nf_unregister_net_hook(&init_net, &nf_post_filter_ops);
 	nf_unregister_net_hook(&init_net, &nf_forward_ops);
 	nf_defrag_ipv4_disable(&init_net);
 	if (proc_pf_stats)

@@ -40,6 +40,7 @@ struct sess_key {
 #define SESS_ACTIVE	0x0001
 #define SESS_BLOCKED	0x0002	/* drop further packets (set by ML/policy) */
 #define SESS_MARKED	0x0004	/* Phase 3: set by IPS/ML on suspicious sessions */
+#define SESS_DIRTY	0x0008	/* revalidate against current policy on next pkt */
 
 /* TCP connection states — managed by sess_tcp_check() in the forward path */
 #define SESS_TCP_NONE         0  /* no packet seen yet */
@@ -168,6 +169,8 @@ unsigned int sess_tcp_check(struct session *s, struct sk_buff *skb, int dir);
 void sess_update(struct session *s, struct sk_buff *skb, int dir);
 
 void sess_delete(struct session *s);
+
+void sess_mark_all_dirty(void);
 
 /*
  * sess_icmp_error_lookup - Find the parent session for an ICMP error message.

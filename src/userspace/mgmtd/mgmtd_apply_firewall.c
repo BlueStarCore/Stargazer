@@ -35,9 +35,12 @@
 #include "mgmtd_dynbuf.h"
 #include "sg_db.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* ── Address / Service resolution ───────────────────────────────────────── */
 
@@ -155,10 +158,13 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 	/* Header */
 	dbuf_append(&buf, "*filter\n", 8);
 
-	/* Foundation rule: allow established/related return traffic */
+	/* Foundation rule: allow established/related return traffic.
+	 * Packets tagged STARGAZER_DIRTY_MARK (0x80) are excluded so that
+	 * sessions marked dirty after a policy rebuild bypass this rule and
+	 * reach the policy rules for re-evaluation. */
 	{
-		const char *est = "-A FORWARD -m conntrack"
-			" --ctstate ESTABLISHED,RELATED -j ACCEPT\n";
+		const char *est = "-A FORWARD -m mark ! --mark 0x80"
+			" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n";
 		dbuf_append(&buf, est, strlen(est));
 	}
 
@@ -317,6 +323,22 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 
 	free(out);
 	free(buf.data);
+
+	/* Mark all existing sessions dirty so their next packet is re-evaluated
+	 * against the new policy rules instead of being fast-pathed through the
+	 * ESTABLISHED,RELATED shortcut. Non-fatal: ENOENT means session.ko is
+	 * not loaded, so there are no sessions to mark. */
+	{
+		int sfd = open("/proc/stargazer/session_ctl", O_WRONLY);
+		if (sfd >= 0) {
+			ssize_t w = write(sfd, "mark_dirty\n", 11);
+			(void)w;
+			close(sfd);
+		} else if (errno != ENOENT) {
+			mgmt_log("WARN", "rebuild_forward_chain: session_ctl: %s",
+				 strerror(errno));
+		}
+	}
 
 	snprintf(result, rsize, "FORWARD chain rebuilt (%d rules)", rule_count);
 	return SG_OK;

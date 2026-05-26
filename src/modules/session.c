@@ -1357,6 +1357,20 @@ static void sess_flush_all(void)
 	 * session_exit() does; the runtime flush path (sess_ctl_write) does not. */
 }
 
+void sess_mark_all_dirty(void)
+{
+	struct session *s;
+	unsigned int b;
+
+	for (b = 0; b < SESSION_TABLE_SIZE; b++) {
+		spin_lock_bh(&bucket_locks[b]);
+		hlist_for_each_entry(s, &sess_table[b], node)
+			WRITE_ONCE(s->flags, READ_ONCE(s->flags) | SESS_DIRTY);
+		spin_unlock_bh(&bucket_locks[b]);
+	}
+}
+EXPORT_SYMBOL_GPL(sess_mark_all_dirty);
+
 /* ---------------------------------------------------------------------- */
 /* /proc/stargazer/session_ctl — control interface (write-only)           */
 /* ---------------------------------------------------------------------- */
@@ -1380,6 +1394,11 @@ static ssize_t sess_ctl_write(struct file *file, const char __user *buf,
 
 	if (strcmp(cmd, "flush") == 0) {
 		sess_flush_all();
+		return (ssize_t)count;
+	}
+
+	if (strcmp(cmd, "mark_dirty") == 0) {
+		sess_mark_all_dirty();
 		return (ssize_t)count;
 	}
 
