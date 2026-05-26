@@ -197,6 +197,7 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 			const char *target = action_to_target(action);
 
 			/* Build rule line */
+			size_t rule_start = buf.used;
 			dbuf_printf(&buf, "-A FORWARD");
 
 			if (srcintf[0] && strcmp(srcintf, "any") != 0)
@@ -244,16 +245,45 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 			}
 
 			/*
-			 * deny → REJECT: send TCP RST for TCP sessions so the
-			 * sender fails immediately; use ICMP port-unreachable
-			 * for everything else (iptables REJECT default).
+			 * deny → REJECT: TCP gets RST so the sender fails
+			 * immediately; everything else gets ICMP port-unreachable.
+			 *
+			 * When the service is "any" (svc_proto empty) we cannot
+			 * know the protocol at rule-build time, so we split into
+			 * two rules: a TCP-specific rule with --reject-with
+			 * tcp-reset, followed by a catch-all for the rest.
+			 * The prefix is copied to a stack buffer before the first
+			 * dbuf_printf because that call may reallocate buf.data.
 			 */
 			if (strcmp(target, "REJECT") == 0 &&
-			    strcmp(svc_proto, "tcp") == 0)
-				dbuf_printf(&buf, " -j REJECT --reject-with tcp-reset\n");
-			else
+			    svc_proto[0] == '\0') {
+				size_t plen = buf.used - rule_start;
+				char saved_pfx[256];
+				if (plen < sizeof(saved_pfx)) {
+					memcpy(saved_pfx, buf.data + rule_start,
+					       plen);
+					dbuf_printf(&buf,
+						" -p tcp"
+						" -j REJECT"
+						" --reject-with tcp-reset\n");
+					rule_count++;
+					dbuf_append(&buf, saved_pfx, plen);
+					dbuf_printf(&buf, " -j REJECT\n");
+					rule_count++;
+				} else {
+					/* Safety: prefix overflowed — emit plain REJECT */
+					dbuf_printf(&buf, " -j REJECT\n");
+					rule_count++;
+				}
+			} else if (strcmp(target, "REJECT") == 0 &&
+				   strcmp(svc_proto, "tcp") == 0) {
+				dbuf_printf(&buf,
+					" -j REJECT --reject-with tcp-reset\n");
+				rule_count++;
+			} else {
 				dbuf_printf(&buf, " -j %s\n", target);
-			rule_count++;
+				rule_count++;
+			}
 		skip_rule:
 			;
 		}
