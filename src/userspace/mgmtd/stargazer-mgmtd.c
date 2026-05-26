@@ -4680,6 +4680,109 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			}
 		}
 
+		/*
+		 * Name-as-id rename (firewall_service, firewall_address):
+		 * The section key IS the object name.  If the 'name' field
+		 * in the payload differs from db_id, the user is renaming the
+		 * object.  A plain sg_db_set would update the data under the
+		 * old key while the 'name' field disagrees — policies that
+		 * reference the old name would still resolve, but the UI would
+		 * show inconsistent names.
+		 *
+		 * Instead, perform an atomic rename:
+		 *   1. Reject if the new name is already taken.
+		 *   2. Write the entry under the new key.
+		 *   3. For every referencing field (e.g. service= in policies,
+		 *      srcaddr=/dstaddr= in policies/NAT), replace the stored
+		 *      value with the new name via sg_db_set_val.
+		 *   4. Delete the old key.
+		 *   5. Trigger a chain rebuild if any firewall_policy or
+		 *      network_nat entry was patched.
+		 */
+		if (!is_new_entry &&
+		    (strcmp(db_type, "firewall_service") == 0 ||
+		     strcmp(db_type, "firewall_address") == 0)) {
+			char new_name[VALBUFSZ];
+			extract_val(clean, "name", new_name, sizeof(new_name));
+			if (new_name[0] && strcmp(new_name, db_id) != 0) {
+				char *conflict = sg_db_get(db_type, new_name);
+				if (conflict) {
+					free(conflict);
+					free(existing);
+					send_error(client_fd, SG_ERR_INVALID_VAL,
+						   "Name already in use");
+					return 0;
+				}
+
+				if (sg_db_set(db_type, new_name, clean) != 0) {
+					free(existing);
+					send_error(client_fd, SG_ERR_IO_FAIL,
+						   "Rename failed");
+					return 0;
+				}
+
+				/* Patch every referencing entry */
+				sg_ref_entry_t refs[16];
+				int nrefs = sg_reg_find_referencing(db_type,
+								    refs, 16);
+				int need_fw_rebuild  = 0;
+				int need_nat_rebuild = 0;
+				for (int i = 0; i < nrefs; i++) {
+					char *found = sg_db_find_referencing(
+						refs[i].type, refs[i].key,
+						db_id);
+					if (!found)
+						continue;
+					char *sp = NULL;
+					for (char *e = strtok_r(found, "\n",
+								&sp);
+					     e;
+					     e = strtok_r(NULL, "\n", &sp)) {
+						char et[256], eid[256];
+						sg_db_parse_section(
+							e, et, sizeof(et),
+							eid, sizeof(eid));
+						sg_db_set_val(et, eid,
+							      refs[i].key,
+							      new_name);
+						if (strcmp(et, "firewall_policy")
+						    == 0)
+							need_fw_rebuild = 1;
+						if (strcmp(et, "network_nat")
+						    == 0)
+							need_nat_rebuild = 1;
+						char amsg[512];
+						snprintf(amsg, sizeof(amsg),
+							 "OK %s:%.64s "
+							 "(rename cascade "
+							 "%.64s:%.64s→%.64s)"
+							 ": %.32s updated",
+							 et, eid, db_type,
+							 db_id, new_name,
+							 refs[i].key);
+						audit_log("__cascade",
+							  "200", amsg);
+					}
+					free(found);
+				}
+
+				sg_db_del(db_type, db_id);
+
+				if (need_fw_rebuild) {
+					char rb[512];
+					rebuild_forward_chain(rb, sizeof(rb));
+				}
+				if (need_nat_rebuild) {
+					char rb[512];
+					rebuild_nat_chains(rb, sizeof(rb));
+				}
+
+				free(existing);
+				send_ok(client_fd, "Config saved", NULL);
+				return 0;
+			}
+		}
+
 		/* Firewall/NAT types: persist first, then atomic rebuild.
 		 * The rebuild reads ALL entries from DB, so the new data
 		 * must be in the DB before we can generate the chain.
