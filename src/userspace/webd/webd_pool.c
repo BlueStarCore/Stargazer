@@ -1053,6 +1053,19 @@ static void flow_resources(work_item_t *item)
 	sys_resources_t r;
 	fetch_resources(item, &r);
 
+	/* Read active kernel session count from session.ko via mgmtd.
+	 * session_count() counts web UI logins, not network sessions. */
+	long long net_sessions = 0;
+	webd_ipc_response_t sr;
+	if (webd_ipc_send(SG_CMD_SESSION_STATS, item->username,
+			  item->session_tag, "", &sr) == 0 &&
+	    sr.status == SG_OK && sr.payload) {
+		const char *kv = strstr(sr.payload, "active=");
+		if (kv)
+			net_sessions = strtoll(kv + 7, NULL, 10);
+	}
+	webd_ipc_resp_free(&sr);
+
 	char *json = malloc(512);
 	if (json)
 		snprintf(json, 512,
@@ -1063,14 +1076,14 @@ static void flow_resources(work_item_t *item)
 			 "\"disk_pct\":%d,"
 			 "\"disk_used_mb\":%lu,"
 			 "\"disk_total_mb\":%lu,"
-			 "\"sessions\":%d,"
+			 "\"sessions\":%lld,"
 			 "\"sessions_max\":65536,"
 			 "\"cpu_cores\":%d,"
 			 "\"cpu_mhz\":%d}",
 			 r.cpu_pct,
 			 r.mem_pct, r.mem_used_mb, r.mem_total_mb,
 			 r.disk_pct, r.disk_used_mb, r.disk_total_mb,
-			 session_count(),
+			 net_sessions,
 			 r.cpu_cores, r.cpu_mhz);
 
 	send_result(item->conn_id, 200, json, json ? strlen(json) : 0);
