@@ -179,6 +179,10 @@ char *safe_exec(const char *const argv[])
 	/* Parent */
 	close(pipefd[1]);
 
+	/* Hard cap: iptables/ip output is never legitimately large.
+	 * Prevents memory exhaustion if a child misbehaves. */
+#define SAFE_EXEC_MAX_OUTPUT (4 * 1024 * 1024)  /* 4 MiB */
+
 	size_t bufsize = 4096, used = 0;
 	char *buf = malloc(bufsize);
 	if (!buf) { close(pipefd[0]); waitpid(pid, NULL, 0); return NULL; }
@@ -186,6 +190,13 @@ char *safe_exec(const char *const argv[])
 	ssize_t n;
 	char tmp[1024];
 	while ((n = read(pipefd[0], tmp, sizeof(tmp))) > 0) {
+		if (used + (size_t)n + 1 > SAFE_EXEC_MAX_OUTPUT) {
+			fprintf(stderr, "[mgmtd] safe_exec: output cap reached\n");
+			free(buf);
+			close(pipefd[0]);
+			waitpid(pid, NULL, 0);
+			return NULL;
+		}
 		while (used + (size_t)n + 1 > bufsize) {
 			bufsize *= 2;
 			char *nb = realloc(buf, bufsize);

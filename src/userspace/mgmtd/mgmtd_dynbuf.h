@@ -62,6 +62,10 @@ static inline int dbuf_printf(struct dynbuf *b, const char *fmt, ...)
 	int len = vsnprintf(tmp, sizeof(tmp), fmt, ap);
 	va_end(ap);
 	if (len < 0) return -1;
+	/* vsnprintf returns the intended length even when it truncates.
+	 * Passing that length to dbuf_append would memcpy past the end of
+	 * tmp[].  Fail instead of reading uninitialised stack bytes. */
+	if (len >= (int)sizeof(tmp)) return -1;
 	return dbuf_append(b, tmp, (size_t)len);
 }
 

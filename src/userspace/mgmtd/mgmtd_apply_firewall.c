@@ -417,6 +417,11 @@ sg_status_t validate_firewall_policy(const char *id, const char *data,
 			if (matches) {
 				int dup = 0;
 				char *copy = strdup(matches);
+				if (!copy) {
+					free(matches);
+					snprintf(result, rsize, "Out of memory");
+					return SG_ERR_SYSTEM_FAIL;
+				}
 				char *sp   = NULL;
 				for (char *t = strtok_r(copy, "\n", &sp);
 				     t; t = strtok_r(NULL, "\n", &sp)) {

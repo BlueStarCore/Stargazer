@@ -1056,7 +1056,7 @@ static void flow_resources(work_item_t *item)
 	/* Read active kernel session count from session.ko via mgmtd.
 	 * session_count() counts web UI logins, not network sessions. */
 	long long net_sessions = 0;
-	webd_ipc_response_t sr;
+	webd_ipc_response_t sr = {0};   /* zero-init: webd_ipc_resp_free is always called */
 	if (webd_ipc_send(SG_CMD_SESSION_STATS, item->username,
 			  item->session_tag, "", &sr) == 0 &&
 	    sr.status == SG_OK && sr.payload) {
@@ -1064,7 +1064,7 @@ static void flow_resources(work_item_t *item)
 		if (kv)
 			net_sessions = strtoll(kv + 7, NULL, 10);
 	}
-	webd_ipc_resp_free(&sr);
+	webd_ipc_resp_free(&sr);   /* safe: free(NULL) is a no-op when IPC failed */
 
 	char *json = malloc(512);
 	if (json)
@@ -1813,7 +1813,10 @@ static void flow_monitor_sessions(work_item_t *item)
 		if (!first) SJ_APP(",", 1);
 		first = 0;
 
-		char entry[512];
+		/* 768 bytes: worst-case u64 pkts/bytes (41 chars each),
+		 * age_ms/expire_ms (19 chars each), policy_name (64 chars),
+		 * remaining fields, and JSON key/punctuation overhead. */
+		char entry[768];
 		int elen = snprintf(entry, sizeof(entry),
 			"{\"proto\":\"%s\",\"src\":\"%s\",\"dst\":\"%s\","
 			"\"id\":\"%s\",\"pkts\":\"%s\",\"bytes\":\"%s\","

@@ -37,12 +37,6 @@ int seq_type_is_orderable(const char *type);
 int seq_auto_assign(const char *type, char *data, size_t data_sz);
 
 /*
- * Check if any entry (excluding exclude_id) has the given sequence.
- * Returns 1 if collision exists, 0 if the slot is free.
- */
-int seq_has_collision(const char *type, int seq, const char *exclude_id);
-
-/*
  * Rotate sequences in the affected range when moving an entry.
  *
  * Moving UP   (old_seq < new_seq): entries in (old_seq, new_seq] get -1

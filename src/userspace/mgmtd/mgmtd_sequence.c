@@ -185,15 +185,6 @@ static int collect_seq_range(const char *type, int lo, int hi,
 	return n;
 }
 
-/* ── seq_has_collision ──────────────────────────────────────────────── */
-
-int seq_has_collision(const char *type, int seq, const char *exclude_id)
-{
-	struct seq_entry *entries = NULL;
-	int n = collect_seq_range(type, seq, seq, exclude_id, &entries);
-	free(entries);
-	return n > 0;
-}
 
 /* ── seq_rotate ─────────────────────────────────────────────────────── *
  *
