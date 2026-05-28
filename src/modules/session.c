@@ -257,7 +257,13 @@ static void src_est_dec(__be32 ip)
 
 static atomic64_t sess_est_src_drops = ATOMIC64_INIT(0); /* per-src est cap hits */
 
-/* sess_is_halfopen() is a static inline defined in session.h — no duplicate here */
+/* Private alias used within session.c — matches sess_tcp_is_halfopen() in session.h */
+static inline bool sess_is_halfopen(u8 state)
+{
+	return state == SESS_TCP_SYN_SENT  ||
+	       state == SESS_TCP_SYN_RECV  ||
+	       state == SESS_TCP_SYN_SENT2;
+}
 
 /* procfs handles */
 struct proc_dir_entry *sg_proc_root;
