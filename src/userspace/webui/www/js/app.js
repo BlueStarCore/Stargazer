@@ -3737,24 +3737,35 @@
         output.style.color = '';
 
         diagAbortCtrl = new AbortController();
+        /* Capture controller and timer for THIS request so resetState()
+         * can distinguish between our cleanup and a newer request's state. */
+        var myCtrl    = diagAbortCtrl;
 
-        /* 35 s client-side watchdog — slightly above backend's 30 s */
         diagTimeoutId = setTimeout(function () {
-            if (diagAbortCtrl) diagAbortCtrl.abort();
+            /* Only abort if this request is still the active one */
+            if (diagAbortCtrl === myCtrl) diagAbortCtrl.abort();
         }, 35000);
+        var myTimeout = diagTimeoutId;
 
         function resetState() {
-            document.querySelectorAll('[data-tool]').forEach(function (b) {
-                b.disabled = false;
-            });
-            if (cancelBtn) cancelBtn.style.display = 'none';
-            if (diagTimeoutId) { clearTimeout(diagTimeoutId); diagTimeoutId = null; }
-            diagAbortCtrl = null;
+            if (diagAbortCtrl === myCtrl) {
+                /* We're still the active request — re-enable UI */
+                document.querySelectorAll('[data-tool]').forEach(function (b) {
+                    b.disabled = false;
+                });
+                if (cancelBtn) cancelBtn.style.display = 'none';
+                diagAbortCtrl = null;
+            }
+            /* Always clear our own timer, never a newer request's timer */
+            if (diagTimeoutId === myTimeout) {
+                clearTimeout(diagTimeoutId);
+                diagTimeoutId = null;
+            }
             output.className = 'diag-output';
         }
 
         api('/diagnose/' + tool, { method: 'POST', body: params,
-                                    signal: diagAbortCtrl.signal })
+                                    signal: myCtrl.signal })
             .then(function (data) {
                 resetState();
                 if (data && data.output) {
@@ -3766,6 +3777,9 @@
                 }
             })
             .catch(function (err) {
+                /* Aborted because a newer tool was clicked — silently discard.
+                 * The new request already shows "Running..." in the output. */
+                if (err.name === 'AbortError' && diagAbortCtrl !== myCtrl) return;
                 resetState();
                 if (err.name === 'AbortError') {
                     output.textContent = 'Cancelled.';

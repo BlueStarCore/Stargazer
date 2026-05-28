@@ -66,9 +66,9 @@ int handle_net_traceroute(int client_fd, const char *user,
 		return 0;
 	}
 
-	/* -m 15: 15 hops × 2 s/hop = 30 s max, within the 30 s webd IPC timeout */
+	/* -m 14: 14 hops × 2 s/hop = 28 s max, 2 s below the 30 s webd IPC timeout */
 	return stream_exec(client_fd,
-		(const char *[]){"traceroute", "-m", "15", "-w", "2",
+		(const char *[]){"traceroute", "-m", "14", "-w", "2",
 				 target, NULL});
 }
 

@@ -1710,11 +1710,16 @@ static void stream_exec_body(int client_fd, const char *const argv[])
 }
 
 /*
- * stream_exec — fork a wrapper child so the mgmtd main loop stays responsive.
+ * stream_exec — double-fork so the mgmtd main loop stays responsive and
+ * no blanket waitpid(-1) is needed (which would race with the supervisor).
  *
- * The wrapper child calls stream_exec_body() (blocking) while the parent
- * returns immediately to accept the next IPC connection. Wrapper children are
- * reaped by the WNOHANG call in the main poll loop.
+ * Pattern:
+ *   Parent → forks wrapper → wrapper forks inner → wrapper exits immediately
+ *   Parent reaps wrapper via synchronous waitpid (returns in < 1 ms).
+ *   Inner is reparented to init which reaps it automatically.
+ *
+ * The inner child runs stream_exec_body() (blocking) while the parent
+ * is already back in accept().  No zombie accumulation, no waitpid race.
  *
  * Returns 1 (parent has closed client_fd — caller must not close it again).
  */
@@ -1728,17 +1733,57 @@ int stream_exec(int client_fd, const char *const argv[])
 		close(client_fd);
 		return 1;
 	}
+
 	if (wrapper == 0) {
-		/* Wrapper child: close the listen socket so it isn't inherited,
-		 * then run the blocking stream body and exit. */
+		/*
+		 * First child (wrapper).
+		 *
+		 * 1. Close the listen socket — must not be inherited.
+		 * 2. Reset signal handlers (SIGCHLD inherited from parent
+		 *    writes to g_child_died which is meaningless here).
+		 *    Keep SIGPIPE as SIG_IGN — stream_exec_body relies on
+		 *    write() returning EPIPE rather than crashing.
+		 * 3. Close all inherited fds except client_fd: SQLite,
+		 *    netlink socket, log file, etc.
+		 * 4. Double-fork: inner child is reparented to init so the
+		 *    parent (mgmtd) never needs to waitpid(-1) for it.
+		 */
 		if (g_listen_fd >= 0)
 			close(g_listen_fd);
+
+		signal(SIGCHLD, SIG_DFL);
+		signal(SIGTERM, SIG_DFL);
+		signal(SIGINT,  SIG_DFL);
+		/* SIGPIPE stays SIG_IGN (inherited) */
+
+		for (int fd = 3; fd < 256; fd++) {
+			if (fd != client_fd)
+				close(fd);   /* EBADF on unopened fds is fine */
+		}
+
+		pid_t inner = fork();
+		if (inner < 0) {
+			send_error(client_fd, SG_ERR_SYSTEM_FAIL,
+				   "Internal error");
+			close(client_fd);
+			_exit(1);
+		}
+		if (inner > 0) {
+			/* Wrapper exits immediately; inner is adopted by init */
+			close(client_fd);
+			_exit(0);
+		}
+		/* Inner child: run the blocking stream loop */
 		stream_exec_body(client_fd, argv);
 		_exit(0);
 	}
-	/* Parent: wrapper child owns client_fd now.  Close our copy and
-	 * return immediately so the main loop can accept new connections.
-	 * The wrapper is reaped by the WNOHANG call in the main poll loop. */
+
+	/*
+	 * Parent: reap the wrapper child synchronously.
+	 * It exits almost instantly (just forks and _exits), so this
+	 * blocks for < 1 ms — no appreciable delay on the accept() path.
+	 */
+	waitpid(wrapper, NULL, 0);
 	close(client_fd);
 	return 1;
 }
@@ -6151,11 +6196,7 @@ int main(void)
 			mgmt_log("ERROR", "poll: %s", strerror(errno));
 			continue;
 		}
-		if (pr == 0) {
-			/* Reap any finished stream_exec wrapper children */
-			while (waitpid(-1, NULL, WNOHANG) > 0) {}
-			continue;
-		}
+		if (pr == 0) continue;  /* timeout, loop back for reap */
 
 		/* Carrier events from kernel — process before accepting IPC */
 		if (nl_fd >= 0 && pfds[1].revents & POLLIN)
