@@ -1618,36 +1618,27 @@ int send_stream_chunk(int fd, const char *data, size_t len)
 }
 
 /*
- * stream_exec — fork+exec argv, stream child stdout/stderr to client_fd.
+ * stream_exec_body — blocking poll loop that streams a child process to client_fd.
  *
- * Uses poll() to monitor both the child pipe and the client socket.
- * If the client disconnects (Ctrl+C), the child is killed immediately
- * instead of waiting for the next line of output.
- *
- * Returns 1 (took ownership of client_fd — caller must not close it).
+ * Called only from a forked child of stream_exec() so the mgmtd main loop
+ * remains free to accept new IPC connections while a diagnostic command runs.
  */
-int stream_exec(int client_fd, const char *const argv[])
+static void stream_exec_body(int client_fd, const char *const argv[])
 {
 	int pipefd[2];
 	if (pipe(pipefd) < 0) {
-		mgmt_log("ERROR", "stream_exec: pipe() failed: %s",
-			 strerror(errno));
-		send_error(client_fd, SG_ERR_SYSTEM_FAIL,
-			   "Internal error");
-		return 0;
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL, "Internal error");
+		return;
 	}
 	pid_t pid = fork();
 	if (pid < 0) {
-		mgmt_log("ERROR", "stream_exec: fork() failed: %s",
-			 strerror(errno));
 		close(pipefd[0]);
 		close(pipefd[1]);
-		send_error(client_fd, SG_ERR_SYSTEM_FAIL,
-			   "Internal error");
-		return 0;
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL, "Internal error");
+		return;
 	}
 	if (pid == 0) {
-		/* Child: redirect stdout+stderr to pipe, exec */
+		/* Grand-child: redirect stdout+stderr to pipe, exec command */
 		close(pipefd[0]);
 		dup2(pipefd[1], STDOUT_FILENO);
 		dup2(pipefd[1], STDERR_FILENO);
@@ -1657,7 +1648,6 @@ int stream_exec(int client_fd, const char *const argv[])
 	}
 	close(pipefd[1]);
 
-	/* Parent: poll pipe (child output) + client socket (disconnect) */
 	struct pollfd pfds[2];
 	pfds[0].fd = pipefd[0];
 	pfds[0].events = POLLIN;
@@ -1670,24 +1660,22 @@ int stream_exec(int client_fd, const char *const argv[])
 		if (ret < 0) {
 			if (errno == EINTR)
 				continue;
-			break; /* poll error */
+			break;
 		}
 		if (ret == 0)
-			break; /* 30s timeout — child stalled */
+			break; /* 30 s timeout — command stalled */
 
-		/* Check client socket first: disconnect → kill child */
 		if (pfds[1].revents & (POLLIN | POLLHUP | POLLERR)) {
 			kill(pid, SIGTERM);
 			killed = 1;
 			break;
 		}
 
-		/* Child has output ready */
 		if (pfds[0].revents & POLLIN) {
 			char buf[1024];
 			ssize_t n = read(pipefd[0], buf, sizeof(buf));
 			if (n <= 0)
-				break; /* EOF or error */
+				break;
 			if (send_stream_chunk(client_fd, buf, (size_t)n) < 0) {
 				kill(pid, SIGTERM);
 				killed = 1;
@@ -1695,9 +1683,7 @@ int stream_exec(int client_fd, const char *const argv[])
 			}
 		}
 
-		/* Child pipe closed (EOF) */
 		if (pfds[0].revents & (POLLHUP | POLLERR)) {
-			/* Drain any remaining data */
 			for (;;) {
 				char buf[1024];
 				ssize_t n = read(pipefd[0], buf, sizeof(buf));
@@ -1720,6 +1706,39 @@ int stream_exec(int client_fd, const char *const argv[])
 		waitpid(pid, NULL, 0);
 	if (!killed)
 		send_ok(client_fd, NULL, NULL);
+	close(client_fd);
+}
+
+/*
+ * stream_exec — fork a wrapper child so the mgmtd main loop stays responsive.
+ *
+ * The wrapper child calls stream_exec_body() (blocking) while the parent
+ * returns immediately to accept the next IPC connection. Wrapper children are
+ * reaped by the WNOHANG call in the main poll loop.
+ *
+ * Returns 1 (parent has closed client_fd — caller must not close it again).
+ */
+int stream_exec(int client_fd, const char *const argv[])
+{
+	pid_t wrapper = fork();
+	if (wrapper < 0) {
+		mgmt_log("ERROR", "stream_exec: fork failed: %s",
+			 strerror(errno));
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL, "Internal error");
+		close(client_fd);
+		return 1;
+	}
+	if (wrapper == 0) {
+		/* Wrapper child: close the listen socket so it isn't inherited,
+		 * then run the blocking stream body and exit. */
+		if (g_listen_fd >= 0)
+			close(g_listen_fd);
+		stream_exec_body(client_fd, argv);
+		_exit(0);
+	}
+	/* Parent: wrapper child owns client_fd now.  Close our copy and
+	 * return immediately so the main loop can accept new connections.
+	 * The wrapper is reaped by the WNOHANG call in the main poll loop. */
 	close(client_fd);
 	return 1;
 }
@@ -6132,7 +6151,11 @@ int main(void)
 			mgmt_log("ERROR", "poll: %s", strerror(errno));
 			continue;
 		}
-		if (pr == 0) continue;  /* timeout, loop back for reap */
+		if (pr == 0) {
+			/* Reap any finished stream_exec wrapper children */
+			while (waitpid(-1, NULL, WNOHANG) > 0) {}
+			continue;
+		}
 
 		/* Carrier events from kernel — process before accepting IPC */
 		if (nl_fd >= 0 && pfds[1].revents & POLLIN)

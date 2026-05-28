@@ -2235,6 +2235,23 @@ tr.drop-below {
     white-space: pre-wrap;
 }
 
+/* Animated dot appended to "Running..." to show the request is active */
+.diag-output.diag-running::after {
+    content: '';
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    margin-left: 6px;
+    vertical-align: middle;
+    animation: diag-blink 1s step-start infinite;
+}
+@keyframes diag-blink {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0;  }
+}
+
 /* Horizontal scroll wrapper for data tables on mobile */
 .table-scroll {
     overflow-x: auto;

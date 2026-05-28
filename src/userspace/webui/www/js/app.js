@@ -3710,14 +3710,53 @@
      *  DIAGNOSTIC TOOLS — wire tool buttons to POST API calls
      * ================================================================ */
 
+    /* In-flight diagnostic request state.
+     * Tab switching does NOT cancel — the request runs in the background.
+     * A new tool click aborts the previous request to avoid DOM races. */
+    var diagAbortCtrl = null;
+    var diagTimeoutId = null;
+
     function runDiagTool(tool, params) {
-        var output = document.getElementById('diag-output');
+        var output    = document.getElementById('diag-output');
+        var cancelBtn = document.getElementById('diag-cancel');
         if (!output) return;
+
+        /* Abort any previous in-flight request (rapid re-click guard) */
+        if (diagAbortCtrl) { diagAbortCtrl.abort(); diagAbortCtrl = null; }
+        if (diagTimeoutId) { clearTimeout(diagTimeoutId); diagTimeoutId = null; }
+
+        /* Disable all tool buttons, show Cancel while running */
+        document.querySelectorAll('[data-tool]').forEach(function (b) {
+            b.disabled = true;
+        });
+        if (cancelBtn) cancelBtn.style.display = 'inline-block';
+
+        /* Animated indicator: CSS .diag-running adds a blinking dot */
+        output.className = 'diag-output diag-running';
         output.textContent = 'Running...';
         output.style.color = '';
 
-        api('/diagnose/' + tool, { method: 'POST', body: params })
+        diagAbortCtrl = new AbortController();
+
+        /* 35 s client-side watchdog — slightly above backend's 30 s */
+        diagTimeoutId = setTimeout(function () {
+            if (diagAbortCtrl) diagAbortCtrl.abort();
+        }, 35000);
+
+        function resetState() {
+            document.querySelectorAll('[data-tool]').forEach(function (b) {
+                b.disabled = false;
+            });
+            if (cancelBtn) cancelBtn.style.display = 'none';
+            if (diagTimeoutId) { clearTimeout(diagTimeoutId); diagTimeoutId = null; }
+            diagAbortCtrl = null;
+            output.className = 'diag-output';
+        }
+
+        api('/diagnose/' + tool, { method: 'POST', body: params,
+                                    signal: diagAbortCtrl.signal })
             .then(function (data) {
+                resetState();
                 if (data && data.output) {
                     output.textContent = data.output;
                     output.style.color = '#333';
@@ -3727,8 +3766,14 @@
                 }
             })
             .catch(function (err) {
-                output.textContent = 'Error: ' + (err.message || 'unknown');
-                output.style.color = '#c62828';
+                resetState();
+                if (err.name === 'AbortError') {
+                    output.textContent = 'Cancelled.';
+                    output.style.color = '#999';
+                } else {
+                    output.textContent = 'Error: ' + (err.message || 'unknown');
+                    output.style.color = '#c62828';
+                }
             });
     }
 
@@ -3763,6 +3808,14 @@
             runDiagTool(tool, params);
         });
     });
+
+    /* Cancel button for in-flight diagnostic requests */
+    var _diagCancelBtn = document.getElementById('diag-cancel');
+    if (_diagCancelBtn) {
+        _diagCancelBtn.addEventListener('click', function () {
+            if (diagAbortCtrl) diagAbortCtrl.abort();
+        });
+    }
 
     /* ================================================================
      *  FIRMWARE — upload + reboot to NAND
