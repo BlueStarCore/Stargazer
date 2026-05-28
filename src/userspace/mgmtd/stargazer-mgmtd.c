@@ -410,6 +410,7 @@ void flush_forward_chain(void)
 {
 	const char *ff[] = {"iptables", "-F", "FORWARD", NULL};
 	const char *fe[] = {"iptables", "-A", "FORWARD",
+			    "-m", "mark", "!", "--mark", "0x80",
 			    "-m", "conntrack",
 			    "--ctstate", "ESTABLISHED,RELATED",
 			    "-j", "ACCEPT", NULL};

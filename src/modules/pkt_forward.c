@@ -264,6 +264,10 @@ static bool src_rate_check(struct src_rate_slot *tbl, __be32 src,
 {
 	u32 idx = jhash_1word((__force u32)src, dos_hash_seed) % SRC_RATE_SLOTS;
 	struct src_rate_slot *sl = &tbl[idx];
+
+	/* rate=0 means disabled — same semantics as global_syn_thr=0 */
+	if (rate == 0)
+		return false;
 	unsigned long now = jiffies;
 	unsigned long elapsed;
 	s32 refill;
@@ -1020,7 +1024,7 @@ static void __exit pkt_forward_exit(void)
 		proc_remove(proc_pf_stats);
 	pr_info("pkt_forward: unloaded (fwd=%lld drop=%lld block=%lld"
 		" syn=%lld udp=%lld icmp=%lld anomaly=%lld"
-		" halfopen_src=%lld gsyn=%lld pktrate=%lld"
+		" halfopen_src=%lld gsyn=%lld gudp=%lld pktrate=%lld"
 		" icmp_err=%lld scan=%lld)\n",
 		atomic64_read(&pkts_forwarded),
 		atomic64_read(&pkts_dropped),
@@ -1031,6 +1035,7 @@ static void __exit pkt_forward_exit(void)
 		atomic64_read(&pkts_anomaly_dropped),
 		atomic64_read(&pkts_halfopen_src_dropped),
 		atomic64_read(&pkts_global_syn_dropped),
+		atomic64_read(&pkts_global_udp_dropped),
 		atomic64_read(&pkts_pkt_rate_dropped),
 		atomic64_read(&pkts_icmp_err_dropped),
 		atomic64_read(&pkts_scan_dropped));

@@ -41,31 +41,47 @@ static int is_any_or_all(const char *val)
  * Append optional -s/-d flags.  Same pattern as firewall rebuild
  * (mgmtd_apply_firewall.c): skip "any"/"all", validate CIDR before use.
  */
-static void append_addr_match(struct dynbuf *buf,
-			      const char *flag,
-			      const char *addr)
+/* Returns 0 if the flag was appended (or match-all, no flag needed).
+ * Returns -1 if the address object was not found (dangling ref) —
+ * caller must discard the entire rule, fail-closed. */
+static int append_addr_match(struct dynbuf *buf,
+			     const char *flag,
+			     const char *addr)
 {
 	char resolved[VALBUFSZ];
 	const char *cidr = resolve_address(addr, resolved,
 					   sizeof(resolved));
-	if (cidr && strcmp(cidr, "SKIP") != 0)
+	if (cidr && strcmp(cidr, "SKIP") == 0) {
+		mgmt_log("ERROR", "append_addr_match: '%s' not found, skipping rule",
+			 addr);
+		return -1;
+	}
+	if (cidr)
 		dbuf_printf(buf, " %s %s", flag, cidr);
+	return 0;
 }
 
 /*
  * Emit one DNAT rule line for a single protocol.
  * Called once for tcp/udp, twice for tcp+udp.
+ *
+ * Returns 0 on success, -1 if an address object was not found.
+ * On -1 the partial rule is rolled back so the buffer stays clean.
  */
 /* srcintf = incoming interface for DNAT (PREROUTING -i) */
-static void emit_dnat_rule(struct dynbuf *buf,
-			   const char *srcaddr, const char *dstaddr,
-			   const char *srcintf, const char *proto,
-			   const char *dstport,
-			   const char *mapped_ip, const char *mapped_port)
+static int emit_dnat_rule(struct dynbuf *buf,
+			  const char *srcaddr, const char *dstaddr,
+			  const char *srcintf, const char *proto,
+			  const char *dstport,
+			  const char *mapped_ip, const char *mapped_port)
 {
+	size_t rule_start = buf->used;
+
 	dbuf_printf(buf, "-A PREROUTING");
-	append_addr_match(buf, "-s", srcaddr);
-	append_addr_match(buf, "-d", dstaddr);
+	if (append_addr_match(buf, "-s", srcaddr) < 0)
+		goto skip;
+	if (append_addr_match(buf, "-d", dstaddr) < 0)
+		goto skip;
 	if (!is_any_or_all(srcintf))
 		dbuf_printf(buf, " -i %s", srcintf);
 	if (proto) {
@@ -79,6 +95,11 @@ static void emit_dnat_rule(struct dynbuf *buf,
 	else
 		dbuf_printf(buf, " -j DNAT --to-destination %s\n",
 			    mapped_ip);
+	return 0;
+
+skip:
+	buf->used = rule_start; /* roll back partial -A PREROUTING write */
+	return -1;
 }
 
 /* ── Rebuild ─────────────────────────────────────────────────────────────── */
@@ -138,9 +159,13 @@ sg_status_t rebuild_nat_chains(char *result, size_t rsize)
 			 * srcintf not usable in POSTROUTING (-i ignored) */
 			if (strcmp(nattype, "snat") == 0 &&
 			    !is_any_or_all(dstintf)) {
+				size_t snat_start = buf.used;
 				dbuf_printf(&buf, "-A POSTROUTING");
-				append_addr_match(&buf, "-s", srcaddr);
-				append_addr_match(&buf, "-d", dstaddr);
+				if (append_addr_match(&buf, "-s", srcaddr) < 0 ||
+				    append_addr_match(&buf, "-d", dstaddr) < 0) {
+					buf.used = snat_start; /* roll back partial write */
+					continue;
+				}
 				dbuf_printf(&buf, " -o %s", dstintf);
 				dbuf_printf(&buf, " -j MASQUERADE\n");
 				snat_count++;
@@ -152,30 +177,31 @@ sg_status_t rebuild_nat_chains(char *result, size_t rsize)
 			if (strcmp(nattype, "dnat") == 0 && mapped_ip[0]) {
 				if (strcmp(protocol, "tcp+udp") == 0) {
 					/* Two separate rules (OpenWrt pattern) */
-					emit_dnat_rule(&buf, srcaddr, dstaddr,
-						       srcintf, "tcp",
-						       dstport,
-						       mapped_ip, mapped_port);
-					emit_dnat_rule(&buf, srcaddr, dstaddr,
-						       srcintf, "udp",
-						       dstport,
-						       mapped_ip, mapped_port);
-					dnat_count += 2;
+					if (emit_dnat_rule(&buf, srcaddr, dstaddr,
+							   srcintf, "tcp",
+							   dstport,
+							   mapped_ip, mapped_port) == 0)
+						dnat_count++;
+					if (emit_dnat_rule(&buf, srcaddr, dstaddr,
+							   srcintf, "udp",
+							   dstport,
+							   mapped_ip, mapped_port) == 0)
+						dnat_count++;
 				} else if (strcmp(protocol, "all") == 0) {
 					/* No -p flag, match all protocols
 					 * (1:1 NAT — dstport ignored) */
-					emit_dnat_rule(&buf, srcaddr, dstaddr,
-						       srcintf, NULL,
-						       dstport,
-						       mapped_ip, mapped_port);
-					dnat_count++;
+					if (emit_dnat_rule(&buf, srcaddr, dstaddr,
+							   srcintf, NULL,
+							   dstport,
+							   mapped_ip, mapped_port) == 0)
+						dnat_count++;
 				} else {
 					/* tcp or udp */
-					emit_dnat_rule(&buf, srcaddr, dstaddr,
-						       srcintf, protocol,
-						       dstport,
-						       mapped_ip, mapped_port);
-					dnat_count++;
+					if (emit_dnat_rule(&buf, srcaddr, dstaddr,
+							   srcintf, protocol,
+							   dstport,
+							   mapped_ip, mapped_port) == 0)
+						dnat_count++;
 				}
 				continue;
 			}

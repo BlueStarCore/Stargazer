@@ -290,8 +290,9 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 				dbuf_printf(&buf, " -j %s\n", target);
 				rule_count++;
 			}
+			continue; /* success — skip the rollback below */
 		skip_rule:
-			;
+			buf.used = rule_start; /* roll back partial -A FORWARD write */
 		}
 		free(list);
 	}
