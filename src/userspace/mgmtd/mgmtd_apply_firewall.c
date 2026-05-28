@@ -420,7 +420,10 @@ sg_status_t validate_firewall_policy(const char *id, const char *data,
 				char *sp   = NULL;
 				for (char *t = strtok_r(copy, "\n", &sp);
 				     t; t = strtok_r(NULL, "\n", &sp)) {
-					if (t[0] && strcmp(t, id) != 0) {
+					/* sg_db_find_referencing returns "type:id" */
+					const char *colon = strchr(t, ':');
+					const char *found_id = colon ? colon + 1 : t;
+					if (found_id[0] && strcmp(found_id, id) != 0) {
 						dup = 1;
 						break;
 					}
