@@ -39,7 +39,12 @@
  * The post_filter_hook clears the bit and the SESS_DIRTY flag after iptables
  * accepts the packet, returning the session to the fast path.
  */
-#define STARGAZER_DIRTY_MARK	0x00000080u
+#define STARGAZER_DIRTY_MARK		0x00000080u
+/* Policy sequence stamped into skb->mark bits 29–16 by iptables MARK rule.
+ * Bits 29–16 (14 bits, range 1–16383) do not overlap with DIRTY_MARK (bit 7).
+ * post_filter_hook reads this to set session->policy_id after iptables accepts. */
+#define STARGAZER_POLICY_MARK_SHIFT	16U
+#define STARGAZER_POLICY_MARK_MASK	0x3FFF0000U
 
 /* Counters (atomic for SMP) */
 static atomic64_t pkts_forwarded            = ATOMIC64_INIT(0);
@@ -917,12 +922,19 @@ static const struct nf_hook_ops nf_forward_ops = {
 };
 
 /*
- * post_filter_hook — clears SESS_DIRTY after iptables has accepted a packet.
+ * post_filter_hook — stamps policy_id and clears SESS_DIRTY after iptables
+ * has accepted a packet.
  *
  * Runs at NF_IP_PRI_FILTER + 1, so it only fires when iptables accepted the
  * packet (NF_DROP from iptables stops traversal; this hook is never reached).
- * It checks the STARGAZER_DIRTY_MARK bit set by forward_hook() to avoid a
- * session lookup on every non-dirty packet.
+ *
+ * Two mark regions are handled here:
+ *   STARGAZER_DIRTY_MARK (bit 7):        set by forward_hook for dirty sessions.
+ *   STARGAZER_POLICY_MARK_MASK (bits 16–29): set by iptables MARK rule before
+ *       each ACCEPT policy rule, encodes the policy's sequence number.
+ *
+ * Fast path: if neither region is set, return immediately without session lookup.
+ * This keeps per-packet cost zero for the normal ESTABLISHED/RELATED path.
  */
 static unsigned int post_filter_hook(void *priv, struct sk_buff *skb,
 				     const struct nf_hook_state *state)
@@ -930,11 +942,18 @@ static unsigned int post_filter_hook(void *priv, struct sk_buff *skb,
 	struct sess_key key;
 	struct session *s;
 	int dir;
+	bool is_dirty;
+	u32 policy_seq;
 
-	if (!(skb->mark & STARGAZER_DIRTY_MARK))
+	is_dirty   = (skb->mark & STARGAZER_DIRTY_MARK)    != 0;
+	policy_seq = (skb->mark & STARGAZER_POLICY_MARK_MASK) >> STARGAZER_POLICY_MARK_SHIFT;
+
+	if (!is_dirty && !policy_seq)
 		return NF_ACCEPT;
 
-	skb->mark &= ~STARGAZER_DIRTY_MARK;
+	/* Clear both regions before the session lookup so the skb is clean
+	 * when it continues toward the network stack. */
+	skb->mark &= ~(STARGAZER_DIRTY_MARK | STARGAZER_POLICY_MARK_MASK);
 
 	if (extract_key(skb, &key) != 0)
 		return NF_ACCEPT;
@@ -943,7 +962,10 @@ static unsigned int post_filter_hook(void *priv, struct sk_buff *skb,
 	s = sess_lookup_bidir(&key, &dir);
 	if (s) {
 		spin_lock(&s->lock);
-		s->flags &= ~SESS_DIRTY;
+		if (is_dirty)
+			s->flags &= ~SESS_DIRTY;
+		if (policy_seq)
+			WRITE_ONCE(s->policy_id, policy_seq);
 		spin_unlock(&s->lock);
 	}
 	rcu_read_unlock();

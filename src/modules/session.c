@@ -1605,7 +1605,7 @@ static int sess_seq_show(struct seq_file *seq, void *v)
 			pf_max_states, pf_adaptive_start, pf_adaptive_end,
 			READ_ONCE(gc_sweep_interval), READ_ONCE(gc_aggressive));
 		seq_puts(seq,
-			"# proto src dst id pkts(o/r) bytes(o/r) age_ms expire_ms ml flags tcp_state\n");
+			"# proto src dst id pkts(o/r) bytes(o/r) age_ms expire_ms ml flags dev policy_id tcp_state\n");
 		return 0;
 	}
 
@@ -1619,7 +1619,8 @@ static int sess_seq_show(struct seq_file *seq, void *v)
 		" pkts=%llu/%llu bytes=%llu/%llu"
 		" age_ms=%lld expire_ms=%lld"
 		" ml=%d flags=0x%x"
-		" dev=%u/%u",
+		" dev=%u/%u"
+		" policy_id=%u",
 		s->key.proto,
 		&s->key.src_ip, ntohs(s->key.src_port),
 		&s->key.dst_ip, ntohs(s->key.dst_port),
@@ -1628,7 +1629,8 @@ static int sess_seq_show(struct seq_file *seq, void *v)
 		s->stats.bytes_orig, s->stats.bytes_reply,
 		age_ms, ttl_ms,
 		READ_ONCE(s->ml_score), READ_ONCE(s->flags),
-		s->ifindex_in, s->ifindex_out);
+		s->ifindex_in, s->ifindex_out,
+		READ_ONCE(s->policy_id));
 	if (s->key.proto == IPPROTO_TCP)
 		seq_printf(seq, " tcp_state=%u", READ_ONCE(s->tcp_state));
 	seq_putc(seq, '\n');

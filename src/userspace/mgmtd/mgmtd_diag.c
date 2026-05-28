@@ -17,6 +17,7 @@
 
 #include "mgmtd_internal.h"
 #include "mgmtd_apply.h"
+#include "mgmtd_dynbuf.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -1392,7 +1393,90 @@ int handle_show_sessions(int client_fd, const char *user,
 		return 0;
 	}
 
-	send_ok(client_fd, NULL, buf);
+	/* Build sequence→name map from firewall_policy DB entries. */
+#define SESS_POLICY_MAP_MAX 256
+	struct {
+		unsigned int seq;
+		char         name[64];
+	} pmap[SESS_POLICY_MAP_MAX];
+	int nmap = 0;
+
+	char *plist = sg_db_list("firewall_policy");
+	if (plist) {
+		char *sp = NULL;
+		for (char *pid = strtok_r(plist, "\n", &sp);
+		     pid && nmap < SESS_POLICY_MAP_MAX;
+		     pid = strtok_r(NULL, "\n", &sp)) {
+			char *sval = sg_db_get_val("firewall_policy", pid, "sequence");
+			char *nval = sg_db_get_val("firewall_policy", pid, "name");
+			if (sval && nval && sval[0] && nval[0]) {
+				pmap[nmap].seq = (unsigned int)strtoul(sval, NULL, 10);
+				snprintf(pmap[nmap].name, sizeof(pmap[nmap].name),
+					 "%s", nval);
+				nmap++;
+			}
+			free(sval);
+			free(nval);
+		}
+		free(plist);
+	}
+
+	/* Second pass: append  policy_name=<name>  to session lines that
+	 * carry a non-zero policy_id field. Fall back to raw buf on OOM. */
+	struct dynbuf out;
+	if (dbuf_init(&out, (size_t)n + 512) < 0) {
+		send_ok(client_fd, NULL, buf);
+		return 0;
+	}
+
+	const char *p = buf;
+	while (*p) {
+		const char *nl = strchr(p, '\n');
+		size_t ll     = nl ? (size_t)(nl - p) : strlen(p);
+
+		dbuf_append(&out, p, ll);
+
+		if (ll > 0 && p[0] != '#') {
+			/* Extract policy_id from the line */
+			char line_copy[512];
+			size_t cp = ll < sizeof(line_copy) - 1
+				    ? ll : sizeof(line_copy) - 1;
+			memcpy(line_copy, p, cp);
+			line_copy[cp] = '\0';
+
+			const char *kv = strstr(line_copy, "policy_id=");
+			if (kv) {
+				unsigned int seq =
+					(unsigned int)strtoul(kv + 10, NULL, 10);
+				if (seq > 0) {
+					const char *name = NULL;
+					for (int i = 0; i < nmap; i++) {
+						if (pmap[i].seq == seq) {
+							name = pmap[i].name;
+							break;
+						}
+					}
+					if (name) {
+						char sfx[80];
+						int sfxlen = snprintf(sfx,
+							sizeof(sfx),
+							" policy_name=%s", name);
+						if (sfxlen > 0)
+							dbuf_append(&out, sfx,
+								    (size_t)sfxlen);
+					}
+				}
+			}
+		}
+
+		dbuf_append(&out, "\n", 1);
+		p = nl ? nl + 1 : p + ll;
+		if (!nl)
+			break;
+	}
+
+	send_ok(client_fd, NULL, out.data);
+	free(out.data);
 	return 0;
 }
 

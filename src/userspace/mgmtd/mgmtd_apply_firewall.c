@@ -185,7 +185,7 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 			char srcintf[VALBUFSZ], dstintf[VALBUFSZ];
 			char srcaddr[VALBUFSZ], dstaddr[VALBUFSZ];
 			char action[VALBUFSZ], status[VALBUFSZ];
-			char service[VALBUFSZ];
+			char service[VALBUFSZ], seq_str[16];
 
 			extract_val(data, "srcintf",  srcintf,  sizeof(srcintf));
 			extract_val(data, "dstintf",  dstintf,  sizeof(dstintf));
@@ -194,6 +194,7 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 			extract_val(data, "action",   action,   sizeof(action));
 			extract_val(data, "status",   status,   sizeof(status));
 			extract_val(data, "service",  service,  sizeof(service));
+			extract_val(data, "sequence", seq_str,  sizeof(seq_str));
 
 			free(data);
 
@@ -287,6 +288,29 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 					" -j REJECT --reject-with tcp-reset\n");
 				rule_count++;
 			} else {
+				/*
+				 * For ACCEPT rules, prepend a MARK rule that stamps
+				 * the policy sequence into skb->mark bits 29–16.
+				 * post_filter_hook reads the mark and writes it to
+				 * session->policy_id so sessions show the policy name.
+				 * Uses the same saved_pfx technique as the REJECT split.
+				 */
+				if (strcmp(target, "ACCEPT") == 0) {
+					unsigned int pseq =
+						(unsigned int)strtoul(seq_str, NULL, 10);
+					size_t plen = buf.used - rule_start;
+					char saved_pfx[256];
+					if (pseq > 0 && plen < sizeof(saved_pfx)) {
+						memcpy(saved_pfx,
+						       buf.data + rule_start, plen);
+						dbuf_printf(&buf,
+							" -j MARK --set-xmark"
+							" 0x%08X/0x3FFF0000\n",
+							pseq << 16);
+						rule_count++;
+						dbuf_append(&buf, saved_pfx, plen);
+					}
+				}
 				dbuf_printf(&buf, " -j %s\n", target);
 				rule_count++;
 			}
@@ -352,7 +376,6 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 sg_status_t validate_firewall_policy(const char *id, const char *data,
 				     char *result, size_t rsize)
 {
-	(void)id;
 	char action[VALBUFSZ], srcintf[VALBUFSZ], dstintf[VALBUFSZ];
 
 	extract_val(data, "action",  action,  sizeof(action));
@@ -383,7 +406,38 @@ sg_status_t validate_firewall_policy(const char *id, const char *data,
 		return SG_ERR_INVALID_VAL;
 	}
 
-	snprintf(result, rsize, "Policy %s validated", id);
+	/* Enforce unique policy name across all firewall_policy entries.
+	 * Skip the check when id is empty (defensive) or name is not set. */
+	if (id && id[0]) {
+		char name[VALBUFSZ];
+		extract_val(data, "name", name, sizeof(name));
+		if (name[0]) {
+			char *matches = sg_db_find_referencing(
+				"firewall_policy", "name", name);
+			if (matches) {
+				int dup = 0;
+				char *copy = strdup(matches);
+				char *sp   = NULL;
+				for (char *t = strtok_r(copy, "\n", &sp);
+				     t; t = strtok_r(NULL, "\n", &sp)) {
+					if (t[0] && strcmp(t, id) != 0) {
+						dup = 1;
+						break;
+					}
+				}
+				free(copy);
+				free(matches);
+				if (dup) {
+					snprintf(result, rsize,
+						 "Policy name '%s' is already in use",
+						 name);
+					return SG_ERR_INVALID_VAL;
+				}
+			}
+		}
+	}
+
+	snprintf(result, rsize, "Policy %s validated", id ? id : "");
 	return SG_OK;
 }
 

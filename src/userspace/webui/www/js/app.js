@@ -4238,7 +4238,7 @@
                 tr.appendChild(makeTd(protoName));
                 tr.appendChild(makeTd(s.src || ''));
                 tr.appendChild(makeTd(s.dst || ''));
-                tr.appendChild(makeTd('-'));
+                tr.appendChild(makeTd(s.policy_name || '-'));
                 tr.appendChild(makeTd(durStr));
                 tr.appendChild(makeTd(bytesStr));
 

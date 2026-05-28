@@ -1777,19 +1777,20 @@ static void flow_monitor_sessions(work_item_t *item)
 
 		char proto[8], src[48], dst[48], id_s[16];
 		char pkts[32], bytes[32], age[24], exp_ms[24];
-		char ml[8], flags[12], tcp_st[8];
+		char ml[8], flags[12], tcp_st[8], policy_name[64];
 
-		kv_extract(line, "proto",     proto,  sizeof(proto));
-		kv_extract(line, "src",       src,    sizeof(src));
-		kv_extract(line, "dst",       dst,    sizeof(dst));
-		kv_extract(line, "id",        id_s,   sizeof(id_s));
-		kv_extract(line, "pkts",      pkts,   sizeof(pkts));
-		kv_extract(line, "bytes",     bytes,  sizeof(bytes));
-		kv_extract(line, "age_ms",    age,    sizeof(age));
-		kv_extract(line, "expire_ms", exp_ms, sizeof(exp_ms));
-		kv_extract(line, "ml",        ml,     sizeof(ml));
-		kv_extract(line, "flags",     flags,  sizeof(flags));
-		kv_extract(line, "tcp_state", tcp_st, sizeof(tcp_st));
+		kv_extract(line, "proto",        proto,       sizeof(proto));
+		kv_extract(line, "src",          src,         sizeof(src));
+		kv_extract(line, "dst",          dst,         sizeof(dst));
+		kv_extract(line, "id",           id_s,        sizeof(id_s));
+		kv_extract(line, "pkts",         pkts,        sizeof(pkts));
+		kv_extract(line, "bytes",        bytes,       sizeof(bytes));
+		kv_extract(line, "age_ms",       age,         sizeof(age));
+		kv_extract(line, "expire_ms",    exp_ms,      sizeof(exp_ms));
+		kv_extract(line, "ml",           ml,          sizeof(ml));
+		kv_extract(line, "flags",        flags,       sizeof(flags));
+		kv_extract(line, "tcp_state",    tcp_st,      sizeof(tcp_st));
+		kv_extract(line, "policy_name",  policy_name, sizeof(policy_name));
 
 		if (!proto[0]) {
 			p = nl ? nl + 1 : p + ll;
@@ -1804,9 +1805,10 @@ static void flow_monitor_sessions(work_item_t *item)
 			"{\"proto\":\"%s\",\"src\":\"%s\",\"dst\":\"%s\","
 			"\"id\":\"%s\",\"pkts\":\"%s\",\"bytes\":\"%s\","
 			"\"age_ms\":\"%s\",\"expire_ms\":\"%s\","
-			"\"ml\":\"%s\",\"flags\":\"%s\",\"tcp_state\":\"%s\"}",
+			"\"ml\":\"%s\",\"flags\":\"%s\",\"tcp_state\":\"%s\","
+			"\"policy_name\":\"%s\"}",
 			proto, src, dst, id_s, pkts, bytes,
-			age, exp_ms, ml, flags, tcp_st);
+			age, exp_ms, ml, flags, tcp_st, policy_name);
 		if (elen > 0 && (size_t)elen < sizeof(entry))
 			SJ_APP(entry, (size_t)elen);
 
