@@ -1601,8 +1601,7 @@ int handle_session_stats(int client_fd, const char *user,
 	/* Read pkt_forward flood counters from its own procfs file */
 	long long syn_dropped = 0, udp_dropped = 0, icmp_dropped = 0;
 	long long anomaly_dropped = 0, halfopen_src_dropped = 0;
-	long long global_syn_dropped = 0, pkt_rate_dropped = 0;
-	long long icmp_err_dropped = 0, scan_dropped = 0;
+	long long pkt_rate_dropped = 0, scan_dropped = 0;
 	if (pkt_fwd_loaded) {
 		char pf_buf[1024];
 		ssize_t pf_n = read_small_file("/proc/stargazer/pkt_forward_stats",
@@ -1619,12 +1618,8 @@ int handle_session_stats(int client_fd, const char *user,
 			if (kv) anomaly_dropped      = strtoll(kv + 21, NULL, 10);
 			kv = strstr(pf_buf, "pkts_halfopen_src_dropped=");
 			if (kv) halfopen_src_dropped = strtoll(kv + 26, NULL, 10);
-			kv = strstr(pf_buf, "pkts_global_syn_dropped=");
-			if (kv) global_syn_dropped   = strtoll(kv + 24, NULL, 10);
 			kv = strstr(pf_buf, "pkts_pkt_rate_dropped=");
 			if (kv) pkt_rate_dropped     = strtoll(kv + 22, NULL, 10);
-			kv = strstr(pf_buf, "pkts_icmp_err_dropped=");
-			if (kv) icmp_err_dropped     = strtoll(kv + 22, NULL, 10);
 			kv = strstr(pf_buf, "pkts_scan_dropped=");
 			if (kv) scan_dropped         = strtoll(kv + 18, NULL, 10);
 		}
@@ -1646,17 +1641,14 @@ int handle_session_stats(int client_fd, const char *user,
 		 "icmp_flood_dropped=%lld\n"
 		 "anomaly_dropped=%lld\n"
 		 "halfopen_src_dropped=%lld\n"
-		 "global_syn_dropped=%lld\n"
 		 "pkt_rate_dropped=%lld\n"
-		 "icmp_err_dropped=%lld\n"
 		 "scan_dropped=%lld\n",
 		 session_loaded, pkt_fwd_loaded,
 		 active, created, expired, invalid,
 		 halfopen, rejected_halfopen, est_src_drops,
 		 syn_dropped, udp_dropped, icmp_dropped,
 		 anomaly_dropped, halfopen_src_dropped,
-		 global_syn_dropped, pkt_rate_dropped,
-		 icmp_err_dropped, scan_dropped);
+		 pkt_rate_dropped, scan_dropped);
 
 	send_ok(client_fd, NULL, resp);
 	return 0;
@@ -1778,6 +1770,33 @@ int handle_session_gc_interval(int client_fd, const char *user,
 	char resp[64];
 	snprintf(resp, sizeof(resp), "gc_sweep_interval=%ld\n", val);
 	send_ok(client_fd, NULL, resp);
+	return 0;
+}
+
+/* ── SG_CMD_SESSION_BLOCKS (658) — recent DoS block events ─────────────── */
+
+int handle_session_blocks(int client_fd, const char *user,
+			  const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)payload; (void)hdr;
+
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "monitor permission required");
+		return 0;
+	}
+
+	char buf[SG_RESPONSE_MAX];
+	ssize_t n = read_small_file("/proc/stargazer/dos_blocks",
+				    buf, sizeof(buf));
+	if (n < 0) {
+		send_error(client_fd, SG_ERR_NOT_FOUND,
+			   "pkt_forward module not loaded "
+			   "(no DoS block log available)");
+		return 0;
+	}
+	send_ok(client_fd, NULL, buf);
 	return 0;
 }
 

@@ -1,560 +1,789 @@
 # Phase 2 — Stateful Session Tracking
 
-## Goal
+## 1. Overview
 
-Wire a stateful session table into the packet forwarding path so that every
-IPv4 packet traversing the router is associated with a tracked session. The
-session carries per-flow statistics (packet counts, byte counts, inter-arrival
-times, TCP flags) that feed Phase 3's ML scoring engine, and enforces a
-`SESS_BLOCKED` flag that lets policy or ML drop a flow without touching
-iptables rules.
+Phase 2 delivers stateful packet tracking for the Stargazer NGFW. Two kernel modules implement the data plane:
 
-The design follows FortiOS behavior: stateful enforcement is done in the kernel
-on every packet, not in userspace rules. Non-SYN TCP drops and RST sequence
-validation are hardcoded, not configurable.
+| Module | File | Role |
+|--------|------|------|
+| `session.ko` | `session.c` / `session.h` | RCU hash table, TCP state machine, session reaper, procfs |
+| `pkt_forward.ko` | `pkt_forward.c` | Netfilter FORWARD hook, DoS protection, policy enforcement |
+| `session_test.ko` | `session_test.c` | Kernel self-test, loaded/unloaded on demand by mgmtd |
 
----
+**Load order** is enforced by `MODULE_SOFTDEP("pre: session nf_defrag_ipv4")` in `pkt_forward.c`. The kernel loads `session.ko` and `nf_defrag_ipv4` before `pkt_forward.ko`. `session_test.ko` carries its own `MODULE_SOFTDEP("pre: session")` and is loaded and unloaded on demand by `handle_diag_session()` in `mgmtd_diag.c`.
 
-## Components
-
-| Component | File | Role |
-|---|---|---|
-| Session table | `src/modules/session.c` | RCU hash table, LRU list, single 1 Hz GC reaper, PF adaptive eviction, procfs |
-| Public API | `src/modules/session.h` | Structs and exported symbols |
-| Packet hook | `src/modules/pkt_forward.c` | Calls session API on every FORWARD packet |
-| Kernel self-test | `src/modules/session_test.c` | Tests API without a network stack |
-| mgmtd handlers | `src/userspace/mgmtd/mgmtd_diag.c` | IPC for status, stats, clear, inject test |
-| CLI commands | `src/userspace/cli/cli_cmd_table.c` | `execute diagnose session *` |
-| Selftest suite | `src/userspace/cli/cli_diagnose_session.c` | SESS-01..12 |
+**Direction model** follows the FortiOS / Linux conntrack convention: the first packet that creates a session defines the "original" direction (`SESS_DIR_ORIG = 0`). Subsequent packets matching the reversed 5-tuple are accounted as "reply" (`SESS_DIR_REPLY = 1`). `sess_lookup_or_create()` tries the key as-is first, then reversed, and only allocates a new session on a complete miss.
 
 ---
 
-## How a packet flows through Phase 2
+## 2. Session Struct
 
-IPv4 fragments are reassembled by `nf_defrag_ipv4` at `NF_INET_PRE_ROUTING`
-(priority -400) before the FORWARD hook fires.  `pkt_forward.ko` depends on
-this via `MODULE_SOFTDEP("pre: nf_defrag_ipv4")` and enables it explicitly
-with `nf_defrag_ipv4_enable(&init_net)` at module load.
-
-```
-NIC → kernel → NF_INET_PRE_ROUTING
-                      │
-                      ▼
-              nf_defrag_ipv4           reassemble fragments (priority -400)
-                      │ complete packet
-                      ▼
-              NF_INET_FORWARD hook (pkt_forward.ko, priority -399)
-                      │
-                      ▼
-              is_valid_ipv4()          invalid IP header → NF_DROP (pkts_dropped++)
-                      │ ok
-                      ▼
-              extract_key()            malformed L4 header → NF_DROP (pkts_dropped++, pr_warn_ratelimited)
-                      │ ok
-                      ▼
-              tcp_is_syn = tcph->syn   (safe: extract_key pulled TCP header)
-                      │
-                      ▼
-          ┌───────────────────────────┐
-          │ TCP && !syn               │ TCP && syn (or non-TCP)
-          │ sess_lookup_bidir()       │ sess_lookup_or_create()
-          │ (never creates)           │
-          └───────────────────────────┘
-                      │
-                      ▼
-              s == NULL?
-              └── ALL protocols → NF_DROP (pkts_dropped++)
-                  (TCP non-SYN: no matching flow; all others: table full or OOM)
-                      │
-                      ▼ s != NULL
-              record ifindex_in/out on first packet (WRITE_ONCE, set-once)
-                      │
-                      ▼
-              s->flags & SESS_BLOCKED? → NF_DROP (pkts_blocked++)
-                      │ not blocked
-                      ▼
-              TCP: sess_tcp_check(s, skb, dir)
-              ├── NF_DROP (RST injection / SYN into ESTABLISHED) → pkts_dropped++
-              └── NF_ACCEPT → continue
-                      │
-                      ▼
-              sess_update(s, skb, dir)   update stats, IAT, TCP flags
-                      │
-                      ▼
-              NF_ACCEPT (pkts_forwarded++)
-```
-
----
-
-## Session table
-
-### Data structure
+### 5-tuple key
 
 ```c
-struct sess_key {           /* 5-tuple, packed (no padding) */
-    __be32 src_ip, dst_ip;
-    __be16 src_port, dst_port;
-    u8     proto;
+struct sess_key {
+    __be32  src_ip;
+    __be32  dst_ip;
+    __be16  src_port;
+    __be16  dst_port;
+    u8      proto;
 } __packed;
+```
 
+`__packed` ensures no padding bytes exist so `memcmp()` and `jhash()` operate over identical byte sequences on any architecture. For non-TCP/UDP protocols both port fields are set to 0 by `extract_key()`.
+
+### Session entry
+
+```c
 struct session {
-    struct hlist_node   node;       /* RCU hash table linkage */
-    struct list_head    lru_node;   /* LRU list: head=oldest, tail=newest */
-    struct sess_key     key;        /* stored in ORIG direction */
+    struct hlist_node   node;
+    struct list_head    lru_node;
+    struct sess_key     key;
     u32                 id;
-    u16                 flags;      /* SESS_ACTIVE | SESS_BLOCKED | SESS_MARKED */
-    u8                  tcp_state;  /* SESS_TCP_* state machine */
-    struct sess_tcp_win tcp_win[2]; /* per-direction RST validation state */
-    u32                 ifindex_in, ifindex_out;
-    struct sess_stats   stats;      /* pkts, bytes, IAT, TCP flags per direction */
-    s32                 ml_score;   /* fixed-point × 1000, written by ML daemon */
+    u16                 flags;
+    u8                  tcp_state;
+    u8                  zero_win_dir;
+    struct sess_tcp_win tcp_win[2];
+    u32                 ifindex_in;
+    u32                 ifindex_out;
+    u32                 policy_id;
+    struct sess_stats   stats;
+    s32                 ml_score;
     ktime_t             expires_at;
+    ktime_t             zero_win_since;
     spinlock_t          lock;
     struct rcu_head     rcu;
 };
 ```
 
-`lru_node` is new in Phase 2. Every session is simultaneously a member of the
-RCU hash table (via `node`) and the LRU doubly-linked list (via `lru_node`).
-The LRU list head is the oldest session; the tail is the most-recently-used.
-`sess_update()` calls `list_move_tail()` on every forwarded packet to maintain
-this ordering.
-
-### Hash table
-
-- 1024 buckets (`SESSION_TABLE_BITS = 10`), hard cap `pf_max_states` (default
-  65536, tunable via module parameter).
-- Hash seed randomized with `get_random_bytes()` at module load — prevents
-  hash-bucket collision (DoS) attacks.
-- Readers use `rcu_read_lock()` — no contention on the read path.
-- Writers take `table_lock` (spinlock) to insert or delete.
-- The create path re-checks both directions under `table_lock` to resolve the
-  race where two CPUs both miss the lockless lookup.
-
-### Locking model
-
-Two spinlocks protect the session data structures:
-
-| Lock | Protects | Acquired from |
-|---|---|---|
-| `table_lock` | Hash table (`hash_add_rcu`, `hash_del_rcu`) and LRU list mutations | Any path that inserts or removes sessions |
-| `lru_lock` | `sess_lru` list pointer writes | `sess_update()` (alone); all other callers hold `table_lock` first |
-
-**Lock ordering rule:** always acquire `table_lock` before `lru_lock`.
-`lru_lock` may be taken alone only in `sess_update()`, which touches the LRU
-tail on every forwarded packet without touching the hash table. Keeping the two
-locks separate means the high-frequency packet path (`sess_update`) never blocks
-on the GC's incremental bucket scan, and vice versa.
-
-The per-session `s->lock` (spinlock) guards mutable session fields
-(`tcp_state`, `expires_at`, stats) and is taken independently of both global
-locks.
-
-### Direction model
-
-The first packet that creates a session defines the **original** (`SESS_DIR_ORIG`)
-direction. Subsequent packets matching the reversed 5-tuple are the **reply**
-(`SESS_DIR_REPLY`) direction. This is identical to Linux conntrack and FortiOS.
-
-`sess_lookup_or_create()` tries the key as-is (ORIG), then reversed (REPLY),
-then creates. `sess_lookup_bidir()` does the same but never creates — used for
-non-SYN TCP so mid-stream injected packets have no session to match.
-
----
-
-## Expiry and GC
-
-### Single 1 Hz reaper (`sess_reaper_fn`)
-
-One `DECLARE_DELAYED_WORK` item, `sess_reaper`, always rescheduled at exactly
-`HZ` (one second). The tick interval is never shortened under load. All
-load-adaptive behavior happens inside the tick itself via three interlocking
-techniques.
-
-**Why a fixed 1 Hz tick?**  On Cortex-A53 each context switch costs ~10–50 µs.
-Shortening the GC interval under a SYN flood (e.g., 10 Hz) would add 10 extra
-wakeups/s × 50 µs = 500 µs of pure scheduler overhead per second, plus
-cache-thrash between the GC and RX-softirq stacks. Keeping it at 1 Hz
-eliminates all of this; the inline emergency path (Weapon 2) absorbs any excess
-within the fixed cadence.
-
-#### Weapon 1a — Adaptive timeout scaling (`sess_pf_timeout`)
-
-Implements the FreeBSD `pf(4)` formula:
-
-```
-factor = (adaptive_end - active_cnt) / (adaptive_end - adaptive_start)
-effective_timeout = base_timeout * factor
-```
-
-Behavior across the three zones:
-
-| Zone | Condition | Effect |
-|---|---|---|
-| Normal | `active_cnt <= pf_adaptive_start` | `factor = 1.0` — full base TTL, no scaling |
-| Pressure | `active_cnt` in `(start, end)` | `factor` ∈ `(0, 1)` — TTL shrinks linearly |
-| Saturation | `active_cnt >= pf_adaptive_end` | `factor = 0` — TTL crushed to 0; immediate eviction candidate |
-
-**TCP ESTABLISHED is excluded from scaling.** Killing live connections during a
-SYN flood harms legitimate users. The attack surface is half-open states:
-`SYN_SENT` (120 s base) and `SYN_RECV` (60 s base) collapse to zero first, well
-before `ESTABLISHED` (3600 s base) would be affected.
-
-All arithmetic is integer-only — no floats (kernel constraint).
-
-#### Weapon 1b — Incremental scanning (gc_idx cursor)
-
-The GC does not scan all 1024 buckets per tick. Instead it advances a cursor
-`gc_idx` by a fixed window:
-
-| Mode | Buckets per tick | Full-table coverage |
-|---|---|---|
-| Normal (below `pf_adaptive_start`) | `GC_SCAN_NORMAL = 64` | ~16 s |
-| Aggressive (at or above `pf_adaptive_start`) | `GC_SCAN_AGGRESSIVE = 256` | ~4 s |
-
-This bounds `table_lock` hold time to ~25 µs (normal) or ~100 µs (aggressive)
-per tick, preventing head-of-line blocking for new-session creation on other
-CPUs even at 90% table fill.
-
-#### Weapon 1c — Hysteresis (`gc_aggressive` latch)
-
-`gc_aggressive` is set `true` when `active >= pf_adaptive_start` and cleared
-only when `active < 85% of pf_adaptive_start`. The 15% band prevents mode
-oscillation when the table drains and refills near the boundary — alternating
-between 64 and 256 buckets/tick on consecutive seconds without actually draining.
-
-#### Phase 1 — Incremental hash bucket scan
-
-Within the scan window `[gc_idx, gc_idx + scan_size)`, every session in every
-bucket is tested with `sess_pf_timeout()`. If the effective timeout is 0, or if
-idle time since `last_seen` exceeds the effective timeout, the session is
-unlinked from both the hash table and the LRU list, decremented from
-`sess_active`, incremented in `sess_expired`, and queued for RCU-deferred free.
-GenL notifications (`SG_FLOW_CMD_SESS_EXPIRED`) are sent outside the spinlock.
-
-#### Phase 2 — LRU-head early eviction (aggressive mode only)
-
-In addition to the bucket scan, when `gc_aggressive` is true the reaper walks
-from the LRU list head (oldest sessions) and evicts up to `GC_LRU_EVICT_MAX = 32`
-sessions per tick that satisfy the same `sess_pf_timeout()` condition. This
-drains the attack surface in temporal order (LRU, oldest first) in parallel with
-the spatial-order bucket scan, allowing the GC to wipe thousands of half-open
-SYN states in a single pass under a flood.
-
-### Inline expiry in `sess_lookup` — Technique 3
-
-On every hash chain hit, `sess_lookup()` checks `ktime_get() >= s->expires_at`
-before returning the session. If expired, it acquires `table_lock`, re-checks
-under the lock (another CPU may have refreshed the TTL), and if still expired:
-unlinks from hash and LRU, decrements `sess_active`, increments `sess_expired`,
-calls `call_rcu()`, and returns `NULL`. This prevents dead sessions accumulating
-in hot chains between 1 Hz GC ticks, keeping lookup O(1) in common cases.
-
-### Weapon 2 — Inline emergency eviction (`pf_purge_expired_states_emergency`)
-
-When `sess_lookup_or_create()` detects `active_cnt >= pf_max_states`, it calls
-`pf_purge_expired_states_emergency()` synchronously in the packet (softirq)
-context before attempting allocation.
-
-The function walks from the LRU list head and scans up to
-`PF_EMERGENCY_SCAN_MAX = 64` entries, evicting any session where
-`sess_pf_timeout() == 0` OR `idle_ns >= effective_timeout * NSEC_PER_SEC`.
-Weapon 1 (TTL scaling) pre-crushes TTLs as the table fills, so the LRU head is
-the most likely location to find zero-TTL entries.
-
-**Does NOT send genl notifications** — avoids `skb` allocation in the DDoS hot
-path.
-
-Two outcomes:
-
-- `freed > 0` — at least one slot was reclaimed; allocation proceeds normally.
-- `freed == 0` — table is saturated with non-expired active sessions. The caller
-  increments `sess_pf_drops` and returns `NULL`, causing `pkt_forward.ko` to
-  return `NF_DROP`. The packet is discarded at the NIC driver layer without
-  allocating any kernel state.
-
-**Why inline and not a wakeup?** Context switches cost 10–50 µs on Cortex-A53.
-Under a 1 Mpps SYN flood, waking a GC thread per packet would burn 10–50
-CPU-seconds per second in scheduler overhead alone. Running inline in the same
-softirq costs only the bounded scan time (~640 ns for 64 entries) — no context
-switch, no cache thrash between stacks.
-
-### Non-TCP timeouts
-
-Non-TCP session idle timeouts are fixed:
-
-| Protocol | Timeout |
-|---|---|
-| UDP | 180 s |
-| ICMP | 60 s |
-| Other | 300 s |
-
-### TCP per-state timeouts
-
-| State | Timeout |
-|---|---|
-| NONE / SYN_SENT | 120 s |
-| SYN_RECV | 60 s |
-| ESTABLISHED | 3600 s |
-| FIN_WAIT | 120 s |
-| CLOSE_WAIT | 60 s |
-| LAST_ACK | 30 s |
-| TIME_WAIT | 120 s |
-| CLOSE | 10 s |
-| SYN_SENT2 | 60 s |
-
----
-
-## Module parameters
-
-Tunable at load time via `modprobe session param=value`:
-
-| Parameter | Type | Permissions | Default | Description |
-|---|---|---|---|---|
-| `pf_max_states` | `uint` | 0444 | 65536 (`MAX_SESSIONS`) | Hard session cap. No new sessions are created at or above this count. |
-| `pf_adaptive_start` | `uint` | 0644 | 75% of `pf_max_states` | Active count at which TTL scaling begins. |
-| `pf_adaptive_end` | `uint` | 0644 | 90% of `pf_max_states` | Active count at which TTL is crushed to 0. |
-| `sess_asymmetric_mode` | `bool` | 0644 | `N` | Allow mid-stream TCP pickup (see below). |
-
-Zero values for `pf_adaptive_start` and `pf_adaptive_end` at load time are
-resolved in `session_init()` to 75% and 90% of `pf_max_states` respectively,
-so the ratios hold for any table size.
-
-Example override:
-
-```
-modprobe session pf_max_states=100000 pf_adaptive_start=60000 pf_adaptive_end=90000
-```
-
-If the supplied thresholds are inconsistent (`start >= end` or `end > max`), the
-module logs a warning and falls back to the default percentages.
-
----
-
-## TCP state machine (`sess_tcp_check`)
-
-Called from `forward_hook` **before** `sess_update`, under `rcu_read_lock()`.
-Takes `s->lock` (spinlock) internally.
-
-```
-NONE ──SYN(orig)──► SYN_SENT ──SYN+ACK(reply)──► SYN_RECV ──ACK(orig)──► ESTABLISHED
-                                                                                │
-                                              FIN(orig) ──────────────────► FIN_WAIT ──FIN(reply)──► TIME_WAIT
-                                              FIN(reply) ─────────────────► CLOSE_WAIT ──FIN(orig)──► LAST_ACK ──ACK(reply)──► CLOSE
-                                              RST (any state, valid seq) ──────────────────────────────────────────────────► CLOSE
-```
-
-### Enforced rules (hardcoded, not configurable)
-
-**Non-SYN TCP without session** — `sess_lookup_bidir()` returns NULL → `NF_DROP`.
-Prevents accepting mid-stream packets that arrive after a reboot or are injected
-by an attacker.
-
-**SYN injection into ESTABLISHED** — a SYN arriving on a session in state
-`SESS_TCP_ESTABLISHED` is `NF_DROP`. An attacker cannot reset an established
-connection by injecting a SYN.
-
-**RST sequence validation** — a RST is only accepted if its sequence number
-falls within the peer's receive window:
-
-```
-peer_win_scaled = peer_win << peer_scale    (RFC 7323 window scaling)
-valid if: (seq - peer_ack) < peer_win_scaled
-```
-
-An out-of-window RST → `NF_DROP` and `pkts_invalid++`. This blocks RST
-injection attacks where the attacker sends RSTs with arbitrary sequence numbers
-to tear down connections.
-
-**Window scale parsing** — `tcp_parse_wscale()` walks TCP options on SYN and
-SYN-ACK to extract the scale factor (RFC 7323). Stored per-direction in
-`tcp_win[dir].scale`. Valid range 0–14 per RFC.
-
----
-
-## Session statistics (`sess_stats`)
-
-Updated by `sess_update()` on every accepted packet, split by direction:
+### Field descriptions
+
+| Field | Type | Owner / Writer | Purpose |
+|-------|------|----------------|---------|
+| `node` | `hlist_node` | session.ko bucket lock | Hash chain linkage; removed via `hash_del_rcu()` under the per-bucket spinlock |
+| `lru_node` | `list_head` | `lru_lock` spinlock | Global LRU list; tail = most recently used, head = oldest (eviction target) |
+| `key` | `sess_key` | session.ko at create | Immutable after insertion; the canonical ORIG-direction 5-tuple |
+| `id` | `u32` | session.ko at create | Monotonically increasing session ID from `atomic_inc_return(&next_id)` |
+| `flags` | `u16` | pkt_forward.ko, ML/policy | Bitmask; see flags table below |
+| `tcp_state` | `u8` | `sess_tcp_check()` under `s->lock` | Current TCP state machine state; one of `SESS_TCP_*` constants |
+| `zero_win_dir` | `u8` | `sess_tcp_check()` under `s->lock` | Direction (`SESS_DIR_ORIG`/`SESS_DIR_REPLY`) that last set `zero_win_since`; prevents the sender side from resetting the zombie timer |
+| `tcp_win[2]` | `sess_tcp_win` | `sess_tcp_check()` under `s->lock` | Per-direction ACK sequence, window size, and window scale for RST validation |
+| `ifindex_in` | `u32` | pkt_forward.ko, first-packet set-once via `cmpxchg` | Ingress interface index at session creation |
+| `ifindex_out` | `u32` | pkt_forward.ko, first-packet set-once | Egress interface index at session creation |
+| `policy_id` | `u32` | `post_filter_hook()` under `s->lock` | Firewall policy sequence number stamped by iptables MARK rule; 0 = unset (Phase 3) |
+| `stats` | `sess_stats` | `sess_update()` under `s->lock` | Per-direction packet/byte counters, timestamps, IAT, TCP flags, packet length min/max |
+| `ml_score` | `s32` | ML scoring daemon (Phase 3) | Fixed-point score scaled × 1000; negative = suspicious |
+| `expires_at` | `ktime_t` | `sess_tcp_check()` and `sess_update()` | Absolute expiry time; reaper compares against `ktime_get()` |
+| `zero_win_since` | `ktime_t` | `sess_tcp_check()` under `s->lock` | Monotonic time when TCP window first became zero; 0 = not active |
+| `lock` | `spinlock_t` | – | Protects `flags`, `tcp_state`, `tcp_win`, `stats`, `expires_at`, `zero_win_since`, `policy_id` |
+| `rcu` | `rcu_head` | session.ko | Passed to `call_rcu()` for deferred `kfree()` after removal from hash |
+
+### Flags bitmask
+
+| Constant | Value | Set by | Cleared by | Meaning |
+|----------|-------|--------|------------|---------|
+| `SESS_ACTIVE` | `0x0001` | `sess_alloc()` at create | Never cleared | Session is live in the table |
+| `SESS_BLOCKED` | `0x0002` | ML scoring daemon / policy | Manual clear | `pkt_forward.ko` drops all packets for this session |
+| `SESS_MARKED` | `0x0004` | IPS/ML (Phase 3) | – | Session flagged as suspicious; reserved for Phase 3 |
+| `SESS_DIRTY` | `0x0008` | `sess_mark_all_dirty()` on policy rebuild | `post_filter_hook()` after iptables accepts packet | Session must be re-evaluated against current policy on next packet |
+
+### Per-direction TCP window state
 
 ```c
-struct sess_stats {
-    u64     pkts_orig,  pkts_reply;
-    u64     bytes_orig, bytes_reply;
-    ktime_t first_seen, last_seen;
-    u64     iat_sum_ns;     /* sum of inter-arrival times */
-    u32     iat_count;
-    u16     tcp_flags_orig, tcp_flags_reply;  /* OR of all flags seen */
-    u32     init_win_orig;                    /* initial window size */
-    struct sess_pkt_len len_orig, len_reply;  /* min/max packet lengths */
+struct sess_tcp_win {
+    u32  ack_seq;   /* last ACK sequence number seen FROM this direction */
+    u16  win;       /* last advertised window FROM this direction (unscaled) */
+    u8   scale;     /* window scale factor from SYN/SYN-ACK option (0..14)  */
+    u8   _pad;
 };
 ```
 
-These fields are designed as ML features for Phase 3. `iat_sum_ns / iat_count`
-gives mean inter-arrival time. `tcp_flags_orig` catches Xmas/NULL scans. `len_*`
-min/max captures payload size distribution.
+Used by the RST sequence validation in `sess_tcp_check()`. The peer window is computed as `(u32)win << scale` before the range check.
+
+### Traffic statistics
+
+```c
+struct sess_stats {
+    u64             pkts_orig;
+    u64             pkts_reply;
+    u64             bytes_orig;
+    u64             bytes_reply;
+    ktime_t         first_seen;
+    ktime_t         last_seen;
+    u64             iat_sum_ns;
+    u32             iat_count;
+    u16             tcp_flags_orig;
+    u16             tcp_flags_reply;
+    u32             init_win_orig;
+    struct sess_pkt_len  len_orig;
+    struct sess_pkt_len  len_reply;
+};
+```
+
+`iat_sum_ns / iat_count` gives mean inter-arrival time in nanoseconds, used as a ML feature. `tcp_flags_orig` and `tcp_flags_reply` are cumulative OR of all TCP flag bytes seen in each direction. `init_win_orig` captures the TCP window from the first packet for ML feature extraction. `len_orig.min` and `len_orig.max` (and their reply counterparts) track packet length distribution.
 
 ---
 
-## procfs visibility
+## 3. Session Table
 
-`/proc/stargazer/sessions` — seq_file, readable by mgmtd (monitor permission):
+### Hash table
 
-```
-# Stargazer sessions  active=3 created=1024 expired=1021 invalid=2 pf_drops=0
-# pf_max=65536 adaptive_start=49152 adaptive_end=58982 gc_aggressive=0
-# proto src dst id pkts(o/r) bytes(o/r) age_ms expire_ms ml flags tcp_state
-proto=6 src=192.168.1.10:54321 dst=8.8.8.8:443 id=42 pkts=7/5 bytes=840/3200 age_ms=1200 expire_ms=2800 ml=0 flags=0x1 dev=2/3 tcp_state=3
+```c
+static DEFINE_HASHTABLE(sess_table, SESSION_TABLE_BITS);  /* 2^16 = 65536 buckets */
+static spinlock_t bucket_locks[SESSION_TABLE_SIZE];
 ```
 
-The header is two lines. Line 1 contains the per-session counters. Line 2
-contains the current PF tunable values and GC mode.
+- **Bucket count**: 65536 (`SESSION_TABLE_BITS = 16`), matching `MAX_SESSIONS`.
+- **Hash function**: `jhash()` over the full `sess_key` struct (13 bytes, `__packed`) with a randomized seed `sess_hash_rnd` initialized from the kernel RNG at `session_init()`. The random seed prevents hash-bucket collision attacks (hash DoS).
+- **Bucket index**: `hash_min(jhash(key, sizeof(*key), sess_hash_rnd), SESSION_TABLE_BITS)`.
 
-`/proc/stargazer/session_ctl` — write-only (mode 0200). Writing `flush` calls
-`sess_flush_all()` which removes all sessions from the table. Used by
-`execute diagnose session clear`.
+### Concurrency model
+
+Reads use RCU: callers must hold `rcu_read_lock()` across any lookup and subsequent dereference of the returned pointer. Writes (insert, delete) acquire the single `bucket_locks[b]` spinlock for the affected bucket. No global table lock exists.
+
+When two bucket locks must be held simultaneously (the create path for a new session, which checks both the ORIG and REPLY bucket to handle simultaneous-open races), they are acquired in ascending index order to prevent AB/BA deadlock. The helper functions `lock_two_buckets()` and `unlock_two_buckets()` implement this ordering. When `ob == rb` (hash collision between orig and reply keys), only one lock is taken.
+
+Lock ordering is strict and never violated:
+
+```
+bucket_locks[lower_index] -> bucket_locks[higher_index] -> lru_lock -> session->lock
+```
+
+`lru_lock` may be taken alone (hot path in `sess_update()`), without holding any `bucket_locks[]` entry.
+
+### LRU list
+
+```c
+static DEFINE_SPINLOCK(lru_lock);
+static LIST_HEAD(sess_lru);
+```
+
+All live sessions are linked into a global LRU list via `session->lru_node`. Head = oldest (eviction target), tail = most recently used. `sess_update()` calls `list_move_tail()` under `lru_lock` on every forwarded packet to touch the session. The emergency eviction path (`pf_purge_expired_states_emergency()`) scans from the LRU head to find idle sessions.
+
+`sess_update()` guards the LRU touch with `list_empty(&s->lru_node)`: the reaper calls `list_del_init()` before `call_rcu()`, leaving `lru_node` self-linked. If `sess_update()` races with eviction in the RCU window, `list_empty()` returns true and the re-insertion is skipped, preventing a double `call_rcu()`.
+
+### Memory layout
+
+Each `struct session` is allocated with `kzalloc(sizeof(*s), GFP_ATOMIC)` on the packet path. Freed via `call_rcu()` → `sess_free_rcu()` → `kfree()`. Maximum live sessions is bounded by `pf_max_states` (default: 65536). At ~400 bytes per session, peak memory use is approximately 26 MB.
 
 ---
 
-## IPC commands (CLI → mgmtd → kernel)
+## 4. Session Lifecycle
 
-| ID | Command | Permission | Action |
-|---|---|---|---|
-| 650 | `SG_CMD_SHOW_SESSIONS` | monitor | Read `/proc/stargazer/sessions` raw |
-| 654 | `SG_CMD_DIAG_SESSION` | monitor | Status (no payload) or inject test (payload=`inject`) |
-| 655 | `SG_CMD_SESSION_CLEAR` | admin | Read active count, write `flush` to session_ctl |
-| 656 | `SG_CMD_SESSION_STATS` | monitor | Parse procfs header + check `/sys/module/pkt_forward` |
+### Creation: `sess_lookup_or_create()`
+
+1. Lockless RCU lookup in the ORIG direction via `sess_lookup()`.
+2. Lockless RCU lookup in the REPLY direction via `sess_lookup()` on the reversed key.
+3. If both miss:
+   a. Half-open cap check: if `key->proto == IPPROTO_TCP` and `sess_halfopen >= max_halfopen`, increment `sess_rejected_halfopen` and return NULL.
+   b. Table-full check: if `sess_active >= pf_max_states`, call `pf_purge_expired_states_emergency()`. If it returns 0 (nothing freed), increment `sess_pf_drops` and return NULL.
+   c. Allocate with `sess_alloc()` (`kzalloc`, `GFP_ATOMIC`).
+   d. Acquire both bucket locks in ascending index order.
+   e. Re-check capacity and half-open cap under lock.
+   f. Re-check both directions under lock (race: another CPU may have inserted a matching session).
+   g. `hash_add_rcu()`, increment `sess_active` and `sess_created`, link to LRU tail, release locks.
+4. Set `*dir_out = SESS_DIR_ORIG` and return.
+
+`sess_alloc()` sets `expires_at` to `now + sess_timeout_for_proto(proto)` in seconds, initializes `stats.len_orig.min = U32_MAX` (so the first packet correctly sets the minimum), and calls `spin_lock_init(&s->lock)`.
+
+### Lookup
+
+**`sess_lookup(key)`**: Iterates `hash_for_each_possible_rcu()` matching on `sess_key_eq()`. Implements inline expired-session cleanup (Technique 3): if `ktime_get() >= s->expires_at`, acquires the bucket lock, re-checks expiry, and if still expired calls `hash_del_rcu()`, `list_del_init()`, `atomic64_dec(&sess_active)`, `atomic64_inc(&sess_expired)`, `call_rcu()`, then returns NULL. The double-check under the lock prevents a race where another CPU refreshed `expires_at` between the lockless test and the lock acquisition.
+
+**`sess_lookup_bidir(key, dir_out)`**: Calls `sess_lookup(key)` (ORIG), then `sess_lookup(reversed_key)` (REPLY). Sets `*dir_out` to match. Returns NULL only if both miss.
+
+**`sess_icmp_error_lookup(skb, dir_out)`**: Handles ICMP type 3 (Destination Unreachable), 11 (Time Exceeded), and 12 (Parameter Problem). Extracts the embedded original IP + L4 header using `pskb_may_pull()`, builds a `sess_key` from the inner packet's 5-tuple, validates that `outer_iph->daddr == inner_key.src_ip` (ICMP forgery check), then calls `sess_lookup_bidir()`. Returns NULL for non-error ICMP types, malformed embedded headers, or forgery detection.
+
+### Update: `sess_update()`
+
+Called from `forward_hook` after `sess_tcp_check()` returns `NF_ACCEPT`. Takes `s->lock`, increments per-direction counters (`pkts_orig`/`pkts_reply`, `bytes_orig`/`bytes_reply`), updates `len_orig`/`len_reply` min/max, accumulates IAT, calls `accumulate_tcp_flags()`, updates `stats.last_seen`, refreshes `expires_at` for non-TCP protocols (TCP expiry is owned by `sess_tcp_check()`), releases `s->lock`, then moves the session to the LRU tail under `lru_lock`.
+
+### Expiry and reaper
+
+**GC reaper** (`sess_reaper_fn`): A `DECLARE_DELAYED_WORK` item scheduled at `HZ/10` (10 Hz). Uses an incremental bucket cursor `gc_idx` that advances `scan_size` buckets per run and wraps at `SESSION_TABLE_SIZE`, matching FreeBSD pf's `pf_purge_thread` design. One full sweep completes in `gc_sweep_interval` seconds (default 16 s, range 5–3600 s). In aggressive mode (entered when `sess_active >= pf_adaptive_start`), `scan_size` is multiplied by 4.
+
+For each session in the scanned buckets, the reaper computes `eff = sess_pf_timeout(s, active_cnt)` (the PF adaptive timeout) and compares idle time against `eff`. Sessions where `idle_ns >= eff * NSEC_PER_SEC` (or `eff == 0`) are removed: `hash_del_rcu()` under the bucket lock, `list_del_init()` under `lru_lock`, `atomic64_dec(&sess_active)`, `atomic64_inc(&sess_expired)`, `call_rcu()`.
+
+**PF adaptive timeout** (`sess_pf_timeout()`): Implements the FreeBSD pf formula:
+
+```
+factor = (adaptive_end - active) / (adaptive_end - adaptive_start)
+effective_timeout = base_timeout * factor
+```
+
+- `active <= pf_adaptive_start` (default 75% of max): full base TTL, no scaling.
+- `active` between start and end: TTL shrinks linearly.
+- `active >= pf_adaptive_end` (default 90% of max): TTL = 0, session is an immediate eviction candidate.
+
+TCP ESTABLISHED sessions are excluded from TTL scaling to avoid disrupting live connections under a SYN flood.
+
+**Emergency eviction** (`pf_purge_expired_states_emergency()`): Called inline in the packet creation path when the table is full. Scans up to `PF_EMERGENCY_SCAN_MAX` (64) entries from the LRU head. Phase 1 collects candidate pointers under `lru_lock` (caller's `rcu_read_lock()` keeps them valid). Phase 2 acquires each session's bucket lock, checks `hlist_unhashed()` (guard against concurrent GC eviction), removes from hash and LRU, schedules deferred free. Returns the number freed; 0 triggers `NF_DROP` at the caller.
+
+**`sess_free_rcu()`**: The RCU callback. Corrects `sess_halfopen` counter for sessions evicted mid-handshake and corrects `src_est_table` for ESTABLISHED sessions reaped by GC without a FIN/RST.
 
 ---
 
-## CLI commands
+## 5. TCP State Machine
+
+### States
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `SESS_TCP_NONE` | 0 | No packet seen yet (initial state after create) |
+| `SESS_TCP_SYN_SENT` | 1 | SYN from ORIG direction, awaiting SYN-ACK |
+| `SESS_TCP_SYN_RECV` | 2 | SYN-ACK from REPLY, awaiting final ACK |
+| `SESS_TCP_ESTABLISHED` | 3 | Three-way handshake complete |
+| `SESS_TCP_FIN_WAIT` | 4 | FIN from ORIG (active close) |
+| `SESS_TCP_CLOSE_WAIT` | 5 | FIN from REPLY (passive close) |
+| `SESS_TCP_LAST_ACK` | 6 | FIN from ORIG after CLOSE_WAIT |
+| `SESS_TCP_TIME_WAIT` | 7 | Both FINs exchanged |
+| `SESS_TCP_CLOSE` | 8 | RST seen or fully closed |
+| `SESS_TCP_SYN_SENT2` | 9 | Simultaneous open: both sides sent SYN |
+
+### Per-state timeouts (module params, all writable at runtime via sysfs)
+
+| State | Module param | Default (s) |
+|-------|-------------|-------------|
+| `SESS_TCP_NONE` | `sess_tt_tcp_none` | 120 |
+| `SESS_TCP_SYN_SENT` | `sess_tt_tcp_syn_sent` | 120 |
+| `SESS_TCP_SYN_RECV` | `sess_tt_tcp_syn_recv` | 60 |
+| `SESS_TCP_ESTABLISHED` | `sess_tt_tcp_est` | 3600 |
+| `SESS_TCP_FIN_WAIT` | `sess_tt_tcp_fin_wait` | 120 |
+| `SESS_TCP_CLOSE_WAIT` | `sess_tt_tcp_close_wait` | 60 |
+| `SESS_TCP_LAST_ACK` | `sess_tt_tcp_last_ack` | 30 |
+| `SESS_TCP_TIME_WAIT` | `sess_tt_tcp_time_wait` | 120 |
+| `SESS_TCP_CLOSE` | `sess_tt_tcp_close` | 10 |
+| `SESS_TCP_SYN_SENT2` | `sess_tt_tcp_syn_sent2` | 60 |
+
+Non-TCP protocol timeouts: UDP 180 s (`sess_tt_udp`), ICMP 60 s (`sess_tt_icmp`), other 300 s (`sess_tt_other`).
+
+### State machine (`sess_tcp_check()`)
+
+`sess_tcp_check()` must be called from `forward_hook` inside `rcu_read_lock()`, before `sess_update()`. It acquires `s->lock` internally.
+
+**RST handling**: Before the state machine switch, if `tcph->rst` is set, the sequence number is validated against the peer's receive window: `tcp_in_window(seq, peer_ack, peer_win)` where `peer_win = (u32)tcp_win[1-dir].win << tcp_win[1-dir].scale`. If `peer_ack != 0` and `peer_win > 0` and the sequence is outside the window, the packet is dropped (`NF_DROP`) and `pkts_invalid` is incremented. A valid RST transitions to `SESS_TCP_CLOSE`.
+
+**State transitions**:
 
 ```
-show sessions                              — live session table (monitor)
+NONE / SYN_SENT:
+  SYN (no ACK), dir=ORIG  -> SYN_SENT      (records ORIG window scale)
+  SYN (no ACK), dir=REPLY -> SYN_SENT2     (simultaneous open)
+  SYN+ACK,      dir=REPLY -> SYN_RECV      (records REPLY window scale)
+  non-SYN, asymmetric_mode -> ESTABLISHED  (mid-stream pickup)
 
-execute diagnose session status            — same as show sessions, with module check
-execute diagnose session stats             — counters + session.ko/pkt_forward.ko loaded?
-execute diagnose session clear             — flush all sessions (admin, confirmation required)
+SYN_SENT2:
+  SYN+ACK (either dir)    -> SYN_RECV
 
-execute diagnose selftest session          — run SESS-01..07 (basic) + SESS-08..12 (full)
-execute diagnose selftest session full     — alias for full mode
+SYN_RECV:
+  ACK (no SYN, no FIN), dir=ORIG -> ESTABLISHED
+
+ESTABLISHED:
+  SYN                     -> NF_DROP (SYN injection attack)
+  FIN, dir=ORIG           -> FIN_WAIT
+  FIN, dir=REPLY          -> CLOSE_WAIT
+
+FIN_WAIT:
+  FIN, dir=REPLY          -> TIME_WAIT
+
+CLOSE_WAIT:
+  FIN, dir=ORIG           -> LAST_ACK
+
+LAST_ACK:
+  ACK, dir=REPLY          -> CLOSE
+
+TIME_WAIT / CLOSE: no further transitions
 ```
 
-### Selftest: what each test checks
+**Post-transition effects**:
+- `expires_at` is updated to `now + tcp_state_timeout(new_state)` on every packet.
+- `tcp_win[dir].ack_seq` and `tcp_win[dir].win` are updated whenever `tcph->ack` is set.
+- Window scale is parsed from SYN and SYN-ACK options via `tcp_parse_wscale()` and stored in `tcp_win[dir].scale` (clamped to 0–14 per RFC 7323).
+- Half-open counter (`sess_halfopen`): incremented when entering a half-open state, decremented when leaving one.
+- Per-source ESTABLISHED cap: when `new_state == SESS_TCP_ESTABLISHED` and the prior state was not ESTABLISHED, `src_est_check_and_inc(s->key.src_ip)` is called. If the cap is exceeded, the completing ACK is dropped and the session stays in `SYN_RECV` until its TTL expires.
+- `src_est_dec()` is called whenever a session leaves `SESS_TCP_ESTABLISHED` for any reason, and also from `sess_free_rcu()` for ESTABLISHED sessions reaped by GC.
 
-| ID | Mode | What it checks |
-|---|---|---|
-| SESS-01 | basic | `session.ko` loaded (`SESSION_STATS` IPC returns `session_loaded=1`) |
-| SESS-02 | basic | `pkt_forward.ko` loaded (`/sys/module/pkt_forward` exists) |
-| SESS-03 | basic | procfs header has `active=` field |
-| SESS-04 | basic | procfs header has `created=` field |
-| SESS-05 | basic | procfs header has `expired=` field |
-| SESS-06 | basic | procfs header has `invalid=` field |
-| SESS-07 | basic | procfs column header line `# proto src dst …` present |
-| SESS-08 | full | `session_test.ko` loaded and ran without error |
-| SESS-09 | full | `sessions_created=1` in session_test procfs output |
-| SESS-10 | full | `pkts_orig=1` (orig direction tracked) |
-| SESS-11 | full | `bytes_orig=32` (byte accounting correct) |
-| SESS-12 | full | `bidirectional=1` (reply direction matched) |
+**Non-SYN drop enforcement**: In `forward_hook`, non-SYN TCP packets that miss both lookups are dropped unconditionally (no `sess_lookup_or_create()` call). In asymmetric mode (`sess_asymmetric_mode == true`), a non-SYN miss is permitted to create a new session, which `sess_tcp_check()` will immediately promote to `SESS_TCP_ESTABLISHED`.
+
+**Zero-window zombie protection**: When `zero_win_timeout > 0` and the session is ESTABLISHED, if a side advertises `win == 0`, `zero_win_since` is set and `zero_win_dir` records the direction. If the zero-window condition persists for more than `zero_win_timeout` seconds (default 60 s), `expires_at` is crushed to `now + 5s`. Only a non-zero window advertisement from `zero_win_dir` (the receiver) clears `zero_win_since`; packets from the sender do not reset the timer.
+
+**Malformed TCP drops**: `doff < 5` (header smaller than 20 bytes) triggers `NF_DROP` and `pkts_invalid++`.
 
 ---
 
-## session_test.ko
+## 6. DoS Protection (pkt_forward.ko)
 
-A loadable kernel module that calls the session API directly without sending
-real packets. On `module_init()` it:
+### 10-step forward_hook pipeline
 
-1. Builds a synthetic `struct sess_key` (UDP 10.0.0.1:1000 → 10.0.0.2:2000).
-2. Calls `sess_lookup_or_create()` — creates the session.
-3. Calls `sess_update()` with a fake 32-byte packet in ORIG direction.
-4. Reverses the key and calls `sess_lookup_or_create()` — must find the same
-   session in REPLY direction (bidirectional lookup).
-5. Calls `sess_update()` in REPLY direction.
-6. Calls `sess_delete()`.
-7. Writes results to `/proc/stargazer/session_test`:
-
-```
-sessions_created=1
-pkts_orig=1
-pkts_reply=1
-bytes_orig=32
-bidirectional=1
+```c
+static unsigned int forward_hook(void *priv, struct sk_buff *skb,
+                                 const struct nf_hook_state *state)
 ```
 
-mgmtd loads the module (`insmod`), waits 50ms, reads the procfs file, and
-unloads (`rmmod`). This happens for every `execute diagnose selftest session`
-run in full mode.
+| Step | What | Scope | Drop counter |
+|------|------|-------|-------------|
+| [1] | IPv4 + L4 header validation (`is_valid_ipv4`, `extract_key`) | All interfaces | `pkts_dropped` |
+| [2] | L3/L4 anomaly detection (`is_ip_anomaly`, `is_tcp_anomaly`, `is_icmp_anomaly`) | All interfaces | `pkts_anomaly_dropped` |
+| [3] | Block list check (`src_block_check`) | Protected interfaces | `pkts_dropped` |
+| [4] | Per-source aggregate packet rate (`src_rate_check` on `pkt_rate`) | Protected interfaces, disabled by default | `pkts_pkt_rate_dropped` |
+| [4b] | Per-source ICMP echo/query rate (`icmp_is_floodable` + `src_rate_check` on `icmp_rate`) | Protected interfaces, per-packet, ICMP error types exempt | `pkts_icmp_dropped` |
+| [5] | Per-source half-open SYN cap (`src_halfopen_check`) | Protected interfaces, TCP SYN only | `pkts_halfopen_src_dropped` |
+| [6] | Port scan detection (`src_scan_check`) | Protected interfaces, TCP SYN only | `pkts_scan_dropped` |
+| [7] | Session lookup/create with per-protocol rate limiting (`src_dos_check`, TCP/UDP only) | Protected interfaces | `pkts_syn_dropped` / `pkts_udp_dropped` |
+| [8] | `SESS_BLOCKED` enforcement | All | `pkts_blocked` |
+| [9] | TCP state machine (`sess_tcp_check`) | TCP sessions | `pkts_dropped` |
+| [10] | Stats update (`sess_update`) | All | – |
+
+`is_protected` is evaluated once per packet from `protected_ifmask`: `idx = state->in->ifindex; is_protected = idx < BITS_PER_LONG && (protected_ifmask >> idx) & 1`. When `protected_ifmask == 0`, the entire DoS subsystem (steps 3–7) is bypassed with a single branch.
+
+**ICMP rate limiting is per-packet (step 4b), not per-session.** ICMP is connectionless: a flood to a single destination is one session, so a per-new-session check (as used for TCP SYN and UDP at step 7) would never see the 2nd..Nth packet. `icmp_is_floodable()` rate-limits every ICMP echo/query packet but exempts ICMP error types (Destination Unreachable / Time Exceeded / Parameter Problem) so Path-MTU discovery and traceroute keep working under load.
+
+### Anomaly detection (step 2, unconditional)
+
+**`is_ip_anomaly()`**:
+- Land attack: `iph->saddr == iph->daddr`.
+- IP source routing: scans IP options for LSRR (type 131) or SSRR (type 137).
+
+**`is_tcp_anomaly()`** (called only when `extract_key()` succeeded for TCP):
+- NULL scan: no control bits set (`fin | syn | rst | psh | ack | urg == 0`).
+- XMAS scan: `fin && urg && psh`.
+- FIN without ACK: invalid per RFC 793.
+- SYN with data: `syn && !ack && tot_len > ip_hlen + tcp_hlen`.
+
+**`is_icmp_anomaly()`**: Ping of Death: `protocol == IPPROTO_ICMP && ntohs(iph->tot_len) > 65500`. IPv4 defrag (`nf_defrag_ipv4`) has already reassembled fragments before this hook fires.
+
+### Token-bucket rate limiters
+
+`src_rate_check(tbl, src, rate, burst)` uses a lock-free approximate hash array (`SRC_RATE_SLOTS = 4096`). Each slot tracks one source IP with token count, refill rate, and last-refill timestamp. Collisions cause the slot to be taken over by the displacing IP; the prior IP loses its rate state and gets a fresh burst. This is intentional: perfect accuracy is unnecessary for flood detection.
+
+`src_dos_check(src, proto)` selects the appropriate table (SYN / UDP), runs the rate check, and on flooding calls `src_block_add(src, reason)` and increments the appropriate drop counter. It is called on new-session creation for TCP SYN and UDP only; ICMP is rate-limited per-packet at step 4b.
+
+Every `src_block_add(src, reason)` also appends a `(jiffies, src_ip, reason)` entry to the block-event ring buffer (see `/proc/stargazer/dos_blocks`).
+
+### Per-source half-open SYN cap (step 5)
+
+`src_halfopen_check(src)` uses a 4096-slot sliding-window counter. The window is `HALFOPEN_WINDOW_SEC = 120` seconds. When `count >= max_halfopen_per_src` within the window, `src_block_add(src)` is called and `pkts_halfopen_src_dropped` is incremented. This catches low-rate SYN floods that stay under the token-bucket threshold but accumulate half-open sessions over time.
+
+### Port scan detection (step 6)
+
+`src_scan_check(src, dst_port, dst_ip)` uses a 32-bit bloom filter per source (`src_scan[SRC_RATE_SLOTS]`). Each unique `(dst_port, dst_ip)` pair from a source maps to one bit via `jhash_2words()`. When `hweight32(bloom) >= scan_threshold`, the source is blocked. The filter resets after `scan_window` seconds. Called only for TCP SYNs.
+
+### Block list
+
+`src_block[SRC_BLOCK_SLOTS]` is an array of 65536 `struct src_block_slot` entries. `src_block_add(src)` stamps `expires = jiffies + src_block_dur * HZ`. `src_block_check(src)` does lazy expiry: if the slot has expired, it clears `expires` and returns false. This avoids a separate timer thread; the hot path O(1) check handles expiry inline.
+
+### Default thresholds
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `protected_ifmask` | 0 (disabled) | Bitmask of protected ifindices |
+| `syn_flood_thr` | 200 | TCP SYN new-session rate/s per source |
+| `syn_flood_burst` | 400 | Token-bucket burst for SYN |
+| `udp_flood_thr` | 1000 | UDP new-session rate/s per source |
+| `udp_flood_burst` | 2000 | Token-bucket burst for UDP |
+| `icmp_flood_thr` | 100 | ICMP echo/query rate per source (packets/s, per-packet) |
+| `icmp_flood_burst` | 200 | Token-bucket burst for ICMP |
+| `src_block_dur` | 30 s | How long a violating source stays blocked |
+| `max_halfopen_per_src` | 10 | Max half-open TCP sessions per source in 120 s window |
+| `pkt_flood_thr` | 0 (disabled) | Per-source aggregate packet rate cap (pkts/s) |
+| `pkt_flood_burst` | 20000 | Token-bucket burst for aggregate rate |
+| `scan_threshold` | 20 | Unique dst-port/IP combos before block |
+| `scan_window` | 10 s | Bloom filter reset window |
 
 ---
 
-## Module counters
+## 7. Policy Marking
 
-### pkt_forward.ko (exit log)
-```
-pkt_forward: unloaded (fwd=N drop=N block=N)
-```
-- `fwd` — packets accepted and forwarded (all tracked; no untracked path exists).
-- `drop` — packets dropped: invalid IP, malformed TCP, non-SYN without session,
-  table full (TCP), TCP state machine rejections (RST injection, SYN into ESTABLISHED).
-- `block` — packets dropped because `SESS_BLOCKED` was set by policy/ML.
+### How policy_id is stamped
 
-### session.ko (procfs header)
+When a firewall policy is applied to the FORWARD chain, each ACCEPT rule is preceded by an iptables `MARK --set-mark` rule that writes the policy's sequence number into `skb->mark` bits 29–16 (14 bits, range 1–16383):
+
 ```
-active=N created=N expired=N invalid=N pf_drops=N
+STARGAZER_POLICY_MARK_MASK  = 0x3FFF0000
+STARGAZER_POLICY_MARK_SHIFT = 16
 ```
-- `active` — sessions currently in the table.
-- `created` — total sessions ever created.
-- `expired` — sessions removed by the GC reaper or inline expiry.
-- `invalid` — TCP state machine drops (RST injection + SYN injection).
-- `pf_drops` — sessions dropped because the table was full and no expired
-  sessions could be reclaimed (PF_DROP path). A non-zero and rising value
-  under sustained load indicates the table is saturated with active (non-expired)
-  sessions; consider raising `pf_max_states` or lowering `pf_adaptive_start`.
+
+This range does not overlap with `STARGAZER_DIRTY_MARK` (bit 7, `0x00000080`).
+
+### `post_filter_hook`
+
+Registered at `NF_IP_PRI_FILTER + 1`. Fires after iptables has accepted a packet (if iptables drops the packet, traversal stops and this hook is never reached).
+
+Fast path: if neither `STARGAZER_DIRTY_MARK` nor `STARGAZER_POLICY_MARK_MASK` bits are set in `skb->mark`, return `NF_ACCEPT` immediately without a session lookup.
+
+When either bit region is set:
+1. Clear both regions from `skb->mark`.
+2. Call `extract_key()` and `sess_lookup_bidir()`.
+3. Acquire `s->lock`.
+4. If `SESS_DIRTY` was set: clear `s->flags &= ~SESS_DIRTY`.
+5. If `policy_seq > 0`: `WRITE_ONCE(s->policy_id, policy_seq)`.
+6. Release `s->lock`.
+
+### `SESS_DIRTY` re-evaluation flow
+
+`sess_mark_all_dirty()` iterates all 65536 buckets (one `bucket_locks[b]` at a time) and sets `SESS_DIRTY` in every session's `flags`. This is called when the firewall policy is rebuilt.
+
+In `forward_hook`, before the TCP state machine, if `READ_ONCE(s->flags) & SESS_DIRTY` is set: `skb->mark |= STARGAZER_DIRTY_MARK`. The iptables ESTABLISHED,RELATED rule is expected to match on `! --mark STARGAZER_DIRTY_MARK`, causing dirty-session packets to skip the fast-path ESTABLISHED rule and fall through to policy rules for re-evaluation. The `post_filter_hook` clears `SESS_DIRTY` after iptables accepts the packet.
 
 ---
 
-## Asymmetric routing mode
+## 8. Procfs Interface
 
-Enabled via module parameter (default off):
+All entries are under `/proc/stargazer/`, a directory created by `session.ko` at `session_init()` and exported as `struct proc_dir_entry *sg_proc_root` (symbol exported with `EXPORT_SYMBOL_GPL`).
 
-```
-modprobe session sess_asymmetric_mode=1
-# or at runtime:
-echo 1 > /sys/module/session/parameters/sess_asymmetric_mode
-```
+### `/proc/stargazer/sessions` (mode 0444)
 
-When on, two behaviors change:
+Implemented via `seq_file` with a custom `sess_seq_ops` that iterates the hash table bucket by bucket under `rcu_read_lock()`.
 
-1. Non-SYN TCP with no existing session is allowed to create one (pickup), instead of being dropped. `pkt_forward.ko` calls `sess_lookup_or_create()` as a fallback after `sess_lookup_bidir()` returns NULL.
-
-2. Data arriving on a half-open session (state NONE or SYN_SENT) promotes it directly to ESTABLISHED instead of staying half-open. This handles HA failover where the SYN+ACK took a different path.
-
-Keep this off unless the network topology requires it — it weakens stateful enforcement.
-
-## ICMP error → parent session mapping
-
-ICMP type 3 (Destination Unreachable), 11 (Time Exceeded), and 12 (Parameter Problem) embed the original IP+L4 header that caused the error. `sess_icmp_error_lookup()` in `session.c`:
-
-1. Pulls and checks the ICMP type.
-2. Pulls the embedded IP header + first 8 bytes of embedded L4.
-3. Builds a `sess_key` from the embedded 5-tuple.
-4. Calls `sess_lookup_bidir()` — the embedded header is in ORIG direction, but `bidir` handles both.
-
-In `forward_hook`, ICMP packets try `sess_icmp_error_lookup()` first. If the parent TCP/UDP session is found, the ICMP error packet uses that session for the `SESS_BLOCKED` check and `sess_update()` (bytes counted in the parent flow's stats). If no parent session exists (e.g., the original flow expired), a new ICMP-keyed session is created normally.
-
-## Simultaneous TCP open (RFC 793 §3.4)
-
-Tracked via the `SESS_TCP_SYN_SENT2` state (value 9):
+**Header lines** (lines beginning with `#`):
 
 ```
-NONE ──SYN(orig)──► SYN_SENT ──SYN(reply, no ACK)──► SYN_SENT2
-                                                            │
-                                              SYN+ACK(either side)
-                                                            │
-                                                       SYN_RECV ──ACK──► ESTABLISHED
+# Stargazer sessions  active=N created=N expired=N invalid=N pf_drops=N
+# halfopen=N rejected_halfopen=N max_halfopen=N
+# est_src_drops=N max_est_per_src=N zero_win_timeout=N
+# pf_max=N adaptive_start=N adaptive_end=N gc_sweep_interval=N gc_aggressive=N
+# proto src dst id pkts(o/r) bytes(o/r) age_ms expire_ms ml flags dev policy_id tcp_state
 ```
 
-When a SYN arrives from the reply direction while in `SYN_SENT`, the session moves to `SYN_SENT2` (60s timeout) instead of being silently ignored. The first SYN+ACK from either direction then transitions to `SYN_RECV`, and the normal final ACK → ESTABLISHED path follows.
+**Session lines**:
 
-## Known limitations (deferred to Phase 3+)
+```
+proto=N src=A.B.C.D:P dst=E.F.G.H:Q id=N pkts=N/N bytes=N/N age_ms=N expire_ms=N ml=N flags=0xN dev=N/N policy_id=N [tcp_state=N]
+```
 
-- **NAT blindness** — the session key is the pre-NAT 5-tuple. Reply packets from a NAT'd connection arrive with the translated addresses and will not match the original session key. Requires adding `nat_key` to the session struct and NAT-awareness in `extract_key()`.
+| Field | Source |
+|-------|--------|
+| `proto` | `s->key.proto` |
+| `src` | `s->key.src_ip:ntohs(s->key.src_port)` |
+| `dst` | `s->key.dst_ip:ntohs(s->key.dst_port)` |
+| `id` | `s->id` |
+| `pkts` | `s->stats.pkts_orig / s->stats.pkts_reply` |
+| `bytes` | `s->stats.bytes_orig / s->stats.bytes_reply` |
+| `age_ms` | `ktime_to_ms(now - s->stats.first_seen)` |
+| `expire_ms` | `ktime_to_ms(s->expires_at - now)` (negative = expired) |
+| `ml` | `s->ml_score` |
+| `flags` | `s->flags` (hex) |
+| `dev` | `s->ifindex_in / s->ifindex_out` |
+| `policy_id` | `s->policy_id` |
+| `tcp_state` | `s->tcp_state` (TCP only) |
+
+### `/proc/stargazer/session_ctl` (mode 0200, CAP_NET_ADMIN required)
+
+Write-only control interface. Accepted commands:
+
+| Command | Effect |
+|---------|--------|
+| `flush` | Calls `sess_flush_all()`: removes all sessions from hash and LRU, schedules deferred free via `call_rcu()`. Does not call `rcu_barrier()`. |
+| `mark_dirty` | Calls `sess_mark_all_dirty()`: sets `SESS_DIRTY` in all sessions. |
+
+### `/proc/stargazer/pkt_forward_stats` (mode 0444)
+
+Simple `single_open` seq_file. One `key=value` line per counter:
+
+| Key | Source |
+|-----|--------|
+| `pkts_forwarded` | Packets that reached `NF_ACCEPT` |
+| `pkts_dropped` | All drops (sum of all drop paths) |
+| `pkts_blocked` | Dropped due to `SESS_BLOCKED` |
+| `pkts_syn_dropped` | Per-source TCP SYN token-bucket exceeded |
+| `pkts_udp_dropped` | Per-source UDP token-bucket exceeded |
+| `pkts_icmp_dropped` | Per-source ICMP token-bucket exceeded |
+| `pkts_anomaly_dropped` | L3/L4 anomaly (land, XMAS, NULL scan, etc.) |
+| `pkts_halfopen_src_dropped` | Per-source half-open sliding-window cap |
+| `pkts_pkt_rate_dropped` | Per-source aggregate packet rate exceeded |
+| `pkts_scan_dropped` | Port scan bloom filter threshold exceeded |
+| `protected_ifmask` | Current value of the `protected_ifmask` module param |
+
+### `/proc/stargazer/dos_blocks` (mode 0444)
+
+Block-event ring buffer (`DOS_BLOCK_LOG_SIZE = 256` entries, lock-free, oldest first). Every `src_block_add()` records `(jiffies, src_ip, reason)`. `dos_blocks_show()` computes age at read time from `jiffies`, so there are no wall-clock concerns in the kernel.
+
+```
+# Stargazer DoS block log (<total> events, showing last <n>)
+# age_sec src reason
+age_sec=12 src=203.0.113.7 reason=syn_flood
+age_sec=4  src=203.0.113.9 reason=icmp_flood
+```
+
+`reason` is one of: `syn_flood`, `udp_flood`, `icmp_flood`, `pkt_rate`, `halfopen`, `scan` (enum `dos_block_reason`). Surfaced to operators via `execute diagnose session blocks`.
+
+### `/proc/stargazer/session_test` (mode 0444)
+
+Created by `session_test.ko` at `module_init()`. Key=value output:
+
+| Key | Meaning |
+|-----|---------|
+| `sessions_created` | 1 if `sess_lookup_or_create()` returned `dir == SESS_DIR_ORIG` |
+| `pkts_orig` | `s->stats.pkts_orig` after one `sess_update()` call |
+| `pkts_reply` | `sr->stats.pkts_reply` after one `sess_update()` call |
+| `bytes_orig` | `s->stats.bytes_orig` (should equal `ST_PKT_LEN = 32`) |
+| `bidirectional` | 1 if reverse lookup returned `dir == SESS_DIR_REPLY` |
+
+---
+
+## 9. IPC and Diagnostics
+
+### Wire format (stargazer_ipc.h)
+
+**Request** (`sg_request_hdr_t`, packed, 84 bytes fixed header + variable payload):
+
+```
+magic:2 | version:1 | debug_flags:1 | cmd:4 | username[64] | payload_len:4 | session_tag:8 | payload[...]
+```
+
+**Response** (`sg_response_hdr_t`, packed, 268 bytes fixed header + variable payload):
+
+```
+magic:2 | version:1 | _pad:1 | status:4 | extra[256] | payload_len:4 | payload[...]
+```
+
+`SG_USERNAME_MAX = 64`, `SG_EXTRA_MAX = 256`, `SG_MSG_MAGIC = 0x5347` ("SG"), `SG_MSG_VERSION = 2`. `SG_RESPONSE_MAX = 65536` bytes, `SG_PAYLOAD_MAX = 4096` bytes.
+
+### Session-related IPC commands
+
+| Command ID | Name | Permission | Handler | Description |
+|-----------|------|------------|---------|-------------|
+| 650 | `SG_CMD_SHOW_SESSIONS` | monitor | `handle_show_sessions()` | Reads `/proc/stargazer/sessions`, enriches with `policy_name` from SQLite |
+| 654 | `SG_CMD_DIAG_SESSION` | monitor (status) / admin (inject) | `handle_diag_session()` | Status mode: returns raw procfs. Inject mode: insmod/rmmod `session_test.ko` |
+| 655 | `SG_CMD_SESSION_CLEAR` | admin | `handle_session_clear()` | Reads active count, writes `flush` to `session_ctl`, returns `flushed=N` |
+| 656 | `SG_CMD_SESSION_STATS` | monitor | `handle_session_stats()` | Parses counters from `/proc/stargazer/sessions` and `/proc/stargazer/pkt_forward_stats` |
+| 657 | `SG_CMD_SESSION_GC_INTERVAL` | admin | `handle_session_gc_interval()` | GET: reads `/sys/module/session/parameters/gc_sweep_interval`. SET: writes new value |
+| 658 | `SG_CMD_SESSION_BLOCKS` | monitor | `handle_session_blocks()` | Reads `/proc/stargazer/dos_blocks` (recent DoS block events) |
+
+### Policy-name enrichment (`handle_show_sessions()`)
+
+Before returning the session table, `handle_show_sessions()` queries the SQLite database for all `firewall_policy` entries, building a map of `policy_id -> policy_name` (up to `SESS_POLICY_MAP_MAX = 256` entries). It then does a second pass over the procfs output: for each non-comment line containing `policy_id=N` where `N > 0`, it appends ` policy_name=<name>` if a match exists. Uses `struct dynbuf` for the output buffer to avoid a fixed-size limit. Falls back to the raw procfs buffer on allocation failure.
+
+### `handle_session_stats()` parsing
+
+Reads both `/proc/stargazer/sessions` (for `active`, `created`, `expired`, `invalid`, `halfopen`, `rejected_halfopen`, `est_src_drops`) and `/proc/stargazer/pkt_forward_stats` (for all flood drop counters) using `strstr()` substring search on the raw text. Module load status is detected via `read_small_file()` return value (< 0 = not loaded) for `session.ko` and `access("/sys/module/pkt_forward", F_OK)` for `pkt_forward.ko`. Returns all parsed counters as a `key=value` text payload.
+
+---
+
+## 10. CLI Commands
+
+All commands under `execute diagnose session` require at minimum "monitor" permission. Commands that modify state require "admin".
+
+### Session diagnostic commands
+
+| Command | IPC cmd | Permission | Output |
+|---------|---------|------------|--------|
+| `execute diagnose session` | `SG_CMD_DIAG_SESSION` | monitor | Raw `/proc/stargazer/sessions` with header and per-session lines |
+| `execute diagnose session status` | `SG_CMD_DIAG_SESSION` | monitor | Same as above |
+| `execute diagnose session stats` | `SG_CMD_SESSION_STATS` | monitor | Formatted counters table with module load status |
+| `execute diagnose session blocks` | `SG_CMD_SESSION_BLOCKS` | monitor | Recent DoS block events: `age_sec`, source IP, reason |
+| `execute diagnose session clear` | `SG_CMD_SESSION_CLEAR` | admin | Confirmation prompt, then `Flushed N session(s).` |
+| `execute diagnose session gc-interval [N]` | `SG_CMD_SESSION_GC_INTERVAL` | admin | GET: `GC sweep interval : N seconds`. SET: `GC sweep interval set to N seconds.` |
+| `show sessions` | `SG_CMD_SHOW_SESSIONS` | monitor | Enriched session table with `policy_name` appended to lines |
+
+### `execute diagnose session stats` example output
+
+```
+  === Session Statistics ===
+  session.ko     : loaded
+  pkt_forward.ko : loaded
+  Active sessions: 1243
+  Created        : 98432
+  Expired        : 97189
+  Invalid (drops): 14
+  Half-open TCP  : 3  (rejected: 0)
+  Est. src drops : 0
+
+  --- DoS Drop Counters ---
+  L3/L4 anomaly  : 0
+  SYN flood/src  : 0
+  SYN halfopen/s : 0
+  UDP flood      : 0
+  ICMP flood     : 0
+  Pkt rate       : 0
+  Port scan      : 0
+```
+
+### Self-test command
+
+```
+execute diagnose selftest session
+execute diagnose selftest session full
+```
+
+Invokes `cli_diagnose_test_session()` which in turn triggers `handle_diag_session()` with payload `inject`, causing mgmtd to `insmod session_test.ko`, read `/proc/stargazer/session_test`, and `rmmod session_test`. The CLI displays pass/fail for each `SESS-*` test case.
+
+---
+
+## 11. Self-Test Module (session_test.ko)
+
+`session_test.ko` exercises the `session.ko` public API directly, without a network stack. It is built as a separate module with `MODULE_SOFTDEP("pre: session")`.
+
+### What it tests
+
+Test 5-tuple: `10.88.0.2:55000 → 10.88.1.2:5353` (UDP, `ST_PKT_LEN = 32`). The `10.88.x.x` subnet is reserved for Stargazer self-tests.
+
+| Test ID | Operation | Verification |
+|---------|-----------|-------------|
+| SESS-06/07 | `sess_lookup_or_create(&orig_key, &dir)` inside `rcu_read_lock()` | `dir == SESS_DIR_ORIG`; session pointer non-NULL |
+| SESS-07 | `sess_update(s, skb, SESS_DIR_ORIG)` | `s->stats.pkts_orig == 1`, `s->stats.bytes_orig == 32` |
+| SESS-09/10 | `sess_lookup_or_create(&reply_key, &dir2)` | `dir2 == SESS_DIR_REPLY`; returns same session |
+| SESS-10 | `sess_update(sr, skb, SESS_DIR_REPLY)` | `sr->stats.pkts_reply == 1` |
+| Cleanup | `sess_lookup(&orig_key)` then `sess_delete(s_del)` outside `rcu_read_lock()` | Session removed cleanly |
+
+### Load/unload
+
+Load (normal): `insmod /lib/modules/stargazer/session_test.ko`
+
+Unload: `rmmod session_test`
+
+`session_test_exit()` removes `/proc/stargazer/session_test`.
+
+mgmtd (`handle_diag_session()` with `inject` payload) automates the load/wait/read/unload sequence. It calls `usleep(50000)` (50 ms) after `insmod` to allow `module_init()` to complete before reading procfs. Requires admin permission.
+
+### Results location
+
+`/proc/stargazer/session_test` — created by `session_test.ko` in `module_init()`, placed under the shared `sg_proc_root` directory owned by `session.ko`.
+
+---
+
+## 12. Module Parameters
+
+### session.ko
+
+All parameters are writable at runtime via `/sys/module/session/parameters/<name>` unless noted (mode 0444 = read-only at runtime).
+
+| Parameter | Default | Mode | Description |
+|-----------|---------|------|-------------|
+| `sess_asymmetric_mode` | false | 0644 | Allow mid-stream TCP pickup for asymmetric routing / ECMP / HA. When true, non-SYN TCP without a session creates one and immediately promotes it to ESTABLISHED. |
+| `pf_max_states` | 65536 | 0444 | Hard session table cap. No new sessions above this count. Cannot exceed `MAX_SESSIONS`. |
+| `pf_adaptive_start` | 0 (resolved to 75% of max) | 0644 | Begin TTL scaling above this active session count. |
+| `pf_adaptive_end` | 0 (resolved to 90% of max) | 0644 | TTL crushed to 0 at this count. |
+| `gc_sweep_interval` | 16 s | 0644 | Seconds for GC to complete one full table sweep. Range: 5–3600. Also writable via `SG_CMD_SESSION_GC_INTERVAL`. |
+| `max_halfopen` | 1024 | 0644 | Global hard cap on half-open TCP sessions (`SYN_SENT` + `SYN_RECV` + `SYN_SENT2`). |
+| `max_est_per_src` | 64 | 0644 | Max ESTABLISHED sessions per source IP (0 = disabled). Approximate: uses a 4096-slot lock-free hash table. |
+| `zero_win_timeout` | 60 s | 0644 | Seconds TCP window=0 before session TTL is crushed to 5 s. Set to 0 to disable. |
+| `sess_tt_tcp_none` | 120 s | 0644 | TCP pre-handshake timeout |
+| `sess_tt_tcp_syn_sent` | 120 s | 0644 | TCP SYN_SENT (half-open) timeout |
+| `sess_tt_tcp_syn_recv` | 60 s | 0644 | TCP SYN_RECV timeout |
+| `sess_tt_tcp_est` | 3600 s | 0644 | TCP ESTABLISHED idle timeout |
+| `sess_tt_tcp_fin_wait` | 120 s | 0644 | TCP FIN_WAIT timeout |
+| `sess_tt_tcp_close_wait` | 60 s | 0644 | TCP CLOSE_WAIT timeout |
+| `sess_tt_tcp_last_ack` | 30 s | 0644 | TCP LAST_ACK timeout |
+| `sess_tt_tcp_time_wait` | 120 s | 0644 | TCP TIME_WAIT timeout |
+| `sess_tt_tcp_close` | 10 s | 0644 | TCP CLOSE (RST) timeout |
+| `sess_tt_tcp_syn_sent2` | 60 s | 0644 | TCP simultaneous-open timeout |
+| `sess_tt_udp` | 180 s | 0644 | UDP session idle timeout |
+| `sess_tt_icmp` | 60 s | 0644 | ICMP session idle timeout |
+| `sess_tt_other` | 300 s | 0644 | Other protocol session timeout |
+
+### pkt_forward.ko
+
+| Parameter | Default | Mode | Description |
+|-----------|---------|------|-------------|
+| `protected_ifmask` | 0 | 0644 | Bitmask of protected interface ifindices; bit N = ifindex N is protected. When 0, entire DoS subsystem is disabled. Supports up to 64 interfaces (BITS_PER_LONG on ARM64). |
+| `syn_flood_thr` | 200 | 0644 | TCP SYN new-session rate limit per source (sessions/s) |
+| `syn_flood_burst` | 400 | 0644 | TCP SYN token-bucket burst capacity |
+| `udp_flood_thr` | 1000 | 0644 | UDP new-session rate limit per source (sessions/s) |
+| `udp_flood_burst` | 2000 | 0644 | UDP token-bucket burst capacity |
+| `icmp_flood_thr` | 100 | 0644 | ICMP echo/query rate limit per source (packets/s, per-packet; error types exempt) |
+| `icmp_flood_burst` | 200 | 0644 | ICMP token-bucket burst capacity |
+| `src_block_dur` | 30 s | 0644 | Duration a violating source stays in the block list |
+| `max_halfopen_per_src` | 10 | 0644 | Max half-open TCP sessions per source in 120 s window (0 = disabled) |
+| `pkt_flood_thr` | 0 | 0644 | Per-source aggregate packet rate cap in pkts/s (0 = disabled) |
+| `pkt_flood_burst` | 20000 | 0644 | Per-source aggregate packet rate burst |
+| `scan_threshold` | 20 | 0644 | Unique (dst_port, dst_ip) combos per window before source is blocked (0 = disabled) |
+| `scan_window` | 10 s | 0644 | Port scan bloom filter window in seconds |
+
+---
+
+## 13. Data-Flow Diagram
+
+```
+  NIC (ingress)
+       |
+       v
+  nf_defrag_ipv4 (PRE_ROUTING, reassemble fragments)
+       |
+       v
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  forward_hook  (NF_INET_FORWARD, priority -399)                  │
+  │                                                                  │
+  │  [1] IPv4+L4 validation (extract_key)             ──► DROP       │
+  │  [2] Anomaly detection (land/XMAS/NULL/PoD/SSRR)  ──► DROP       │
+  │  [3] Block list check (protected ifaces only)     ──► DROP       │
+  │  [4] Aggregate pkt rate (pkt_flood_thr, disabled) ──► DROP       │
+  │  [4b] ICMP echo/query rate (per-packet, err-exempt) ──► DROP     │
+  │  [5] Per-src half-open SYN cap (SYN only)         ──► DROP       │
+  │  [6] Port scan bloom filter (SYN only)            ──► DROP       │
+  │                                                                  │
+  │  rcu_read_lock()                                                 │
+  │  [7] Protocol dispatch:                                          │
+  │      TCP non-SYN ──► sess_lookup_bidir()     ─── miss ──► DROP   │
+  │      TCP SYN     ──► src_dos_check()         ─── flood ──► DROP  │
+  │                  ──► sess_lookup_or_create() ─── full ──► DROP   │
+  │                        │                                         │
+  │                        v                                         │
+  │                   ┌──────────────┐                               │
+  │                   │ SESSION TABLE │  (RCU hash, 65536 buckets)   │
+  │                   │  session.ko   │                               │
+  │                   └──────────────┘                               │
+  │                        │  session pointer (valid in RCU section) │
+  │                        v                                         │
+  │      record ifindex_in/out (cmpxchg, first-packet only)         │
+  │                                                                  │
+  │  [8] SESS_BLOCKED?  ──yes──► DROP (pkts_blocked++)               │
+  │                                                                  │
+  │  [8b] SESS_DIRTY?   ──yes──► skb->mark |= DIRTY_MARK             │
+  │                                                                  │
+  │  [9] TCP: sess_tcp_check()  ──► NF_DROP on state violation       │
+  │           (updates expires_at, tcp_state, tcp_win[])             │
+  │                                                                  │
+  │  [10] sess_update()                                              │
+  │       (pkts/bytes/iat/flags/len stats, LRU touch)                │
+  │  rcu_read_unlock()                                               │
+  │                                                                  │
+  │  pkts_forwarded++  ──► NF_ACCEPT                                 │
+  └──────────────────────────────────────────────────────────────────┘
+       |
+       v
+  iptables FORWARD chain (priority 0)
+    - ESTABLISHED,RELATED rule (skips packets with DIRTY_MARK)
+    - Policy rules (may stamp skb->mark bits 16-29 with policy sequence)
+    - ACCEPT / DROP
+       |
+       | (on ACCEPT only)
+       v
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  post_filter_hook  (NF_INET_FORWARD, priority +1)                │
+  │                                                                  │
+  │  Fast path: neither DIRTY_MARK nor POLICY_MARK set?             │
+  │  ──yes──► NF_ACCEPT immediately (zero session-table cost)        │
+  │                                                                  │
+  │  rcu_read_lock()                                                 │
+  │  sess_lookup_bidir()                                             │
+  │  s->lock:                                                        │
+  │    DIRTY_MARK set?  ──► s->flags &= ~SESS_DIRTY                  │
+  │    POLICY_MARK set? ──► WRITE_ONCE(s->policy_id, policy_seq)     │
+  │  rcu_read_unlock()                                               │
+  │                                                                  │
+  │  NF_ACCEPT                                                       │
+  └──────────────────────────────────────────────────────────────────┘
+       |
+       v
+  NIC (egress)
+
+
+  Parallel path — GC reaper (10 Hz delayed_work):
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  sess_reaper_fn                                                  │
+  │    scan_size buckets per run (SESSION_TABLE_SIZE / interval*10)  │
+  │    aggressive mode (4×) when active >= pf_adaptive_start         │
+  │    for each session: eff = sess_pf_timeout(s, active)            │
+  │      if idle_ns >= eff * NSEC_PER_SEC:                           │
+  │        hash_del_rcu + list_del_init + call_rcu(sess_free_rcu)    │
+  └─────────────────────────────────────────────────────────────────┘
+
+  Inline emergency eviction (called from sess_lookup_or_create):
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  pf_purge_expired_states_emergency()                             │
+  │    scan up to PF_EMERGENCY_SCAN_MAX (64) LRU head entries        │
+  │    evict those with eff==0 or idle >= eff                        │
+  │    returns freed count; 0 ──► NF_DROP at caller                 │
+  └─────────────────────────────────────────────────────────────────┘
+```

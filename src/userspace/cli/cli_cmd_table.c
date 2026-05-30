@@ -774,8 +774,7 @@ static int cmd_diag_session(const char *args, const char *permissions)
 		long long halfopen = 0, rejected_halfopen = 0, est_src_drops = 0;
 		long long syn_dropped = 0, udp_dropped = 0, icmp_dropped = 0;
 		long long anomaly_dropped = 0, halfopen_src_dropped = 0;
-		long long global_syn_dropped = 0, pkt_rate_dropped = 0;
-		long long icmp_err_dropped = 0, scan_dropped = 0;
+		long long pkt_rate_dropped = 0, scan_dropped = 0;
 		int sess_loaded = 0, pkt_fwd_loaded = 0;
 		const char *kv;
 		kv = strstr(p, "session_loaded=");
@@ -806,12 +805,8 @@ static int cmd_diag_session(const char *args, const char *permissions)
 		if (kv) anomaly_dropped  = strtoll(kv + 16, NULL, 10);
 		kv = strstr(p, "halfopen_src_dropped=");
 		if (kv) halfopen_src_dropped = strtoll(kv + 21, NULL, 10);
-		kv = strstr(p, "global_syn_dropped=");
-		if (kv) global_syn_dropped   = strtoll(kv + 19, NULL, 10);
 		kv = strstr(p, "pkt_rate_dropped=");
 		if (kv) pkt_rate_dropped     = strtoll(kv + 17, NULL, 10);
-		kv = strstr(p, "icmp_err_dropped=");
-		if (kv) icmp_err_dropped     = strtoll(kv + 17, NULL, 10);
 		kv = strstr(p, "scan_dropped=");
 		if (kv) scan_dropped         = strtoll(kv + 13, NULL, 10);
 
@@ -829,13 +824,29 @@ static int cmd_diag_session(const char *args, const char *permissions)
 			printf("  L3/L4 anomaly  : %lld\n", anomaly_dropped);
 			printf("  SYN flood/src  : %lld\n", syn_dropped);
 			printf("  SYN halfopen/s : %lld\n", halfopen_src_dropped);
-			printf("  Global SYN cap : %lld\n", global_syn_dropped);
 			printf("  UDP flood      : %lld\n", udp_dropped);
 			printf("  ICMP flood     : %lld\n", icmp_dropped);
-			printf("  ICMP error rate: %lld\n", icmp_err_dropped);
 			printf("  Pkt rate       : %lld\n", pkt_rate_dropped);
 			printf("  Port scan      : %lld\n", scan_dropped);
 		}
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	/* ── blocks: recent DoS block events ─────────────────────────── */
+	if (strcmp(sub, "blocks") == 0) {
+		struct ipc_response resp = {0};
+		int rc = ipc_send_str(SG_CMD_SESSION_BLOCKS, "", &resp);
+		if (rc != 0 || resp.status != SG_OK) {
+			print_ipc_error("Error", &resp);
+			ipc_resp_free(&resp);
+			return 0;
+		}
+		printf("  === Recent DoS Blocks ===\n");
+		if (resp.payload && resp.payload[0])
+			printf("%s", resp.payload);
+		else
+			printf("  No blocks recorded.\n");
 		ipc_resp_free(&resp);
 		return 0;
 	}
@@ -873,7 +884,7 @@ static int cmd_diag_session(const char *args, const char *permissions)
 	}
 
 	printf("  Unknown subcommand: %s\n", sub);
-	printf("  Usage: execute diagnose session [status|stats|clear|gc-interval]\n");
+	printf("  Usage: execute diagnose session [status|stats|blocks|clear|gc-interval]\n");
 	return 0;
 }
 

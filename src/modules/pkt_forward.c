@@ -55,11 +55,42 @@ static atomic64_t pkts_udp_dropped          = ATOMIC64_INIT(0); /* per-src UDP f
 static atomic64_t pkts_icmp_dropped         = ATOMIC64_INIT(0); /* per-src ICMP flood     */
 static atomic64_t pkts_anomaly_dropped      = ATOMIC64_INIT(0); /* L3/L4 anomaly          */
 static atomic64_t pkts_halfopen_src_dropped = ATOMIC64_INIT(0); /* per-src half-open cap  */
-static atomic64_t pkts_global_syn_dropped   = ATOMIC64_INIT(0); /* global SYN cap         */
-static atomic64_t pkts_global_udp_dropped   = ATOMIC64_INIT(0); /* global UDP cap         */
 static atomic64_t pkts_pkt_rate_dropped     = ATOMIC64_INIT(0); /* per-src aggregate rate */
-static atomic64_t pkts_icmp_err_dropped     = ATOMIC64_INIT(0); /* ICMP error rate        */
 static atomic64_t pkts_scan_dropped         = ATOMIC64_INIT(0); /* port scan              */
+
+/*
+ * Block-event log — a lock-free ring buffer recording each source IP added to
+ * the block list, with the reason and a monotonic timestamp.  Aggregate drop
+ * counters answer "how many"; this answers "who, why, and when" so an operator
+ * can see a flood in progress via /proc/stargazer/dos_blocks without a packet
+ * capture.  Best-effort: concurrent writers may race on a slot, which at worst
+ * produces one slightly-garbled entry — acceptable for a diagnostic log.
+ */
+enum dos_block_reason {
+	DOS_REASON_SYN_FLOOD = 0,
+	DOS_REASON_UDP_FLOOD,
+	DOS_REASON_ICMP_FLOOD,
+	DOS_REASON_PKT_RATE,
+	DOS_REASON_HALFOPEN,
+	DOS_REASON_SCAN,
+	DOS_REASON_MAX
+};
+
+static const char *const dos_reason_str[DOS_REASON_MAX] = {
+	"syn_flood", "udp_flood", "icmp_flood", "pkt_rate", "halfopen", "scan"
+};
+
+#define DOS_BLOCK_LOG_SIZE 256U   /* power of two; ring index is modulo this */
+
+struct dos_block_event {
+	__be32         ip;
+	u8             reason;
+	unsigned long  ts;       /* jiffies at block time */
+};
+
+static struct dos_block_event dos_block_log[DOS_BLOCK_LOG_SIZE];
+/* Monotonic total count of block events; (head-1) % SIZE is the last slot. */
+static atomic_t dos_block_log_head = ATOMIC_INIT(0);
 
 /*
  * FortiGate-style per-source DoS protection.
@@ -112,24 +143,9 @@ static struct src_rate_slot      syn_rate[SRC_RATE_SLOTS];
 static struct src_rate_slot      udp_rate[SRC_RATE_SLOTS];
 static struct src_rate_slot      icmp_rate[SRC_RATE_SLOTS];
 static struct src_rate_slot      pkt_rate[SRC_RATE_SLOTS];     /* aggregate pkts/s  */
-static struct src_rate_slot      icmp_err_rate[SRC_RATE_SLOTS];/* ICMP type 3/11/12 */
 static struct src_block_slot     src_block[SRC_BLOCK_SLOTS];
 static struct src_halfopen_slot  src_halfopen[SRC_RATE_SLOTS];
 static struct src_scan_slot      src_scan[SRC_RATE_SLOTS];
-
-/* Global SYN token bucket — single bucket shared across all WAN sources */
-static struct {
-	s32           tokens;
-	unsigned long last_ts;
-} global_syn_bucket;
-static DEFINE_SPINLOCK(global_syn_lock);
-
-/* Global UDP token bucket — caps total UDP new-session rate across all sources */
-static struct {
-	s32           tokens;
-	unsigned long last_ts;
-} global_udp_bucket;
-static DEFINE_SPINLOCK(global_udp_lock);
 
 static u32 dos_hash_seed;
 
@@ -180,41 +196,14 @@ module_param(max_halfopen_per_src, uint, 0644);
 MODULE_PARM_DESC(max_halfopen_per_src,
 	"Max half-open TCP sessions per source in 120s window (0=disabled, default: 10)");
 
-static unsigned int global_syn_thr   = 5000;
-static unsigned int global_syn_burst = 10000;
-module_param(global_syn_thr,   uint, 0644);
-module_param(global_syn_burst, uint, 0644);
-MODULE_PARM_DESC(global_syn_thr,
-	"Global SYN new-session rate cap, SYNs/s (0=disabled, default: 5000)");
-MODULE_PARM_DESC(global_syn_burst,
-	"Global SYN burst capacity (default: 10000)");
-
-static unsigned int global_udp_thr   = 5000;
-static unsigned int global_udp_burst = 10000;
-module_param(global_udp_thr,   uint, 0644);
-module_param(global_udp_burst, uint, 0644);
-MODULE_PARM_DESC(global_udp_thr,
-	"Global UDP new-session rate cap, sessions/s (0=disabled, default: 5000)");
-MODULE_PARM_DESC(global_udp_burst,
-	"Global UDP burst capacity (default: 10000)");
-
-static unsigned int pkt_flood_thr   = 10000;
+static unsigned int pkt_flood_thr   = 0;
 static unsigned int pkt_flood_burst = 20000;
 module_param(pkt_flood_thr,   uint, 0644);
 module_param(pkt_flood_burst, uint, 0644);
 MODULE_PARM_DESC(pkt_flood_thr,
-	"Per-source aggregate packet rate cap, pkts/s (0=disabled, default: 10000)");
+	"Per-source aggregate packet rate cap, pkts/s (0=disabled, default: 0)");
 MODULE_PARM_DESC(pkt_flood_burst,
 	"Per-source aggregate packet rate burst (default: 20000)");
-
-static unsigned int icmp_err_thr   = 50;
-static unsigned int icmp_err_burst = 100;
-module_param(icmp_err_thr,   uint, 0644);
-module_param(icmp_err_burst, uint, 0644);
-MODULE_PARM_DESC(icmp_err_thr,
-	"ICMP error message rate limit per source, msgs/s (default: 50)");
-MODULE_PARM_DESC(icmp_err_burst,
-	"ICMP error rate burst capacity (default: 100)");
 
 static unsigned int scan_threshold = 20;
 static unsigned int scan_window    = 10;
@@ -247,14 +236,27 @@ static bool src_block_check(__be32 src)
 	return true;
 }
 
-/* src_block_add - add src to the block list for src_block_dur seconds. */
-static void src_block_add(__be32 src)
+/*
+ * src_block_add - add src to the block list for src_block_dur seconds and
+ * record the event in the block-event ring buffer.  reason is one of
+ * enum dos_block_reason and identifies which detector tripped.
+ */
+static void src_block_add(__be32 src, u8 reason)
 {
 	u32 idx = jhash_1word((__force u32)src, dos_hash_seed) % SRC_BLOCK_SLOTS;
 	struct src_block_slot *sl = &src_block[idx];
+	u32 slot;
+	struct dos_block_event *ev;
 
 	WRITE_ONCE(sl->ip,      src);
 	WRITE_ONCE(sl->expires, jiffies + (unsigned long)src_block_dur * HZ);
+
+	/* Append to the block-event ring (lock-free, best-effort). */
+	slot = (u32)atomic_inc_return(&dos_block_log_head) - 1;
+	ev   = &dos_block_log[slot % DOS_BLOCK_LOG_SIZE];
+	WRITE_ONCE(ev->ip,     src);
+	WRITE_ONCE(ev->reason, reason);
+	WRITE_ONCE(ev->ts,     jiffies);
 }
 
 /*
@@ -270,7 +272,7 @@ static bool src_rate_check(struct src_rate_slot *tbl, __be32 src,
 	u32 idx = jhash_1word((__force u32)src, dos_hash_seed) % SRC_RATE_SLOTS;
 	struct src_rate_slot *sl = &tbl[idx];
 
-	/* rate=0 means disabled — same semantics as global_syn_thr=0 */
+	/* rate=0 means this check is disabled */
 	if (rate == 0)
 		return false;
 	unsigned long now = jiffies;
@@ -320,13 +322,16 @@ static bool src_dos_check(__be32 src, u8 proto)
 					  icmp_flood_thr, icmp_flood_burst);
 
 	if (flooding) {
-		src_block_add(src);
-		if (proto == IPPROTO_TCP)
+		if (proto == IPPROTO_TCP) {
+			src_block_add(src, DOS_REASON_SYN_FLOOD);
 			atomic64_inc(&pkts_syn_dropped);
-		else if (proto == IPPROTO_UDP)
+		} else if (proto == IPPROTO_UDP) {
+			src_block_add(src, DOS_REASON_UDP_FLOOD);
 			atomic64_inc(&pkts_udp_dropped);
-		else
+		} else {
+			src_block_add(src, DOS_REASON_ICMP_FLOOD);
 			atomic64_inc(&pkts_icmp_dropped);
+		}
 	}
 	return flooding;
 }
@@ -429,31 +434,6 @@ static bool is_icmp_anomaly(struct sk_buff *skb)
 }
 
 /*
- * icmp_is_error - Return true if this ICMP packet is an error type (3/11/12).
- * Used to select the ICMP error rate table before sess_icmp_error_lookup().
- */
-static bool icmp_is_error(struct sk_buff *skb)
-{
-	struct iphdr   *iph;
-	struct icmphdr *icmph;
-	u8              type;
-
-	iph = ip_hdr(skb);
-	if (iph->protocol != IPPROTO_ICMP)
-		return false;
-	if (!pskb_may_pull(skb, (unsigned int)iph->ihl * 4 +
-			       sizeof(struct icmphdr)))
-		return false;
-	/* Re-fetch after pull */
-	iph   = ip_hdr(skb);
-	icmph = (struct icmphdr *)((u8 *)iph + iph->ihl * 4);
-	type  = icmph->type;
-	return type == ICMP_DEST_UNREACH  ||
-	       type == ICMP_TIME_EXCEEDED ||
-	       type == ICMP_PARAMETERPROB;
-}
-
-/*
  * src_halfopen_check - Per-source half-open TCP session sliding-window cap.
  *
  * Counts SYNs from a source IP within a HALFOPEN_WINDOW_SEC window.
@@ -481,99 +461,12 @@ static bool src_halfopen_check(__be32 src)
 	}
 
 	if (sl->count >= max_halfopen_per_src) {
-		src_block_add(src);
+		src_block_add(src, DOS_REASON_HALFOPEN);
 		atomic64_inc(&pkts_halfopen_src_dropped);
 		return true;
 	}
 	sl->count++;
 	return false;
-}
-
-/*
- * global_syn_check - Single shared token bucket for all WAN SYNs.
- *
- * A distributed SYN flood from many sources can stay under per-source
- * thresholds while overwhelming the session table.  This cap is the
- * last backstop before sess_lookup_or_create().
- * Returns true (drop) when the global bucket is empty.
- * Does NOT block individual sources — the source is not necessarily at fault.
- */
-static bool global_syn_check(void)
-{
-	unsigned long now  = jiffies;
-	unsigned long elapsed;
-	s32           refill;
-	bool          drop;
-
-	spin_lock(&global_syn_lock);
-
-	elapsed = now - global_syn_bucket.last_ts;
-	if (elapsed) {
-		refill = (s32)min_t(u64,
-				    (u64)elapsed * global_syn_thr / HZ,
-				    (u64)global_syn_burst);
-		global_syn_bucket.tokens = min(
-			global_syn_bucket.tokens + refill,
-			(s32)global_syn_burst);
-		global_syn_bucket.last_ts = now;
-	}
-
-	if (global_syn_bucket.tokens > 0) {
-		global_syn_bucket.tokens--;
-		drop = false;
-	} else {
-		drop = true;
-	}
-
-	spin_unlock(&global_syn_lock);
-
-	if (drop)
-		atomic64_inc(&pkts_global_syn_dropped);
-	return drop;
-}
-
-/*
- * global_udp_check - Single shared token bucket for all WAN UDP new sessions.
- *
- * Per-source UDP rate limits stop single-source floods but cannot stop a
- * distributed flood where each source stays under its individual threshold.
- * This cap bounds the total rate of new UDP session creation regardless of
- * how many source IPs are involved.
- * Returns true (drop) when the global bucket is empty.
- * Does NOT block individual sources — the source is not necessarily at fault.
- */
-static bool global_udp_check(void)
-{
-	unsigned long now  = jiffies;
-	unsigned long elapsed;
-	s32           refill;
-	bool          drop;
-
-	spin_lock(&global_udp_lock);
-
-	elapsed = now - global_udp_bucket.last_ts;
-	if (elapsed) {
-		refill = (s32)min_t(u64,
-				    (u64)elapsed * global_udp_thr / HZ,
-				    (u64)global_udp_burst);
-		global_udp_bucket.tokens = min(
-			global_udp_bucket.tokens + refill,
-			(s32)global_udp_burst);
-		global_udp_bucket.last_ts = now;
-	}
-
-	if (global_udp_bucket.tokens > 0) {
-		global_udp_bucket.tokens--;
-		drop = false;
-	} else {
-		drop = true;
-	}
-
-	spin_unlock(&global_udp_lock);
-
-	if (drop)
-		atomic64_inc(&pkts_global_udp_dropped);
-	return drop;
 }
 
 /*
@@ -605,11 +498,41 @@ static bool src_scan_check(__be32 src, __be16 dst_port, __be32 dst_ip)
 	sl->bloom |= bit;
 
 	if (hweight32(sl->bloom) >= scan_threshold) {
-		src_block_add(src);
+		src_block_add(src, DOS_REASON_SCAN);
 		atomic64_inc(&pkts_scan_dropped);
 		return true;
 	}
 	return false;
+}
+
+/*
+ * icmp_is_floodable - true for ICMP query/echo types that should be rate-limited
+ * on every packet.
+ *
+ * ICMP is connectionless: an echo flood to a single destination is one session,
+ * so a per-new-session rate check never sees the 2nd..Nth packet.  This per-packet
+ * check closes that gap.  ICMP error types (Destination Unreachable, Time
+ * Exceeded, Parameter Problem) are exempt so Path-MTU discovery and traceroute
+ * keep working under load.
+ */
+static bool icmp_is_floodable(struct sk_buff *skb)
+{
+	struct iphdr   *iph = ip_hdr(skb);
+	struct icmphdr *icmph;
+	u8              type;
+
+	if (iph->protocol != IPPROTO_ICMP)
+		return false;
+	if (!pskb_may_pull(skb, (unsigned int)iph->ihl * 4 +
+			       sizeof(struct icmphdr)))
+		return false;
+	iph   = ip_hdr(skb); /* re-fetch after potential realloc */
+	icmph = (struct icmphdr *)((u8 *)iph + iph->ihl * 4);
+	type  = icmph->type;
+
+	return type != ICMP_DEST_UNREACH  &&
+	       type != ICMP_TIME_EXCEEDED &&
+	       type != ICMP_PARAMETERPROB;
 }
 
 /* --- Packet validation ---------------------------------------------------- */
@@ -636,15 +559,14 @@ static bool is_valid_ipv4(struct sk_buff *skb)
  *   [2]  L3/L4 anomaly detection (land attack, TCP NULL/XMAS/FIN-no-ACK/
  *        SYN+data, Ping of Death, IP source routing) — all interfaces
  *   [3]  DoS block list check (WAN-scoped, O(1) reject before session table)
- *   [4]  ICMP error rate limiter (WAN-scoped, type 3/11/12 only)
- *   [5]  Per-source aggregate packet rate (WAN-scoped, catches ACK/data floods)
- *   [6]  Global SYN cap (WAN-scoped, backstop for distributed SYN floods)
- *   [7]  Per-source half-open SYN cap (WAN-scoped, 120s sliding window)
- *   [8]  Port scan detection (WAN-scoped, bloom filter on SYNs)
- *   [9]  Session lookup / create with per-protocol rate limiting
- *   [10] SESS_BLOCKED policy enforcement
- *   [11] TCP state machine
- *   [12] Stats update
+ *   [4]  Per-source aggregate packet rate (WAN-scoped, disabled by default)
+ *   [4b] Per-source ICMP echo/query rate (WAN-scoped, per-packet, error-exempt)
+ *   [5]  Per-source half-open SYN cap (WAN-scoped, 120s sliding window)
+ *   [6]  Port scan detection (WAN-scoped, bloom filter on SYNs)
+ *   [7]  Session lookup / create with per-protocol rate limiting (TCP/UDP)
+ *   [8]  SESS_BLOCKED policy enforcement
+ *   [9]  TCP state machine
+ *   [10] Stats update
  */
 static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 				 const struct nf_hook_state *state)
@@ -702,41 +624,39 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 		return NF_DROP;
 	}
 
-	/* [4] ICMP error rate limiter: caps flood of crafted ICMP errors */
-	if (is_protected && icmp_err_thr && icmp_is_error(skb) &&
-	    src_rate_check(icmp_err_rate, key.src_ip,
-			   icmp_err_thr, icmp_err_burst)) {
-		src_block_add(key.src_ip);
-		atomic64_inc(&pkts_icmp_err_dropped);
-		atomic64_inc(&pkts_dropped);
-		return NF_DROP;
-	}
-
-	/* [5] Per-source aggregate packet rate: ACK flood / data flood */
+	/* [4] Per-source aggregate packet rate: ACK flood / data flood (disabled by default) */
 	if (is_protected && pkt_flood_thr &&
 	    src_rate_check(pkt_rate, key.src_ip,
 			   pkt_flood_thr, pkt_flood_burst)) {
-		src_block_add(key.src_ip);
+		src_block_add(key.src_ip, DOS_REASON_PKT_RATE);
 		atomic64_inc(&pkts_pkt_rate_dropped);
 		atomic64_inc(&pkts_dropped);
 		return NF_DROP;
 	}
 
-	/* [6–8] SYN-specific WAN defenses */
-	if (is_protected && tcp_is_syn) {
-		/* [6] Global SYN cap: distributed SYN flood from many sources */
-		if (global_syn_thr && global_syn_check()) {
-			atomic64_inc(&pkts_dropped);
-			return NF_DROP;
-		}
+	/* [4b] Per-source ICMP echo/query rate: ping flood to a single target.
+	 * Per-packet (not per-session) because ICMP is connectionless — a flood to
+	 * one destination is a single session that would otherwise bypass the
+	 * new-session rate check below.  Error types are exempt (icmp_is_floodable). */
+	if (is_protected && key.proto == IPPROTO_ICMP && icmp_flood_thr &&
+	    icmp_is_floodable(skb) &&
+	    src_rate_check(icmp_rate, key.src_ip,
+			   icmp_flood_thr, icmp_flood_burst)) {
+		src_block_add(key.src_ip, DOS_REASON_ICMP_FLOOD);
+		atomic64_inc(&pkts_icmp_dropped);
+		atomic64_inc(&pkts_dropped);
+		return NF_DROP;
+	}
 
-		/* [7] Per-source half-open cap: slow-rate single-source SYN flood */
+	/* [5–6] SYN-specific WAN defenses */
+	if (is_protected && tcp_is_syn) {
+		/* [5] Per-source half-open cap: slow-rate single-source SYN flood */
 		if (max_halfopen_per_src && src_halfopen_check(key.src_ip)) {
 			atomic64_inc(&pkts_dropped);
 			return NF_DROP;
 		}
 
-		/* [8] Port scan: bloom filter on unique (dst_port, dst_ip) combos */
+		/* [6] Port scan: bloom filter on unique (dst_port, dst_ip) combos */
 		if (scan_threshold &&
 		    src_scan_check(key.src_ip, key.dst_port, key.dst_ip)) {
 			atomic64_inc(&pkts_dropped);
@@ -746,7 +666,7 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 
 	rcu_read_lock();
 
-	/* [9] Session lookup / create */
+	/* [7] Session lookup / create */
 	if (key.proto == IPPROTO_TCP && !tcp_is_syn) {
 		/*
 		 * Stateful enforcement: non-SYN TCP must match an existing session.
@@ -771,21 +691,18 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 	} else if (key.proto == IPPROTO_ICMP) {
 		/*
 		 * For ICMP error messages (type 3/11/12) sess_icmp_error_lookup()
-		 * returns the parent TCP/UDP session — no new session, no rate
-		 * check.  For non-error ICMP (echo etc.) it returns NULL and we
-		 * fall through to create an ICMP-keyed session with rate limiting.
+		 * returns the parent TCP/UDP session.  For non-error ICMP (echo etc.)
+		 * it returns NULL and we create an ICMP-keyed session.
+		 *
+		 * ICMP flood rate limiting is done per-packet at step [4b] above
+		 * (icmp_is_floodable), not here — ICMP is connectionless, so a
+		 * per-new-session check would miss every packet after the first.
 		 */
 		s = sess_icmp_error_lookup(skb, &dir);
 		if (!s) {
 			s = sess_lookup_bidir(&key, &dir);
-			if (!s) {
-				if (is_protected && src_dos_check(key.src_ip, IPPROTO_ICMP)) {
-					rcu_read_unlock();
-					atomic64_inc(&pkts_dropped);
-					return NF_DROP;
-				}
+			if (!s)
 				s = sess_lookup_or_create(&key, &dir);
-			}
 		}
 
 	} else {
@@ -797,12 +714,6 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 		s = sess_lookup_bidir(&key, &dir);
 		if (!s) {
 			if (is_protected && src_dos_check(key.src_ip, key.proto)) {
-				rcu_read_unlock();
-				atomic64_inc(&pkts_dropped);
-				return NF_DROP;
-			}
-			if (is_protected && key.proto == IPPROTO_UDP &&
-			    global_udp_thr && global_udp_check()) {
 				rcu_read_unlock();
 				atomic64_inc(&pkts_dropped);
 				return NF_DROP;
@@ -830,19 +741,19 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 				   state->out ? (u32)state->out->ifindex : 0u);
 	}
 
-	/* [10] SESS_BLOCKED: ML/policy enforcement */
+	/* [8] SESS_BLOCKED: ML/policy enforcement */
 	if (READ_ONCE(s->flags) & SESS_BLOCKED) {
 		rcu_read_unlock();
 		atomic64_inc(&pkts_blocked);
 		return NF_DROP;
 	}
 
-	/* [10b] SESS_DIRTY: policy was rebuilt — tag packet so the iptables
+	/* [8b] SESS_DIRTY: policy was rebuilt — tag packet so the iptables
 	 * ESTABLISHED,RELATED rule skips it and policy rules re-evaluate it. */
 	if (READ_ONCE(s->flags) & SESS_DIRTY)
 		skb->mark |= STARGAZER_DIRTY_MARK;
 
-	/* [11] TCP state machine */
+	/* [9] TCP state machine */
 	if (key.proto == IPPROTO_TCP) {
 		unsigned int verdict = sess_tcp_check(s, skb, dir);
 
@@ -853,7 +764,7 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 		}
 	}
 
-	/* [12] Stats update */
+	/* [10] Stats update */
 	sess_update(s, skb, dir);
 
 	rcu_read_unlock();
@@ -876,10 +787,7 @@ static int pf_stats_show(struct seq_file *m, void *v)
 		"pkts_icmp_dropped=%lld\n"
 		"pkts_anomaly_dropped=%lld\n"
 		"pkts_halfopen_src_dropped=%lld\n"
-		"pkts_global_syn_dropped=%lld\n"
-		"pkts_global_udp_dropped=%lld\n"
 		"pkts_pkt_rate_dropped=%lld\n"
-		"pkts_icmp_err_dropped=%lld\n"
 		"pkts_scan_dropped=%lld\n"
 		"protected_ifmask=%lu\n",
 		atomic64_read(&pkts_forwarded),
@@ -890,10 +798,7 @@ static int pf_stats_show(struct seq_file *m, void *v)
 		atomic64_read(&pkts_icmp_dropped),
 		atomic64_read(&pkts_anomaly_dropped),
 		atomic64_read(&pkts_halfopen_src_dropped),
-		atomic64_read(&pkts_global_syn_dropped),
-		atomic64_read(&pkts_global_udp_dropped),
 		atomic64_read(&pkts_pkt_rate_dropped),
-		atomic64_read(&pkts_icmp_err_dropped),
 		atomic64_read(&pkts_scan_dropped),
 		READ_ONCE(protected_ifmask));
 	return 0;
@@ -906,6 +811,53 @@ static int pf_stats_open(struct inode *inode, struct file *file)
 
 static const struct proc_ops pf_stats_proc_ops = {
 	.proc_open    = pf_stats_open,
+	.proc_read    = seq_read,
+	.proc_lseek   = seq_lseek,
+	.proc_release = single_release,
+};
+
+/* --- procfs: /proc/stargazer/dos_blocks ----------------------------------- */
+
+static struct proc_dir_entry *proc_dos_blocks;
+
+/*
+ * dos_blocks_show - dump the block-event ring buffer, oldest first.
+ *
+ * Each line: age_sec=<s> src=<ip> reason=<name>.  age_sec is how long ago the
+ * block was recorded (computed at read time from the monotonic timestamp), so
+ * there are no wall-clock / timezone concerns in the kernel.
+ */
+static int dos_blocks_show(struct seq_file *m, void *v)
+{
+	int           head  = atomic_read(&dos_block_log_head);
+	int           count = min(head, (int)DOS_BLOCK_LOG_SIZE);
+	unsigned long now   = jiffies;
+	int           i;
+
+	seq_printf(m, "# Stargazer DoS block log (%d events, showing last %d)\n",
+		   head, count);
+	seq_puts(m, "# age_sec src reason\n");
+
+	for (i = head - count; i < head; i++) {
+		struct dos_block_event *ev = &dos_block_log[(u32)i % DOS_BLOCK_LOG_SIZE];
+		u8  reason = READ_ONCE(ev->reason);
+		s64 age_s  = (s64)(now - READ_ONCE(ev->ts)) / HZ;
+
+		seq_printf(m, "age_sec=%lld src=%pI4 reason=%s\n",
+			   age_s, &ev->ip,
+			   reason < DOS_REASON_MAX ? dos_reason_str[reason]
+						   : "unknown");
+	}
+	return 0;
+}
+
+static int dos_blocks_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, dos_blocks_show, NULL);
+}
+
+static const struct proc_ops dos_blocks_proc_ops = {
+	.proc_open    = dos_blocks_open,
 	.proc_read    = seq_read,
 	.proc_lseek   = seq_lseek,
 	.proc_release = single_release,
@@ -986,12 +938,6 @@ static int __init pkt_forward_init(void)
 
 	get_random_bytes(&dos_hash_seed, sizeof(dos_hash_seed));
 
-	global_syn_bucket.tokens  = (s32)global_syn_burst;
-	global_syn_bucket.last_ts = jiffies;
-
-	global_udp_bucket.tokens  = (s32)global_udp_burst;
-	global_udp_bucket.last_ts = jiffies;
-
 	ret = nf_defrag_ipv4_enable(&init_net);
 	if (ret < 0) {
 		pr_err("pkt_forward: failed to enable IPv4 defrag (%d)\n", ret);
@@ -1020,19 +966,21 @@ static int __init pkt_forward_init(void)
 	if (!proc_pf_stats)
 		pr_warn("pkt_forward: could not create /proc/stargazer/pkt_forward_stats\n");
 
+	proc_dos_blocks = proc_create("dos_blocks", 0444, sg_proc_root,
+				      &dos_blocks_proc_ops);
+	if (!proc_dos_blocks)
+		pr_warn("pkt_forward: could not create /proc/stargazer/dos_blocks\n");
+
 	pr_info("pkt_forward: loaded (v%s) dos=%s syn=%u/%u udp=%u/%u"
 		" icmp=%u/%u block_dur=%us halfopen_src=%u"
-		" global_syn=%u/%u pktrate=%u/%u"
-		" icmp_err=%u/%u scan=%u/%us\n",
+		" pktrate=%u/%u scan=%u/%us\n",
 		PKT_FWD_VERSION,
 		READ_ONCE(protected_ifmask) ? "on" : "off",
 		syn_flood_thr,   syn_flood_burst,
 		udp_flood_thr,   udp_flood_burst,
 		icmp_flood_thr,  icmp_flood_burst,
 		src_block_dur,   max_halfopen_per_src,
-		global_syn_thr,  global_syn_burst,
 		pkt_flood_thr,   pkt_flood_burst,
-		icmp_err_thr,    icmp_err_burst,
 		scan_threshold,  scan_window);
 	return 0;
 }
@@ -1044,10 +992,11 @@ static void __exit pkt_forward_exit(void)
 	nf_defrag_ipv4_disable(&init_net);
 	if (proc_pf_stats)
 		proc_remove(proc_pf_stats);
+	if (proc_dos_blocks)
+		proc_remove(proc_dos_blocks);
 	pr_info("pkt_forward: unloaded (fwd=%lld drop=%lld block=%lld"
 		" syn=%lld udp=%lld icmp=%lld anomaly=%lld"
-		" halfopen_src=%lld gsyn=%lld gudp=%lld pktrate=%lld"
-		" icmp_err=%lld scan=%lld)\n",
+		" halfopen_src=%lld pktrate=%lld scan=%lld)\n",
 		atomic64_read(&pkts_forwarded),
 		atomic64_read(&pkts_dropped),
 		atomic64_read(&pkts_blocked),
@@ -1056,10 +1005,7 @@ static void __exit pkt_forward_exit(void)
 		atomic64_read(&pkts_icmp_dropped),
 		atomic64_read(&pkts_anomaly_dropped),
 		atomic64_read(&pkts_halfopen_src_dropped),
-		atomic64_read(&pkts_global_syn_dropped),
-		atomic64_read(&pkts_global_udp_dropped),
 		atomic64_read(&pkts_pkt_rate_dropped),
-		atomic64_read(&pkts_icmp_err_dropped),
 		atomic64_read(&pkts_scan_dropped));
 }
 

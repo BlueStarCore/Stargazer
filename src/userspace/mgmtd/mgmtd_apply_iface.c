@@ -530,14 +530,11 @@ sg_status_t apply_dos_policy(const char *id, const char *data,
 	char icmp_thr[VALBUFSZ], icmp_burst[VALBUFSZ];
 	char block_dur[VALBUFSZ];
 	char halfopen_src[VALBUFSZ];
-	char gsyn_thr[VALBUFSZ],  gsyn_burst[VALBUFSZ];
-	char gudp_thr[VALBUFSZ],  gudp_burst[VALBUFSZ];
 	char anti_spoof[VALBUFSZ];
 	char per_src_limit[VALBUFSZ];
 	char adaptive_to[VALBUFSZ];
 	char zero_win[VALBUFSZ];
 	char pkt_thr[VALBUFSZ],  pkt_burst[VALBUFSZ];
-	char icmp_err_thr[VALBUFSZ], icmp_err_burst[VALBUFSZ];
 	char scan_thr[VALBUFSZ], scan_win[VALBUFSZ];
 
 	extract_val(data, "interface",             iface,          sizeof(iface));
@@ -550,18 +547,12 @@ sg_status_t apply_dos_policy(const char *id, const char *data,
 	extract_val(data, "icmp-flood-burst",      icmp_burst,     sizeof(icmp_burst));
 	extract_val(data, "block-duration",        block_dur,      sizeof(block_dur));
 	extract_val(data, "halfopen-per-src",      halfopen_src,   sizeof(halfopen_src));
-	extract_val(data, "global-syn-threshold",  gsyn_thr,       sizeof(gsyn_thr));
-	extract_val(data, "global-syn-burst",      gsyn_burst,     sizeof(gsyn_burst));
-	extract_val(data, "global-udp-threshold",  gudp_thr,       sizeof(gudp_thr));
-	extract_val(data, "global-udp-burst",      gudp_burst,     sizeof(gudp_burst));
 	extract_val(data, "anti-spoofing",         anti_spoof,     sizeof(anti_spoof));
 	extract_val(data, "per-src-session-limit", per_src_limit,  sizeof(per_src_limit));
 	extract_val(data, "adaptive-timeout",      adaptive_to,    sizeof(adaptive_to));
 	extract_val(data, "zero-window-timeout",   zero_win,       sizeof(zero_win));
 	extract_val(data, "pkt-rate-threshold",    pkt_thr,        sizeof(pkt_thr));
 	extract_val(data, "pkt-rate-burst",        pkt_burst,      sizeof(pkt_burst));
-	extract_val(data, "icmp-err-threshold",    icmp_err_thr,   sizeof(icmp_err_thr));
-	extract_val(data, "icmp-err-burst",        icmp_err_burst, sizeof(icmp_err_burst));
 	extract_val(data, "scan-threshold",        scan_thr,       sizeof(scan_thr));
 	extract_val(data, "scan-window",           scan_win,       sizeof(scan_win));
 
@@ -657,14 +648,8 @@ sg_status_t apply_dos_policy(const char *id, const char *data,
 		{ "icmp_flood_burst",     icmp_burst[0]    ? icmp_burst    : "200"   },
 		{ "src_block_dur",        block_dur[0]     ? block_dur     : "30"    },
 		{ "max_halfopen_per_src", halfopen_src[0]  ? halfopen_src  : "10"    },
-		{ "global_syn_thr",       gsyn_thr[0]      ? gsyn_thr      : "5000"  },
-		{ "global_syn_burst",     gsyn_burst[0]    ? gsyn_burst    : "10000" },
-		{ "global_udp_thr",       gudp_thr[0]      ? gudp_thr      : "5000"  },
-		{ "global_udp_burst",     gudp_burst[0]    ? gudp_burst    : "10000" },
-		{ "pkt_flood_thr",        pkt_thr[0]       ? pkt_thr       : "10000" },
+		{ "pkt_flood_thr",        pkt_thr[0]       ? pkt_thr       : "0"     },
 		{ "pkt_flood_burst",      pkt_burst[0]     ? pkt_burst     : "20000" },
-		{ "icmp_err_thr",         icmp_err_thr[0]  ? icmp_err_thr  : "50"    },
-		{ "icmp_err_burst",       icmp_err_burst[0]? icmp_err_burst: "100"   },
 		{ "scan_threshold",       scan_thr[0]      ? scan_thr      : "20"    },
 		{ "scan_window",          scan_win[0]      ? scan_win      : "10"    },
 		{ NULL, NULL }
