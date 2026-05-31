@@ -1477,9 +1477,10 @@ struct sg_nfgenmsg {
 /*
  * conntrack_flush_all - flush the whole conntrack table via NFNETLINK
  * (the in-process equivalent of "conntrack -F"; no system command).
- * Returns 0 on success, negative on failure.
+ * Returns 0 on success, negative on failure. Declared in mgmtd_apply.h so
+ * the firewall apply path can force live-flow re-evaluation on policy change.
  */
-static int conntrack_flush_all(void)
+int conntrack_flush_all(void)
 {
 	int fd = socket(AF_NETLINK, SOCK_RAW, SG_NETLINK_NETFILTER);
 	if (fd < 0)

@@ -351,10 +351,14 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 	free(out);
 	free(buf.data);
 
-	/* NOTE: with conntrack as the state authority, flows already ESTABLISHED
-	 * keep their verdict via the fast-path rule until they close — a policy
-	 * change does not re-evaluate live connections (standard conntrack
-	 * behaviour). Flush conntrack here if forced re-evaluation is ever needed. */
+	/* Re-evaluate live flows against the new policy: flush conntrack so every
+	 * existing flow becomes NEW and re-traverses the rebuilt FORWARD chain on
+	 * its next packet. This restores the "a policy change applies immediately
+	 * to active connections" behaviour that the old session.ko SESS_DIRTY
+	 * mechanism provided (e.g. blocking an in-progress ping stops it at once).
+	 * Trade-off: this briefly resets ALL tracked connections — still-allowed
+	 * ones re-establish on their next packet. Done in-process via netlink. */
+	conntrack_flush_all();
 
 	snprintf(result, rsize, "FORWARD chain rebuilt (%d rules)", rule_count);
 	return SG_OK;

@@ -134,4 +134,8 @@ sg_status_t apply_ntp(const char *id, const char *data,
 sg_status_t apply_session_ttl(const char *id, const char *data,
 			      char *result, size_t rsize);
 
+/* Flush the whole conntrack table via NFNETLINK (in-process, no shelling).
+ * Defined in mgmtd_diag.c. Returns 0 on success, negative on failure. */
+int conntrack_flush_all(void);
+
 #endif /* MGMTD_APPLY_H */
