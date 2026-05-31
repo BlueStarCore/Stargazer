@@ -4191,11 +4191,6 @@
         });
     }
 
-    var TCP_STATES = ['NONE','SYN_SENT','SYN_RECV','ESTABLISHED',
-                      'FIN_WAIT','CLOSE_WAIT','LAST_ACK',
-                      'TIME_WAIT','CLOSE','SYN_SENT2'];
-    var PROTO_NAMES = { '6': 'TCP', '17': 'UDP', '1': 'ICMP' };
-
     var sessionData = [];
     var sessState = { page: 0, pageSize: 25, search: '', proto: '', state: '' };
 
@@ -4204,12 +4199,9 @@
             var summaryEl = document.getElementById('session-summary');
             if (summaryEl) {
                 if (!data || !data.loaded) {
-                    summaryEl.innerHTML = '<span style="color:var(--status-disabled)">Session module not loaded</span>';
+                    summaryEl.innerHTML = '<span style="color:var(--status-disabled)">Connection tracking not available</span>';
                 } else {
-                    summaryEl.innerHTML =
-                        'Active: <strong>' + (data.active || 0) + '</strong>' +
-                        ' &nbsp; Created: <strong>' + (data.created || 0) + '</strong>' +
-                        ' &nbsp; Expired: <strong>' + (data.expired || 0) + '</strong>';
+                    summaryEl.innerHTML = 'Active: <strong>' + (data.active || 0) + '</strong>';
                 }
             }
             sessionData = (data && data.sessions) || [];
@@ -4237,18 +4229,7 @@
 
         if (sessState.state) {
             filtered = filtered.filter(function (s) {
-                var flagNum = parseInt(s.flags, 16) || 0;
-                var blocked = (flagNum & 0x02) !== 0;
-                var st;
-                if (blocked) {
-                    st = 'BLOCKED';
-                } else if (s.proto === '6' && s.tcp_state != null && s.tcp_state !== '') {
-                    var idx = parseInt(s.tcp_state, 10);
-                    st = TCP_STATES[idx] || ('ST' + idx);
-                } else {
-                    st = 'ACTIVE';
-                }
-                return st === sessState.state;
+                return (s.state || '-') === sessState.state;
             });
         }
 
@@ -4257,7 +4238,7 @@
             filtered = filtered.filter(function (s) {
                 return (s.src || '').toLowerCase().indexOf(q) !== -1 ||
                        (s.dst || '').toLowerCase().indexOf(q) !== -1 ||
-                       (PROTO_NAMES[s.proto] || s.proto || '').toLowerCase().indexOf(q) !== -1;
+                       (s.proto || '').toLowerCase().indexOf(q) !== -1;
             });
         }
 
@@ -4272,49 +4253,27 @@
 
         tbody.innerHTML = '';
         if (page.length === 0) {
-            tbody.appendChild(buildEmptyRow(7));
+            tbody.appendChild(buildEmptyRow(6));
         } else {
             var frag = document.createDocumentFragment();
             page.forEach(function (s) {
-                var protoName = PROTO_NAMES[s.proto] || ('P' + s.proto);
-
-                var flagNum = parseInt(s.flags, 16) || 0;
-                var blocked = (flagNum & 0x02) !== 0;
-                var stateStr;
-                if (blocked) {
-                    stateStr = 'BLOCKED';
-                } else if (s.proto === '6' && s.tcp_state != null && s.tcp_state !== '') {
-                    var idx = parseInt(s.tcp_state, 10);
-                    stateStr = TCP_STATES[idx] || ('ST' + idx);
-                } else {
-                    stateStr = 'ACTIVE';
-                }
-
-                var ageMs = parseInt(s.age_ms, 10) || 0;
-                var durStr = formatDuration(Math.floor(ageMs / 1000));
-
-                var bytesStr = '-';
-                if (s.bytes) {
-                    var parts = s.bytes.split('/');
-                    var total2 = (parseInt(parts[0], 10) || 0) +
-                                 (parseInt(parts[1], 10) || 0);
-                    bytesStr = formatBytes(total2);
-                }
+                var stateStr = s.state || '-';
+                var bytesStr = s.bytes ? formatBytes(parseInt(s.bytes, 10) || 0) : '-';
 
                 var tr = document.createElement('tr');
-                tr.appendChild(makeTd(protoName));
+                tr.appendChild(makeTd((s.proto || '').toUpperCase()));
                 tr.appendChild(makeTd(s.src || ''));
                 tr.appendChild(makeTd(s.dst || ''));
-                tr.appendChild(makeTd(s.policy_name || '-'));
-                tr.appendChild(makeTd(durStr));
-                tr.appendChild(makeTd(bytesStr));
 
                 var stateTd = document.createElement('td');
-                var cls = blocked ? 'status-dot disabled' :
-                          (stateStr === 'ESTABLISHED' ? 'status-dot up' : 'status-dot warn');
+                var cls = (stateStr === 'ESTABLISHED') ? 'status-dot up' :
+                          (stateStr === '-' ? 'status-dot' : 'status-dot warn');
                 stateTd.appendChild(makeSpan(cls, null));
                 stateTd.appendChild(document.createTextNode(stateStr));
                 tr.appendChild(stateTd);
+
+                tr.appendChild(makeTd(s.pkts || '0'));
+                tr.appendChild(makeTd(bytesStr));
 
                 frag.appendChild(tr);
             });

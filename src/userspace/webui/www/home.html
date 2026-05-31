@@ -808,9 +808,9 @@
                     <span class="filter-label">Protocol</span>
                     <select class="rf-page-size" id="sess-filter-proto">
                         <option value="">All</option>
-                        <option value="6">TCP</option>
-                        <option value="17">UDP</option>
-                        <option value="1">ICMP</option>
+                        <option value="tcp">TCP</option>
+                        <option value="udp">UDP</option>
+                        <option value="icmp">ICMP</option>
                     </select>
                     <span class="filter-label">State</span>
                     <select class="rf-page-size" id="sess-filter-state">
@@ -823,16 +823,13 @@
                         <option value="LAST_ACK">LAST_ACK</option>
                         <option value="TIME_WAIT">TIME_WAIT</option>
                         <option value="CLOSE">CLOSE</option>
-                        <option value="SYN_SENT2">SYN_SENT2</option>
-                        <option value="NONE">NONE</option>
-                        <option value="ACTIVE">ACTIVE</option>
-                        <option value="BLOCKED">BLOCKED</option>
+                        <option value="-">(none / UDP)</option>
                     </select>
                     <button class="btn rf-btn" id="sess-filter-clear" style="margin-left:auto">Clear filters</button>
                 </div>
-                <div id="session-summary" class="session-summary">Active: <strong>--</strong> / max: <strong>--</strong></div>
+                <div id="session-summary" class="session-summary">Active: <strong>--</strong></div>
                 <table class="data-table">
-                    <thead><tr><th>PROTO</th><th>SOURCE</th><th>DESTINATION</th><th>POLICY</th><th>DURATION</th><th>BYTES</th><th>STATE</th></tr></thead>
+                    <thead><tr><th>PROTO</th><th>SOURCE</th><th>DESTINATION</th><th>STATE</th><th>PACKETS</th><th>BYTES</th></tr></thead>
                     <tbody id="sess-tbody">
                     </tbody>
                 </table>

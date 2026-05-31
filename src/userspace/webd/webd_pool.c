@@ -1715,13 +1715,10 @@ static void flow_monitor_sessions(work_item_t *item)
 		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
 		return;
 	}
-	if (resp.status != SG_OK) {
-		/* module not loaded → return empty result, not an error */
-		const char *empty =
-			"{\"active\":0,\"created\":0,"
-			"\"expired\":0,\"invalid\":0,"
-			"\"loaded\":false,\"sessions\":[]}";
-		char *j = strdup(empty);
+	if (resp.status != SG_OK ||
+	    strcmp(resp.extra, "not_available") == 0) {
+		/* conntrack unavailable → empty result, not an error */
+		char *j = strdup("{\"active\":0,\"loaded\":false,\"sessions\":[]}");
 		send_result(item->conn_id, 200, j, j ? strlen(j) : 0);
 		webd_ipc_resp_free(&resp);
 		return;
@@ -1729,16 +1726,13 @@ static void flow_monitor_sessions(work_item_t *item)
 
 	const char *text = resp.payload ? resp.payload : "";
 
-	/* Parse header line counters:
-	 * "# Stargazer sessions  active=N created=N expired=N invalid=N" */
-	long long active = 0, created = 0, expired_cnt = 0, invalid = 0;
+	/* Header line: "active=N" (conntrack flow count). */
+	long long active = 0;
 	const char *hdr = strstr(text, "active=");
 	if (hdr) {
 		char tmp[32];
-		kv_extract(hdr, "active",  tmp, sizeof(tmp)); active = strtoll(tmp, NULL, 10);
-		kv_extract(hdr, "created", tmp, sizeof(tmp)); created = strtoll(tmp, NULL, 10);
-		kv_extract(hdr, "expired", tmp, sizeof(tmp)); expired_cnt = strtoll(tmp, NULL, 10);
-		kv_extract(hdr, "invalid", tmp, sizeof(tmp)); invalid = strtoll(tmp, NULL, 10);
+		kv_extract(hdr, "active", tmp, sizeof(tmp));
+		active = strtoll(tmp, NULL, 10);
 	}
 
 	/* Build JSON output */
@@ -1762,12 +1756,9 @@ static void flow_monitor_sessions(work_item_t *item)
 	memcpy(json + pos, (s), (n)); pos += (n); \
 } while (0)
 
-	char hbuf[128];
+	char hbuf[96];
 	int hlen = snprintf(hbuf, sizeof(hbuf),
-		"{\"active\":%lld,\"created\":%lld,"
-		"\"expired\":%lld,\"invalid\":%lld,"
-		"\"loaded\":true,\"sessions\":[",
-		active, created, expired_cnt, invalid);
+		"{\"active\":%lld,\"loaded\":true,\"sessions\":[", active);
 	if (hlen > 0) SJ_APP(hbuf, (size_t)hlen);
 
 	/* Parse session rows — skip lines starting with '#' */
@@ -1788,22 +1779,14 @@ static void flow_monitor_sessions(work_item_t *item)
 		memcpy(line, p, cp);
 		line[cp] = '\0';
 
-		char proto[8], src[48], dst[48], id_s[16];
-		char pkts[32], bytes[32], age[24], exp_ms[24];
-		char ml[8], flags[12], tcp_st[8], policy_name[64];
+		char proto[12], state[24], src[64], dst[64], pkts[32], bytes[32];
 
-		kv_extract(line, "proto",        proto,       sizeof(proto));
-		kv_extract(line, "src",          src,         sizeof(src));
-		kv_extract(line, "dst",          dst,         sizeof(dst));
-		kv_extract(line, "id",           id_s,        sizeof(id_s));
-		kv_extract(line, "pkts",         pkts,        sizeof(pkts));
-		kv_extract(line, "bytes",        bytes,       sizeof(bytes));
-		kv_extract(line, "age_ms",       age,         sizeof(age));
-		kv_extract(line, "expire_ms",    exp_ms,      sizeof(exp_ms));
-		kv_extract(line, "ml",           ml,          sizeof(ml));
-		kv_extract(line, "flags",        flags,       sizeof(flags));
-		kv_extract(line, "tcp_state",    tcp_st,      sizeof(tcp_st));
-		kv_extract(line, "policy_name",  policy_name, sizeof(policy_name));
+		kv_extract(line, "proto", proto, sizeof(proto));
+		kv_extract(line, "state", state, sizeof(state));
+		kv_extract(line, "src",   src,   sizeof(src));
+		kv_extract(line, "dst",   dst,   sizeof(dst));
+		kv_extract(line, "pkts",  pkts,  sizeof(pkts));
+		kv_extract(line, "bytes", bytes, sizeof(bytes));
 
 		if (!proto[0]) {
 			p = nl ? nl + 1 : p + ll;
@@ -1813,18 +1796,11 @@ static void flow_monitor_sessions(work_item_t *item)
 		if (!first) SJ_APP(",", 1);
 		first = 0;
 
-		/* 768 bytes: worst-case u64 pkts/bytes (41 chars each),
-		 * age_ms/expire_ms (19 chars each), policy_name (64 chars),
-		 * remaining fields, and JSON key/punctuation overhead. */
-		char entry[768];
+		char entry[320];
 		int elen = snprintf(entry, sizeof(entry),
-			"{\"proto\":\"%s\",\"src\":\"%s\",\"dst\":\"%s\","
-			"\"id\":\"%s\",\"pkts\":\"%s\",\"bytes\":\"%s\","
-			"\"age_ms\":\"%s\",\"expire_ms\":\"%s\","
-			"\"ml\":\"%s\",\"flags\":\"%s\",\"tcp_state\":\"%s\","
-			"\"policy_name\":\"%s\"}",
-			proto, src, dst, id_s, pkts, bytes,
-			age, exp_ms, ml, flags, tcp_st, policy_name);
+			"{\"proto\":\"%s\",\"state\":\"%s\",\"src\":\"%s\","
+			"\"dst\":\"%s\",\"pkts\":\"%s\",\"bytes\":\"%s\"}",
+			proto, state, src, dst, pkts, bytes);
 		if (elen > 0 && (size_t)elen < sizeof(entry))
 			SJ_APP(entry, (size_t)elen);
 
