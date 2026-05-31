@@ -147,6 +147,48 @@ static const char *action_to_target(const char *action)
 
 /* ── Rebuild ─────────────────────────────────────────────────────────────── */
 
+/*
+ * connmark_supported - probe once whether iptables can use the connmark
+ * match + CONNMARK target (needs CONFIG_NF_CONNTRACK_MARK + xt_connmark).
+ * Result is cached. When available we re-evaluate only the affected live flows
+ * on a policy change via a connmark "generation" tag; when not, we fall back to
+ * flushing the whole conntrack table.
+ */
+static int connmark_supported(void)
+{
+	static int cached = -1;
+	if (cached >= 0)
+		return cached;
+
+	const char *newc[]   = {"iptables", "-N", "SG_CMK_PROBE", NULL};
+	const char *addc[]   = {"iptables", "-A", "SG_CMK_PROBE",
+				"-m", "connmark", "--mark", "0/0xff",
+				"-j", "CONNMARK", "--set-xmark", "0/0xff", NULL};
+	const char *flushc[] = {"iptables", "-F", "SG_CMK_PROBE", NULL};
+	const char *delc[]   = {"iptables", "-X", "SG_CMK_PROBE", NULL};
+
+	ipt_exec(newc);
+	cached = (ipt_exec(addc) == 0) ? 1 : 0;
+	ipt_exec(flushc);
+	ipt_exec(delc);
+
+	mgmt_log("INFO", "connmark %s; policy changes %s",
+		 cached ? "available" : "unavailable",
+		 cached ? "re-evaluate only affected live flows"
+			: "flush conntrack (fallback)");
+	return cached;
+}
+
+/*
+ * Policy generation tag, carried in connmark bits 0-7 (values 1..255). Bumped
+ * on each FORWARD rebuild so live flows re-traverse the new policy: still-
+ * allowed flows get re-stamped with the new gen and continue uninterrupted;
+ * flows the new policy denies fall through to DROP. In-memory only (resets to
+ * 1 on mgmtd restart — harmless, flows simply re-evaluate once).
+ */
+#define SG_CMK_MASK 0xFFu
+static unsigned int fwd_policy_gen = 1;
+
 sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 {
 	struct dynbuf buf;
@@ -154,6 +196,10 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 		snprintf(result, rsize, "Out of memory");
 		return SG_ERR_SYSTEM_FAIL;
 	}
+
+	int cmk = connmark_supported();
+	if (cmk)
+		fwd_policy_gen = (fwd_policy_gen % 255) + 1;  /* 1..255, skip 0 */
 
 	/* Header */
 	dbuf_append(&buf, "*filter\n", 8);
@@ -164,10 +210,19 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 	 *   - fast-path accept of established/related return traffic. */
 	{
 		const char *inv = "-A FORWARD -m conntrack --ctstate INVALID -j DROP\n";
-		const char *est = "-A FORWARD -m conntrack"
-			" --ctstate ESTABLISHED,RELATED -j ACCEPT\n";
 		dbuf_append(&buf, inv, strlen(inv));
-		dbuf_append(&buf, est, strlen(est));
+		if (cmk)
+			/* Only flows tagged with the CURRENT generation take the
+			 * fast-path; stale-gen and NEW flows fall through to the
+			 * policy rules below for (re-)evaluation. */
+			dbuf_printf(&buf,
+				"-A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED"
+				" -m connmark --mark 0x%x/0x%x -j ACCEPT\n",
+				fwd_policy_gen, SG_CMK_MASK);
+		else
+			dbuf_printf(&buf,
+				"-A FORWARD -m conntrack"
+				" --ctstate ESTABLISHED,RELATED -j ACCEPT\n");
 	}
 
 	/* Read all policies ordered by sequence DESC (highest first) */
@@ -187,7 +242,7 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 			char srcintf[VALBUFSZ], dstintf[VALBUFSZ];
 			char srcaddr[VALBUFSZ], dstaddr[VALBUFSZ];
 			char action[VALBUFSZ], status[VALBUFSZ];
-			char service[VALBUFSZ], seq_str[16];
+			char service[VALBUFSZ];
 
 			extract_val(data, "srcintf",  srcintf,  sizeof(srcintf));
 			extract_val(data, "dstintf",  dstintf,  sizeof(dstintf));
@@ -196,7 +251,6 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 			extract_val(data, "action",   action,   sizeof(action));
 			extract_val(data, "status",   status,   sizeof(status));
 			extract_val(data, "service",  service,  sizeof(service));
-			extract_val(data, "sequence", seq_str,  sizeof(seq_str));
 
 			free(data);
 
@@ -291,24 +345,23 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 				rule_count++;
 			} else {
 				/*
-				 * For ACCEPT rules, prepend a MARK rule that stamps
-				 * the policy sequence into skb->mark bits 29–16.
-				 * post_filter_hook reads the mark and writes it to
-				 * session->policy_id so sessions show the policy name.
+				 * For ACCEPT rules (when connmark is available), prepend a
+				 * CONNMARK rule that stamps the current policy generation on
+				 * the flow so its subsequent packets take the fast-path.
 				 * Uses the same saved_pfx technique as the REJECT split.
+				 * DENY/DROP flows are never stamped, so on a policy change
+				 * they keep falling through to their drop until they expire.
 				 */
-				if (strcmp(target, "ACCEPT") == 0) {
-					unsigned int pseq =
-						(unsigned int)strtoul(seq_str, NULL, 10);
+				if (strcmp(target, "ACCEPT") == 0 && cmk) {
 					size_t plen = buf.used - rule_start;
 					char saved_pfx[256];
-					if (pseq > 0 && plen < sizeof(saved_pfx)) {
+					if (plen < sizeof(saved_pfx)) {
 						memcpy(saved_pfx,
 						       buf.data + rule_start, plen);
 						dbuf_printf(&buf,
-							" -j MARK --set-xmark"
-							" 0x%08X/0x3FFF0000\n",
-							pseq << 16);
+							" -j CONNMARK --set-xmark"
+							" 0x%x/0x%x\n",
+							fwd_policy_gen, SG_CMK_MASK);
 						rule_count++;
 						dbuf_append(&buf, saved_pfx, plen);
 					}
@@ -351,14 +404,13 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 	free(out);
 	free(buf.data);
 
-	/* Re-evaluate live flows against the new policy: flush conntrack so every
-	 * existing flow becomes NEW and re-traverses the rebuilt FORWARD chain on
-	 * its next packet. This restores the "a policy change applies immediately
-	 * to active connections" behaviour that the old session.ko SESS_DIRTY
-	 * mechanism provided (e.g. blocking an in-progress ping stops it at once).
-	 * Trade-off: this briefly resets ALL tracked connections — still-allowed
-	 * ones re-establish on their next packet. Done in-process via netlink. */
-	conntrack_flush_all();
+	/* Apply the policy change to live flows. With connmark, the generation
+	 * bump at the top already forces every live flow to re-traverse the new
+	 * policy on its next packet — still-allowed flows re-stamp and continue,
+	 * only denied flows drop (surgical; management/allowed flows untouched).
+	 * Without connmark, fall back to flushing the whole conntrack table. */
+	if (!cmk)
+		conntrack_flush_all();
 
 	snprintf(result, rsize, "FORWARD chain rebuilt (%d rules)", rule_count);
 	return SG_OK;
