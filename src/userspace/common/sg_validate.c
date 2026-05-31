@@ -37,7 +37,6 @@ static const sg_type_info_t type_table[] = {
 	{ "system_password-policy", CFG_SINGLE, "admin",     "Configure global password policy"    },
 	{ "system_admin-profile",   CFG_TABLE,  "admin",     "Configure admin permission profiles" },
 	{ "system_admin",           CFG_TABLE,  "admin",     "Configure admin accounts"            },
-	{ "system_dos-policy",      CFG_TABLE,  "configure", "Configure per-interface DoS protection" },
 	{ NULL, 0, NULL, NULL }
 };
 
@@ -161,26 +160,6 @@ static const struct field_entry field_table[] = {
 	{ "system_admin", "password",                 "password-interactive",     1, NULL,     "Account password"                    },
 	{ "system_admin", "enforce-change-password",  "enum:enable,disable",     0, "enable", "Force password change on first login" },
 	{ "system_admin", "enforce-password-policy",  "enum:enable,disable",     0, "enable", "Apply password policy rules"         },
-
-	/* system_dos-policy */
-	{ "system_dos-policy", "interface",            "ref-iface:system_interface", 0, NULL,    "WAN interface to protect"               },
-	{ "system_dos-policy", "status",               "enum:enable,disable",        0, "enable","Enable or disable DoS protection"       },
-	{ "system_dos-policy", "syn-flood-threshold",  "uint:1:65535",               1, "200",   "SYN flood rate limit (packets/second)"  },
-	{ "system_dos-policy", "syn-flood-burst",      "uint:1:65535",               1, "400",   "SYN flood token bucket burst size"      },
-	{ "system_dos-policy", "udp-flood-threshold",  "uint:1:65535",               1, "1000",  "UDP flood rate limit (packets/second)"  },
-	{ "system_dos-policy", "udp-flood-burst",      "uint:1:65535",               1, "2000",  "UDP flood token bucket burst size"      },
-	{ "system_dos-policy", "icmp-flood-threshold", "uint:1:65535",               1, "100",   "ICMP flood rate limit (packets/second)" },
-	{ "system_dos-policy", "icmp-flood-burst",     "uint:1:65535",               1, "200",   "ICMP flood token bucket burst size"     },
-	{ "system_dos-policy", "block-duration",        "uint:1:3600",         1, "30",    "Source block duration (seconds)"                              },
-	{ "system_dos-policy", "halfopen-per-src",      "uint:0:1024",         1, "10",    "Max half-open TCP sessions per source in 120s window (0=disabled)" },
-	{ "system_dos-policy", "anti-spoofing",         "enum:enable,disable", 1, "enable","Drop spoofed packets with no reverse route (rpfilter)"             },
-	{ "system_dos-policy", "per-src-session-limit", "uint:0:1000",         1, "64",    "Max established sessions per source IP (0=disabled)"               },
-	{ "system_dos-policy", "adaptive-timeout",      "enum:enable,disable", 1, "enable","Shrink idle TTLs under high session table load"                    },
-	{ "system_dos-policy", "zero-window-timeout",   "uint:0:300",          1, "60",    "Seconds TCP window=0 before accelerated teardown (0=disabled)"     },
-	{ "system_dos-policy", "pkt-rate-threshold",    "uint:0:1000000",      1, "0",     "Per-source aggregate packet rate cap, pkts/s (0=disabled)"         },
-	{ "system_dos-policy", "pkt-rate-burst",        "uint:1:2000000",      1, "20000", "Per-source aggregate packet rate burst"                            },
-	{ "system_dos-policy", "scan-threshold",        "uint:0:32",           1, "20",    "Port scan: unique dst ports per window before block (0=disabled)"  },
-	{ "system_dos-policy", "scan-window",           "uint:1:60",           1, "10",    "Port scan: bloom filter window duration in seconds"                },
 
 	{ NULL, NULL, NULL, 0, NULL, NULL }
 };

@@ -420,12 +420,15 @@ void flush_nat_rules(void)
 void flush_forward_chain(void)
 {
 	const char *ff[] = {"iptables", "-F", "FORWARD", NULL};
+	const char *fi[] = {"iptables", "-A", "FORWARD",
+			    "-m", "conntrack", "--ctstate", "INVALID",
+			    "-j", "DROP", NULL};
 	const char *fe[] = {"iptables", "-A", "FORWARD",
-			    "-m", "mark", "!", "--mark", "0x80",
 			    "-m", "conntrack",
 			    "--ctstate", "ESTABLISHED,RELATED",
 			    "-j", "ACCEPT", NULL};
 	ipt_exec(ff);
+	ipt_exec(fi);
 	ipt_exec(fe);
 	fprintf(stderr, "[mgmtd] flush: FORWARD chain\n");
 }
@@ -3136,7 +3139,6 @@ static void mgmtd_replay_config(void)
 		"system_admin-profile",  /* must be before system_admin */
 		"system_admin",          /* depends on profiles */
 		"system_interface",      /* IP + allowaccess INPUT rules */
-		"system_dos-policy",     /* WAN DoS protection via pkt_forward.ko */
 		"network_route_static",  /* flush proto static first */
 		"firewall_address",      /* data-only: before firewall/NAT rebuild */
 		"firewall_service",      /* data-only: before firewall/NAT rebuild */
@@ -3393,9 +3395,6 @@ static sg_status_t apply_config(const char *type, const char *id,
 
 	if (strcmp(type, "system_ntp") == 0)
 		return apply_ntp(id, data, result, rsize);
-
-	if (strcmp(type, "system_dos-policy") == 0)
-		return apply_dos_policy(id, data, result, rsize);
 
 	if (strcmp(type, "system_session-ttl") == 0)
 		return apply_session_ttl(id, data, result, rsize);
@@ -5871,8 +5870,6 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		return handle_session_stats(client_fd, user, payload, hdr);
 	case SG_CMD_SESSION_GC_INTERVAL:
 		return handle_session_gc_interval(client_fd, user, payload, hdr);
-	case SG_CMD_SESSION_BLOCKS:
-		return handle_session_blocks(client_fd, user, payload, hdr);
 	case SG_CMD_SHOW_SESSIONS:
 		return handle_show_sessions(client_fd, user, payload, hdr);
 	case SG_CMD_SHOW_BOOT_CONFIG:

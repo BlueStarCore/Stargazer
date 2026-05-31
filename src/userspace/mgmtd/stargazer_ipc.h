@@ -138,7 +138,6 @@ typedef enum {
 	SG_CMD_SESSION_CLEAR     = 655,  /* Flush all active sessions          */
 	SG_CMD_SESSION_STATS     = 656,  /* Parsed session counters + status   */
 	SG_CMD_SESSION_GC_INTERVAL = 657, /* Get/set GC sweep interval (seconds) */
-	SG_CMD_SESSION_BLOCKS    = 658,  /* Recent DoS block events (dos_blocks) */
 	/* Debug state (66x) */
 	SG_CMD_DEBUG_STATE_GET   = 660,  /* Read debug conf key=value pairs    */
 	SG_CMD_DEBUG_STATE_SET   = 661,  /* Atomic write debug conf            */

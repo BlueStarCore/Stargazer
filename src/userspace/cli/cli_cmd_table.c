@@ -772,9 +772,7 @@ static int cmd_diag_session(const char *args, const char *permissions)
 		const char *p = resp.payload ? resp.payload : "";
 		long long active = 0, created = 0, expired = 0, invalid = 0;
 		long long halfopen = 0, rejected_halfopen = 0, est_src_drops = 0;
-		long long syn_dropped = 0, udp_dropped = 0, icmp_dropped = 0;
-		long long anomaly_dropped = 0, halfopen_src_dropped = 0;
-		long long pkt_rate_dropped = 0, scan_dropped = 0;
+		long long anomaly_dropped = 0;
 		int sess_loaded = 0, pkt_fwd_loaded = 0;
 		const char *kv;
 		kv = strstr(p, "session_loaded=");
@@ -795,20 +793,8 @@ static int cmd_diag_session(const char *args, const char *permissions)
 		if (kv) rejected_halfopen = strtoll(kv + 18, NULL, 10);
 		kv = strstr(p, "est_src_drops=");
 		if (kv) est_src_drops    = strtoll(kv + 14, NULL, 10);
-		kv = strstr(p, "syn_flood_dropped=");
-		if (kv) syn_dropped      = strtoll(kv + 18, NULL, 10);
-		kv = strstr(p, "udp_flood_dropped=");
-		if (kv) udp_dropped      = strtoll(kv + 18, NULL, 10);
-		kv = strstr(p, "icmp_flood_dropped=");
-		if (kv) icmp_dropped     = strtoll(kv + 19, NULL, 10);
 		kv = strstr(p, "anomaly_dropped=");
 		if (kv) anomaly_dropped  = strtoll(kv + 16, NULL, 10);
-		kv = strstr(p, "halfopen_src_dropped=");
-		if (kv) halfopen_src_dropped = strtoll(kv + 21, NULL, 10);
-		kv = strstr(p, "pkt_rate_dropped=");
-		if (kv) pkt_rate_dropped     = strtoll(kv + 17, NULL, 10);
-		kv = strstr(p, "scan_dropped=");
-		if (kv) scan_dropped         = strtoll(kv + 13, NULL, 10);
 
 		printf("  === Session Statistics ===\n");
 		printf("  session.ko     : %s\n", sess_loaded    ? C_GREEN "loaded" C_NC : C_RED "not loaded" C_NC);
@@ -819,34 +805,8 @@ static int cmd_diag_session(const char *args, const char *permissions)
 		printf("  Invalid (drops): %lld\n", invalid);
 		printf("  Half-open TCP  : %lld  (rejected: %lld)\n", halfopen, rejected_halfopen);
 		printf("  Est. src drops : %lld\n", est_src_drops);
-		if (pkt_fwd_loaded) {
-			printf("\n  --- DoS Drop Counters ---\n");
+		if (pkt_fwd_loaded)
 			printf("  L3/L4 anomaly  : %lld\n", anomaly_dropped);
-			printf("  SYN flood/src  : %lld\n", syn_dropped);
-			printf("  SYN halfopen/s : %lld\n", halfopen_src_dropped);
-			printf("  UDP flood      : %lld\n", udp_dropped);
-			printf("  ICMP flood     : %lld\n", icmp_dropped);
-			printf("  Pkt rate       : %lld\n", pkt_rate_dropped);
-			printf("  Port scan      : %lld\n", scan_dropped);
-		}
-		ipc_resp_free(&resp);
-		return 0;
-	}
-
-	/* ── blocks: recent DoS block events ─────────────────────────── */
-	if (strcmp(sub, "blocks") == 0) {
-		struct ipc_response resp = {0};
-		int rc = ipc_send_str(SG_CMD_SESSION_BLOCKS, "", &resp);
-		if (rc != 0 || resp.status != SG_OK) {
-			print_ipc_error("Error", &resp);
-			ipc_resp_free(&resp);
-			return 0;
-		}
-		printf("  === Recent DoS Blocks ===\n");
-		if (resp.payload && resp.payload[0])
-			printf("%s", resp.payload);
-		else
-			printf("  No blocks recorded.\n");
 		ipc_resp_free(&resp);
 		return 0;
 	}
@@ -884,7 +844,7 @@ static int cmd_diag_session(const char *args, const char *permissions)
 	}
 
 	printf("  Unknown subcommand: %s\n", sub);
-	printf("  Usage: execute diagnose session [status|stats|blocks|clear|gc-interval]\n");
+	printf("  Usage: execute diagnose session [status|stats|clear|gc-interval]\n");
 	return 0;
 }
 

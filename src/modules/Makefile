@@ -2,8 +2,6 @@
 # Stargazer NGFW - Kernel modules build
 
 obj-m += pkt_forward.o
-obj-m += session.o
-obj-m += session_test.o
 
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules KBUILD_MODPOST_WARN=1

@@ -1,5 +1,13 @@
 # Phase 2 — Stateful Session Tracking
 
+> ⚠️ **TRẠNG THÁI (đang tái kiến trúc):** Tính năng **DoS policy đã được GỠ BỎ**
+> (Phase 1 của lộ trình chuyển sang `nf_conntrack`). Các phần mô tả DoS bên dưới
+> (token bucket per-source, block list, port scan, half-open cap, `/proc/stargazer/dos_blocks`,
+> config `system_dos-policy`) **không còn trong code**. `pkt_forward.ko` hiện chỉ còn
+> session tracking + anomaly detection + defrag. Kế hoạch: bỏ `session.ko` (Phase 2) và
+> thay bằng module trích xuất feature ML + chặn bằng ipset (Phase 3). Tài liệu này sẽ
+> được viết lại sau khi kiến trúc mới ổn định.
+
 ## 1. Overview
 
 Phase 2 delivers stateful packet tracking for the Stargazer NGFW. Two kernel modules implement the data plane:

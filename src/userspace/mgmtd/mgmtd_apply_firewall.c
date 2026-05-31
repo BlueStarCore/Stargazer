@@ -158,13 +158,15 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 	/* Header */
 	dbuf_append(&buf, "*filter\n", 8);
 
-	/* Foundation rule: allow established/related return traffic.
-	 * Packets tagged STARGAZER_DIRTY_MARK (0x80) are excluded so that
-	 * sessions marked dirty after a policy rebuild bypass this rule and
-	 * reach the policy rules for re-evaluation. */
+	/* Foundation rules (conntrack-stateful):
+	 *   - drop packets conntrack cannot associate with a valid flow (INVALID),
+	 *     replacing the stateful validation that session.ko used to perform;
+	 *   - fast-path accept of established/related return traffic. */
 	{
-		const char *est = "-A FORWARD -m mark ! --mark 0x80"
-			" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n";
+		const char *inv = "-A FORWARD -m conntrack --ctstate INVALID -j DROP\n";
+		const char *est = "-A FORWARD -m conntrack"
+			" --ctstate ESTABLISHED,RELATED -j ACCEPT\n";
+		dbuf_append(&buf, inv, strlen(inv));
 		dbuf_append(&buf, est, strlen(est));
 	}
 
@@ -349,21 +351,10 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 	free(out);
 	free(buf.data);
 
-	/* Mark all existing sessions dirty so their next packet is re-evaluated
-	 * against the new policy rules instead of being fast-pathed through the
-	 * ESTABLISHED,RELATED shortcut. Non-fatal: ENOENT means session.ko is
-	 * not loaded, so there are no sessions to mark. */
-	{
-		int sfd = open("/proc/stargazer/session_ctl", O_WRONLY);
-		if (sfd >= 0) {
-			ssize_t w = write(sfd, "mark_dirty\n", 11);
-			(void)w;
-			close(sfd);
-		} else if (errno != ENOENT) {
-			mgmt_log("WARN", "rebuild_forward_chain: session_ctl: %s",
-				 strerror(errno));
-		}
-	}
+	/* NOTE: with conntrack as the state authority, flows already ESTABLISHED
+	 * keep their verdict via the fast-path rule until they close — a policy
+	 * change does not re-evaluate live connections (standard conntrack
+	 * behaviour). Flush conntrack here if forced re-evaluation is ever needed. */
 
 	snprintf(result, rsize, "FORWARD chain rebuilt (%d rules)", rule_count);
 	return SG_OK;
