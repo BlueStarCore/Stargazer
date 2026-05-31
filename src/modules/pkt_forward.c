@@ -21,7 +21,10 @@
 #include <linux/skbuff.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#include <linux/timekeeping.h>
 #include <net/netfilter/ipv4/nf_defrag_ipv4.h>
+#include <net/netfilter/nf_conntrack.h>
+#include <net/netfilter/nf_conntrack_ml.h>
 
 #ifndef PKT_FWD_VERSION
 #define PKT_FWD_VERSION "unknown"
@@ -147,13 +150,72 @@ static bool is_valid_ipv4(struct sk_buff *skb)
 	return true;
 }
 
+/* --- ML feature accounting ------------------------------------------------- */
+
+/*
+ * ml_account - record this packet into the flow's conntrack NF_CT_EXT_ML
+ * extension. conntrack ran at PRE_ROUTING, so the entry is already attached
+ * and the extension allocated; here we add the per-flow features the ACCT and
+ * TSTAMP extensions don't carry — inter-arrival time, packet-length spread,
+ * and accumulated TCP flags. Direction is taken from conntrack (CTINFO2DIR).
+ * Best-effort, under the per-conntrack lock; untracked packets (no ext) skip.
+ */
+static void ml_account(struct sk_buff *skb, u8 proto)
+{
+	enum ip_conntrack_info ctinfo;
+	struct nf_conn *ct = nf_ct_get(skb, &ctinfo);
+	struct nf_conn_ml *ml;
+	struct iphdr *iph;
+	u64 now;
+	int dir;
+	u16 len;
+
+	if (!ct)
+		return;
+	ml = nf_conn_ml_find(ct);
+	if (!ml)
+		return;
+
+	iph = ip_hdr(skb);
+	len = ntohs(iph->tot_len);
+	dir = CTINFO2DIR(ctinfo);
+	now = ktime_get_ns();
+
+	spin_lock_bh(&ct->lock);
+	if (ml->first_ns == 0) {
+		ml->first_ns = now;
+	} else {
+		ml->iat_sum_ns += now - ml->last_ns;
+		ml->iat_count++;
+	}
+	ml->last_ns = now;
+	if (len < ml->len_min[dir])
+		ml->len_min[dir] = len;
+	if (len > ml->len_max[dir])
+		ml->len_max[dir] = len;
+	if (proto == IPPROTO_TCP) {
+		struct tcphdr *th = (struct tcphdr *)((u8 *)iph + iph->ihl * 4);
+		u16 f = 0;
+
+		if (th->fin) f |= 0x01;
+		if (th->syn) f |= 0x02;
+		if (th->rst) f |= 0x04;
+		if (th->psh) f |= 0x08;
+		if (th->ack) f |= 0x10;
+		if (th->urg) f |= 0x20;
+		ml->tcp_flags[dir] |= f;
+	}
+	spin_unlock_bh(&ct->lock);
+}
+
 /*
  * forward_hook - Netfilter callback for the FORWARD chain.
  *
- * Stateless anomaly screen, runs before conntrack/NAT:
+ * Runs before conntrack confirm / NAT:
  *   [1] IPv4 header validation
  *   [2] L3/L4 anomaly detection (land attack, IP source routing, TCP
  *       NULL/XMAS/FIN-no-ACK/SYN+data, Ping of Death) — all interfaces
+ *   [3] ML feature accounting into the conntrack NF_CT_EXT_ML extension
  *
  * Accepted packets continue to conntrack, the iptables policy chain, and NAT.
  */
@@ -185,6 +247,9 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 		atomic64_inc(&pkts_dropped);
 		return NF_DROP;
 	}
+
+	/* [3] Accepted: record per-flow features for the ML daemon. */
+	ml_account(skb, proto);
 
 	atomic64_inc(&pkts_forwarded);
 	return NF_ACCEPT;
