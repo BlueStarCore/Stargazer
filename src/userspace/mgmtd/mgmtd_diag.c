@@ -27,6 +27,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <linux/netlink.h>
+#include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1653,6 +1654,214 @@ int handle_session_clear(int client_fd, const char *user,
 	char resp[64];
 	snprintf(resp, sizeof(resp), "flushed=%ld\n", before);
 	send_ok(client_fd, NULL, resp);
+	return 0;
+}
+
+/* ── SG_CMD_SESSION_ML (659) — per-flow ML features via ctnetlink dump ──────
+ *
+ * Read-only collector/viewer: dump conntrack (IPCTNL_MSG_CT_GET + NLM_F_DUMP)
+ * and print the per-flow CTA_ML feature blob the kernel exports. No scoring,
+ * no blocking — for verification and training-data collection until a model
+ * exists. In-process netlink (no shelling out).
+ */
+
+/* CTA_* numbers (stable ABI; defined locally — CTA_ML is a Stargazer addition
+ * absent from the host uapi header, and this avoids depending on it). */
+#define SG_IPCTNL_MSG_CT_GET    1
+#define SG_NLA_TYPE_MASK        0x3fff
+#define SG_CTA_TUPLE_ORIG       1
+#define SG_CTA_TUPLE_IP         1   /* nested in CTA_TUPLE_* */
+#define SG_CTA_IP_V4_SRC        1
+#define SG_CTA_IP_V4_DST        2
+#define SG_CTA_TUPLE_PROTO      2   /* nested in CTA_TUPLE_* */
+#define SG_CTA_PROTO_NUM        1
+#define SG_CTA_PROTO_SRC_PORT   2
+#define SG_CTA_PROTO_DST_PORT   3
+#define SG_CTA_ML               27
+
+/* Must match the kernel struct nf_conn_ml (same host/arch, host byte order). */
+struct sg_nf_conn_ml {
+	uint64_t first_ns, last_ns, iat_sum_ns;
+	uint32_t iat_count;
+	uint16_t tcp_flags[2];
+	uint16_t len_min[2];
+	uint16_t len_max[2];
+	int32_t  ml_score;
+};
+
+/* Find attribute `want` in an nlattr stream [data, data+len); return payload. */
+static const void *sg_nla_find(const void *data, int len, int want, int *plen)
+{
+	const struct nlattr *nla = data;
+
+	while (len >= (int)NLA_HDRLEN) {
+		int alen = nla->nla_len;
+
+		if (alen < (int)NLA_HDRLEN || alen > len)
+			break;
+		if ((nla->nla_type & SG_NLA_TYPE_MASK) == want) {
+			*plen = alen - NLA_HDRLEN;
+			return (const char *)nla + NLA_HDRLEN;
+		}
+		len -= NLA_ALIGN(alen);
+		nla = (const struct nlattr *)((const char *)nla + NLA_ALIGN(alen));
+	}
+	return NULL;
+}
+
+/* Parse one conntrack dump message; if it carries CTA_ML, append a line. */
+static void ct_ml_emit(const struct nlmsghdr *nh, struct dynbuf *out, long *count)
+{
+	const void *attrs = (const char *)NLMSG_DATA(nh) +
+			    NLMSG_ALIGN(sizeof(struct sg_nfgenmsg));
+	int alen = (int)nh->nlmsg_len - NLMSG_HDRLEN -
+		   (int)NLMSG_ALIGN(sizeof(struct sg_nfgenmsg));
+	const void *mlp, *tup;
+	int ml_len = 0, tlen = 0;
+	struct sg_nf_conn_ml ml;
+	char src[INET_ADDRSTRLEN] = "?", dst[INET_ADDRSTRLEN] = "?";
+	unsigned proto = 0, sport = 0, dport = 0;
+	unsigned long long dur_ms, iat_us;
+	char line[320];
+	int ll;
+
+	if (alen <= 0)
+		return;
+
+	mlp = sg_nla_find(attrs, alen, SG_CTA_ML, &ml_len);
+	if (!mlp)
+		return;			/* flow has no ML features — skip */
+	memset(&ml, 0, sizeof(ml));
+	memcpy(&ml, mlp, ml_len < (int)sizeof(ml) ? (size_t)ml_len : sizeof(ml));
+
+	tup = sg_nla_find(attrs, alen, SG_CTA_TUPLE_ORIG, &tlen);
+	if (tup) {
+		int l = 0;
+		const void *ip = sg_nla_find(tup, tlen, SG_CTA_TUPLE_IP, &l);
+		const void *pr;
+
+		if (ip) {
+			int il = 0;
+			const void *s = sg_nla_find(ip, l, SG_CTA_IP_V4_SRC, &il);
+			const void *d = sg_nla_find(ip, l, SG_CTA_IP_V4_DST, &il);
+
+			if (s) inet_ntop(AF_INET, s, src, sizeof(src));
+			if (d) inet_ntop(AF_INET, d, dst, sizeof(dst));
+		}
+		l = 0;
+		pr = sg_nla_find(tup, tlen, SG_CTA_TUPLE_PROTO, &l);
+		if (pr) {
+			int pl = 0;
+			const void *pn = sg_nla_find(pr, l, SG_CTA_PROTO_NUM, &pl);
+			const void *sp = sg_nla_find(pr, l, SG_CTA_PROTO_SRC_PORT, &pl);
+			const void *dp = sg_nla_find(pr, l, SG_CTA_PROTO_DST_PORT, &pl);
+
+			if (pn) proto = *(const uint8_t *)pn;
+			if (sp) sport = ntohs(*(const uint16_t *)sp);
+			if (dp) dport = ntohs(*(const uint16_t *)dp);
+		}
+	}
+
+	dur_ms = (ml.last_ns > ml.first_ns) ?
+		 (ml.last_ns - ml.first_ns) / 1000000ULL : 0;
+	iat_us = ml.iat_count ? (ml.iat_sum_ns / ml.iat_count) / 1000ULL : 0;
+
+	ll = snprintf(line, sizeof(line),
+		"proto=%u src=%s:%u dst=%s:%u iat_avg_us=%llu dur_ms=%llu "
+		"len_o=%u-%u len_r=%u-%u flags_o=0x%02x flags_r=0x%02x score=%d\n",
+		proto, src, sport, dst, dport, iat_us, dur_ms,
+		ml.len_min[0] == UINT16_MAX ? 0 : ml.len_min[0], ml.len_max[0],
+		ml.len_min[1] == UINT16_MAX ? 0 : ml.len_min[1], ml.len_max[1],
+		ml.tcp_flags[0], ml.tcp_flags[1], ml.ml_score);
+	if (ll > 0)
+		dbuf_append(out, line, (size_t)ll);
+	(*count)++;
+}
+
+int handle_session_ml(int client_fd, const char *user,
+		      const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)payload; (void)hdr;
+
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "monitor permission required");
+		return 0;
+	}
+
+	int fd = socket(AF_NETLINK, SOCK_RAW, SG_NETLINK_NETFILTER);
+	if (fd < 0) {
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL, "netlink socket failed");
+		return 0;
+	}
+	struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+	struct {
+		struct nlmsghdr    nlh;
+		struct sg_nfgenmsg nfg;
+	} req;
+	memset(&req, 0, sizeof(req));
+	req.nlh.nlmsg_len    = NLMSG_LENGTH(sizeof(req.nfg));
+	req.nlh.nlmsg_type   = (SG_NFNL_SUBSYS_CTNETLINK << 8) | SG_IPCTNL_MSG_CT_GET;
+	req.nlh.nlmsg_flags  = NLM_F_REQUEST | NLM_F_DUMP;
+	req.nlh.nlmsg_seq    = 1;
+	req.nfg.nfgen_family = AF_INET;
+
+	struct sockaddr_nl sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.nl_family = AF_NETLINK;
+
+	if (sendto(fd, &req, req.nlh.nlmsg_len, 0,
+		   (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		close(fd);
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL, "conntrack dump request failed");
+		return 0;
+	}
+
+	struct dynbuf out;
+	if (dbuf_init(&out, 8192) < 0) {
+		close(fd);
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL, "out of memory");
+		return 0;
+	}
+
+	long count = 0;
+	char rbuf[32768];
+	int done = 0;
+
+	while (!done) {
+		ssize_t rn = recv(fd, rbuf, sizeof(rbuf), 0);
+		struct nlmsghdr *nh;
+		int rem;
+
+		if (rn <= 0)
+			break;
+		rem = (int)rn;
+		for (nh = (struct nlmsghdr *)rbuf; NLMSG_OK(nh, rem);
+		     nh = NLMSG_NEXT(nh, rem)) {
+			if (nh->nlmsg_type == NLMSG_DONE ||
+			    nh->nlmsg_type == NLMSG_ERROR) {
+				done = 1;
+				break;
+			}
+			ct_ml_emit(nh, &out, &count);
+		}
+	}
+	close(fd);
+
+	struct dynbuf resp;
+	if (dbuf_init(&resp, out.used + 64) < 0) {
+		send_ok(client_fd, NULL, out.data);
+		free(out.data);
+		return 0;
+	}
+	dbuf_printf(&resp, "flows=%ld\n", count);
+	dbuf_append(&resp, out.data, out.used);
+	send_ok(client_fd, NULL, resp.data);
+	free(out.data);
+	free(resp.data);
 	return 0;
 }
 

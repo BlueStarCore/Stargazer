@@ -831,8 +831,26 @@ static int cmd_diag_session(const char *args, const char *permissions)
 		return 0;
 	}
 
+	/* ── ml: per-flow ML features (conntrack CTA_ML) ─────────────── */
+	if (strcmp(sub, "ml") == 0) {
+		struct ipc_response resp = {0};
+		int rc = ipc_send_str(SG_CMD_SESSION_ML, "", &resp);
+		if (rc != 0 || resp.status != SG_OK) {
+			print_ipc_error("Error", &resp);
+			ipc_resp_free(&resp);
+			return 0;
+		}
+		printf("  === Per-flow ML Features ===\n");
+		if (resp.payload && resp.payload[0])
+			printf("%s", resp.payload);
+		else
+			printf("  No flows with features.\n");
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
 	printf("  Unknown subcommand: %s\n", sub);
-	printf("  Usage: execute diagnose session [status|stats|clear]\n");
+	printf("  Usage: execute diagnose session [status|stats|clear|ml]\n");
 	return 0;
 }
 

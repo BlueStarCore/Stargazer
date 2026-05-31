@@ -125,6 +125,7 @@ X("execute diagnose session",              "Session table diagnostics",         
 X("execute diagnose session status",       "Show live session table",                 "monitor",         0,  NULL)
 X("execute diagnose session stats",        "Show session counters and module status", "monitor",         0,  NULL)
 X("execute diagnose session clear",        "Flush all active connections (conntrack)", "admin",          0,  NULL)
+X("execute diagnose session ml",           "Per-flow ML features (conntrack CTA_ML)",  "monitor",         0,  NULL)
 
 X("execute diagnose dhcp",                 "DHCP diagnostics",                        "monitor",         0,  NULL)
 X("execute diagnose dhcp client",          "Show DHCP client status (all interfaces)", "monitor",        1,  cmd_diag_dhcp_client)

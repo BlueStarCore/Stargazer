@@ -138,6 +138,7 @@ typedef enum {
 	SG_CMD_SESSION_CLEAR     = 655,  /* Flush conntrack table (via netlink) */
 	SG_CMD_SESSION_STATS     = 656,  /* conntrack flow count + pkt_forward  */
 	/* 657 (was SG_CMD_SESSION_GC_INTERVAL — session.ko GC knob) retired     */
+	SG_CMD_SESSION_ML        = 659,  /* Per-flow ML features (CTA_ML dump)  */
 	/* Debug state (66x) */
 	SG_CMD_DEBUG_STATE_GET   = 660,  /* Read debug conf key=value pairs    */
 	SG_CMD_DEBUG_STATE_SET   = 661,  /* Atomic write debug conf            */

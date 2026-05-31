@@ -5866,6 +5866,8 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		return handle_session_clear(client_fd, user, payload, hdr);
 	case SG_CMD_SESSION_STATS:
 		return handle_session_stats(client_fd, user, payload, hdr);
+	case SG_CMD_SESSION_ML:
+		return handle_session_ml(client_fd, user, payload, hdr);
 	case SG_CMD_SHOW_SESSIONS:
 		return handle_show_sessions(client_fd, user, payload, hdr);
 	case SG_CMD_SHOW_BOOT_CONFIG:
