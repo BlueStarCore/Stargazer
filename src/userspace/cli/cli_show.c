@@ -60,10 +60,10 @@ void show_sessions(void)
 	struct ipc_response resp = {0};
 	if (ipc_send_str(SG_CMD_SHOW_SESSIONS, "", &resp) == 0 &&
 	    resp.status == SG_OK && resp.payload && resp.payload[0]) {
-		printf("  === Active Sessions ===\n");
+		printf("  === Active Connections (conntrack) ===\n");
 		printf("%s", resp.payload);
 	} else {
-		printf("  Session tracking not available (module not loaded)\n");
+		printf("  Connection tracking not available\n");
 	}
 	ipc_resp_free(&resp);
 }

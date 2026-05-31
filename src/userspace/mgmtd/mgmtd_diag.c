@@ -25,6 +25,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <sys/socket.h>
+#include <linux/netlink.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1369,7 +1371,158 @@ int handle_disk_smart(int client_fd, const char *user,
 	return 0;
 }
 
-/* ── SG_CMD_SHOW_SESSIONS (650) ────────────────────────────────────────── */
+/* ── nf_conntrack readers ───────────────────────────────────────────────────
+ *
+ * session.ko is gone; connection state lives in the kernel's nf_conntrack.
+ * These read /proc/net/nf_conntrack (file IO) and "clear" flushes via netlink
+ * in-process — the firewall never shells out to system commands.
+ */
+
+/* Recognised L4 protocol names — anchors parsing whether or not the line
+ * carries the legacy "ipv4 2 " L3 prefix. */
+static const char *ct_l4_name(const char *t)
+{
+	if (!strcmp(t, "tcp") || !strcmp(t, "udp") || !strcmp(t, "icmp") ||
+	    !strcmp(t, "icmpv6") || !strcmp(t, "udplite") ||
+	    !strcmp(t, "sctp") || !strcmp(t, "dccp") || !strcmp(t, "gre"))
+		return t;
+	return NULL;
+}
+
+/*
+ * ct_emit_line - parse one /proc/net/nf_conntrack line, append a normalized
+ * session line to `out`:
+ *   proto=<p> state=<S> src=<ip>:<port> dst=<ip>:<port> pkts=<n> bytes=<n>
+ * pkts/bytes sum both directions (nf_conntrack_acct). Returns 0 on success,
+ * -1 if unparseable. `line` is modified by strtok_r.
+ */
+static int ct_emit_line(char *line, struct dynbuf *out)
+{
+	char proto[12] = "", state[24] = "";
+	char src[INET_ADDRSTRLEN] = "", dst[INET_ADDRSTRLEN] = "";
+	unsigned sport = 0, dport = 0;
+	unsigned long long pkts = 0, bytes = 0;
+	int have_proto = 0, have_tuple = 0;
+	char *sp = NULL;
+
+	for (char *t = strtok_r(line, " \t\n", &sp); t;
+	     t = strtok_r(NULL, " \t\n", &sp)) {
+		if (!have_proto) {
+			const char *p = ct_l4_name(t);
+			if (p) {
+				snprintf(proto, sizeof(proto), "%s", p);
+				have_proto = 1;
+				continue;
+			}
+		}
+		/* TCP state: an UPPERCASE word before the first src=, not a [FLAG] */
+		if (have_proto && !have_tuple && !state[0] &&
+		    t[0] >= 'A' && t[0] <= 'Z' && t[0] != '[' && !strchr(t, '=')) {
+			snprintf(state, sizeof(state), "%s", t);
+			continue;
+		}
+		if (!strncmp(t, "src=", 4)) {
+			if (!src[0]) snprintf(src, sizeof(src), "%s", t + 4);
+			have_tuple = 1;
+		} else if (!strncmp(t, "dst=", 4)) {
+			if (!dst[0]) snprintf(dst, sizeof(dst), "%s", t + 4);
+		} else if (!strncmp(t, "sport=", 6)) {
+			if (!sport) sport = (unsigned)atoi(t + 6);
+		} else if (!strncmp(t, "dport=", 6)) {
+			if (!dport) dport = (unsigned)atoi(t + 6);
+		} else if (!strncmp(t, "packets=", 8)) {
+			pkts += strtoull(t + 8, NULL, 10);
+		} else if (!strncmp(t, "bytes=", 6)) {
+			bytes += strtoull(t + 6, NULL, 10);
+		}
+	}
+	if (!have_proto || !src[0])
+		return -1;
+
+	char l[256];
+	int n = snprintf(l, sizeof(l),
+			 "proto=%s state=%s src=%s:%u dst=%s:%u pkts=%llu bytes=%llu\n",
+			 proto, state[0] ? state : "-",
+			 src, sport, dst, dport, pkts, bytes);
+	if (n > 0)
+		dbuf_append(out, l, (size_t)n);
+	return 0;
+}
+
+/* Count active conntrack flows (one per line). -1 if conntrack unavailable. */
+static long conntrack_count(void)
+{
+	FILE *fp = fopen("/proc/net/nf_conntrack", "r");
+	if (!fp)
+		return -1;
+	long n = 0;
+	char line[1024];
+	while (fgets(line, sizeof(line), fp))
+		n++;
+	fclose(fp);
+	return n;
+}
+
+/* nfnetlink constants defined locally to avoid build-sysroot header deps. */
+#define SG_NETLINK_NETFILTER      12
+#define SG_NFNL_SUBSYS_CTNETLINK  1
+#define SG_IPCTNL_MSG_CT_DELETE   2
+
+struct sg_nfgenmsg {
+	unsigned char  nfgen_family;
+	unsigned char  version;
+	unsigned short res_id;
+};
+
+/*
+ * conntrack_flush_all - flush the whole conntrack table via NFNETLINK
+ * (the in-process equivalent of "conntrack -F"; no system command).
+ * Returns 0 on success, negative on failure.
+ */
+static int conntrack_flush_all(void)
+{
+	int fd = socket(AF_NETLINK, SOCK_RAW, SG_NETLINK_NETFILTER);
+	if (fd < 0)
+		return -1;
+
+	/* Don't let a missing ACK hang single-threaded mgmtd. */
+	struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+	struct {
+		struct nlmsghdr    nlh;
+		struct sg_nfgenmsg nfg;
+	} req;
+	memset(&req, 0, sizeof(req));
+	req.nlh.nlmsg_len    = NLMSG_LENGTH(sizeof(req.nfg));
+	req.nlh.nlmsg_type   = (SG_NFNL_SUBSYS_CTNETLINK << 8) | SG_IPCTNL_MSG_CT_DELETE;
+	req.nlh.nlmsg_flags  = NLM_F_REQUEST | NLM_F_ACK;
+	req.nlh.nlmsg_seq    = 1;
+	req.nfg.nfgen_family = AF_UNSPEC;   /* flush all families */
+
+	struct sockaddr_nl sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.nl_family = AF_NETLINK;
+
+	int ret = -1;
+	if (sendto(fd, &req, req.nlh.nlmsg_len, 0,
+		   (struct sockaddr *)&sa, sizeof(sa)) >= 0) {
+		char rbuf[256];
+		ssize_t r = recv(fd, rbuf, sizeof(rbuf), 0);
+		ret = 0;  /* request accepted */
+		if (r >= (ssize_t)NLMSG_LENGTH(sizeof(struct nlmsgerr))) {
+			struct nlmsghdr *rh = (struct nlmsghdr *)rbuf;
+			if (rh->nlmsg_type == NLMSG_ERROR) {
+				struct nlmsgerr *e = (struct nlmsgerr *)NLMSG_DATA(rh);
+				ret = e->error;  /* 0 = success ACK */
+			}
+		}
+	}
+	close(fd);
+	return ret;
+}
+
+/* ── SG_CMD_SHOW_SESSIONS (650) — active flows from nf_conntrack ────────── */
 
 int handle_show_sessions(int client_fd, const char *user,
 			 const char *payload, const sg_request_hdr_t *hdr)
@@ -1383,173 +1536,43 @@ int handle_show_sessions(int client_fd, const char *user,
 		return 0;
 	}
 
-	char buf[SG_RESPONSE_MAX];
-	ssize_t n = read_small_file("/proc/stargazer/sessions",
-				    buf, sizeof(buf));
-	if (n < 0) {
+	FILE *fp = fopen("/proc/net/nf_conntrack", "r");
+	if (!fp) {
 		send_ok(client_fd, "not_available",
-			"Session tracking not available "
-			"(module not loaded)\n");
+			"Connection tracking not available\n");
 		return 0;
 	}
 
-	/* Build sequence→name map from firewall_policy DB entries. */
-#define SESS_POLICY_MAP_MAX 256
-	struct {
-		unsigned int seq;
-		char         name[64];
-	} pmap[SESS_POLICY_MAP_MAX];
-	int nmap = 0;
-
-	char *plist = sg_db_list("firewall_policy");
-	if (plist) {
-		char *sp = NULL;
-		for (char *pid = strtok_r(plist, "\n", &sp);
-		     pid && nmap < SESS_POLICY_MAP_MAX;
-		     pid = strtok_r(NULL, "\n", &sp)) {
-			char *sval = sg_db_get_val("firewall_policy", pid, "sequence");
-			char *nval = sg_db_get_val("firewall_policy", pid, "name");
-			if (sval && nval && sval[0] && nval[0]) {
-				pmap[nmap].seq = (unsigned int)strtoul(sval, NULL, 10);
-				snprintf(pmap[nmap].name, sizeof(pmap[nmap].name),
-					 "%s", nval);
-				nmap++;
-			}
-			free(sval);
-			free(nval);
-		}
-		free(plist);
-	}
-
-	/* Second pass: append  policy_name=<name>  to session lines that
-	 * carry a non-zero policy_id field. Fall back to raw buf on OOM. */
 	struct dynbuf out;
-	if (dbuf_init(&out, (size_t)n + 512) < 0) {
-		send_ok(client_fd, NULL, buf);
+	if (dbuf_init(&out, 8192) < 0) {
+		fclose(fp);
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL, "out of memory");
 		return 0;
 	}
 
-	const char *p = buf;
-	while (*p) {
-		const char *nl = strchr(p, '\n');
-		size_t ll     = nl ? (size_t)(nl - p) : strlen(p);
-
-		dbuf_append(&out, p, ll);
-
-		if (ll > 0 && p[0] != '#') {
-			/* Extract policy_id from the line */
-			char line_copy[512];
-			size_t cp = ll < sizeof(line_copy) - 1
-				    ? ll : sizeof(line_copy) - 1;
-			memcpy(line_copy, p, cp);
-			line_copy[cp] = '\0';
-
-			const char *kv = strstr(line_copy, "policy_id=");
-			if (kv) {
-				unsigned int seq =
-					(unsigned int)strtoul(kv + 10, NULL, 10);
-				if (seq > 0) {
-					const char *name = NULL;
-					for (int i = 0; i < nmap; i++) {
-						if (pmap[i].seq == seq) {
-							name = pmap[i].name;
-							break;
-						}
-					}
-					if (name) {
-						char sfx[80];
-						int sfxlen = snprintf(sfx,
-							sizeof(sfx),
-							" policy_name=%s", name);
-						if (sfxlen > 0)
-							dbuf_append(&out, sfx,
-								    (size_t)sfxlen);
-					}
-				}
-			}
-		}
-
-		dbuf_append(&out, "\n", 1);
-		p = nl ? nl + 1 : p + ll;
-		if (!nl)
-			break;
+	long count = 0;
+	char line[1024];
+	while (fgets(line, sizeof(line), fp)) {
+		if (ct_emit_line(line, &out) == 0)
+			count++;
 	}
+	fclose(fp);
 
-	send_ok(client_fd, NULL, out.data);
+	struct dynbuf resp;
+	if (dbuf_init(&resp, out.used + 64) < 0) {
+		send_ok(client_fd, NULL, out.data);
+		free(out.data);
+		return 0;
+	}
+	dbuf_printf(&resp, "active=%ld\n", count);
+	dbuf_append(&resp, out.data, out.used);
+	send_ok(client_fd, NULL, resp.data);
 	free(out.data);
+	free(resp.data);
 	return 0;
 }
 
-/* ── SG_CMD_DIAG_SESSION (654) — session_test.ko kernel self-test ──────── */
-
-int handle_diag_session(int client_fd, const char *user,
-			const char *payload, const sg_request_hdr_t *hdr)
-{
-	(void)hdr;
-
-	const char *perms = get_user_permissions(user);
-	if (!has_permission(perms, "monitor")) {
-		send_error(client_fd, SG_ERR_PERM_DENIED,
-			   "monitor permission required");
-		return 0;
-	}
-
-	char proc_buf[SG_RESPONSE_MAX];
-	ssize_t n = read_small_file("/proc/stargazer/sessions",
-				    proc_buf, sizeof(proc_buf));
-	if (n < 0) {
-		send_error(client_fd, SG_ERR_NOT_FOUND,
-			   "session module not loaded");
-		return 0;
-	}
-
-	/* Status mode: return live session table */
-	if (!payload || !strstr(payload, "inject")) {
-		send_ok(client_fd, NULL, proc_buf);
-		return 0;
-	}
-
-	/* ── Inject mode: load session_test.ko, read its procfs output ──────── */
-	/* Loading a kernel module requires admin privilege */
-	if (!has_permission(perms, "admin")) {
-		send_error(client_fd, SG_ERR_PERM_DENIED,
-			   "admin permission required for inject mode");
-		return 0;
-	}
-
-	/* Clean up any leftover from a prior run */
-	system("rmmod session_test 2>/dev/null");
-
-	if (system("insmod /lib/modules/stargazer/session_test.ko") != 0) {
-		send_error(client_fd, SG_ERR_SYSTEM_FAIL,
-			   "error=session_test_load_failed "
-			   "(run 'make modules' to build session_test.ko)\n");
-		return 0;
-	}
-
-	/* Give module_init() time to complete and write procfs */
-	usleep(50000);
-
-	/* Try primary path first, then fallback name */
-	n = read_small_file("/proc/stargazer/session_test",
-			    proc_buf, sizeof(proc_buf));
-	if (n < 0)
-		n = read_small_file("/proc/stargazer_session_test",
-				    proc_buf, sizeof(proc_buf));
-
-	system("rmmod session_test 2>/dev/null");
-
-	if (n < 0) {
-		send_error(client_fd, SG_ERR_SYSTEM_FAIL,
-			   "error=session_test_procfs_missing\n");
-		return 0;
-	}
-
-	send_ok(client_fd, NULL, proc_buf);
-	return 0;
-}
-
-/* ── SG_CMD_SESSION_STATS (656) ────────────────────────────────────────── */
+/* ── SG_CMD_SESSION_STATS (656) — conntrack flow count + pkt_forward stats ── */
 
 int handle_session_stats(int client_fd, const char *user,
 			 const char *payload, const sg_request_hdr_t *hdr)
@@ -1563,76 +1586,43 @@ int handle_session_stats(int client_fd, const char *user,
 		return 0;
 	}
 
-	char proc_buf[SG_RESPONSE_MAX];
-	ssize_t n = read_small_file("/proc/stargazer/sessions",
-				    proc_buf, sizeof(proc_buf));
+	long active = conntrack_count();
+	int conntrack_ok = (active >= 0);
+	if (active < 0)
+		active = 0;
 
-	int session_loaded = (n >= 0);
 	int pkt_fwd_loaded = (access("/sys/module/pkt_forward", F_OK) == 0);
-
-	/* Parse counters from the procfs header lines */
-	long long active = 0, created = 0, expired = 0, invalid = 0;
-	long long halfopen = 0, rejected_halfopen = 0;
-	if (session_loaded) {
-		const char *p = proc_buf;
-		const char *kv;
-
-		kv = strstr(p, "active=");
-		if (kv) active = strtoll(kv + 7, NULL, 10);
-		kv = strstr(p, "created=");
-		if (kv) created = strtoll(kv + 8, NULL, 10);
-		kv = strstr(p, "expired=");
-		if (kv) expired = strtoll(kv + 8, NULL, 10);
-		kv = strstr(p, "invalid=");
-		if (kv) invalid = strtoll(kv + 8, NULL, 10);
-		kv = strstr(p, "# halfopen=");
-		if (kv) halfopen = strtoll(kv + 11, NULL, 10);
-		kv = strstr(p, "rejected_halfopen=");
-		if (kv) rejected_halfopen = strtoll(kv + 18, NULL, 10);
-	}
-
-	/* Parse per-source established cap drops from session header */
-	long long est_src_drops = 0;
-	if (session_loaded) {
-		const char *kv = strstr(proc_buf, "est_src_drops=");
-		if (kv) est_src_drops = strtoll(kv + 14, NULL, 10);
-	}
-
-	/* Read pkt_forward anomaly counter from its own procfs file */
-	long long anomaly_dropped = 0;
+	long long forwarded = 0, dropped = 0, anomaly_dropped = 0;
 	if (pkt_fwd_loaded) {
 		char pf_buf[1024];
 		ssize_t pf_n = read_small_file("/proc/stargazer/pkt_forward_stats",
 					       pf_buf, sizeof(pf_buf));
 		if (pf_n > 0) {
 			const char *kv;
+			kv = strstr(pf_buf, "pkts_forwarded=");
+			if (kv) forwarded       = strtoll(kv + 15, NULL, 10);
+			kv = strstr(pf_buf, "pkts_dropped=");
+			if (kv) dropped         = strtoll(kv + 13, NULL, 10);
 			kv = strstr(pf_buf, "pkts_anomaly_dropped=");
-			if (kv) anomaly_dropped      = strtoll(kv + 21, NULL, 10);
+			if (kv) anomaly_dropped = strtoll(kv + 21, NULL, 10);
 		}
 	}
 
-	char resp[1280];
+	char resp[512];
 	snprintf(resp, sizeof(resp),
-		 "session_loaded=%d\n"
+		 "conntrack_available=%d\n"
 		 "pkt_forward_loaded=%d\n"
-		 "active=%lld\n"
-		 "created=%lld\n"
-		 "expired=%lld\n"
-		 "invalid=%lld\n"
-		 "halfopen=%lld\n"
-		 "rejected_halfopen=%lld\n"
-		 "est_src_drops=%lld\n"
+		 "active=%ld\n"
+		 "forwarded=%lld\n"
+		 "dropped=%lld\n"
 		 "anomaly_dropped=%lld\n",
-		 session_loaded, pkt_fwd_loaded,
-		 active, created, expired, invalid,
-		 halfopen, rejected_halfopen, est_src_drops,
-		 anomaly_dropped);
-
+		 conntrack_ok, pkt_fwd_loaded, active,
+		 forwarded, dropped, anomaly_dropped);
 	send_ok(client_fd, NULL, resp);
 	return 0;
 }
 
-/* ── SG_CMD_SESSION_CLEAR (655) ─────────────────────────────────────────── */
+/* ── SG_CMD_SESSION_CLEAR (655) — flush conntrack via netlink ───────────── */
 
 int handle_session_clear(int client_fd, const char *user,
 			 const char *payload, const sg_request_hdr_t *hdr)
@@ -1646,107 +1636,21 @@ int handle_session_clear(int client_fd, const char *user,
 		return 0;
 	}
 
-	/* Read current active count before flushing */
-	char proc_buf[SG_RESPONSE_MAX];
-	ssize_t n = read_small_file("/proc/stargazer/sessions",
-				    proc_buf, sizeof(proc_buf));
-	if (n < 0) {
+	long before = conntrack_count();
+	if (before < 0) {
 		send_error(client_fd, SG_ERR_NOT_FOUND,
-			   "session module not loaded");
+			   "connection tracking not available");
 		return 0;
 	}
 
-	long long active_before = 0;
-	const char *kv = strstr(proc_buf, "active=");
-	if (kv) active_before = strtoll(kv + 7, NULL, 10);
-
-	/* Write "flush" to the kernel control interface */
-	int fd = open("/proc/stargazer/session_ctl", O_WRONLY);
-	if (fd < 0) {
+	if (conntrack_flush_all() < 0) {
 		send_error(client_fd, SG_ERR_SYSTEM_FAIL,
-			   "session_ctl not available "
-			   "(session.ko too old — rebuild modules)");
-		return 0;
-	}
-	const char *cmd = "flush\n";
-	ssize_t w = write(fd, cmd, strlen(cmd));
-	close(fd);
-
-	if (w < 0) {
-		send_error(client_fd, SG_ERR_SYSTEM_FAIL,
-			   "flush write failed");
-		return 0;
-	}
-
-	char resp[128];
-	snprintf(resp, sizeof(resp), "flushed=%lld\n", active_before);
-	send_ok(client_fd, NULL, resp);
-	return 0;
-}
-
-/* ── SG_CMD_SESSION_GC_INTERVAL (657) ──────────────────────────────────── */
-
-int handle_session_gc_interval(int client_fd, const char *user,
-				const char *payload, const sg_request_hdr_t *hdr)
-{
-	(void)hdr;
-
-	const char *perms = get_user_permissions(user);
-	if (!has_permission(perms, "admin")) {
-		send_error(client_fd, SG_ERR_PERM_DENIED,
-			   "admin permission required");
-		return 0;
-	}
-
-	/* Read current value first */
-	char cur_buf[32];
-	ssize_t n = read_small_file(
-		"/sys/module/session/parameters/gc_sweep_interval",
-		cur_buf, sizeof(cur_buf));
-	long cur_val = (n > 0) ? strtol(cur_buf, NULL, 10) : -1;
-
-	/* GET: no payload or empty payload */
-	if (!payload || !payload[0]) {
-		char resp[64];
-		if (cur_val < 0) {
-			send_error(client_fd, SG_ERR_NOT_FOUND,
-				   "session module not loaded");
-			return 0;
-		}
-		snprintf(resp, sizeof(resp), "gc_sweep_interval=%ld\n", cur_val);
-		send_ok(client_fd, NULL, resp);
-		return 0;
-	}
-
-	/* SET: payload is the new interval in seconds */
-	char *end;
-	long val = strtol(payload, &end, 10);
-	if (*end != '\0' || val < 5 || val > 3600) {
-		send_error(client_fd, SG_ERR_INVALID_VAL,
-			   "gc_sweep_interval must be 5..3600 seconds");
-		return 0;
-	}
-
-	int fd = open("/sys/module/session/parameters/gc_sweep_interval",
-		      O_WRONLY);
-	if (fd < 0) {
-		send_error(client_fd, SG_ERR_NOT_FOUND,
-			   "session module not loaded");
-		return 0;
-	}
-
-	char wbuf[32];
-	int wlen = snprintf(wbuf, sizeof(wbuf), "%ld\n", val);
-	ssize_t w = write(fd, wbuf, (size_t)wlen);
-	close(fd);
-	if (w < 0) {
-		send_error(client_fd, SG_ERR_SYSTEM_FAIL,
-			   "failed to write gc_sweep_interval");
+			   "conntrack flush failed");
 		return 0;
 	}
 
 	char resp[64];
-	snprintf(resp, sizeof(resp), "gc_sweep_interval=%ld\n", val);
+	snprintf(resp, sizeof(resp), "flushed=%ld\n", before);
 	send_ok(client_fd, NULL, resp);
 	return 0;
 }

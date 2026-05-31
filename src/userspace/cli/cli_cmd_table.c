@@ -742,25 +742,25 @@ static int cmd_diag_session(const char *args, const char *permissions)
 	while (sub && *sub == ' ')
 		sub++;
 
-	/* ── status: live session table ─────────────────────────────── */
+	/* ── status: live connection table (conntrack) ──────────────── */
 	if (!sub || !*sub || strcmp(sub, "status") == 0) {
 		struct ipc_response resp = {0};
-		int rc = ipc_send_str(SG_CMD_DIAG_SESSION, "", &resp);
+		int rc = ipc_send_str(SG_CMD_SHOW_SESSIONS, "", &resp);
 		if (rc != 0 || resp.status != SG_OK) {
-			printf("  Session module not available.\n");
+			printf("  Connection tracking not available.\n");
 			ipc_resp_free(&resp);
 			return 0;
 		}
-		printf("  === Session Table ===\n");
+		printf("  === Active Connections (conntrack) ===\n");
 		if (resp.payload && resp.payload[0])
 			printf("%s", resp.payload);
 		else
-			printf("  No active sessions.\n");
+			printf("  No active connections.\n");
 		ipc_resp_free(&resp);
 		return 0;
 	}
 
-	/* ── stats: counters + module status ────────────────────────── */
+	/* ── stats: conntrack flow count + pkt_forward counters ─────── */
 	if (strcmp(sub, "stats") == 0) {
 		struct ipc_response resp = {0};
 		int rc = ipc_send_str(SG_CMD_SESSION_STATS, "", &resp);
@@ -770,43 +770,31 @@ static int cmd_diag_session(const char *args, const char *permissions)
 			return 0;
 		}
 		const char *p = resp.payload ? resp.payload : "";
-		long long active = 0, created = 0, expired = 0, invalid = 0;
-		long long halfopen = 0, rejected_halfopen = 0, est_src_drops = 0;
-		long long anomaly_dropped = 0;
-		int sess_loaded = 0, pkt_fwd_loaded = 0;
+		long long active = 0, forwarded = 0, dropped = 0, anomaly_dropped = 0;
+		int ct_ok = 0, pkt_fwd_loaded = 0;
 		const char *kv;
-		kv = strstr(p, "session_loaded=");
-		if (kv) sess_loaded      = (int)strtol(kv + 15, NULL, 10);
+		kv = strstr(p, "conntrack_available=");
+		if (kv) ct_ok            = (int)strtol(kv + 20, NULL, 10);
 		kv = strstr(p, "pkt_forward_loaded=");
 		if (kv) pkt_fwd_loaded   = (int)strtol(kv + 19, NULL, 10);
 		kv = strstr(p, "active=");
 		if (kv) active           = strtoll(kv + 7, NULL, 10);
-		kv = strstr(p, "created=");
-		if (kv) created          = strtoll(kv + 8, NULL, 10);
-		kv = strstr(p, "expired=");
-		if (kv) expired          = strtoll(kv + 8, NULL, 10);
-		kv = strstr(p, "invalid=");
-		if (kv) invalid          = strtoll(kv + 8, NULL, 10);
-		kv = strstr(p, "\nhalfopen=");
-		if (kv) halfopen         = strtoll(kv + 10, NULL, 10);
-		kv = strstr(p, "rejected_halfopen=");
-		if (kv) rejected_halfopen = strtoll(kv + 18, NULL, 10);
-		kv = strstr(p, "est_src_drops=");
-		if (kv) est_src_drops    = strtoll(kv + 14, NULL, 10);
+		kv = strstr(p, "forwarded=");
+		if (kv) forwarded        = strtoll(kv + 10, NULL, 10);
+		kv = strstr(p, "\ndropped=");
+		if (kv) dropped          = strtoll(kv + 9, NULL, 10);
 		kv = strstr(p, "anomaly_dropped=");
 		if (kv) anomaly_dropped  = strtoll(kv + 16, NULL, 10);
 
 		printf("  === Session Statistics ===\n");
-		printf("  session.ko     : %s\n", sess_loaded    ? C_GREEN "loaded" C_NC : C_RED "not loaded" C_NC);
+		printf("  conntrack      : %s\n", ct_ok          ? C_GREEN "available" C_NC : C_RED "unavailable" C_NC);
 		printf("  pkt_forward.ko : %s\n", pkt_fwd_loaded ? C_GREEN "loaded" C_NC : C_RED "not loaded" C_NC);
-		printf("  Active sessions: %lld\n", active);
-		printf("  Created        : %lld\n", created);
-		printf("  Expired        : %lld\n", expired);
-		printf("  Invalid (drops): %lld\n", invalid);
-		printf("  Half-open TCP  : %lld  (rejected: %lld)\n", halfopen, rejected_halfopen);
-		printf("  Est. src drops : %lld\n", est_src_drops);
-		if (pkt_fwd_loaded)
+		printf("  Active flows   : %lld\n", active);
+		if (pkt_fwd_loaded) {
+			printf("  Forwarded      : %lld\n", forwarded);
+			printf("  Dropped        : %lld\n", dropped);
 			printf("  L3/L4 anomaly  : %lld\n", anomaly_dropped);
+		}
 		ipc_resp_free(&resp);
 		return 0;
 	}
@@ -844,51 +832,7 @@ static int cmd_diag_session(const char *args, const char *permissions)
 	}
 
 	printf("  Unknown subcommand: %s\n", sub);
-	printf("  Usage: execute diagnose session [status|stats|clear|gc-interval]\n");
-	return 0;
-}
-
-static int cmd_diag_session_gc_interval(const char *args, const char *permissions)
-{
-	(void)permissions;
-
-	struct ipc_response resp = {0};
-	const char *val_str = args;
-	int rc;
-
-	while (val_str && *val_str == ' ')
-		val_str++;
-
-	if (!val_str || !*val_str) {
-		/* GET: show current value */
-		rc = ipc_send_str(SG_CMD_SESSION_GC_INTERVAL, "", &resp);
-		if (rc != 0 || resp.status != SG_OK) {
-			print_ipc_error("Error", &resp);
-			ipc_resp_free(&resp);
-			return 0;
-		}
-		const char *p = resp.payload ? resp.payload : "";
-		long val = 0;
-		const char *kv = strstr(p, "gc_sweep_interval=");
-		if (kv) val = strtol(kv + 18, NULL, 10);
-		printf("  GC sweep interval : %ld seconds\n", val);
-		ipc_resp_free(&resp);
-		return 0;
-	}
-
-	/* SET: send new interval */
-	rc = ipc_send_str(SG_CMD_SESSION_GC_INTERVAL, val_str, &resp);
-	if (rc != 0 || resp.status != SG_OK) {
-		print_ipc_error("Error", &resp);
-		ipc_resp_free(&resp);
-		return 0;
-	}
-	const char *p = resp.payload ? resp.payload : "";
-	long val = 0;
-	const char *kv = strstr(p, "gc_sweep_interval=");
-	if (kv) val = strtol(kv + 18, NULL, 10);
-	printf("  GC sweep interval set to %ld seconds.\n", val);
-	ipc_resp_free(&resp);
+	printf("  Usage: execute diagnose session [status|stats|clear]\n");
 	return 0;
 }
 

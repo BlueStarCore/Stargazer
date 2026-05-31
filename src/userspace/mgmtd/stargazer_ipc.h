@@ -130,14 +130,14 @@ typedef enum {
 	SG_CMD_DISK_SMART        = 649,  /* eMMC wear/health (life_time etc)   */
 
 	/* Show data (65x) */
-	SG_CMD_SHOW_SESSIONS     = 650,  /* /proc/stargazer/sessions contents  */
+	SG_CMD_SHOW_SESSIONS     = 650,  /* Active conntrack flows (normalized) */
 	SG_CMD_SHOW_BOOT_CONFIG  = 651,  /* modules + sysctl config files      */
 	SG_CMD_DIAG_NTP          = 652,  /* NTP status: server, pid, time      */
 	SG_CMD_DIAG_BUSYBOX_LIST = 653,  /* Enumerate busybox applet symlinks  */
-	SG_CMD_DIAG_SESSION      = 654,  /* Session table status + inject test */
-	SG_CMD_SESSION_CLEAR     = 655,  /* Flush all active sessions          */
-	SG_CMD_SESSION_STATS     = 656,  /* Parsed session counters + status   */
-	SG_CMD_SESSION_GC_INTERVAL = 657, /* Get/set GC sweep interval (seconds) */
+	/* 654 (was SG_CMD_DIAG_SESSION — session.ko self-test) retired         */
+	SG_CMD_SESSION_CLEAR     = 655,  /* Flush conntrack table (via netlink) */
+	SG_CMD_SESSION_STATS     = 656,  /* conntrack flow count + pkt_forward  */
+	/* 657 (was SG_CMD_SESSION_GC_INTERVAL — session.ko GC knob) retired     */
 	/* Debug state (66x) */
 	SG_CMD_DEBUG_STATE_GET   = 660,  /* Read debug conf key=value pairs    */
 	SG_CMD_DEBUG_STATE_SET   = 661,  /* Atomic write debug conf            */

@@ -5862,14 +5862,10 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		return handle_diag_ntp(client_fd, user, payload, hdr);
 	case SG_CMD_DIAG_BUSYBOX_LIST:
 		return handle_diag_busybox_list(client_fd, user, payload, hdr);
-	case SG_CMD_DIAG_SESSION:
-		return handle_diag_session(client_fd, user, payload, hdr);
 	case SG_CMD_SESSION_CLEAR:
 		return handle_session_clear(client_fd, user, payload, hdr);
 	case SG_CMD_SESSION_STATS:
 		return handle_session_stats(client_fd, user, payload, hdr);
-	case SG_CMD_SESSION_GC_INTERVAL:
-		return handle_session_gc_interval(client_fd, user, payload, hdr);
 	case SG_CMD_SHOW_SESSIONS:
 		return handle_show_sessions(client_fd, user, payload, hdr);
 	case SG_CMD_SHOW_BOOT_CONFIG:

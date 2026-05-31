@@ -161,14 +161,10 @@ int handle_diag_busybox_list(int client_fd, const char *user,
 			     const char *payload, const sg_request_hdr_t *hdr);
 int handle_show_sessions(int client_fd, const char *user,
 			 const char *payload, const sg_request_hdr_t *hdr);
-int handle_diag_session(int client_fd, const char *user,
-			const char *payload, const sg_request_hdr_t *hdr);
 int handle_session_clear(int client_fd, const char *user,
 			 const char *payload, const sg_request_hdr_t *hdr);
 int handle_session_stats(int client_fd, const char *user,
 			 const char *payload, const sg_request_hdr_t *hdr);
-int handle_session_gc_interval(int client_fd, const char *user,
-			       const char *payload, const sg_request_hdr_t *hdr);
 int handle_show_boot_config(int client_fd, const char *user,
 			    const char *payload, const sg_request_hdr_t *hdr);
 int handle_debug_state_get(int client_fd, const char *user,
