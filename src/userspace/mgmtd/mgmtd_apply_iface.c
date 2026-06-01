@@ -476,20 +476,6 @@ sg_status_t apply_interface(const char *id, const char *data,
 }
 
 /* Write a single value to a sysfs module parameter file. Returns 0 on success. */
-static int write_sysfs_param(const char *module, const char *param,
-			     const char *val)
-{
-	char path[160];
-	snprintf(path, sizeof(path),
-		 "/sys/module/%s/parameters/%s", module, param);
-	FILE *fp = fopen(path, "w");
-	if (!fp)
-		return -1;
-	fprintf(fp, "%s\n", val);
-	fclose(fp);
-	return 0;
-}
-
 /*
  * handle_netlink_link_event — process one RTM_NEWLINK message.
  *
@@ -572,30 +558,61 @@ sg_status_t apply_session_ttl(const char *id, const char *data,
 {
 	(void)id;
 
-	static const struct { const char *key; const char *param; const char *def; } map[] = {
-		{ "tcp-none",        "sess_tt_tcp_none",       "120"  },
-		{ "tcp-syn-sent",    "sess_tt_tcp_syn_sent",   "120"  },
-		{ "tcp-syn-recv",    "sess_tt_tcp_syn_recv",   "60"   },
-		{ "tcp-established", "sess_tt_tcp_est",        "3600" },
-		{ "tcp-fin-wait",    "sess_tt_tcp_fin_wait",   "120"  },
-		{ "tcp-close-wait",  "sess_tt_tcp_close_wait", "60"   },
-		{ "tcp-last-ack",    "sess_tt_tcp_last_ack",   "30"   },
-		{ "tcp-time-wait",   "sess_tt_tcp_time_wait",  "120"  },
-		{ "tcp-close",       "sess_tt_tcp_close",      "10"   },
-		{ "tcp-syn-sent2",   "sess_tt_tcp_syn_sent2",  "60"   },
-		{ "udp",             "sess_tt_udp",            "180"  },
-		{ "icmp",            "sess_tt_icmp",           "60"   },
-		{ "other",           "sess_tt_other",          "300"  },
+	/* Map each configured idle timeout onto its nf_conntrack timeout sysctl
+	 * under /proc/sys/net/netfilter/. Each entry is a config key, the sysctl
+	 * name to write, and the default applied when the key is unset. */
+	static const struct { const char *key; const char *sysctl; const char *def; } map[] = {
+		{ "tcp-syn-sent",    "nf_conntrack_tcp_timeout_syn_sent",   "120"  },
+		{ "tcp-syn-recv",    "nf_conntrack_tcp_timeout_syn_recv",   "60"   },
+		{ "tcp-established", "nf_conntrack_tcp_timeout_established", "3600" },
+		{ "tcp-fin-wait",    "nf_conntrack_tcp_timeout_fin_wait",   "120"  },
+		{ "tcp-close-wait",  "nf_conntrack_tcp_timeout_close_wait", "60"   },
+		{ "tcp-last-ack",    "nf_conntrack_tcp_timeout_last_ack",   "30"   },
+		{ "tcp-time-wait",   "nf_conntrack_tcp_timeout_time_wait",  "120"  },
+		{ "tcp-close",       "nf_conntrack_tcp_timeout_close",      "10"   },
+		{ "udp",             "nf_conntrack_udp_timeout",            "180"  },
+		{ "icmp",            "nf_conntrack_icmp_timeout",           "60"   },
+		{ "other",           "nf_conntrack_generic_timeout",        "300"  },
 		{ NULL, NULL, NULL }
 	};
 
+	int applied = 0, failed = 0;
+
 	for (int i = 0; map[i].key; i++) {
 		char val[VALBUFSZ];
+		char path[160];
 		extract_val(data, map[i].key, val, sizeof(val));
-		write_sysfs_param("session", map[i].param,
-				  val[0] ? val : map[i].def);
+
+		snprintf(path, sizeof(path),
+			 "/proc/sys/net/netfilter/%s", map[i].sysctl);
+		FILE *fp = fopen(path, "w");
+		if (!fp) {
+			failed++;
+			continue;
+		}
+		int ok = (fprintf(fp, "%s\n", val[0] ? val : map[i].def) >= 0);
+		if (fclose(fp) != 0)
+			ok = 0;
+		if (ok)
+			applied++;
+		else
+			failed++;
 	}
 
-	snprintf(result, rsize, "Session timeouts applied.");
+	/* If no sysctl could be written the timeouts are unavailable (the
+	 * /proc/sys/net/netfilter/ files exist only when nf_conntrack is
+	 * loaded) — report failure rather than success. */
+	if (applied == 0) {
+		snprintf(result, rsize,
+			 "Connection tracking timeouts unavailable "
+			 "(is nf_conntrack loaded?)");
+		return SG_ERR_SYSTEM_FAIL;
+	}
+	if (failed)
+		snprintf(result, rsize,
+			 "Applied %d timeout(s); %d could not be set.",
+			 applied, failed);
+	else
+		snprintf(result, rsize, "Session timeouts applied.");
 	return SG_OK;
 }
