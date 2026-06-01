@@ -24,6 +24,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <linux/netlink.h>
@@ -1390,19 +1391,158 @@ static const char *ct_l4_name(const char *t)
 	return NULL;
 }
 
+/* connmark layout — MUST match mgmtd_apply_firewall.c. A permitted flow is
+ * stamped with its policy's cmkid in bits 8-31; bit 0 is the DIRTY flag. */
+#define SG_CMK_DIRTY            0x00000001u
+#define SG_CMK_PID_SHIFT        8
+
+/*
+ * cmkid → policy display-name map, built once per session dump so the
+ * per-line parse does no SQL. `name` is the policy's friendly name, or its
+ * DB id when unnamed.
+ */
+struct ct_pol {
+	unsigned cmkid;
+	char     name[64];
+};
+
+/*
+ * ct_policy_map_build - snapshot firewall_policy cmkid→name pairs.
+ * Returns the entry count (>= 0); *out is malloc'd and the caller frees it
+ * (even when the count is 0). Returns -1 on allocation failure.
+ */
+static int ct_policy_map_build(struct ct_pol **out)
+{
+	*out = NULL;
+
+	char *list = sg_db_list("firewall_policy");
+	if (!list)
+		return 0;
+
+	size_t cap = 16, n = 0;
+	struct ct_pol *arr = malloc(cap * sizeof(*arr));
+	if (!arr) {
+		free(list);
+		return -1;
+	}
+
+	char *sp = NULL;
+	for (char *id = strtok_r(list, "\n", &sp); id;
+	     id = strtok_r(NULL, "\n", &sp)) {
+		char *cmk = sg_db_get_val("firewall_policy", id, "cmkid");
+		if (!cmk)
+			continue;               /* never stamped → not in map */
+		unsigned cmkid = (unsigned)atoi(cmk);
+		free(cmk);
+		if (cmkid == 0)
+			continue;
+
+		if (n >= cap) {
+			cap *= 2;
+			struct ct_pol *nb = realloc(arr, cap * sizeof(*arr));
+			if (!nb) {
+				free(arr);
+				free(list);
+				return -1;
+			}
+			arr = nb;
+		}
+		arr[n].cmkid = cmkid;
+		char *name = sg_db_get_val("firewall_policy", id, "name");
+		snprintf(arr[n].name, sizeof(arr[n].name), "%s",
+			 (name && name[0]) ? name : id);
+		free(name);
+		n++;
+	}
+	free(list);
+	*out = arr;
+	return (int)n;
+}
+
+/* Resolve a connmark's cmkid to a policy name; "-" if unstamped or stale
+ * (a deleted policy's stamp is cleared by the next dirty-all re-eval). */
+static const char *ct_policy_name(const struct ct_pol *map, int n,
+				  unsigned cmkid)
+{
+	if (cmkid == 0)
+		return "-";
+	for (int i = 0; i < n; i++)
+		if (map[i].cmkid == cmkid)
+			return map[i].name;
+	return "-";
+}
+
+/*
+ * Per-flow in/out interface map. conntrack does NOT track interfaces; the
+ * pkt_forward FORWARD hook records the original-direction ingress/egress
+ * ifindex into the NF_CT_EXT_ML extension, which is only reachable via
+ * ctnetlink (CTA_ML), not /proc. ct_iface_map_build() dumps it once per
+ * session listing, keyed by the original 5-tuple so ct_emit_line() (which
+ * parses /proc) can overlay it.
+ */
+struct ct_iface_ent {
+	char     key[80];
+	uint16_t iif;
+	uint16_t oif;
+};
+
+/* Build the flow key shared by the /proc and ctnetlink sides: it must be
+ * byte-identical from both, so both call this one formatter. */
+static void ct_flow_key(char *buf, size_t sz, const char *proto,
+			const char *src, unsigned sport,
+			const char *dst, unsigned dport)
+{
+	snprintf(buf, sz, "%s|%s|%u|%s|%u", proto, src, sport, dst, dport);
+}
+
+/* Defined after the ctnetlink helpers below; built in handle_show_sessions. */
+static int ct_iface_map_build(struct ct_iface_ent **out);
+
+/* Look up a flow's ingress/egress ifindex by key; 0/0 if absent (e.g. local
+ * INPUT flows never traverse FORWARD, so they carry no recorded interface). */
+static void ct_iface_lookup(const struct ct_iface_ent *map, int n,
+			    const char *key, unsigned *iif, unsigned *oif)
+{
+	*iif = 0;
+	*oif = 0;
+	if (!map)
+		return;
+	for (int i = 0; i < n; i++) {
+		if (strcmp(map[i].key, key) == 0) {
+			*iif = map[i].iif;
+			*oif = map[i].oif;
+			return;
+		}
+	}
+}
+
+/* ifindex → name into buf (size >= IF_NAMESIZE); "-" if 0 or unresolvable. */
+static const char *ct_ifname(unsigned ifindex, char *buf, size_t sz)
+{
+	if (ifindex == 0 || sz < IF_NAMESIZE)
+		return "-";
+	if (!if_indextoname(ifindex, buf))
+		return "-";
+	return buf;
+}
+
 /*
  * ct_emit_line - parse one /proc/net/nf_conntrack line, append a normalized
  * session line to `out`:
- *   proto=<p> state=<S> src=<ip>:<port> dst=<ip>:<port> pkts=<n> bytes=<n>
- * pkts/bytes sum both directions (nf_conntrack_acct). Returns 0 on success,
- * -1 if unparseable. `line` is modified by strtok_r.
+ *   proto=<p> state=<S> src=<ip>:<port> dst=<ip>:<port> pkts=<n> bytes=<n> policy=<name> iif=<if> oif=<if>
+ * pkts/bytes sum both directions (nf_conntrack_acct); policy is resolved from
+ * the flow's connmark via `map`; iif/oif from the ML iface overlay via `imap`.
+ * Returns 0 on success, -1 if unparseable. `line` is modified by strtok_r.
  */
-static int ct_emit_line(char *line, struct dynbuf *out)
+static int ct_emit_line(char *line, struct dynbuf *out,
+			const struct ct_pol *map, int nmap,
+			const struct ct_iface_ent *imap, int nimap)
 {
 	char proto[12] = "", state[24] = "";
 	char src[INET_ADDRSTRLEN] = "", dst[INET_ADDRSTRLEN] = "";
 	unsigned sport = 0, dport = 0;
 	unsigned long long pkts = 0, bytes = 0;
+	unsigned long mark = 0;
 	int have_proto = 0, have_tuple = 0;
 	char *sp = NULL;
 
@@ -1435,16 +1575,31 @@ static int ct_emit_line(char *line, struct dynbuf *out)
 			pkts += strtoull(t + 8, NULL, 10);
 		} else if (!strncmp(t, "bytes=", 6)) {
 			bytes += strtoull(t + 6, NULL, 10);
+		} else if (!strncmp(t, "mark=", 5)) {
+			if (!mark) mark = strtoul(t + 5, NULL, 0);
 		}
 	}
 	if (!have_proto || !src[0])
 		return -1;
 
-	char l[256];
+	unsigned cmkid = (unsigned)(mark >> SG_CMK_PID_SHIFT);
+	const char *policy = ct_policy_name(map, nmap, cmkid);
+
+	/* Overlay the in/out interfaces recorded in the ML extension, matched
+	 * by the original 5-tuple. Local/INPUT flows carry none → "-". */
+	char key[80];
+	ct_flow_key(key, sizeof(key), proto, src, sport, dst, dport);
+	unsigned iif = 0, oif = 0;
+	ct_iface_lookup(imap, nimap, key, &iif, &oif);
+	char ibuf[IF_NAMESIZE], obuf[IF_NAMESIZE];
+	const char *iifn = ct_ifname(iif, ibuf, sizeof(ibuf));
+	const char *oifn = ct_ifname(oif, obuf, sizeof(obuf));
+
+	char l[320];
 	int n = snprintf(l, sizeof(l),
-			 "proto=%s state=%s src=%s:%u dst=%s:%u pkts=%llu bytes=%llu\n",
+			 "proto=%s state=%s src=%s:%u dst=%s:%u pkts=%llu bytes=%llu policy=%s iif=%s oif=%s\n",
 			 proto, state[0] ? state : "-",
-			 src, sport, dst, dport, pkts, bytes);
+			 src, sport, dst, dport, pkts, bytes, policy, iifn, oifn);
 	if (n > 0)
 		dbuf_append(out, l, (size_t)n);
 	return 0;
@@ -1552,13 +1707,25 @@ int handle_show_sessions(int client_fd, const char *user,
 		return 0;
 	}
 
+	struct ct_pol *pmap = NULL;
+	int npmap = ct_policy_map_build(&pmap);
+	if (npmap < 0)
+		npmap = 0;   /* alloc failure → flows just show policy=- */
+
+	struct ct_iface_ent *imap = NULL;
+	int nimap = ct_iface_map_build(&imap);
+	if (nimap < 0)
+		nimap = 0;   /* dump failure → flows just show iif/oif=- */
+
 	long count = 0;
 	char line[1024];
 	while (fgets(line, sizeof(line), fp)) {
-		if (ct_emit_line(line, &out) == 0)
+		if (ct_emit_line(line, &out, pmap, npmap, imap, nimap) == 0)
 			count++;
 	}
 	fclose(fp);
+	free(pmap);
+	free(imap);
 
 	struct dynbuf resp;
 	if (dbuf_init(&resp, out.used + 64) < 0) {
@@ -1678,6 +1845,13 @@ int handle_session_clear(int client_fd, const char *user,
 #define SG_CTA_PROTO_SRC_PORT   2
 #define SG_CTA_PROTO_DST_PORT   3
 #define SG_CTA_ML               27
+#define SG_CTA_MARK             8    /* conntrack connmark (be32) */
+#define SG_CTA_MARK_MASK        11   /* masked connmark update */
+#define SG_IPCTNL_MSG_CT_NEW    0    /* also used as "update" (no NLM_F_CREATE) */
+#define SG_NLA_F_NESTED         0x8000
+
+/* SG_CMK_DIRTY / SG_CMK_PID_SHIFT are defined up in the nf_conntrack readers
+ * section (above ct_emit_line), which also uses them. */
 
 /* Must match the kernel struct nf_conn_ml (same host/arch, host byte order). */
 struct sg_nf_conn_ml {
@@ -1687,6 +1861,8 @@ struct sg_nf_conn_ml {
 	uint16_t len_min[2];
 	uint16_t len_max[2];
 	int32_t  ml_score;
+	uint16_t iif;   /* ingress ifindex, original direction (0 = unset) */
+	uint16_t oif;   /* egress  ifindex, original direction (0 = unset) */
 };
 
 /* Find attribute `want` in an nlattr stream [data, data+len); return payload. */
@@ -1863,6 +2039,413 @@ int handle_session_ml(int client_fd, const char *user,
 	free(out.data);
 	free(resp.data);
 	return 0;
+}
+
+/* L4 protocol number → /proc name, so a ctnetlink-built key matches the key
+ * ct_emit_line builds from /proc (which uses the name). NULL = unrecognised
+ * (those flows simply won't get an iface overlay). Mirrors ct_l4_name(). */
+static const char *ct_proto_name(unsigned num)
+{
+	switch (num) {
+	case 6:   return "tcp";
+	case 17:  return "udp";
+	case 1:   return "icmp";
+	case 58:  return "icmpv6";
+	case 136: return "udplite";
+	case 132: return "sctp";
+	case 33:  return "dccp";
+	case 47:  return "gre";
+	default:  return NULL;
+	}
+}
+
+/*
+ * ct_iface_map_build - dump conntrack via ctnetlink and capture each FORWARD
+ * flow's original-direction ingress/egress ifindex from the ML extension,
+ * keyed by the same 5-tuple string ct_emit_line() builds from /proc. Flows
+ * with no recorded interface (local/INPUT never hit the FORWARD hook) are
+ * skipped. Returns the entry count (>=0); *out is malloc'd (caller frees,
+ * even when 0). Returns -1 on socket/send/OOM failure → caller shows iif/oif
+ * as "-". A mid-dump timeout returns the partial map (display-only overlay,
+ * so a missing entry is a cosmetic "-", never a correctness issue).
+ */
+static int ct_iface_map_build(struct ct_iface_ent **out)
+{
+	*out = NULL;
+
+	int fd = socket(AF_NETLINK, SOCK_RAW, SG_NETLINK_NETFILTER);
+	if (fd < 0)
+		return -1;
+	struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+	struct {
+		struct nlmsghdr    nlh;
+		struct sg_nfgenmsg nfg;
+	} req;
+	memset(&req, 0, sizeof(req));
+	req.nlh.nlmsg_len    = NLMSG_LENGTH(sizeof(req.nfg));
+	req.nlh.nlmsg_type   = (SG_NFNL_SUBSYS_CTNETLINK << 8) | SG_IPCTNL_MSG_CT_GET;
+	req.nlh.nlmsg_flags  = NLM_F_REQUEST | NLM_F_DUMP;
+	req.nlh.nlmsg_seq    = 1;
+	req.nfg.nfgen_family = AF_INET;
+
+	struct sockaddr_nl sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.nl_family = AF_NETLINK;
+
+	if (sendto(fd, &req, req.nlh.nlmsg_len, 0,
+		   (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		close(fd);
+		return -1;
+	}
+
+	struct ct_iface_ent *arr = NULL;
+	size_t n = 0, cap = 0;
+	char rbuf[32768];
+	int done = 0;
+
+	while (!done) {
+		ssize_t rn = recv(fd, rbuf, sizeof(rbuf), 0);
+		struct nlmsghdr *nh;
+		int rem;
+
+		if (rn <= 0)
+			break;		/* timeout → return partial map */
+		rem = (int)rn;
+		for (nh = (struct nlmsghdr *)rbuf; NLMSG_OK(nh, rem);
+		     nh = NLMSG_NEXT(nh, rem)) {
+			const void *attrs, *mlp, *tup;
+			int alen, ml_len = 0, tlen = 0;
+			struct sg_nf_conn_ml ml;
+			char src[INET_ADDRSTRLEN] = "", dst[INET_ADDRSTRLEN] = "";
+			unsigned sport = 0, dport = 0;
+			const char *pname = NULL;
+
+			if (nh->nlmsg_type == NLMSG_DONE ||
+			    nh->nlmsg_type == NLMSG_ERROR) {
+				done = 1;
+				break;
+			}
+			attrs = (const char *)NLMSG_DATA(nh) +
+				NLMSG_ALIGN(sizeof(struct sg_nfgenmsg));
+			alen = (int)nh->nlmsg_len - NLMSG_HDRLEN -
+			       (int)NLMSG_ALIGN(sizeof(struct sg_nfgenmsg));
+			if (alen <= 0)
+				continue;
+
+			mlp = sg_nla_find(attrs, alen, SG_CTA_ML, &ml_len);
+			if (!mlp)
+				continue;
+			memset(&ml, 0, sizeof(ml));
+			memcpy(&ml, mlp,
+			       ml_len < (int)sizeof(ml) ? (size_t)ml_len : sizeof(ml));
+			if (ml.iif == 0 && ml.oif == 0)
+				continue;	/* no interface recorded */
+
+			tup = sg_nla_find(attrs, alen, SG_CTA_TUPLE_ORIG, &tlen);
+			if (!tup)
+				continue;
+			{
+				int l = 0;
+				const void *ip = sg_nla_find(tup, tlen,
+							     SG_CTA_TUPLE_IP, &l);
+				const void *pr;
+
+				if (ip) {
+					int il = 0;
+					const void *s = sg_nla_find(ip, l,
+							SG_CTA_IP_V4_SRC, &il);
+					const void *d = sg_nla_find(ip, l,
+							SG_CTA_IP_V4_DST, &il);
+					if (s) inet_ntop(AF_INET, s, src, sizeof(src));
+					if (d) inet_ntop(AF_INET, d, dst, sizeof(dst));
+				}
+				l = 0;
+				pr = sg_nla_find(tup, tlen, SG_CTA_TUPLE_PROTO, &l);
+				if (pr) {
+					int pl = 0;
+					const void *pn = sg_nla_find(pr, l,
+							SG_CTA_PROTO_NUM, &pl);
+					const void *sp = sg_nla_find(pr, l,
+							SG_CTA_PROTO_SRC_PORT, &pl);
+					const void *dp = sg_nla_find(pr, l,
+							SG_CTA_PROTO_DST_PORT, &pl);
+					if (pn) pname = ct_proto_name(*(const uint8_t *)pn);
+					if (sp) sport = ntohs(*(const uint16_t *)sp);
+					if (dp) dport = ntohs(*(const uint16_t *)dp);
+				}
+			}
+			if (!pname || !src[0])
+				continue;	/* can't form a matching key */
+
+			if (n == cap) {
+				size_t ncap = cap ? cap * 2 : 256;
+				struct ct_iface_ent *t =
+					realloc(arr, ncap * sizeof(*arr));
+				if (!t) {
+					free(arr);
+					close(fd);
+					return -1;
+				}
+				arr = t;
+				cap = ncap;
+			}
+			ct_flow_key(arr[n].key, sizeof(arr[n].key),
+				    pname, src, sport, dst, dport);
+			arr[n].iif = ml.iif;
+			arr[n].oif = ml.oif;
+			n++;
+		}
+	}
+	close(fd);
+	*out = arr;
+	return (int)n;
+}
+
+/* One buffered live flow: its CTA_TUPLE_ORIG payload (verbatim, to echo back in
+ * the update) plus the current connmark. */
+struct sg_dirty_ent {
+	uint32_t mark;
+	uint16_t tlen;
+	uint8_t  tuple[128];
+};
+
+/* Append one netlink attribute to a flat message buffer. Returns 0 / -1. */
+static int sg_nla_put(char *buf, int *off, int cap, int type,
+		      const void *data, int dlen)
+{
+	int total = NLA_HDRLEN + dlen;
+	int aligned = NLA_ALIGN(total);
+	struct nlattr *nla;
+	int i;
+
+	if (dlen < 0 || *off + aligned > cap)
+		return -1;
+	nla = (struct nlattr *)(buf + *off);
+	nla->nla_len  = (uint16_t)total;
+	nla->nla_type = (uint16_t)type;
+	if (dlen)
+		memcpy(buf + *off + NLA_HDRLEN, data, (size_t)dlen);
+	for (i = total; i < aligned; i++)
+		buf[*off + i] = 0;
+	*off += aligned;
+	return 0;
+}
+
+/*
+ * conntrack_mark_dirty_by_policy - set the connmark DIRTY bit on live flows so
+ * they re-traverse the freshly-rebuilt FORWARD chain on their next packet.
+ *
+ * pid == 0  → every flow. pid == cmkid → only flows that policy stamped
+ * (mark>>SG_CMK_PID_SHIFT == pid). Two passes on one in-process NFNETLINK
+ * socket: (1) CT_GET|NLM_F_DUMP, buffer matching flows; (2) CT_NEW masked
+ * update per flow, setting DIRTY without disturbing the policy_id bits.
+ *
+ * Returns 0 on success, negative on a hard failure (caller then flushes the
+ * whole table). Benign per-flow update errors (e.g. a flow torn down between
+ * the two passes) are tolerated; only an all-updates-failed run is treated as
+ * a hard failure.
+ */
+int conntrack_mark_dirty_by_policy(unsigned int pid)
+{
+	int fd, rc = -1;
+	struct sockaddr_nl sa;
+	struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+	struct sg_dirty_ent *ents = NULL;
+	size_t n = 0, cap = 0;
+	unsigned int seq = 100;
+	char rbuf[32768];
+
+	fd = socket(AF_NETLINK, SOCK_RAW, SG_NETLINK_NETFILTER);
+	if (fd < 0)
+		return -1;
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	memset(&sa, 0, sizeof(sa));
+	sa.nl_family = AF_NETLINK;
+
+	/* ── Pass 1: dump every flow, buffer the ones we need to dirty ── */
+	{
+		struct {
+			struct nlmsghdr    nlh;
+			struct sg_nfgenmsg nfg;
+		} req;
+		int done = 0, dump_ok = 0;
+
+		memset(&req, 0, sizeof(req));
+		req.nlh.nlmsg_len    = NLMSG_LENGTH(sizeof(req.nfg));
+		req.nlh.nlmsg_type   = (SG_NFNL_SUBSYS_CTNETLINK << 8) |
+				       SG_IPCTNL_MSG_CT_GET;
+		req.nlh.nlmsg_flags  = NLM_F_REQUEST | NLM_F_DUMP;
+		req.nlh.nlmsg_seq    = ++seq;
+		req.nfg.nfgen_family = AF_INET;
+
+		if (sendto(fd, &req, req.nlh.nlmsg_len, 0,
+			   (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+			close(fd);
+			return -1;
+		}
+
+		while (!done) {
+			ssize_t rn = recv(fd, rbuf, sizeof(rbuf), 0);
+			struct nlmsghdr *nh;
+			int rem;
+
+			if (rn <= 0)
+				break;		/* timeout/error: dump incomplete */
+			rem = (int)rn;
+			for (nh = (struct nlmsghdr *)rbuf; NLMSG_OK(nh, rem);
+			     nh = NLMSG_NEXT(nh, rem)) {
+				const void *attrs, *mp, *tup;
+				int alen, mlen = 0, tlen = 0;
+				uint32_t mark;
+
+				/* A clean NLMSG_DONE is the only success terminator.
+				 * NLMSG_ERROR means the dump request was rejected —
+				 * leave dump_ok = 0 so we fall back to a full flush
+				 * rather than mistaking a failed dump for an empty
+				 * table and skipping re-evaluation. */
+				if (nh->nlmsg_type == NLMSG_DONE) {
+					done = 1;
+					dump_ok = 1;
+					break;
+				}
+				if (nh->nlmsg_type == NLMSG_ERROR) {
+					done = 1;
+					break;
+				}
+				attrs = (const char *)NLMSG_DATA(nh) +
+					NLMSG_ALIGN(sizeof(struct sg_nfgenmsg));
+				alen = (int)nh->nlmsg_len - NLMSG_HDRLEN -
+				       (int)NLMSG_ALIGN(sizeof(struct sg_nfgenmsg));
+				if (alen <= 0)
+					continue;
+
+				mp = sg_nla_find(attrs, alen, SG_CTA_MARK, &mlen);
+				mark = (mp && mlen >= 4) ?
+				       ntohl(*(const uint32_t *)mp) : 0;
+
+				/* Narrow filter: only the policy's own flows. */
+				if (pid != 0 &&
+				    (mark >> SG_CMK_PID_SHIFT) != pid)
+					continue;
+				/* Already dirty → nothing to do. */
+				if (mark & SG_CMK_DIRTY)
+					continue;
+
+				tup = sg_nla_find(attrs, alen,
+						  SG_CTA_TUPLE_ORIG, &tlen);
+				if (!tup || tlen <= 0 ||
+				    tlen > (int)sizeof(ents[0].tuple))
+					continue;	/* can't address it — skip */
+
+				if (n == cap) {
+					size_t ncap = cap ? cap * 2 : 256;
+					struct sg_dirty_ent *t =
+						realloc(ents,
+							ncap * sizeof(*ents));
+					if (!t) {
+						free(ents);
+						close(fd);
+						return -1;  /* OOM → flush */
+					}
+					ents = t;
+					cap = ncap;
+				}
+				ents[n].mark = mark;
+				ents[n].tlen = (uint16_t)tlen;
+				memcpy(ents[n].tuple, tup, (size_t)tlen);
+				n++;
+			}
+		}
+
+		/* Dump ended without a clean NLMSG_DONE (rejected request or a
+		 * recv timeout mid-stream) → we may not have seen every flow.
+		 * Fail safe: tell the caller to flush rather than leave some
+		 * now-denied flows carrying a stale clean fast-path mark. */
+		if (!dump_ok) {
+			free(ents);
+			close(fd);
+			return -1;
+		}
+	}
+
+	if (n == 0) {		/* nothing matched — success, nothing to do */
+		free(ents);
+		close(fd);
+		return 0;
+	}
+
+	/* ── Pass 2: masked CT_NEW update setting DIRTY on each buffered flow ── */
+	{
+		size_t i, fails = 0;
+
+		for (i = 0; i < n; i++) {
+			char msg[512];
+			struct nlmsghdr *nlh = (struct nlmsghdr *)msg;
+			struct sg_nfgenmsg *nfg =
+				(struct sg_nfgenmsg *)(msg + NLMSG_HDRLEN);
+			int off = NLMSG_HDRLEN +
+				  NLMSG_ALIGN(sizeof(struct sg_nfgenmsg));
+			uint32_t bmark = htonl(ents[i].mark | SG_CMK_DIRTY);
+			uint32_t bmask = htonl(SG_CMK_DIRTY);
+
+			memset(msg, 0, sizeof(msg));
+			if (sg_nla_put(msg, &off, sizeof(msg),
+				       SG_CTA_TUPLE_ORIG | SG_NLA_F_NESTED,
+				       ents[i].tuple, ents[i].tlen) < 0 ||
+			    sg_nla_put(msg, &off, sizeof(msg),
+				       SG_CTA_MARK, &bmark, 4) < 0 ||
+			    sg_nla_put(msg, &off, sizeof(msg),
+				       SG_CTA_MARK_MASK, &bmask, 4) < 0) {
+				fails++;
+				continue;
+			}
+
+			nlh->nlmsg_len   = (uint32_t)off;
+			nlh->nlmsg_type  = (SG_NFNL_SUBSYS_CTNETLINK << 8) |
+					   SG_IPCTNL_MSG_CT_NEW;
+			nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+			nlh->nlmsg_seq   = ++seq;
+			nfg->nfgen_family = AF_INET;
+
+			if (sendto(fd, msg, off, 0, (struct sockaddr *)&sa,
+				   sizeof(sa)) < 0) {
+				fails++;
+				continue;
+			}
+			/* Drain the ACK so the socket buffer can't back up. A
+			 * per-flow ENOENT (flow vanished between passes) arrives
+			 * as a real NLMSG_ERROR and is benign. A missing ACK
+			 * (recv timeout / short read) means the update was NOT
+			 * confirmed — count it as a failure too, mirroring the
+			 * pass-1 dump_ok discipline, so an all-timed-out run
+			 * yields fails >= n → flush rather than silently leaving
+			 * stale clean marks (fail-closed). */
+			{
+				ssize_t rn = recv(fd, rbuf, sizeof(rbuf), 0);
+				if (rn < (ssize_t)NLMSG_HDRLEN) {
+					fails++;	/* timeout / short read */
+				} else {
+					struct nlmsghdr *rh =
+						(struct nlmsghdr *)rbuf;
+					if (rh->nlmsg_type == NLMSG_ERROR) {
+						struct nlmsgerr *e =
+							NLMSG_DATA(rh);
+						if (e->error != 0)
+							fails++;
+					}
+				}
+			}
+		}
+		/* Every single update failed → masked update unsupported or the
+		 * table is unreachable; tell the caller to flush instead. */
+		rc = (fails >= n) ? -1 : 0;
+	}
+
+	free(ents);
+	close(fd);
+	return rc;
 }
 
 /* ── SG_CMD_SHOW_BOOT_CONFIG (651) ─────────────────────────────────────── */

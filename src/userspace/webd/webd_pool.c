@@ -1780,27 +1780,35 @@ static void flow_monitor_sessions(work_item_t *item)
 		line[cp] = '\0';
 
 		char proto[12], state[24], src[64], dst[64], pkts[32], bytes[32];
+		char policy[64], iif[24], oif[24];
 
-		kv_extract(line, "proto", proto, sizeof(proto));
-		kv_extract(line, "state", state, sizeof(state));
-		kv_extract(line, "src",   src,   sizeof(src));
-		kv_extract(line, "dst",   dst,   sizeof(dst));
-		kv_extract(line, "pkts",  pkts,  sizeof(pkts));
-		kv_extract(line, "bytes", bytes, sizeof(bytes));
+		kv_extract(line, "proto",  proto,  sizeof(proto));
+		kv_extract(line, "state",  state,  sizeof(state));
+		kv_extract(line, "src",    src,    sizeof(src));
+		kv_extract(line, "dst",    dst,    sizeof(dst));
+		kv_extract(line, "pkts",   pkts,   sizeof(pkts));
+		kv_extract(line, "bytes",  bytes,  sizeof(bytes));
+		kv_extract(line, "policy", policy, sizeof(policy));
+		kv_extract(line, "iif",    iif,    sizeof(iif));
+		kv_extract(line, "oif",    oif,    sizeof(oif));
 
 		if (!proto[0]) {
 			p = nl ? nl + 1 : p + ll;
 			continue;
 		}
+		if (!policy[0]) { policy[0] = '-'; policy[1] = '\0'; }
+		if (!iif[0])    { iif[0]    = '-'; iif[1]    = '\0'; }
+		if (!oif[0])    { oif[0]    = '-'; oif[1]    = '\0'; }
 
 		if (!first) SJ_APP(",", 1);
 		first = 0;
 
-		char entry[320];
+		char entry[448];
 		int elen = snprintf(entry, sizeof(entry),
 			"{\"proto\":\"%s\",\"state\":\"%s\",\"src\":\"%s\","
-			"\"dst\":\"%s\",\"pkts\":\"%s\",\"bytes\":\"%s\"}",
-			proto, state, src, dst, pkts, bytes);
+			"\"dst\":\"%s\",\"pkts\":\"%s\",\"bytes\":\"%s\","
+			"\"policy\":\"%s\",\"iif\":\"%s\",\"oif\":\"%s\"}",
+			proto, state, src, dst, pkts, bytes, policy, iif, oif);
 		if (elen > 0 && (size_t)elen < sizeof(entry))
 			SJ_APP(entry, (size_t)elen);
 

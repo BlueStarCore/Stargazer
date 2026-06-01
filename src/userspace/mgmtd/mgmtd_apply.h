@@ -138,4 +138,14 @@ sg_status_t apply_session_ttl(const char *id, const char *data,
  * Defined in mgmtd_diag.c. Returns 0 on success, negative on failure. */
 int conntrack_flush_all(void);
 
+/* Set the connmark DIRTY bit on live flows so they re-traverse the FORWARD
+ * chain on their next packet. pid==0 = all flows; pid==cmkid = only flows that
+ * policy stamped. In-process NFNETLINK dump + per-flow update. Defined in
+ * mgmtd_diag.c. Returns 0 on success, negative on failure. */
+int conntrack_mark_dirty_by_policy(unsigned int pid);
+
+/* Re-evaluate live flows after a FORWARD policy rebuild (connmark dirty, or
+ * flush fallback). Defined in mgmtd_apply_firewall.c. */
+void conntrack_reeval_after_policy_change(unsigned int pid);
+
 #endif /* MGMTD_APPLY_H */

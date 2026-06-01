@@ -160,7 +160,7 @@ static bool is_valid_ipv4(struct sk_buff *skb)
  * and accumulated TCP flags. Direction is taken from conntrack (CTINFO2DIR).
  * Best-effort, under the per-conntrack lock; untracked packets (no ext) skip.
  */
-static void ml_account(struct sk_buff *skb, u8 proto)
+static void ml_account(struct sk_buff *skb, u8 proto, int iif, int oif)
 {
 	enum ip_conntrack_info ctinfo;
 	struct nf_conn *ct = nf_ct_get(skb, &ctinfo);
@@ -182,6 +182,12 @@ static void ml_account(struct sk_buff *skb, u8 proto)
 	now = ktime_get_ns();
 
 	spin_lock_bh(&ct->lock);
+	/* Record the flow's in/out interfaces from the original direction only
+	 * (reply packets traverse FORWARD with in/out swapped). Set once. */
+	if (dir == IP_CT_DIR_ORIGINAL && ml->iif == 0) {
+		ml->iif = (u16)iif;
+		ml->oif = (u16)oif;
+	}
 	if (ml->first_ns == 0) {
 		ml->first_ns = now;
 	} else {
@@ -248,8 +254,12 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 		return NF_DROP;
 	}
 
-	/* [3] Accepted: record per-flow features for the ML daemon. */
-	ml_account(skb, proto);
+	/* [3] Accepted: record per-flow features for the ML daemon.
+	 * At the FORWARD hook state->in/out are the flow's actual ingress and
+	 * egress interfaces (conntrack stores neither, so we capture them here). */
+	ml_account(skb, proto,
+		   state->in  ? state->in->ifindex  : 0,
+		   state->out ? state->out->ifindex : 0);
 
 	atomic64_inc(&pkts_forwarded);
 	return NF_ACCEPT;

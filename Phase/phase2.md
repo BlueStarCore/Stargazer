@@ -34,8 +34,9 @@ That design has been retired. What this phase delivers now:
   session header, and the entire DoS-policy configuration/validation/CLI/IPC
   surface are deleted.
 
-Policy enforcement is delegated to **iptables** using a connmark "generation"
-scheme so that a policy change re-evaluates only the affected live flows.
+Policy enforcement is delegated to **iptables** using a per-flow connmark
+`policy_id` + DIRTY-bit scheme so that a policy change re-evaluates the affected
+live flows instead of dropping every connection.
 
 ---
 
@@ -46,7 +47,7 @@ Division of labour after the migration:
 | Component | Responsibility |
 |---|---|
 | **nf_conntrack** (kernel) | All connection state, the TCP state machine, and NAT. Source of truth for flows. |
-| **iptables FORWARD chain** | Policy enforcement: `INVALID` drop, connmark-generation fast-path/re-eval, ACCEPT/DROP per configured rule. |
+| **iptables FORWARD chain** | Policy enforcement: `INVALID` drop, connmark DIRTY-bit fast-path/re-eval (per-flow `policy_id`), ACCEPT/DROP per configured rule. |
 | **pkt_forward.ko** | Stateless anomaly screen (IPv4 validation + L3/L4 anomaly drop) and per-packet ML feature accounting into the conntrack ML extension. |
 | **ipset / ML scoring daemon** | Active blocking based on `ml_score`. **Deferred** — no model and `CONFIG_IP_SET` is off. The `ml_score` field exists and is exportable, but nothing writes it back or blocks on it yet. |
 
@@ -123,13 +124,13 @@ drops malformed/attack packets before the kernel spends work tracking them.
 |---|---|
 | `src/modules/pkt_forward.c` | Rewritten: stateless anomaly screen + `ml_account()` into the conntrack ML extension. All session/DoS code removed. |
 | `src/modules/Makefile` | `obj-m += pkt_forward.o` only (dropped `session.o`, `session_test.o`). |
-| `src/userspace/mgmtd/mgmtd_diag.c` | Conntrack readers: `handle_show_sessions`, `handle_session_stats`, `handle_session_clear` (netlink CT_DELETE), `handle_session_ml` (netlink CT_GET+DUMP, parses `CTA_ML`); `ct_emit_line()`, `ct_ml_emit()`, `conntrack_flush_all()`. |
-| `src/userspace/mgmtd/mgmtd_apply_firewall.c` | `rebuild_forward_chain()` connmark-generation re-eval; `connmark_supported()` probe; flush fallback. |
+| `src/userspace/mgmtd/mgmtd_diag.c` | Conntrack readers: `handle_show_sessions` (resolves each flow's `policy_id` to a policy name via `ct_policy_map_build`), `handle_session_stats`, `handle_session_clear` (netlink CT_DELETE), `handle_session_ml` (netlink CT_GET+DUMP, parses `CTA_ML`); `ct_emit_line()`, `ct_ml_emit()`, `conntrack_flush_all()`, `conntrack_mark_dirty_by_policy()`. |
+| `src/userspace/mgmtd/mgmtd_apply_firewall.c` | `rebuild_forward_chain()` builds the DIRTY-bit/`policy_id` fast-path + ACCEPT stamps; `connmark_supported()` probe; `conntrack_reeval_after_policy_change()` (dirty live flows, flush on failure). |
 | `src/userspace/mgmtd/stargazer-mgmtd.c` | Dispatch for `SG_CMD_SESSION_*`; DoS dispatcher/apply-order entries removed. |
 | `src/userspace/mgmtd/stargazer_ipc.h` | IPC command IDs; `SG_CMD_SESSION_BLOCKS` removed. |
 | `src/userspace/cli/cli_cmd_table.c`, `cli_show.c`, `cli_diagnose_session.c` | `show sessions`, `execute diagnose session {status,stats,clear,ml}`, selftest SESS-01..05; DoS `blocks` command removed. |
-| `src/userspace/webd/webd_pool.c` | `flow_monitor_sessions()` → `/monitor/sessions` JSON. |
-| `src/userspace/webui/www/home.html`, `js/app.js` | Session table, filters, dashboard session gauge. |
+| `src/userspace/webd/webd_pool.c` | `flow_monitor_sessions()` → `/monitor/sessions` JSON (includes per-flow `policy` name). |
+| `src/userspace/webui/www/home.html`, `js/app.js` | Session table (incl. `POLICY` column), filters, dashboard session gauge. |
 | `src/userspace/common/sg_validate.c` | `system_dos-policy` type + 18 fields and validation removed. |
 | `etc/sysctl.d/10-stargazer.conf` | `nf_conntrack_max`, `nf_conntrack_acct=1`, `nf_conntrack_timestamp=1`. |
 | `etc/modules-load.d/stargazer.conf` | Load `pkt_forward` (and `af_packet`); session module removed. |
@@ -253,41 +254,78 @@ packets are skipped), resolves direction via `CTINFO2DIR(ctinfo)`, then under
 - Update `len_min[dir]` / `len_max[dir]`.
 - For TCP, OR the flag bitmap into `tcp_flags[dir]`.
 
-### (b) Policy-change connmark-generation re-evaluation
+### (b) Policy-change re-evaluation — per-flow `policy_id` (DIRTY bit)
 
-When firewall policy changes, `rebuild_forward_chain()` re-evaluates only the
-flows the change affects, instead of dropping every connection.
+When firewall policy changes, live flows are re-evaluated against the rebuilt
+FORWARD chain instead of every connection being dropped. The scheme is the
+FortiGate-style "dirty session": each permitted flow carries the **policy_id**
+(a stable per-policy `cmkid`) of the rule that allowed it, and a policy change
+flags the relevant flows **dirty** so their next packet re-traverses the chain.
 
 `connmark_supported()` runs a one-time probe: it builds a temp chain and tests
-`-m connmark --mark 0/0xff -j CONNMARK --set-xmark 0/0xff`, caching the result.
+`-m connmark --mark 0/0x1 -j CONNMARK --set-xmark 0/0x1`, caching the result.
 
-**Connmark path** (`SG_CMK_MASK = 0xFF`, generation cycles `1..255`, never 0):
+**Connmark layout** (`mgmtd_apply_firewall.c`, mirrored in `mgmtd_diag.c`):
 
-1. Bump `fwd_policy_gen = (fwd_policy_gen % 255) + 1`. Flush the FORWARD chain
-   (policy `DROP` covers the rebuild window).
-2. Foundation rules:
+```
+bit 0      DIRTY                 SG_CMK_DIRTY      0x00000001
+bit 1-7    reserved (0)
+bit 8-31   policy_id (cmkid)     SG_CMK_PID_SHIFT  8
+stamp mask (set pid, clear DIRTY)  SG_CMK_STAMP_MASK 0xFFFFFF01
+```
+
+`cmkid` is a monotonic per-policy id (`cmkid_auto_assign()` on create,
+backfilled in `mgmtd_reconcile_config`); unlike `sequence` it never changes on
+reorder, so a flow's stamp keeps pointing at the same policy. It is an internal
+field — hidden from `show`/config export.
+
+1. Foundation rules:
    ```
    -A FORWARD -m conntrack --ctstate INVALID -j DROP
    -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED \
-              -m connmark --mark 0x<gen>/0xff -j ACCEPT
+              -m connmark ! --mark 0x1/0x1 -j ACCEPT
    ```
-   Only flows stamped with the **current** generation take the fast-path;
-   stale-generation and NEW flows fall through to be re-evaluated.
-3. Policy rules (highest sequence first):
-   - **ACCEPT** rules are preceded by a `CONNMARK --set-xmark 0x<gen>/0xff` stamp,
-     then `-j ACCEPT`.
-   - **DENY/DROP** rules do **not** stamp — those flows stay stale-gen and fall
-     to the policy `DROP`.
-4. On the next packet of each live flow:
-   - **Still allowed** → matches a rule → re-stamped with the new gen → fast-path,
-     uninterrupted.
-   - **Newly denied** → falls through the ESTABLISHED rule (gen no longer matches)
-     → hits the policy `DROP`.
-   - **Management/SSH** flows that remain allowed are re-stamped and untouched.
+   A flow with DIRTY **clear** takes the fast-path ACCEPT; DIRTY-set and NEW
+   flows fall through to the policy rules to be re-evaluated.
+2. Policy rules (highest sequence first):
+   - **ACCEPT** rules are preceded by
+     `CONNMARK --set-xmark 0x<cmkid<<8>/0xffffff01` (writes policy_id, clears
+     DIRTY), then `-j ACCEPT`.
+   - **DENY/DROP** rules do **not** stamp — a dirty denied flow stays dirty and
+     falls to the policy `DROP`.
+3. `rebuild_forward_chain()` only rebuilds the chain; the dirty step is a
+   separate caller action: `conntrack_reeval_after_policy_change(pid)` →
+   `conntrack_mark_dirty_by_policy(pid)` sets the DIRTY bit on live flows via
+   in-process NFNETLINK (CT dump, then masked `CT_NEW` updates — no shell-out).
+   `pid == 0` dirties **all** flows; `pid == cmkid` dirties only that policy's
+   own flows. The scope is chosen by the caller per operation, defaulting to 0
+   on any doubt (under-dirtying would fail open):
+   - **Narrow** (`pid = cmkid(P)`) — *delete P*, and an *in-place edit of P*
+     that changes only its action/comment (no selector, sequence, or
+     disabled→enabled change). In both cases the only live flows whose verdict
+     can change are the ones P already permitted, which carry `cmkid(P)`.
+     `policy_reeval_scope()` makes the edit decision by diffing old vs new.
+   - **Dirty-all** (`pid = 0`) — *create* a policy, *enable* a disabled one,
+     *reorder* (sequence change / `CFG_INSERT`), any *selector edit*, and
+     *address/service cascade* rebuilds. These can re-shadow flows that belong
+     to **other** policies (carrying a different cmkid), so a narrow pass would
+     miss them.
+   Boot replay does not re-evaluate.
+4. On the next packet of each dirtied flow:
+   - **Still allowed** → matches a rule → re-stamped (policy_id set, DIRTY
+     cleared) → fast-path again, non-destructive.
+   - **Newly denied** → no ACCEPT rule matches → hits the policy `DROP`.
+   - **Management/SSH** is in INPUT, not FORWARD — untouched.
 
-**Fallback (no connmark support):** `conntrack_flush_all()` (netlink
-`CT_DELETE`) clears the whole table; all flows re-establish, which can briefly
-interrupt management traffic.
+**Fallbacks:** if connmark is unsupported, or `conntrack_mark_dirty_by_policy()`
+reports a hard failure (e.g. the CT dump was rejected or timed out — it returns
+negative rather than mistaking a failed dump for an empty table),
+`conntrack_reeval_after_policy_change()` calls `conntrack_flush_all()` (netlink
+`CT_DELETE`) so no flow is ever left with a stale clean mark.
+
+**Policy-name display:** `SHOW_SESSIONS` reads each flow's `mark`, derives
+`cmkid = mark >> 8`, and resolves it to the owning policy's name (cmkid→name map
+built once per dump) — shown as the `POLICY` column in the web session table.
 
 ### (c) ML feature lifecycle
 

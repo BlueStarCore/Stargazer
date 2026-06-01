@@ -878,6 +878,11 @@ static int context_entry(const char *type_name, const char *label,
 				       sg_reg_valid_keys(type_name));
 				continue;
 			}
+			if (sg_reg_is_hidden_key(type_name, key)) {
+				printf("  Error: '%s' is an internal field"
+				       " and cannot be set\n", key);
+				continue;
+			}
 			/* Password: interactive prompt */
 			if (strcmp(type_name, "system_admin") == 0 &&
 			    strcmp(key, "password") == 0) {
@@ -933,6 +938,11 @@ static int context_entry(const char *type_name, const char *label,
 			if (!sg_reg_is_valid_key(type_name, key)) {
 				printf("  Error: invalid key '%s' for %s\n",
 				       key, type_name);
+				continue;
+			}
+			if (sg_reg_is_hidden_key(type_name, key)) {
+				printf("  Error: '%s' is an internal field"
+				       " and cannot be unset\n", key);
 				continue;
 			}
 			if (strcmp(type_name, "system_admin") == 0 &&

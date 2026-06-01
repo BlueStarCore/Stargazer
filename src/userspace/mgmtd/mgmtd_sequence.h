@@ -37,6 +37,14 @@ int seq_type_is_orderable(const char *type);
 int seq_auto_assign(const char *type, char *data, size_t data_sz);
 
 /*
+ * Auto-assign a stable connmark id: cmkid = max(existing) + 1.
+ * Appends "cmkid=N\n" to data buffer if no "cmkid=" key exists.
+ * Used by firewall_policy so live flows can be stamped with the owning
+ * policy and re-evaluated on policy change. Returns 0 / -1 (buffer too small).
+ */
+int cmkid_auto_assign(const char *type, char *data, size_t data_sz);
+
+/*
  * Rotate sequences in the affected range when moving an entry.
  *
  * Moving UP   (old_seq < new_seq): entries in (old_seq, new_seq] get -1

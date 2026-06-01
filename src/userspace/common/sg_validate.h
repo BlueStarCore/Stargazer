@@ -81,6 +81,10 @@ const char *sg_reg_valid_keys(const char *type_name);
 /* Check if key is valid for type. Returns 1 if valid, 0 if not. */
 int sg_reg_is_valid_key(const char *type_name, const char *key);
 
+/* Check if key is an internal hidden field (not user-settable, not shown).
+ * Returns 1 if hidden, 0 otherwise (including unknown keys). */
+int sg_reg_is_hidden_key(const char *type_name, const char *key);
+
 /* Check if key is optional. Returns 1 if optional, 0 if required. */
 int sg_reg_is_optional(const char *type_name, const char *key);
 

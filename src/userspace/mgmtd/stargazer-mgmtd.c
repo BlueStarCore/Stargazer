@@ -2267,6 +2267,45 @@ static void mgmtd_reconcile_config(void)
 		}
 	}
 
+	/* ── Phase 4b: backfill connmark ids (firewall_policy) ──────
+	 *
+	 * Every policy needs a stable cmkid so its ACCEPT rule can stamp
+	 * the flows it permits. Assign monotonically to any policy lacking
+	 * one (e.g. rows created before this feature, or the seeded base
+	 * policy). cmkid never gets reused, so we start above the max. */
+	{
+		char *list = sg_db_list("firewall_policy");
+		if (list) {
+			char *max_str =
+				sg_db_get_max_int("firewall_policy", "cmkid");
+			int next_cmkid = (max_str ? atoi(max_str) : 0) + 1;
+			free(max_str);
+
+			char *saveptr = NULL;
+			for (char *tok = strtok_r(list, "\n", &saveptr);
+			     tok;
+			     tok = strtok_r(NULL, "\n", &saveptr)) {
+				char *existing = sg_db_get_val(
+					"firewall_policy", tok, "cmkid");
+				if (existing) {
+					free(existing);
+					continue;
+				}
+				char val[16];
+				snprintf(val, sizeof(val), "%d", next_cmkid);
+				sg_db_set_val("firewall_policy", tok,
+					      "cmkid", val);
+				mgmt_log("INFO",
+					 "reconcile: backfilled "
+					 "firewall_policy:%s cmkid=%d",
+					 tok, next_cmkid);
+				next_cmkid++;
+				changes++;
+			}
+			free(list);
+		}
+	}
+
 	/* ── Phase 5: purge stale types ───────────────────────────── */
 
 	char *db_types = sg_db_list_types();
@@ -3366,6 +3405,58 @@ void extract_val(const char *data, const char *key,
 	}
 }
 
+/*
+ * policy_reeval_scope — after an in-place firewall_policy edit, decide which
+ * live flows must be re-evaluated.  Returns the policy's cmkid to dirty ONLY
+ * that policy's own flows, or 0 to dirty ALL flows.
+ *
+ * Narrowing to cmkid(P) is correct only when the edit cannot change which
+ * flows P matches, cannot move P, and cannot make a disabled P newly active.
+ * In those cases the only live flows whose verdict can change are the ones P
+ * already permitted (they carry cmkid(P)); every other flow keeps matching the
+ * same policy at the same position, so its verdict is unchanged.
+ *
+ * If ANY match/position field changes (srcintf, dstintf, srcaddr, dstaddr,
+ * service, schedule, sequence) or a disabled policy is being enabled, the edit
+ * can re-shadow flows that belong to OTHER policies (which carry a different
+ * cmkid) — those would be missed by a narrow pass, so we fall back to all.
+ * Defaults to 0 (dirty-all) on any doubt; under-dirtying would fail open.
+ *
+ * Both old_data and new_data are full, default-backfilled entry payloads, so
+ * every shadow-relevant key is present in each.
+ */
+static unsigned policy_reeval_scope(const char *old_data, const char *new_data)
+{
+	if (!old_data || !new_data)
+		return 0;
+
+	/* Match/position keys: any change can re-shadow other policies' flows. */
+	static const char *shadow_keys[] = {
+		"srcintf", "dstintf", "srcaddr", "dstaddr",
+		"service", "schedule", "sequence", NULL
+	};
+	char ov[VALBUFSZ], nv[VALBUFSZ];
+	for (int i = 0; shadow_keys[i]; i++) {
+		extract_val(old_data, shadow_keys[i], ov, sizeof(ov));
+		extract_val(new_data, shadow_keys[i], nv, sizeof(nv));
+		if (strcmp(ov, nv) != 0)
+			return 0;	/* selector or order changed → all */
+	}
+
+	/* Enabling a previously-disabled policy inserts it into the chain, which
+	 * can shadow other policies' flows.  Disabling it, or leaving it enabled
+	 * while only action/comment changed, affects this policy's flows only. */
+	extract_val(old_data, "status", ov, sizeof(ov));
+	extract_val(new_data, "status", nv, sizeof(nv));
+	if (strcmp(ov, "enable") != 0 && strcmp(nv, "enable") == 0)
+		return 0;		/* disabled → enabled → all */
+
+	/* Safe to narrow: only this policy's own flows can change verdict. */
+	char cmk[VALBUFSZ];
+	extract_val(new_data, "cmkid", cmk, sizeof(cmk));
+	return (unsigned)atoi(cmk);	/* 0 (unstamped) → all, also safe */
+}
+
 /* ── Apply config to running system ─────────────────────────────────────── */
 
 static sg_status_t apply_config(const char *type, const char *id,
@@ -3685,6 +3776,10 @@ static void usage_cascade(const char *type, const char *id,
 	if (need_fw_rebuild) {
 		char rb[512];
 		rebuild_forward_chain(rb, sizeof(rb));
+		/* A cascade (renamed/deleted address or service) can change which
+		 * flows a policy matches and can re-shadow others, so re-evaluate
+		 * every live flow against the rebuilt chain. */
+		conntrack_reeval_after_policy_change(0);
 		char amsg[512];
 		snprintf(amsg, sizeof(amsg),
 			 "cascade from %.64s:%.64s: %.256s", type, id, rb);
@@ -4718,6 +4813,13 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			seq_auto_assign(db_type, clean, sizeof(clean));
 		}
 
+		/* Auto-assign a stable connmark id for new firewall policies so
+		 * ACCEPT rules can stamp the owning policy onto each flow (used
+		 * by the live-flow re-evaluation on policy change). */
+		if (is_new_entry && strcmp(db_type, "firewall_policy") == 0) {
+			cmkid_auto_assign(db_type, clean, sizeof(clean));
+		}
+
 		/* Auto-reorder sequences so "set sequence N" always wins.
 		 *
 		 * New entry with explicit sequence: shift all entries at
@@ -4846,6 +4948,7 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 				if (need_fw_rebuild) {
 					char rb[512];
 					rebuild_forward_chain(rb, sizeof(rb));
+					conntrack_reeval_after_policy_change(0);
 				}
 				if (need_nat_rebuild) {
 					char rb[512];
@@ -4910,8 +5013,28 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 				send_error(client_fd, rb_rc, rb_result);
 				return 0;
 			}
+			/* Re-evaluate live flows against the rebuilt chain so a
+			 * policy change applies to already-open connections.
+			 * Decide the scope while we still hold both the old
+			 * (existing) and new (clean) entry:
+			 *  - a NEW policy can shadow flows that matched other
+			 *    policies → dirty ALL (0);
+			 *  - an in-place edit that only changes this policy's
+			 *    action (no selector/order/enable change) affects
+			 *    only its own flows → dirty just cmkid(P);
+			 *  - anything policy_reeval_scope is unsure about → 0.
+			 * NAT rebuilds don't affect FORWARD verdicts. */
+			unsigned reeval_cmkid = 0;   /* 0 = dirty all */
+			if (strcmp(db_type, "firewall_policy") == 0 &&
+			    !is_new_entry)
+				reeval_cmkid =
+					policy_reeval_scope(existing, clean);
+
 			free(existing);
 			existing = NULL;
+
+			if (strcmp(db_type, "firewall_policy") == 0)
+				conntrack_reeval_after_policy_change(reeval_cmkid);
 
 			send_ok(client_fd, "Config saved", NULL);
 			return 0;
@@ -5153,6 +5276,24 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		/* Firewall/NAT: no per-rule unapply needed — atomic
 		 * rebuild after DB delete handles everything. */
 
+		/* Capture the policy's cmkid before deletion so we can dirty
+		 * only its own live flows. Deleting P changes the verdict of
+		 * exactly the flows P was permitting — those carry cmkid(P).
+		 * Flows that matched other policies still match them at the
+		 * same position, so their verdict is unchanged. (A DENY/DROP
+		 * policy stamps nothing and has no live flows, so its cmkid
+		 * dirties nothing — which is correct.) */
+		unsigned del_cmkid = 0;
+		if (strcmp(db_type, "firewall_policy") == 0) {
+			char *pdata = sg_db_get(db_type, db_id);
+			if (pdata) {
+				char cmk[VALBUFSZ];
+				extract_val(pdata, "cmkid", cmk, sizeof(cmk));
+				del_cmkid = (unsigned)atoi(cmk);
+				free(pdata);
+			}
+		}
+
 		if (sg_db_del(db_type, db_id) != 0) {
 			send_error(client_fd, SG_ERR_IO_FAIL, "Failed to delete section");
 			return 0;
@@ -5162,6 +5303,9 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		if (strcmp(db_type, "firewall_policy") == 0) {
 			char rb[512];
 			rebuild_forward_chain(rb, sizeof(rb));
+			/* Only the deleted policy's own flows can change verdict
+			 * (cmkid 0 here → dirty all, also safe). */
+			conntrack_reeval_after_policy_change(del_cmkid);
 		} else if (strcmp(db_type, "network_nat") == 0) {
 			char rb[512];
 			rebuild_nat_chains(rb, sizeof(rb));
@@ -5408,9 +5552,12 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 
 		/* Step 3: Atomic rebuild from DB */
 		char result[512];
-		if (strcmp(db_type, "firewall_policy") == 0)
+		if (strcmp(db_type, "firewall_policy") == 0) {
 			rebuild_forward_chain(result, sizeof(result));
-		else
+			/* Reordering changes priority and thus shadowing —
+			 * re-evaluate all live flows. */
+			conntrack_reeval_after_policy_change(0);
+		} else
 			rebuild_nat_chains(result, sizeof(result));
 
 		send_ok(client_fd, result, NULL);

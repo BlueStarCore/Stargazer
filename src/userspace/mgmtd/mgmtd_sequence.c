@@ -86,6 +86,37 @@ int seq_auto_assign(const char *type, char *data, size_t data_sz)
 	return 0;
 }
 
+/* ── cmkid_auto_assign ──────────────────────────────────────────────── *
+ *
+ * Assign a stable connmark id (cmkid) to a new firewall_policy entry. The
+ * cmkid is stamped into a flow's connmark (bits 8-31) by the ACCEPT rule that
+ * permits it, so the live-flow re-evaluation path can tell which policy owns a
+ * flow. Unlike "sequence", cmkid must NOT change when rules are reordered.
+ *
+ * cmkid = max(existing cmkid) + 1. Reuse after a delete is harmless: deleting
+ * a policy triggers a dirty-all re-evaluation, so no live flow keeps a stamp
+ * that could collide with a later policy reusing the number.
+ */
+int cmkid_auto_assign(const char *type, char *data, size_t data_sz)
+{
+	if (sg_kv_has_key(data, "cmkid"))
+		return 0;
+
+	char *max_str = sg_db_get_max_int(type, "cmkid");
+	int next = (max_str ? atoi(max_str) : 0) + 1;
+	free(max_str);
+
+	char suffix[32];
+	int slen = snprintf(suffix, sizeof(suffix), "cmkid=%d\n", next);
+
+	size_t cur_len = strlen(data);
+	if (cur_len + (size_t)slen + 1 > data_sz)
+		return -1;
+
+	memcpy(data + cur_len, suffix, (size_t)slen + 1);
+	return 0;
+}
+
 /* seq_compute_position — REMOVED.
  * No longer needed with atomic iptables-restore rebuild.
  * Rule ordering is now implicit in the generated ruleset

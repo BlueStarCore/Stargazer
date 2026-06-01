@@ -4253,7 +4253,7 @@
 
         tbody.innerHTML = '';
         if (page.length === 0) {
-            tbody.appendChild(buildEmptyRow(6));
+            tbody.appendChild(buildEmptyRow(9));
         } else {
             var frag = document.createDocumentFragment();
             page.forEach(function (s) {
@@ -4272,6 +4272,9 @@
                 stateTd.appendChild(document.createTextNode(stateStr));
                 tr.appendChild(stateTd);
 
+                tr.appendChild(makeTd(s.policy || '-'));
+                tr.appendChild(makeTd(s.iif || '-'));
+                tr.appendChild(makeTd(s.oif || '-'));
                 tr.appendChild(makeTd(s.pkts || '0'));
                 tr.appendChild(makeTd(bytesStr));
 

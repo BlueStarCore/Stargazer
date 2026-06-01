@@ -150,8 +150,8 @@ static const char *action_to_target(const char *action)
 /*
  * connmark_supported - probe once whether iptables can use the connmark
  * match + CONNMARK target (needs CONFIG_NF_CONNTRACK_MARK + xt_connmark).
- * Result is cached. When available we re-evaluate only the affected live flows
- * on a policy change via a connmark "generation" tag; when not, we fall back to
+ * Result is cached. When available we re-evaluate live flows on a policy change
+ * via a connmark DIRTY bit + per-flow policy_id; when not, we fall back to
  * flushing the whole conntrack table.
  */
 static int connmark_supported(void)
@@ -180,14 +180,28 @@ static int connmark_supported(void)
 }
 
 /*
- * Policy generation tag, carried in connmark bits 0-7 (values 1..255). Bumped
- * on each FORWARD rebuild so live flows re-traverse the new policy: still-
- * allowed flows get re-stamped with the new gen and continue uninterrupted;
- * flows the new policy denies fall through to DROP. In-memory only (resets to
- * 1 on mgmtd restart — harmless, flows simply re-evaluate once).
+ * Per-flow connmark layout (FortiGate-style dirty-session):
+ *   bit 0      DIRTY     — set on flows that must re-traverse the policy chain
+ *   bits 1-7   reserved  (kept 0)
+ *   bits 8-31  policy_id — the cmkid of the policy that last permitted the flow
+ *
+ * An ACCEPT rule stamps (cmkid << 8) and clears DIRTY in one masked write, so a
+ * permitted flow records its policy and fast-paths. The fast-path rule accepts
+ * ESTABLISHED,RELATED only while DIRTY is clear; a flow marked dirty (by
+ * conntrack_mark_dirty_by_policy on a policy change) falls through and is
+ * re-evaluated against the current chain — still-allowed flows get re-stamped,
+ * denied flows fall to DROP. The DIRTY bit is non-destructive: the connection
+ * tracking entry is kept, so a still-allowed flow resumes the moment one
+ * original-direction packet re-stamps it (clearing DIRTY heals both directions,
+ * since connmark is per-entry). The policy rules match the original direction
+ * only, so during the brief dirty window a reply-direction-only packet finds no
+ * fast-path and no matching rule and is dropped until the original direction
+ * re-stamps — for TCP this is absorbed by ACK/retransmit; bursty asymmetric
+ * flows may see a momentary blip, not a teardown.
  */
-#define SG_CMK_MASK 0xFFu
-static unsigned int fwd_policy_gen = 1;
+#define SG_CMK_DIRTY       0x00000001u
+#define SG_CMK_PID_SHIFT   8
+#define SG_CMK_STAMP_MASK  0xFFFFFF01u   /* policy_id field + DIRTY bit */
 
 sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 {
@@ -198,8 +212,6 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 	}
 
 	int cmk = connmark_supported();
-	if (cmk)
-		fwd_policy_gen = (fwd_policy_gen % 255) + 1;  /* 1..255, skip 0 */
 
 	/* Header */
 	dbuf_append(&buf, "*filter\n", 8);
@@ -212,13 +224,13 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 		const char *inv = "-A FORWARD -m conntrack --ctstate INVALID -j DROP\n";
 		dbuf_append(&buf, inv, strlen(inv));
 		if (cmk)
-			/* Only flows tagged with the CURRENT generation take the
-			 * fast-path; stale-gen and NEW flows fall through to the
-			 * policy rules below for (re-)evaluation. */
+			/* Established/related flows fast-path ONLY while their DIRTY
+			 * bit is clear. A flow marked dirty on a policy change falls
+			 * through to the policy rules below for re-evaluation. */
 			dbuf_printf(&buf,
 				"-A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED"
-				" -m connmark --mark 0x%x/0x%x -j ACCEPT\n",
-				fwd_policy_gen, SG_CMK_MASK);
+				" -m connmark ! --mark 0x%x/0x%x -j ACCEPT\n",
+				SG_CMK_DIRTY, SG_CMK_DIRTY);
 		else
 			dbuf_printf(&buf,
 				"-A FORWARD -m conntrack"
@@ -242,7 +254,7 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 			char srcintf[VALBUFSZ], dstintf[VALBUFSZ];
 			char srcaddr[VALBUFSZ], dstaddr[VALBUFSZ];
 			char action[VALBUFSZ], status[VALBUFSZ];
-			char service[VALBUFSZ];
+			char service[VALBUFSZ], cmkid_s[VALBUFSZ];
 
 			extract_val(data, "srcintf",  srcintf,  sizeof(srcintf));
 			extract_val(data, "dstintf",  dstintf,  sizeof(dstintf));
@@ -251,8 +263,13 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 			extract_val(data, "action",   action,   sizeof(action));
 			extract_val(data, "status",   status,   sizeof(status));
 			extract_val(data, "service",  service,  sizeof(service));
+			extract_val(data, "cmkid",    cmkid_s,  sizeof(cmkid_s));
 
 			free(data);
+
+			/* Stable per-policy id stamped into connmark bits 8-31 so a
+			 * flow records which policy permitted it (0 = none/unstamped). */
+			unsigned long cmkid = strtoul(cmkid_s, NULL, 10);
 
 			if (strcmp(status, "disable") == 0)
 				continue;
@@ -345,14 +362,15 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 				rule_count++;
 			} else {
 				/*
-				 * For ACCEPT rules (when connmark is available), prepend a
-				 * CONNMARK rule that stamps the current policy generation on
-				 * the flow so its subsequent packets take the fast-path.
+				 * For ACCEPT rules (when connmark is available and the
+				 * policy has a stable cmkid), prepend a CONNMARK rule that
+				 * stamps the policy_id into bits 8-31 and clears the DIRTY
+				 * bit, so the flow records its policy and fast-paths.
 				 * Uses the same saved_pfx technique as the REJECT split.
-				 * DENY/DROP flows are never stamped, so on a policy change
-				 * they keep falling through to their drop until they expire.
+				 * DENY/DROP flows are never stamped, so a dirtied flow the
+				 * new policy denies keeps falling through to its drop.
 				 */
-				if (strcmp(target, "ACCEPT") == 0 && cmk) {
+				if (strcmp(target, "ACCEPT") == 0 && cmk && cmkid > 0) {
 					size_t plen = buf.used - rule_start;
 					char saved_pfx[256];
 					if (plen < sizeof(saved_pfx)) {
@@ -360,8 +378,9 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 						       buf.data + rule_start, plen);
 						dbuf_printf(&buf,
 							" -j CONNMARK --set-xmark"
-							" 0x%x/0x%x\n",
-							fwd_policy_gen, SG_CMK_MASK);
+							" 0x%lx/0x%x\n",
+							(cmkid << SG_CMK_PID_SHIFT),
+							SG_CMK_STAMP_MASK);
 						rule_count++;
 						dbuf_append(&buf, saved_pfx, plen);
 					}
@@ -404,16 +423,33 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 	free(out);
 	free(buf.data);
 
-	/* Apply the policy change to live flows. With connmark, the generation
-	 * bump at the top already forces every live flow to re-traverse the new
-	 * policy on its next packet — still-allowed flows re-stamp and continue,
-	 * only denied flows drop (surgical; management/allowed flows untouched).
-	 * Without connmark, fall back to flushing the whole conntrack table. */
-	if (!cmk)
-		conntrack_flush_all();
-
+	/* NOTE: rebuild only rewrites the rules. Applying the change to LIVE flows
+	 * (marking them dirty so they re-traverse, or flushing in the no-connmark
+	 * fallback) is a separate step the caller invokes via
+	 * conntrack_reeval_after_policy_change() — boot replay skips it. */
 	snprintf(result, rsize, "FORWARD chain rebuilt (%d rules)", rule_count);
 	return SG_OK;
+}
+
+/*
+ * conntrack_reeval_after_policy_change - force live flows to be re-evaluated
+ * against the just-rebuilt FORWARD chain. Call AFTER rebuild_forward_chain()
+ * on any real policy change (not boot replay).
+ *
+ * pid == 0 dirties all flows; pid == cmkid(P) dirties only flows that policy P
+ * permitted (safe only for changes that cannot newly-shadow other flows — v1
+ * callers pass 0). With connmark we mark flows dirty (non-destructive: allowed
+ * flows re-stamp and continue, denied flows drop). Without connmark, or if the
+ * dirty pass fails, we fall back to flushing the whole conntrack table.
+ */
+void conntrack_reeval_after_policy_change(unsigned int pid)
+{
+	if (!connmark_supported()) {
+		conntrack_flush_all();
+		return;
+	}
+	if (conntrack_mark_dirty_by_policy(pid) != 0)
+		conntrack_flush_all();   /* fallback: never leave stale fast-path marks */
 }
 
 /*

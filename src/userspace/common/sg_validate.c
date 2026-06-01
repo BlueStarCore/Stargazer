@@ -42,6 +42,11 @@ static const sg_type_info_t type_table[] = {
 
 /* ── Unified field table ─────────────────────────────────────────────────── */
 
+/* field_entry.flags bits */
+#define SG_FLD_HIDDEN  0x1u   /* internal field: valid for the config engine but
+			       * never shown in `show`/export and not user-settable
+			       * (e.g. cmkid, auto-assigned and reconcile-backfilled) */
+
 struct field_entry {
 	const char *type;
 	const char *key;
@@ -49,119 +54,121 @@ struct field_entry {
 	int         optional;   /* 0 = required, 1 = optional */
 	const char *defval;     /* default value, or NULL */
 	const char *desc;       /* human-readable help text */
+	unsigned    flags;      /* SG_FLD_* bitmask (0 = normal user field) */
 };
 
 static const struct field_entry field_table[] = {
 	/* network_route_static */
-	{ "network_route_static", "dst",      "cidr",                0, NULL,     "Destination network"          },
-	{ "network_route_static", "gateway",  "ipv4",                0, NULL,     "Next-hop gateway address"     },
-	{ "network_route_static", "device",   "ref-iface:system_interface", 0, NULL, "Outgoing interface"          },
-	{ "network_route_static", "distance", "uint:1:255",          0, "10",     "Administrative distance"      },
-	{ "network_route_static", "status",   "enum:enable,disable", 0, "enable", "Enable or disable this route" },
-	{ "network_route_static", "comment",  "string",              1, NULL,     "Optional description"         },
+	{ "network_route_static", "dst",      "cidr",                0, NULL,     "Destination network", 0 },
+	{ "network_route_static", "gateway",  "ipv4",                0, NULL,     "Next-hop gateway address", 0 },
+	{ "network_route_static", "device",   "ref-iface:system_interface", 0, NULL, "Outgoing interface", 0 },
+	{ "network_route_static", "distance", "uint:1:255",          0, "10",     "Administrative distance", 0 },
+	{ "network_route_static", "status",   "enum:enable,disable", 0, "enable", "Enable or disable this route", 0 },
+	{ "network_route_static", "comment",  "string",              1, NULL,     "Optional description", 0 },
 
 	/* network_nat */
-	{ "network_nat", "type",        "enum:snat,dnat",        0, NULL,     "NAT type"                    },
-	{ "network_nat", "srcintf",     "ref-iface-or:system_interface:any", 0, NULL, "Source interface"            },
-	{ "network_nat", "dstintf",     "ref-iface-or:system_interface:any", 1, NULL, "Destination interface"       },
-	{ "network_nat", "protocol",    "enum:tcp,udp,tcp+udp,all", 0, "all", "Protocol (tcp, udp, tcp+udp, or all)" },
-	{ "network_nat", "srcaddr",     "ref-or-cidr:firewall_address:all,any", 0, NULL, "Source address object or subnet" },
-	{ "network_nat", "dstaddr",     "ref-or-cidr:firewall_address:all,any", 0, NULL, "Destination address object or subnet" },
-	{ "network_nat", "dstport",     "uint:1:65535",          1, NULL,     "Destination port"             },
-	{ "network_nat", "mapped-ip",   "ipv4",                  1, NULL,     "Translated IP address"        },
-	{ "network_nat", "mapped-port", "uint:1:65535",          1, NULL,     "Translated port"              },
-	{ "network_nat", "status",      "enum:enable,disable",   0, "enable", "Enable or disable this rule"  },
-	{ "network_nat", "sequence",    "uint:1:9999",           1, NULL,     "Priority (higher = checked first)" },
+	{ "network_nat", "type",        "enum:snat,dnat",        0, NULL,     "NAT type", 0 },
+	{ "network_nat", "srcintf",     "ref-iface-or:system_interface:any", 0, NULL, "Source interface", 0 },
+	{ "network_nat", "dstintf",     "ref-iface-or:system_interface:any", 1, NULL, "Destination interface", 0 },
+	{ "network_nat", "protocol",    "enum:tcp,udp,tcp+udp,all", 0, "all", "Protocol (tcp, udp, tcp+udp, or all)", 0 },
+	{ "network_nat", "srcaddr",     "ref-or-cidr:firewall_address:all,any", 0, NULL, "Source address object or subnet", 0 },
+	{ "network_nat", "dstaddr",     "ref-or-cidr:firewall_address:all,any", 0, NULL, "Destination address object or subnet", 0 },
+	{ "network_nat", "dstport",     "uint:1:65535",          1, NULL,     "Destination port", 0 },
+	{ "network_nat", "mapped-ip",   "ipv4",                  1, NULL,     "Translated IP address", 0 },
+	{ "network_nat", "mapped-port", "uint:1:65535",          1, NULL,     "Translated port", 0 },
+	{ "network_nat", "status",      "enum:enable,disable",   0, "enable", "Enable or disable this rule", 0 },
+	{ "network_nat", "sequence",    "uint:1:9999",           1, NULL,     "Priority (higher = checked first)", 0 },
 
 	/* system_interface */
-	{ "system_interface", "mode",        "enum:static,dhcp", 0, "static", "Addressing mode"              },
-	{ "system_interface", "ip",          "cidr",             1, "0.0.0.0/0", "Interface IP address and mask"  },
-	{ "system_interface", "status",      "enum:up,down",     0, "up",   "Administrative state"           },
-	{ "system_interface", "mtu",         "uint:576:65535",   0, "1500", "Maximum transmission unit"      },
-	{ "system_interface", "allowaccess", "access-services",  1, NULL,   "Allowed management services"    },
-	{ "system_interface", "description", "string",           1, NULL,   "Interface description"          },
+	{ "system_interface", "mode",        "enum:static,dhcp", 0, "static", "Addressing mode", 0 },
+	{ "system_interface", "ip",          "cidr",             1, "0.0.0.0/0", "Interface IP address and mask", 0 },
+	{ "system_interface", "status",      "enum:up,down",     0, "up",   "Administrative state", 0 },
+	{ "system_interface", "mtu",         "uint:576:65535",   0, "1500", "Maximum transmission unit", 0 },
+	{ "system_interface", "allowaccess", "access-services",  1, NULL,   "Allowed management services", 0 },
+	{ "system_interface", "description", "string",           1, NULL,   "Interface description", 0 },
 
 	/* system_settings */
-	{ "system_settings", "hostname",   "safe-id",             0, "stargazer", "System hostname"      },
-	{ "system_settings", "ip-forward", "enum:enable,disable", 0, "enable",    "IPv4 packet forwarding" },
-	{ "system_settings", "timezone",   "tz-token",            0, "UTC",       "System timezone"      },
+	{ "system_settings", "hostname",   "safe-id",             0, "stargazer", "System hostname", 0 },
+	{ "system_settings", "ip-forward", "enum:enable,disable", 0, "enable",    "IPv4 packet forwarding", 0 },
+	{ "system_settings", "timezone",   "tz-token",            0, "UTC",       "System timezone", 0 },
 
 	/* network_dns — always on, no status field */
-	{ "network_dns", "primary",   "ipv4", 0, "1.1.1.1", "Primary DNS server"   },
-	{ "network_dns", "secondary", "ipv4", 1, "8.8.8.8", "Secondary DNS server" },
+	{ "network_dns", "primary",   "ipv4", 0, "1.1.1.1", "Primary DNS server", 0 },
+	{ "network_dns", "secondary", "ipv4", 1, "8.8.8.8", "Secondary DNS server", 0 },
 
 	/* network_dhcp-server */
-	{ "network_dhcp-server", "interface",   "ref-iface:system_interface", 0, NULL, "Interface to serve DHCP"     },
-	{ "network_dhcp-server", "start-ip",    "ipv4",                0, NULL,     "Pool start address"           },
-	{ "network_dhcp-server", "end-ip",      "ipv4",                0, NULL,     "Pool end address"             },
-	{ "network_dhcp-server", "netmask",     "ipv4",                0, NULL,     "Subnet mask for clients"      },
-	{ "network_dhcp-server", "gateway",     "ipv4",                1, NULL,     "Default gateway for clients"  },
-	{ "network_dhcp-server", "dns-server",  "ipv4",                1, NULL,     "DNS server for clients"       },
-	{ "network_dhcp-server", "domain-name", "safe-id",             1, NULL,     "Domain name for clients"      },
-	{ "network_dhcp-server", "lease-time",  "uint:60:604800",      0, "86400",  "Lease time in seconds"        },
-	{ "network_dhcp-server", "status",      "enum:enable,disable", 0, "enable", "Enable or disable this pool"  },
+	{ "network_dhcp-server", "interface",   "ref-iface:system_interface", 0, NULL, "Interface to serve DHCP", 0 },
+	{ "network_dhcp-server", "start-ip",    "ipv4",                0, NULL,     "Pool start address", 0 },
+	{ "network_dhcp-server", "end-ip",      "ipv4",                0, NULL,     "Pool end address", 0 },
+	{ "network_dhcp-server", "netmask",     "ipv4",                0, NULL,     "Subnet mask for clients", 0 },
+	{ "network_dhcp-server", "gateway",     "ipv4",                1, NULL,     "Default gateway for clients", 0 },
+	{ "network_dhcp-server", "dns-server",  "ipv4",                1, NULL,     "DNS server for clients", 0 },
+	{ "network_dhcp-server", "domain-name", "safe-id",             1, NULL,     "Domain name for clients", 0 },
+	{ "network_dhcp-server", "lease-time",  "uint:60:604800",      0, "86400",  "Lease time in seconds", 0 },
+	{ "network_dhcp-server", "status",      "enum:enable,disable", 0, "enable", "Enable or disable this pool", 0 },
 
 	/* system_ntp — always on, no status field */
-	{ "system_ntp", "server", "safe-id", 0, "pool.ntp.org", "NTP server address or hostname" },
+	{ "system_ntp", "server", "safe-id", 0, "pool.ntp.org", "NTP server address or hostname", 0 },
 
 	/* system_session-ttl — global session idle timeouts */
-	{ "system_session-ttl", "tcp-none",        "uint:10:600",   0, "120",  "TCP pre-handshake timeout (seconds)"            },
-	{ "system_session-ttl", "tcp-syn-sent",    "uint:10:600",   0, "120",  "TCP SYN_SENT half-open timeout (seconds)"       },
-	{ "system_session-ttl", "tcp-syn-recv",    "uint:5:300",    0, "60",   "TCP SYN_RECV timeout (seconds)"                 },
-	{ "system_session-ttl", "tcp-established", "uint:60:86400", 0, "3600", "TCP ESTABLISHED idle timeout (seconds)"         },
-	{ "system_session-ttl", "tcp-fin-wait",    "uint:10:600",   0, "120",  "TCP FIN_WAIT timeout (seconds)"                 },
-	{ "system_session-ttl", "tcp-close-wait",  "uint:5:300",    0, "60",   "TCP CLOSE_WAIT timeout (seconds)"               },
-	{ "system_session-ttl", "tcp-last-ack",    "uint:5:120",    0, "30",   "TCP LAST_ACK timeout (seconds)"                 },
-	{ "system_session-ttl", "tcp-time-wait",   "uint:10:600",   0, "120",  "TCP TIME_WAIT timeout (seconds)"                },
-	{ "system_session-ttl", "tcp-close",       "uint:1:60",     0, "10",   "TCP CLOSE (RST) cleanup timeout (seconds)"      },
-	{ "system_session-ttl", "tcp-syn-sent2",   "uint:5:300",    0, "60",   "TCP simultaneous-open timeout (seconds)"        },
-	{ "system_session-ttl", "udp",             "uint:10:3600",  0, "180",  "UDP session idle timeout (seconds)"             },
-	{ "system_session-ttl", "icmp",            "uint:5:300",    0, "60",   "ICMP session idle timeout (seconds)"            },
-	{ "system_session-ttl", "other",           "uint:10:3600",  0, "300",  "Other protocol timeout — GRE, ESP, etc. (seconds)" },
+	{ "system_session-ttl", "tcp-none",        "uint:10:600",   0, "120",  "TCP pre-handshake timeout (seconds)", 0 },
+	{ "system_session-ttl", "tcp-syn-sent",    "uint:10:600",   0, "120",  "TCP SYN_SENT half-open timeout (seconds)", 0 },
+	{ "system_session-ttl", "tcp-syn-recv",    "uint:5:300",    0, "60",   "TCP SYN_RECV timeout (seconds)", 0 },
+	{ "system_session-ttl", "tcp-established", "uint:60:86400", 0, "3600", "TCP ESTABLISHED idle timeout (seconds)", 0 },
+	{ "system_session-ttl", "tcp-fin-wait",    "uint:10:600",   0, "120",  "TCP FIN_WAIT timeout (seconds)", 0 },
+	{ "system_session-ttl", "tcp-close-wait",  "uint:5:300",    0, "60",   "TCP CLOSE_WAIT timeout (seconds)", 0 },
+	{ "system_session-ttl", "tcp-last-ack",    "uint:5:120",    0, "30",   "TCP LAST_ACK timeout (seconds)", 0 },
+	{ "system_session-ttl", "tcp-time-wait",   "uint:10:600",   0, "120",  "TCP TIME_WAIT timeout (seconds)", 0 },
+	{ "system_session-ttl", "tcp-close",       "uint:1:60",     0, "10",   "TCP CLOSE (RST) cleanup timeout (seconds)", 0 },
+	{ "system_session-ttl", "tcp-syn-sent2",   "uint:5:300",    0, "60",   "TCP simultaneous-open timeout (seconds)", 0 },
+	{ "system_session-ttl", "udp",             "uint:10:3600",  0, "180",  "UDP session idle timeout (seconds)", 0 },
+	{ "system_session-ttl", "icmp",            "uint:5:300",    0, "60",   "ICMP session idle timeout (seconds)", 0 },
+	{ "system_session-ttl", "other",           "uint:10:3600",  0, "300",  "Other protocol timeout — GRE, ESP, etc. (seconds)", 0 },
 
 	/* firewall_policy */
-	{ "firewall_policy", "name",     "safe-id",                         0, NULL,     "Policy name"                },
-	{ "firewall_policy", "srcintf",  "ref-iface-or:system_interface:any", 0, "any",   "Source interface"           },
-	{ "firewall_policy", "dstintf",  "ref-iface-or:system_interface:any", 0, "any",   "Destination interface"      },
-	{ "firewall_policy", "srcaddr",  "ref:firewall_address",            0, "all",    "Source address object"      },
-	{ "firewall_policy", "dstaddr",  "ref:firewall_address",            0, "all",    "Destination address object" },
-	{ "firewall_policy", "action",   "enum:accept,deny,drop",           0, "deny",   "Matching traffic action"    },
-	{ "firewall_policy", "service",  "ref:firewall_service",            0, "all",    "Service object"             },
-	{ "firewall_policy", "schedule", "safe-id-or:all,any",              0, "all",    "Schedule object"            },
-	{ "firewall_policy", "status",   "enum:enable,disable",             0, "enable", "Enable or disable this policy" },
-	{ "firewall_policy", "comment",  "string",                          1, NULL,     "Optional description"       },
-	{ "firewall_policy", "sequence", "uint:1:9999",                     1, NULL,     "Priority (higher = checked first)" },
+	{ "firewall_policy", "name",     "safe-id",                         0, NULL,     "Policy name", 0 },
+	{ "firewall_policy", "srcintf",  "ref-iface-or:system_interface:any", 0, "any",   "Source interface", 0 },
+	{ "firewall_policy", "dstintf",  "ref-iface-or:system_interface:any", 0, "any",   "Destination interface", 0 },
+	{ "firewall_policy", "srcaddr",  "ref:firewall_address",            0, "all",    "Source address object", 0 },
+	{ "firewall_policy", "dstaddr",  "ref:firewall_address",            0, "all",    "Destination address object", 0 },
+	{ "firewall_policy", "action",   "enum:accept,deny,drop",           0, "deny",   "Matching traffic action", 0 },
+	{ "firewall_policy", "service",  "ref:firewall_service",            0, "all",    "Service object", 0 },
+	{ "firewall_policy", "schedule", "safe-id-or:all,any",              0, "all",    "Schedule object", 0 },
+	{ "firewall_policy", "status",   "enum:enable,disable",             0, "enable", "Enable or disable this policy", 0 },
+	{ "firewall_policy", "comment",  "string",                          1, NULL,     "Optional description", 0 },
+	{ "firewall_policy", "sequence", "uint:1:9999",                     1, NULL,     "Priority (higher = checked first)", 0 },
+	{ "firewall_policy", "cmkid",    "uint:1:16777215",                 1, NULL,     "Connmark id stamped on permitted flows (internal)", SG_FLD_HIDDEN },
 
 	/* firewall_address */
-	{ "firewall_address", "name",    "safe-id",                  0, NULL,     "Address object name"  },
-	{ "firewall_address", "subnet",  "cidr",                     0, NULL,     "Network address and mask" },
-	{ "firewall_address", "type",    "enum:ipmask,iprange,fqdn", 0, "ipmask", "Address type"         },
-	{ "firewall_address", "comment", "string",                   1, NULL,     "Optional description" },
+	{ "firewall_address", "name",    "safe-id",                  0, NULL,     "Address object name", 0 },
+	{ "firewall_address", "subnet",  "cidr",                     0, NULL,     "Network address and mask", 0 },
+	{ "firewall_address", "type",    "enum:ipmask,iprange,fqdn", 0, "ipmask", "Address type", 0 },
+	{ "firewall_address", "comment", "string",                   1, NULL,     "Optional description", 0 },
 
 	/* firewall_service */
-	{ "firewall_service", "name",       "safe-id",           0, NULL,  "Service object name"  },
-	{ "firewall_service", "protocol",   "enum:tcp,udp,icmp,all", 0, "tcp", "IP protocol"          },
-	{ "firewall_service", "port-range", "port-or-range",         1, NULL,  "Port or port range"   },
-	{ "firewall_service", "comment",    "string",            1, NULL,  "Optional description" },
+	{ "firewall_service", "name",       "safe-id",           0, NULL,  "Service object name", 0 },
+	{ "firewall_service", "protocol",   "enum:tcp,udp,icmp,all", 0, "tcp", "IP protocol", 0 },
+	{ "firewall_service", "port-range", "port-or-range",         1, NULL,  "Port or port range", 0 },
+	{ "firewall_service", "comment",    "string",            1, NULL,  "Optional description", 0 },
 
 	/* system_password-policy */
-	{ "system_password-policy", "min-length",    "uint:0:128", 0, "8", "Minimum password length"      },
-	{ "system_password-policy", "min-uppercase", "uint:0:128", 0, "0", "Required uppercase characters" },
-	{ "system_password-policy", "min-lowercase", "uint:0:128", 0, "0", "Required lowercase characters" },
-	{ "system_password-policy", "min-digit",     "uint:0:128", 0, "0", "Required digit characters"    },
-	{ "system_password-policy", "min-special",   "uint:0:128", 0, "0", "Required special characters"  },
+	{ "system_password-policy", "min-length",    "uint:0:128", 0, "8", "Minimum password length", 0 },
+	{ "system_password-policy", "min-uppercase", "uint:0:128", 0, "0", "Required uppercase characters", 0 },
+	{ "system_password-policy", "min-lowercase", "uint:0:128", 0, "0", "Required lowercase characters", 0 },
+	{ "system_password-policy", "min-digit",     "uint:0:128", 0, "0", "Required digit characters", 0 },
+	{ "system_password-policy", "min-special",   "uint:0:128", 0, "0", "Required special characters", 0 },
 
 	/* system_admin-profile */
-	{ "system_admin-profile", "permissions", "permissions-csv", 0, NULL, "Granted permissions"  },
-	{ "system_admin-profile", "description", "string",          1, NULL, "Profile description"  },
+	{ "system_admin-profile", "permissions", "permissions-csv", 0, NULL, "Granted permissions", 0 },
+	{ "system_admin-profile", "description", "string",          1, NULL, "Profile description", 0 },
 
 	/* system_admin */
-	{ "system_admin", "profile",                  "ref:system_admin-profile", 0, NULL,     "Admin permission profile"            },
-	{ "system_admin", "password",                 "password-interactive",     1, NULL,     "Account password"                    },
-	{ "system_admin", "enforce-change-password",  "enum:enable,disable",     0, "enable", "Force password change on first login" },
-	{ "system_admin", "enforce-password-policy",  "enum:enable,disable",     0, "enable", "Apply password policy rules"         },
+	{ "system_admin", "profile",                  "ref:system_admin-profile", 0, NULL,     "Admin permission profile", 0 },
+	{ "system_admin", "password",                 "password-interactive",     1, NULL,     "Account password", 0 },
+	{ "system_admin", "enforce-change-password",  "enum:enable,disable",     0, "enable", "Force password change on first login", 0 },
+	{ "system_admin", "enforce-password-policy",  "enum:enable,disable",     0, "enable", "Apply password policy rules", 0 },
 
-	{ NULL, NULL, NULL, 0, NULL, NULL }
+	{ NULL, NULL, NULL, 0, NULL, NULL, 0 }
 };
 
 /* ── Key=Value utility functions ────────────────────────────────────────── */
@@ -627,6 +634,24 @@ sg_reg_is_valid_key(const char *type_name, const char *key)
 	return 0;
 }
 
+/*
+ * Is this an internal (SG_FLD_HIDDEN) field?  Such keys are valid for the
+ * config engine (auto-assigned / backfilled internally) but must not be
+ * shown in `show`/export or set/unset by a user.  Returns 0 for unknown keys.
+ */
+int
+sg_reg_is_hidden_key(const char *type_name, const char *key)
+{
+	if (!type_name || !key)
+		return 0;
+	for (const struct field_entry *f = field_table; f->type; f++) {
+		if (strcmp(f->type, type_name) == 0 &&
+		    strcmp(f->key, key) == 0)
+			return (f->flags & SG_FLD_HIDDEN) ? 1 : 0;
+	}
+	return 0;
+}
+
 int
 sg_reg_is_optional(const char *type_name, const char *key)
 {
@@ -707,8 +732,10 @@ sg_reg_all_keys_defaults(const char *type_name)
 	for (const struct field_entry *f = field_table; f->type; f++) {
 		if (strcmp(f->type, type_name) != 0)
 			continue;
-		/* Skip internal-only keys */
-		if (strcmp(f->key, "builtin") == 0 ||
+		/* Skip internal-only keys (SG_FLD_HIDDEN fields plus the
+		 * metadata keys that never appear as field_table rows). */
+		if ((f->flags & SG_FLD_HIDDEN) ||
+		    strcmp(f->key, "builtin") == 0 ||
 		    strcmp(f->key, "password") == 0 ||
 		    strcmp(f->key, "password-hash") == 0)
 			continue;
