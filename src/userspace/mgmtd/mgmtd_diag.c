@@ -1375,9 +1375,9 @@ int handle_disk_smart(int client_fd, const char *user,
 
 /* ── nf_conntrack readers ───────────────────────────────────────────────────
  *
- * session.ko is gone; connection state lives in the kernel's nf_conntrack.
- * These read /proc/net/nf_conntrack (file IO) and "clear" flushes via netlink
- * in-process — the firewall never shells out to system commands.
+ * Connection state lives in the kernel's nf_conntrack. These read
+ * /proc/net/nf_conntrack (file IO) and "clear" flushes via netlink in-process —
+ * the firewall never shells out to system commands.
  */
 
 /* Recognised L4 protocol names — anchors parsing whether or not the line

@@ -1053,8 +1053,8 @@ static void flow_resources(work_item_t *item)
 	sys_resources_t r;
 	fetch_resources(item, &r);
 
-	/* Read active kernel session count from session.ko via mgmtd.
-	 * session_count() counts web UI logins, not network sessions. */
+	/* Read the active conntrack flow count from mgmtd (SG_CMD_SESSION_STATS).
+	 * session_count() counts web UI logins, not network flows. */
 	long long net_sessions = 0;
 	webd_ipc_response_t sr = {0};   /* zero-init: webd_ipc_resp_free is always called */
 	if (webd_ipc_send(SG_CMD_SESSION_STATS, item->username,

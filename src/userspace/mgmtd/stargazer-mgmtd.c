@@ -3144,7 +3144,7 @@ static void mgmtd_replay_config(void)
 		"system_password-policy", /* load before admin auth checks */
 		"network_dns",            /* write /etc/resolv.conf */
 		"system_ntp",             /* write /etc/ntp.conf */
-		"system_session-ttl",     /* session idle timeouts → session.ko */
+		"system_session-ttl",     /* nf_conntrack idle-timeout sysctls */
 		NULL
 	};
 	for (int i = 0; single_types[i]; i++) {
@@ -4735,6 +4735,7 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 				continue;
 			}
 			if (cpos + ll + 1 >= sizeof(clean)) {
+				free(existing);
 				send_error(client_fd, SG_ERR_INVALID_ARG,
 					   "Config payload too large");
 				return 0;
@@ -4745,22 +4746,13 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			dp += ll;
 			if (el) dp++;
 		}
-		/* Re-append preserved internal fields */
+		/* Re-append the builtin flag stripped above, so it survives the
+		 * write back to the DB. */
 		if (was_builtin) {
 			const char *tag = "builtin=yes\n";
 			size_t tlen = strlen(tag);
 			if (cpos + tlen >= sizeof(clean)) {
-				send_error(client_fd, SG_ERR_INVALID_ARG,
-					   "Config payload too large");
-				return 0;
-			}
-			memcpy(clean + cpos, tag, tlen);
-			cpos += tlen;
-		}
-		if (was_immutable) {
-			const char *tag = "immutable=yes\n";
-			size_t tlen = strlen(tag);
-			if (cpos + tlen >= sizeof(clean)) {
+				free(existing);
 				send_error(client_fd, SG_ERR_INVALID_ARG,
 					   "Config payload too large");
 				return 0;

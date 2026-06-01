@@ -10,7 +10,9 @@
  * routing and NAT path.
  *
  * Connection state tracking and NAT are handled by the kernel's nf_conntrack.
- * Per-flow ML feature extraction is a separate module (Phase 3).
+ * For accepted packets the hook also accounts per-flow ML features into the
+ * conntrack NF_CT_EXT_ML extension (timing, packet-length spread, TCP flags,
+ * and the flow's in/out interface) — see ml_account().
  */
 
 #include <linux/module.h>
@@ -320,8 +322,8 @@ static int __init pkt_forward_init(void)
 		return ret;
 	}
 
-	/* pkt_forward.ko now owns /proc/stargazer/ (session.ko is gone).
-	 * Failure is non-fatal — the module still functions without procfs. */
+	/* Create /proc/stargazer/ for the stats file. Failure is non-fatal —
+	 * the module still functions without procfs. */
 	pf_proc_root = proc_mkdir("stargazer", NULL);
 	if (pf_proc_root)
 		proc_pf_stats = proc_create("pkt_forward_stats", 0444,

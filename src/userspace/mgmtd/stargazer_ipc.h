@@ -134,10 +134,10 @@ typedef enum {
 	SG_CMD_SHOW_BOOT_CONFIG  = 651,  /* modules + sysctl config files      */
 	SG_CMD_DIAG_NTP          = 652,  /* NTP status: server, pid, time      */
 	SG_CMD_DIAG_BUSYBOX_LIST = 653,  /* Enumerate busybox applet symlinks  */
-	/* 654 (was SG_CMD_DIAG_SESSION — session.ko self-test) retired         */
+	/* 654 reserved — do not reuse                                          */
 	SG_CMD_SESSION_CLEAR     = 655,  /* Flush conntrack table (via netlink) */
 	SG_CMD_SESSION_STATS     = 656,  /* conntrack flow count + pkt_forward  */
-	/* 657 (was SG_CMD_SESSION_GC_INTERVAL — session.ko GC knob) retired     */
+	/* 657, 658 reserved — do not reuse                                     */
 	SG_CMD_SESSION_ML        = 659,  /* Per-flow ML features (CTA_ML dump)  */
 	/* Debug state (66x) */
 	SG_CMD_DEBUG_STATE_GET   = 660,  /* Read debug conf key=value pairs    */

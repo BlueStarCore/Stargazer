@@ -217,8 +217,7 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 	dbuf_append(&buf, "*filter\n", 8);
 
 	/* Foundation rules (conntrack-stateful):
-	 *   - drop packets conntrack cannot associate with a valid flow (INVALID),
-	 *     replacing the stateful validation that session.ko used to perform;
+	 *   - drop packets conntrack cannot associate with a valid flow (INVALID);
 	 *   - fast-path accept of established/related return traffic. */
 	{
 		const char *inv = "-A FORWARD -m conntrack --ctstate INVALID -j DROP\n";
@@ -437,10 +436,12 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
  * on any real policy change (not boot replay).
  *
  * pid == 0 dirties all flows; pid == cmkid(P) dirties only flows that policy P
- * permitted (safe only for changes that cannot newly-shadow other flows — v1
- * callers pass 0). With connmark we mark flows dirty (non-destructive: allowed
- * flows re-stamp and continue, denied flows drop). Without connmark, or if the
- * dirty pass fails, we fall back to flushing the whole conntrack table.
+ * permitted. Narrowing is used only where it cannot newly-shadow other flows
+ * (deleting P, or an action/comment-only edit of P — see policy_reeval_scope);
+ * every other change passes 0. With connmark we mark flows dirty
+ * (non-destructive: allowed flows re-stamp and continue, denied flows drop).
+ * Without connmark, or if the dirty pass fails, we fall back to flushing the
+ * whole conntrack table.
  */
 void conntrack_reeval_after_policy_change(unsigned int pid)
 {

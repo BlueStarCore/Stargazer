@@ -2,10 +2,9 @@
 /*
  * cli_diagnose_session.c — Connection-tracking diagnostics for Stargazer CLI
  *
- * session.ko was removed; connection state now lives in the kernel's
- * nf_conntrack. These checks verify the conntrack-backed session views work
- * (SG_CMD_SESSION_STATS / SG_CMD_SHOW_SESSIONS), and that pkt_forward.ko's
- * anomaly screen is active.
+ * Connection state lives in the kernel's nf_conntrack. These checks verify the
+ * conntrack-backed session views work (SG_CMD_SESSION_STATS /
+ * SG_CMD_SHOW_SESSIONS) and that pkt_forward.ko's anomaly screen is active.
  *
  * Invoked via: execute diagnose selftest session
  */
