@@ -1863,6 +1863,18 @@ struct sg_nf_conn_ml {
 	int32_t  ml_score;
 	uint16_t iif;   /* ingress ifindex, original direction (0 = unset) */
 	uint16_t oif;   /* egress  ifindex, original direction (0 = unset) */
+	uint64_t flow_iat_sq_sum;
+	int64_t  last_seen_fwd;   /* kernel ktime_t (s64) */
+	uint64_t fwd_iat_sum;
+	uint64_t fwd_iat_sq_sum;
+	uint64_t pktlen_sum;
+	uint64_t pktlen_sq_sum;
+	uint32_t flow_iat_min;
+	uint32_t fwd_iat_count;
+	uint32_t syn_count;
+	uint32_t ack_count;
+	uint32_t psh_count;
+	uint32_t urg_count;
 };
 
 /* Find attribute `want` in an nlattr stream [data, data+len); return payload. */
@@ -1897,8 +1909,8 @@ static void ct_ml_emit(const struct nlmsghdr *nh, struct dynbuf *out, long *coun
 	struct sg_nf_conn_ml ml;
 	char src[INET_ADDRSTRLEN] = "?", dst[INET_ADDRSTRLEN] = "?";
 	unsigned proto = 0, sport = 0, dport = 0;
-	unsigned long long dur_ms, iat_us;
-	char line[320];
+	unsigned long long dur_ms, iat_us, iat_min;
+	char line[512];
 	int ll;
 
 	if (alen <= 0)
@@ -1941,14 +1953,25 @@ static void ct_ml_emit(const struct nlmsghdr *nh, struct dynbuf *out, long *coun
 	dur_ms = (ml.last_ns > ml.first_ns) ?
 		 (ml.last_ns - ml.first_ns) / 1000000ULL : 0;
 	iat_us = ml.iat_count ? (ml.iat_sum_ns / ml.iat_count) / 1000ULL : 0;
+	iat_min = (ml.flow_iat_min == UINT32_MAX) ? 0 : ml.flow_iat_min;
 
 	ll = snprintf(line, sizeof(line),
-		"proto=%u src=%s:%u dst=%s:%u iat_avg_us=%llu dur_ms=%llu "
-		"len_o=%u-%u len_r=%u-%u flags_o=0x%02x flags_r=0x%02x score=%d\n",
-		proto, src, sport, dst, dport, iat_us, dur_ms,
+		"proto=%u src=%s:%u dst=%s:%u iat_avg_us=%llu flow_iat_min=%llu "
+		"flow_iat_sq_sum=%llu dur_ms=%llu fwd_iat_count=%u fwd_iat_sum=%llu "
+		"fwd_iat_sq_sum=%llu len_o=%u-%u len_r=%u-%u pktlen_sum=%llu "
+		"pktlen_sq_sum=%llu flags_o=0x%02x flags_r=0x%02x "
+		"syn=%u ack=%u psh=%u urg=%u score=%d\n",
+		proto, src, sport, dst, dport, iat_us, iat_min,
+		(unsigned long long)ml.flow_iat_sq_sum, dur_ms,
+		ml.fwd_iat_count, (unsigned long long)ml.fwd_iat_sum,
+		(unsigned long long)ml.fwd_iat_sq_sum,
 		ml.len_min[0] == UINT16_MAX ? 0 : ml.len_min[0], ml.len_max[0],
 		ml.len_min[1] == UINT16_MAX ? 0 : ml.len_min[1], ml.len_max[1],
-		ml.tcp_flags[0], ml.tcp_flags[1], ml.ml_score);
+		(unsigned long long)ml.pktlen_sum,
+		(unsigned long long)ml.pktlen_sq_sum,
+		ml.tcp_flags[0], ml.tcp_flags[1],
+		ml.syn_count, ml.ack_count, ml.psh_count, ml.urg_count,
+		ml.ml_score);
 	if (ll > 0)
 		dbuf_append(out, line, (size_t)ll);
 	(*count)++;

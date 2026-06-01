@@ -189,6 +189,10 @@ kernel-config:
 			--module NF_NAT_TFTP \
 			--module NF_FLOW_TABLE \
 			--module NF_FLOW_TABLE_INET \
+			--disable IP_NF_TARGET_SYNPROXY \
+			--disable IP6_NF_TARGET_SYNPROXY \
+			--disable NFT_SYNPROXY \
+			--disable NET_ACT_CT \
 			--enable VIRTIO --enable VIRTIO_PCI --enable VIRTIO_NET \
 			--enable VIRTIO_BLK --enable VIRTIO_MMIO \
 			--enable MODULES --enable MODULE_UNLOAD \

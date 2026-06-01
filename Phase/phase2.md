@@ -143,36 +143,55 @@ on static-route change).
 ### `struct nf_conn_ml` (kernel)
 
 Defined in `include/net/netfilter/nf_conntrack_ml.h`. Per-flow ML feature vector,
-**48 bytes**, with the two-element arrays indexed by direction
+**120 bytes**, with the two-element arrays indexed by direction
 `[0]=IP_CT_DIR_ORIGINAL`, `[1]=IP_CT_DIR_REPLY`.
 
 ```c
 struct nf_conn_ml {
-    u64   first_ns;      /* ktime of the first packet (flow start)    */
-    u64   last_ns;       /* ktime of the last packet (IAT + duration) */
-    u64   iat_sum_ns;    /* sum of inter-arrival gaps (both dirs)     */
-    u32   iat_count;     /* number of gaps accumulated                */
-    u16   tcp_flags[2];  /* OR of TCP flag bits seen, per direction   */
-    u16   len_min[2];    /* smallest L3 packet length, per direction  */
-    u16   len_max[2];    /* largest  L3 packet length, per direction  */
-    s32   ml_score;      /* score written back by the ML daemon       */
-    u16   iif;           /* ingress ifindex, original direction (0=unset) */
-    u16   oif;           /* egress  ifindex, original direction (0=unset) */
+    u64   first_ns;          /* ktime of the first packet (flow start)    */
+    u64   last_ns;           /* ktime of the last packet (IAT + duration) */
+    u64   iat_sum_ns;        /* sum of inter-arrival gaps, both dirs (ns) */
+    u32   iat_count;         /* number of gaps accumulated                */
+    u16   tcp_flags[2];      /* OR of TCP flag bits seen, per direction   */
+    u16   len_min[2];        /* smallest L3 packet length, per direction  */
+    u16   len_max[2];        /* largest  L3 packet length, per direction  */
+    s32   ml_score;          /* score written back by the ML daemon       */
+    u16   iif;               /* ingress ifindex, original dir (0=unset)   */
+    u16   oif;               /* egress  ifindex, original dir (0=unset)   */
+    u64   flow_iat_sq_sum;   /* sum of squared inter-arrival gaps (us^2)  */
+    ktime_t last_seen_fwd;   /* ktime of the last forward packet (0=none) */
+    u64   fwd_iat_sum;       /* sum of forward gaps (us)                  */
+    u64   fwd_iat_sq_sum;    /* sum of squared forward gaps (us^2)        */
+    u64   pktlen_sum;        /* sum of L3 packet lengths (bytes)          */
+    u64   pktlen_sq_sum;     /* sum of squared L3 packet lengths          */
+    u32   flow_iat_min;      /* smallest inter-arrival gap (us; U32_MAX)  */
+    u32   fwd_iat_count;     /* number of forward gaps accumulated        */
+    u32   syn_count;         /* TCP packets seen with SYN set             */
+    u32   ack_count;         /* TCP packets seen with ACK set             */
+    u32   psh_count;         /* TCP packets seen with PSH set             */
+    u32   urg_count;         /* TCP packets seen with URG set             */
 };
 ```
+
+The kernel never computes mean/variance/std (no floating point). It only
+accumulates the integer sums, counts, sum-of-squares, and min/max; a consumer
+derives the statistics: `mean = sum/count`,
+`variance = sq_sum/count - mean^2`, `std = sqrt(variance)`.
 
 | Field | Meaning |
 |---|---|
 | `first_ns` / `last_ns` | First and most-recent packet `ktime_get_ns()`; duration = `last_ns - first_ns`. |
-| `iat_sum_ns` / `iat_count` | Sum and count of inter-arrival gaps (both directions); average IAT = `iat_sum_ns / iat_count`. |
-| `tcp_flags[2]` | OR of TCP flag bits per direction (FIN 0x01, SYN 0x02, RST 0x04, PSH 0x08, ACK 0x10, URG 0x20). |
-| `len_min[2]` / `len_max[2]` | Smallest/largest L3 packet length per direction (`len_min` primed to `U16_MAX`). |
+| `iat_sum_ns` / `iat_count` / `flow_iat_sq_sum` / `flow_iat_min` | Inter-arrival gaps over both directions: sum (ns) and count → mean; sum-of-squares (µs²) → variance/std; minimum (µs, primed `U32_MAX`). Gaps are reduced to µs before squaring so the square fits `u64`. |
+| `last_seen_fwd` / `fwd_iat_sum` / `fwd_iat_sq_sum` / `fwd_iat_count` | Same statistics (µs) restricted to the **forward** (original) direction. `last_seen_fwd` is the previous forward packet time used to measure each forward gap. |
+| `tcp_flags[2]` | OR of TCP flag bits seen per direction (FIN 0x01, SYN 0x02, RST 0x04, PSH 0x08, ACK 0x10, URG 0x20) — presence, not frequency. |
+| `syn_count` / `ack_count` / `psh_count` / `urg_count` | Per-flag packet counts (frequency), complementing the `tcp_flags` presence bitmaps. |
+| `len_min[2]` / `len_max[2]` / `pktlen_sum` / `pktlen_sq_sum` | Packet length: per-direction min/max (`len_min` primed `U16_MAX`); flow-wide sum and sum-of-squares (bytes) → mean/variance/std. |
 | `ml_score` | Score written back by the ML daemon. Currently 0 — no daemon writes it yet. |
 | `iif` / `oif` | Original-direction ingress/egress `ifindex`, recorded once on the first packet. 0 = unset (a flow that never crossed FORWARD, e.g. traffic to the firewall itself). |
 
 > Packet/byte counts come from the standard conntrack **ACCT** extension;
-> `nf_conn_ml` holds only what ACCT/TSTAMP do not (timing, length spread,
-> accumulated flags, interface) plus the ML score.
+> `nf_conn_ml` holds only what ACCT/TSTAMP do not (timing statistics, length
+> spread, TCP flag presence and counts, interface) plus the ML score.
 
 ### Registration as conntrack extension `NF_CT_EXT_ML`
 
@@ -183,7 +202,8 @@ struct nf_conn_ml {
    table in range.
 3. **Allocation** (`init_conntrack()`): `nf_ct_ml_ext_add(ct, GFP_ATOMIC)` on the
    not-yet-confirmed conntrack. The helper zero-fills the extension and primes
-   `len_min[0]`/`len_min[1]` to `U16_MAX`; `iif`/`oif`/`ml_score` start at 0.
+   the minima (`len_min[0]`/`len_min[1]` to `U16_MAX`, `flow_iat_min` to
+   `U32_MAX`); the remaining fields start at 0.
 
 Compiled unconditionally (no `CONFIG` guard) — present on every
 conntrack-enabled build.
@@ -201,6 +221,12 @@ struct sg_nf_conn_ml {
     uint16_t len_min[2], len_max[2];
     int32_t  ml_score;
     uint16_t iif, oif;
+    uint64_t flow_iat_sq_sum;
+    int64_t  last_seen_fwd;   /* kernel ktime_t (s64) */
+    uint64_t fwd_iat_sum, fwd_iat_sq_sum;
+    uint64_t pktlen_sum, pktlen_sq_sum;
+    uint32_t flow_iat_min, fwd_iat_count;
+    uint32_t syn_count, ack_count, psh_count, urg_count;
 };
 ```
 
@@ -350,8 +376,11 @@ interface is matched against the current policies. Boot replay does not dirty.
   `IPCTNL_MSG_CT_GET | NLM_F_DUMP` (family `AF_INET`), reads to `NLMSG_DONE`, and
   `ct_ml_emit()` parses each message's `CTA_ML` into one line:
   ```
-  proto=<u> src=<ip>:<u> dst=<ip>:<u> iat_avg_us=<llu> dur_ms=<llu> \
-    len_o=<u>-<u> len_r=<u>-<u> flags_o=0x<x> flags_r=0x<x> score=<d>
+  proto=<u> src=<ip>:<u> dst=<ip>:<u> iat_avg_us=<llu> flow_iat_min=<llu> \
+    flow_iat_sq_sum=<llu> dur_ms=<llu> fwd_iat_count=<u> fwd_iat_sum=<llu> \
+    fwd_iat_sq_sum=<llu> len_o=<u>-<u> len_r=<u>-<u> pktlen_sum=<llu> \
+    pktlen_sq_sum=<llu> flags_o=0x<x> flags_r=0x<x> \
+    syn=<u> ack=<u> psh=<u> urg=<u> score=<d>
   ```
 
 ---
@@ -463,7 +492,17 @@ net.netfilter.nf_conntrack_timestamp = 1        # flow timestamps
 | `CONFIG_NF_CONNTRACK_MARK` | `y` | connmark — required by the `policy_id` DIRTY-bit re-eval. |
 | `CONFIG_NF_CONNTRACK_EVENTS` | **off** | Not needed; ML export is dump-only. |
 | `CONFIG_IP_SET` | **off** | → ipset-based blocking deferred. |
+| `CONFIG_NETFILTER_SYNPROXY` (and the `IP_NF_TARGET_SYNPROXY` / `IP6_NF_TARGET_SYNPROXY` / `NFT_SYNPROXY` targets that select it) | **off** | Frees its conntrack extension slot for `NF_CT_EXT_ML`. Unused (no SYNPROXY rules). |
+| `CONFIG_NET_ACT_CT` | **off** | Frees its conntrack extension slot. Unused (tc act_ct; the firewall uses iptables). |
 
+> **Conntrack extension budget.** `struct nf_ct_ext` stores each extension's
+> offset in a `u8`, so the **sum of all enabled conntrack extensions must be
+> ≤ 255 bytes** (`BUILD_BUG_ON(total_extension_size() > 255)`). `nf_conn_ml` is
+> 120 bytes; with NAT/help/seqadj/acct also present, SYNPROXY and NET_ACT_CT are
+> disabled above to keep the total under the limit. Re-enabling either while
+> `nf_conn_ml` is this large fails the build — shrink the struct or free another
+> extension first.
+>
 > The kernel `struct nf_conn_ml` and the userspace `struct sg_nf_conn_ml` must
 > stay byte-compatible. Any change to the struct requires rebuilding the kernel,
 > `pkt_forward.ko`, and mgmtd together, then reflashing.

@@ -24,6 +24,7 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/timekeeping.h>
+#include <linux/math64.h>
 #include <net/netfilter/ipv4/nf_defrag_ipv4.h>
 #include <net/netfilter/nf_conntrack.h>
 #include <net/netfilter/nf_conntrack_ml.h>
@@ -190,13 +191,44 @@ static void ml_account(struct sk_buff *skb, u8 proto, int iif, int oif)
 		ml->iif = (u16)iif;
 		ml->oif = (u16)oif;
 	}
+	/* Packet-length sum / sum-of-squares (both directions). */
+	ml->pktlen_sum    += len;
+	ml->pktlen_sq_sum += (u64)len * len;
+
+	/* Inter-arrival times. Gaps are reduced to microseconds before squaring
+	 * so the sum-of-squares fits u64 (ns^2 overflows on the first gap). A
+	 * gap is clamped to U32_MAX us (~4295 s) so a single square cannot
+	 * overflow; conntrack timeouts keep real gaps well below that. */
 	if (ml->first_ns == 0) {
 		ml->first_ns = now;
 	} else {
-		ml->iat_sum_ns += now - ml->last_ns;
+		u64 gap_ns = now - ml->last_ns;
+		u64 gap_us = div_u64(gap_ns, 1000);
+
+		if (gap_us > U32_MAX)
+			gap_us = U32_MAX;
+		ml->iat_sum_ns      += gap_ns;
+		ml->flow_iat_sq_sum += gap_us * gap_us;
 		ml->iat_count++;
+		if (gap_us < ml->flow_iat_min)
+			ml->flow_iat_min = (u32)gap_us;
 	}
 	ml->last_ns = now;
+
+	/* Forward-direction (original) inter-arrival times. */
+	if (dir == IP_CT_DIR_ORIGINAL) {
+		if (ml->last_seen_fwd) {
+			u64 fgap_us = div_u64(now - (u64)ml->last_seen_fwd, 1000);
+
+			if (fgap_us > U32_MAX)
+				fgap_us = U32_MAX;
+			ml->fwd_iat_sum    += fgap_us;
+			ml->fwd_iat_sq_sum += fgap_us * fgap_us;
+			ml->fwd_iat_count++;
+		}
+		ml->last_seen_fwd = now;
+	}
+
 	if (len < ml->len_min[dir])
 		ml->len_min[dir] = len;
 	if (len > ml->len_max[dir])
@@ -206,11 +238,11 @@ static void ml_account(struct sk_buff *skb, u8 proto, int iif, int oif)
 		u16 f = 0;
 
 		if (th->fin) f |= 0x01;
-		if (th->syn) f |= 0x02;
+		if (th->syn) { f |= 0x02; ml->syn_count++; }
 		if (th->rst) f |= 0x04;
-		if (th->psh) f |= 0x08;
-		if (th->ack) f |= 0x10;
-		if (th->urg) f |= 0x20;
+		if (th->psh) { f |= 0x08; ml->psh_count++; }
+		if (th->ack) { f |= 0x10; ml->ack_count++; }
+		if (th->urg) { f |= 0x20; ml->urg_count++; }
 		ml->tcp_flags[dir] |= f;
 	}
 	spin_unlock_bh(&ct->lock);
