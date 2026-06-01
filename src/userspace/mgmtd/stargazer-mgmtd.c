@@ -5131,6 +5131,15 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			}
 		}
 
+		/* A static route change can move a live flow's egress interface.
+		 * Interface-matched policies are not re-checked on the fast
+		 * path, so a flow that should now be denied on the new egress
+		 * would keep being accepted. Routing can't be narrowed by
+		 * cmkid, so dirty all flows to force re-evaluation against the
+		 * new routing on their next packet. */
+		if (strcmp(db_type, "network_route_static") == 0)
+			conntrack_reeval_after_policy_change(0);
+
 		if (cascade_warn[0]) {
 			char msg[768];
 			snprintf(msg, sizeof(msg),
@@ -5309,6 +5318,11 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		} else if (strcmp(db_type, "network_nat") == 0) {
 			char rb[512];
 			rebuild_nat_chains(rb, sizeof(rb));
+		} else if (strcmp(db_type, "network_route_static") == 0) {
+			/* Removing a route can move a live flow's egress
+			 * interface; dirty all flows so interface-matched
+			 * policies are re-checked against the new routing. */
+			conntrack_reeval_after_policy_change(0);
 		}
 
 		send_ok(client_fd, "Deleted", NULL);
