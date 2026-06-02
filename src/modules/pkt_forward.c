@@ -20,6 +20,8 @@
 #include <linux/netfilter_ipv4.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
+#include <linux/udp.h>
+#include <linux/icmp.h>
 #include <linux/skbuff.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
@@ -159,19 +161,23 @@ static bool is_valid_ipv4(struct sk_buff *skb)
  * ml_account - record this packet into the flow's conntrack NF_CT_EXT_ML
  * extension. conntrack ran at PRE_ROUTING, so the entry is already attached
  * and the extension allocated; here we add the per-flow features the ACCT and
- * TSTAMP extensions don't carry — inter-arrival time, packet-length spread,
- * and accumulated TCP flags. Direction is taken from conntrack (CTINFO2DIR).
- * Best-effort, under the per-conntrack lock; untracked packets (no ext) skip.
+ * TSTAMP extensions don't carry — inter-arrival time, payload-length spread,
+ * and accumulated TCP flags. Lengths are the L4 payload only (CICFlowMeter
+ * convention): the IP and transport headers are subtracted off. Direction is
+ * taken from conntrack (CTINFO2DIR). Best-effort, under the per-conntrack lock;
+ * untracked packets (no ext) skip.
  */
 static void ml_account(struct sk_buff *skb, u8 proto, int iif, int oif)
 {
 	enum ip_conntrack_info ctinfo;
 	struct nf_conn *ct = nf_ct_get(skb, &ctinfo);
 	struct nf_conn_ml *ml;
+	struct tcphdr *th = NULL;
 	struct iphdr *iph;
 	u64 now;
 	int dir;
-	u16 len;
+	u32 l3len;
+	u16 ihl, l4hdr = 0, len;
 
 	if (!ct)
 		return;
@@ -180,7 +186,23 @@ static void ml_account(struct sk_buff *skb, u8 proto, int iif, int oif)
 		return;
 
 	iph = ip_hdr(skb);
-	len = ntohs(iph->tot_len);
+	ihl = iph->ihl * 4;
+	/* Effective L3 length: the smaller of the IP header's tot_len and the
+	 * bytes actually present in the skb. */
+	l3len = min_t(u32, ntohs(iph->tot_len), skb->len);
+	/* Size of the transport header, to be subtracted for the L4 payload. */
+	if (proto == IPPROTO_TCP) {
+		th = (struct tcphdr *)((u8 *)iph + ihl);
+		l4hdr = th->doff * 4;
+	} else if (proto == IPPROTO_UDP) {
+		l4hdr = sizeof(struct udphdr);
+	} else if (proto == IPPROTO_ICMP) {
+		l4hdr = sizeof(struct icmphdr);
+	}
+	/* L4 payload length, clamped at 0 so a malformed/short header (header
+	 * claims more than the effective length) cannot wrap the subtraction. */
+	len = (l3len > ihl + l4hdr) ? (u16)(l3len - ihl - l4hdr) : 0;
+
 	dir = CTINFO2DIR(ctinfo);
 	now = ktime_get_ns();
 
@@ -191,23 +213,28 @@ static void ml_account(struct sk_buff *skb, u8 proto, int iif, int oif)
 		ml->iif = (u16)iif;
 		ml->oif = (u16)oif;
 	}
-	/* Packet-length sum / sum-of-squares (both directions). */
+	/* Payload-length sum / sum-of-squares / sample count (both directions),
+	 * plus the per-direction payload totals for the fwd/bwd length means. */
 	ml->pktlen_sum    += len;
 	ml->pktlen_sq_sum += (u64)len * len;
+	ml->pktlen_count++;
+	if (dir == IP_CT_DIR_ORIGINAL)
+		ml->bytes_fwd += len;
+	else
+		ml->bytes_bwd += len;
 
-	/* Inter-arrival times. Gaps are reduced to microseconds before squaring
-	 * so the sum-of-squares fits u64 (ns^2 overflows on the first gap). A
-	 * gap is clamped to U32_MAX us (~4295 s) so a single square cannot
-	 * overflow; conntrack timeouts keep real gaps well below that. */
+	/* Inter-arrival times, kept in microseconds: the mean is
+	 * iat_sum_us/iat_count and the squares stay consistent with it. A gap is
+	 * clamped to U32_MAX us (~4295 s) so a single square cannot overflow u64;
+	 * conntrack timeouts keep real gaps well below that. */
 	if (ml->first_ns == 0) {
 		ml->first_ns = now;
 	} else {
-		u64 gap_ns = now - ml->last_ns;
-		u64 gap_us = div_u64(gap_ns, 1000);
+		u64 gap_us = div_u64(now - ml->last_ns, 1000);
 
 		if (gap_us > U32_MAX)
 			gap_us = U32_MAX;
-		ml->iat_sum_ns      += gap_ns;
+		ml->iat_sum_us      += gap_us;
 		ml->flow_iat_sq_sum += gap_us * gap_us;
 		ml->iat_count++;
 		if (gap_us < ml->flow_iat_min)
@@ -233,8 +260,7 @@ static void ml_account(struct sk_buff *skb, u8 proto, int iif, int oif)
 		ml->len_min[dir] = len;
 	if (len > ml->len_max[dir])
 		ml->len_max[dir] = len;
-	if (proto == IPPROTO_TCP) {
-		struct tcphdr *th = (struct tcphdr *)((u8 *)iph + iph->ihl * 4);
+	if (proto == IPPROTO_TCP && th) {
 		u16 f = 0;
 
 		if (th->fin) f |= 0x01;

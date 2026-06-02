@@ -1855,7 +1855,7 @@ int handle_session_clear(int client_fd, const char *user,
 
 /* Must match the kernel struct nf_conn_ml (same host/arch, host byte order). */
 struct sg_nf_conn_ml {
-	uint64_t first_ns, last_ns, iat_sum_ns;
+	uint64_t first_ns, last_ns, iat_sum_us;
 	uint32_t iat_count;
 	uint16_t tcp_flags[2];
 	uint16_t len_min[2];
@@ -1869,12 +1869,15 @@ struct sg_nf_conn_ml {
 	uint64_t fwd_iat_sq_sum;
 	uint64_t pktlen_sum;
 	uint64_t pktlen_sq_sum;
+	uint64_t bytes_fwd;
+	uint64_t bytes_bwd;
 	uint32_t flow_iat_min;
 	uint32_t fwd_iat_count;
 	uint32_t syn_count;
 	uint32_t ack_count;
 	uint32_t psh_count;
 	uint32_t urg_count;
+	uint32_t pktlen_count;
 };
 
 /* Find attribute `want` in an nlattr stream [data, data+len); return payload. */
@@ -1910,7 +1913,7 @@ static void ct_ml_emit(const struct nlmsghdr *nh, struct dynbuf *out, long *coun
 	char src[INET_ADDRSTRLEN] = "?", dst[INET_ADDRSTRLEN] = "?";
 	unsigned proto = 0, sport = 0, dport = 0;
 	unsigned long long dur_ms, iat_us, iat_min;
-	char line[512];
+	char line[768];
 	int ll;
 
 	if (alen <= 0)
@@ -1952,14 +1955,16 @@ static void ct_ml_emit(const struct nlmsghdr *nh, struct dynbuf *out, long *coun
 
 	dur_ms = (ml.last_ns > ml.first_ns) ?
 		 (ml.last_ns - ml.first_ns) / 1000000ULL : 0;
-	iat_us = ml.iat_count ? (ml.iat_sum_ns / ml.iat_count) / 1000ULL : 0;
+	/* iat_sum_us is in microseconds; the mean is sum/count. */
+	iat_us = ml.iat_count ? ml.iat_sum_us / ml.iat_count : 0;
 	iat_min = (ml.flow_iat_min == UINT32_MAX) ? 0 : ml.flow_iat_min;
 
 	ll = snprintf(line, sizeof(line),
 		"proto=%u src=%s:%u dst=%s:%u iat_avg_us=%llu flow_iat_min=%llu "
 		"flow_iat_sq_sum=%llu dur_ms=%llu fwd_iat_count=%u fwd_iat_sum=%llu "
 		"fwd_iat_sq_sum=%llu len_o=%u-%u len_r=%u-%u pktlen_sum=%llu "
-		"pktlen_sq_sum=%llu flags_o=0x%02x flags_r=0x%02x "
+		"pktlen_sq_sum=%llu pktlen_count=%u bytes_fwd=%llu bytes_bwd=%llu "
+		"flags_o=0x%02x flags_r=0x%02x "
 		"syn=%u ack=%u psh=%u urg=%u score=%d\n",
 		proto, src, sport, dst, dport, iat_us, iat_min,
 		(unsigned long long)ml.flow_iat_sq_sum, dur_ms,
@@ -1969,11 +1974,19 @@ static void ct_ml_emit(const struct nlmsghdr *nh, struct dynbuf *out, long *coun
 		ml.len_min[1] == UINT16_MAX ? 0 : ml.len_min[1], ml.len_max[1],
 		(unsigned long long)ml.pktlen_sum,
 		(unsigned long long)ml.pktlen_sq_sum,
+		ml.pktlen_count,
+		(unsigned long long)ml.bytes_fwd,
+		(unsigned long long)ml.bytes_bwd,
 		ml.tcp_flags[0], ml.tcp_flags[1],
 		ml.syn_count, ml.ack_count, ml.psh_count, ml.urg_count,
 		ml.ml_score);
-	if (ll > 0)
+	/* snprintf returns the would-be length; clamp to what actually landed in
+	 * the buffer so dbuf_append never reads past it on truncation. */
+	if (ll > 0) {
+		if (ll >= (int)sizeof(line))
+			ll = (int)sizeof(line) - 1;
 		dbuf_append(out, line, (size_t)ll);
+	}
 	(*count)++;
 }
 
