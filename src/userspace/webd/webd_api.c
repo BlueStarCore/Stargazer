@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 /* ── Login rate limiter ──────────────────────────────────────────────── */
 
@@ -991,9 +992,25 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 					return -1;
 				}
 
-				/* Write to staging file */
-				FILE *ufp = fopen("/tmp/sg-fw-upload.tar.gz", "wb");
+				/* Write to a UNIQUE staging file (mkstemp): a
+				 * fixed shared path let two concurrent uploads
+				 * race — one client's bytes could be flashed
+				 * under another's request. Each upload now gets
+				 * its own file, named so mgmtd can validate it
+				 * by prefix. */
+				char stage[64];
+				snprintf(stage, sizeof(stage),
+					 "/tmp/sg-fw-upload.XXXXXX");
+				int sfd = mkstemp(stage);
+				if (sfd < 0) {
+					reply_json(c, 500,
+						   "{\"error\":\"Cannot create firmware staging file\"}");
+					return -1;
+				}
+				FILE *ufp = fdopen(sfd, "wb");
 				if (!ufp) {
+					close(sfd);
+					unlink(stage);
 					reply_json(c, 500,
 						   "{\"error\":\"Cannot create firmware staging file\"}");
 					return -1;
@@ -1004,15 +1021,18 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 				fclose(ufp);
 
 				if (uferr || wr != part.body.len) {
+					unlink(stage);
 					reply_json(c, 500,
 						   "{\"error\":\"Failed to write firmware staging file\"}");
 					return -1;
 				}
 
 				/* Dispatch IPC to mgmtd to process staged file */
-				char *upayload = strdup(
-					"path=/tmp/sg-fw-upload.tar.gz\n");
+				char upbuf[96];
+				snprintf(upbuf, sizeof(upbuf), "path=%s\n", stage);
+				char *upayload = strdup(upbuf);
 				if (!upayload) {
+					unlink(stage);
 					reply_json(c, 500,
 						   "{\"error\":\"Out of memory\"}");
 					return -1;

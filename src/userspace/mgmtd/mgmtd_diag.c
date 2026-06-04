@@ -3007,6 +3007,43 @@ int handle_diag_ntp(int client_fd, const char *user,
 	return 0;
 }
 
+/*
+ * json_escape_field — escape a string for a JSON double-quoted value.
+ *
+ * Escapes the metacharacters " and \ and any control byte (< 0x20). The
+ * DHCP hostname is DHCP option-12 — fully attacker-controlled by any LAN
+ * client — and was previously interpolated raw, letting a quote break out
+ * of the JSON string and forge/poison the leases response. Writes at most
+ * outsz-1 chars + NUL; stops early (never truncates mid-escape) if the
+ * escaped form would not fit.
+ */
+static void json_escape_field(const char *in, char *out, size_t outsz)
+{
+	size_t o = 0;
+
+	if (outsz == 0)
+		return;
+	for (size_t i = 0; in && in[i] && o + 7 < outsz; i++) {
+		unsigned char c = (unsigned char)in[i];
+
+		if (c == '"' || c == '\\') {
+			out[o++] = '\\';
+			out[o++] = (char)c;
+		} else if (c == '\n') {
+			out[o++] = '\\'; out[o++] = 'n';
+		} else if (c == '\r') {
+			out[o++] = '\\'; out[o++] = 'r';
+		} else if (c == '\t') {
+			out[o++] = '\\'; out[o++] = 't';
+		} else if (c < 0x20) {
+			o += (size_t)snprintf(out + o, outsz - o, "\\u%04x", c);
+		} else {
+			out[o++] = (char)c;
+		}
+	}
+	out[o] = '\0';
+}
+
 /* ─────────────────────────────────────────────────────────────────────────
  * handle_diag_dhcp_leases — active leases from all udhcpd pools.
  *
@@ -3152,23 +3189,31 @@ int handle_diag_dhcp_leases(int client_fd, const char *user,
 				char hostname[21];
 				memcpy(hostname, rec.hostname, 20);
 				hostname[20] = '\0';
-				/* Scrub non-printable bytes from hostname */
-				for (int i = 0; i < 20; i++)
-					if ((unsigned char)hostname[i] < 0x20)
-						hostname[i] = '\0';
+
+				/* hostname is DHCP option-12 (attacker-
+				 * controlled); pool_id is config-derived.
+				 * Escape both before interpolating into JSON
+				 * so a " or \ cannot break the structure. A
+				 * 20-byte hostname can expand ~6x when fully
+				 * escaped, so size the buffer for it. */
+				char host_esc[128], pool_esc[256];
+				json_escape_field(hostname, host_esc,
+						  sizeof(host_esc));
+				json_escape_field(pool_id, pool_esc,
+						  sizeof(pool_esc));
 
 				if (!first)
 					LEASE_JA(",", 1);
 				first = 0;
 
-				char entry[256];
+				char entry[512];
 				int elen = snprintf(entry, sizeof(entry),
 					"{\"pool\":\"%s\","
 					"\"ip\":\"%s\","
 					"\"mac\":\"%s\","
 					"\"hostname\":\"%s\","
 					"\"expires\":%lld}",
-					pool_id, ip_str, mac_str, hostname,
+					pool_esc, ip_str, mac_str, host_esc,
 					(long long)abs_exp);
 				if (elen > 0 && (size_t)elen < sizeof(entry))
 					LEASE_JA(entry, (size_t)elen);

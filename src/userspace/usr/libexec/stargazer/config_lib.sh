@@ -1263,7 +1263,7 @@ _delete_system_user_direct() {
 _get_valid_keys() {
 	case "$1" in
 		network_route_static) echo "dst gateway device distance status comment" ;;
-		network_nat)          echo "type srcintf dstintf srcaddr dstaddr dstport mapped-ip mapped-port status" ;;
+		network_nat)          echo "type srcintf dstintf protocol srcaddr dstaddr dstport mapped-ip mapped-port status" ;;
 		system_interface)     echo "ip status mtu description" ;;
 		system_settings)      echo "hostname ip-forward timezone" ;;
 		system_hostname)      echo "hostname" ;;
@@ -1825,11 +1825,14 @@ _apply_config_direct() {
 		network_nat)
 			_type=$(grep '^type=' "$_apply_file" 2>/dev/null | cut -d= -f2-)
 			_srcintf=$(grep '^srcintf=' "$_apply_file" 2>/dev/null | cut -d= -f2-)
+			_protocol=$(grep '^protocol=' "$_apply_file" 2>/dev/null | cut -d= -f2-)
 			_dstport=$(grep '^dstport=' "$_apply_file" 2>/dev/null | cut -d= -f2-)
 			_mapped_ip=$(grep '^mapped-ip=' "$_apply_file" 2>/dev/null | cut -d= -f2-)
 			_mapped_port=$(grep '^mapped-port=' "$_apply_file" 2>/dev/null | cut -d= -f2-)
 			_status=$(grep '^status=' "$_apply_file" 2>/dev/null | cut -d= -f2-)
 			[ "$_status" = "disable" ] && return
+			# Backward compat: entries written before the protocol field
+			[ -z "$_protocol" ] && _protocol=all
 			case "$_type" in
 				snat|dnat) ;;
 				*) echo "  Error: invalid NAT type '$_type' (snat|dnat)"; return 1 ;;
@@ -1850,16 +1853,45 @@ _apply_config_direct() {
 				echo "  Error: invalid mapped-port '$_mapped_port' (1-65535)"
 				return 1
 			}
+			case "$_protocol" in
+				tcp|udp|tcp+udp|all) ;;
+				*) echo "  Error: invalid protocol '$_protocol' (tcp|udp|tcp+udp|all)"; return 1 ;;
+			esac
+			# Append a nat rule only if an identical one is not present, so
+			# repeated replay/rollback does not pile up duplicates.
+			_nat_add() {  # $1=chain, rest=rule spec
+				_c=$1; shift
+				iptables -t nat -C "$_c" "$@" 2>/dev/null || \
+					iptables -t nat -A "$_c" "$@" 2>&1 | sed 's/^/  /'
+			}
 			case "$_type" in
 				snat)
-					[ -n "$_srcintf" ] && iptables -t nat -A POSTROUTING -o "$_srcintf" -j MASQUERADE 2>&1 | sed 's/^/  /'
+					[ -n "$_srcintf" ] && _nat_add POSTROUTING -o "$_srcintf" -j MASQUERADE
 					echo "  SNAT rule $_apply_id applied."
 					;;
 				dnat)
-					if [ -n "$_dstport" ] && [ -n "$_mapped_ip" ]; then
+					if [ -n "$_mapped_ip" ]; then
 						_target="$_mapped_ip"
 						[ -n "$_mapped_port" ] && _target="${_target}:${_mapped_port}"
-						iptables -t nat -A PREROUTING -p tcp --dport "$_dstport" -j DNAT --to-destination "$_target" 2>&1 | sed 's/^/  /'
+						# Honor the configured protocol (was hardcoded
+						# tcp, diverging from the mgmtd apply path).
+						case "$_protocol" in
+							all)
+								# 1:1 NAT, all protocols (dstport ignored)
+								_nat_add PREROUTING -j DNAT --to-destination "$_target"
+								;;
+							tcp+udp)
+								if [ -n "$_dstport" ]; then
+									_nat_add PREROUTING -p tcp --dport "$_dstport" -j DNAT --to-destination "$_target"
+									_nat_add PREROUTING -p udp --dport "$_dstport" -j DNAT --to-destination "$_target"
+								fi
+								;;
+							tcp|udp)
+								if [ -n "$_dstport" ]; then
+									_nat_add PREROUTING -p "$_protocol" --dport "$_dstport" -j DNAT --to-destination "$_target"
+								fi
+								;;
+						esac
 						echo "  DNAT rule $_apply_id applied."
 					fi
 					;;

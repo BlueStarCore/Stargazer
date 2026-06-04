@@ -492,6 +492,39 @@ chk("1A+: rsp_appendf carries printf format attribute (-Wformat covers callers)"
 chk("1A+: no raw 'pos += snprintf' accumulation remains in mgmtd",
     "pos += snprintf" not in _re.sub(r'\* .*snprintf.*\n', '', _mg))
 
+# ── Audit MEDIUM fixes (2026-06) — regression locks ────────────────────────
+_dg2 = rd("src/userspace/mgmtd/mgmtd_diag.c")
+# M1: DHCP hostname (option-12, attacker-controlled) must be JSON-escaped
+# before interpolation, else a " forges/poisons the leases response.
+chk("M1: dhcp leases JSON-escape helper exists",
+    "static void json_escape_field(" in _dg2)
+chk("M1: hostname + pool_id escaped before the leases JSON snprintf",
+    "json_escape_field(hostname" in _dg2 and "json_escape_field(pool_id" in _dg2
+    and "host_esc, ip_str, mac_str" not in _dg2  # old raw-var order gone
+    and "pool_esc, ip_str, mac_str, host_esc" in _dg2)
+# M2: /etc/group rewrite must not split lines >1023B (getline, not fgets).
+_us = rd("src/userspace/mgmtd/mgmtd_user.c")
+chk("M2: add_user_to_group uses getline (no fixed-buffer truncation)",
+    "getline(&line, &linecap, fp)" in _us)
+# M3: per-upload staging path (mkstemp), validated by prefix; no shared file.
+_wa = rd("src/userspace/webd/webd_api.c")
+chk("M3: webd stages firmware via mkstemp (unique path, no race)",
+    'mkstemp(stage)' in _wa and '"/tmp/sg-fw-upload.tar.gz"' not in _wa)
+_fw2 = rd("src/userspace/mgmtd/mgmtd_firmware.c")
+chk("M3: mgmtd validates upload path by prefix and consumes that exact path",
+    '"/tmp/sg-fw-upload."' in _fw2 and "rename(path, FW_DL_FILE)" in _fw2
+    and "#define FW_UPLOAD_FILE" not in _fw2)  # fixed-path macro removed
+# M4/M5: direct NAT path honors protocol + is idempotent.
+_cl = rd("src/userspace/usr/libexec/stargazer/config_lib.sh")
+chk("M4: direct NAT reads protocol and is in valid keys",
+    "_protocol=$(grep '^protocol=' " in _cl
+    and "type srcintf dstintf protocol srcaddr" in _cl)
+chk("M4: direct DNAT no longer hardcodes -p tcp (honors tcp/udp/tcp+udp/all)",
+    'iptables -t nat -A PREROUTING -p tcp --dport "$_dstport"' not in _cl
+    and '-p "$_protocol" --dport' in _cl)
+chk("M5: direct NAT is idempotent (check-then-add, no duplicate accumulation)",
+    'iptables -t nat -C "$_c" "$@" 2>/dev/null ||' in _cl)
+
 # ─────────────────────────────────────────────────────────────────────────────
 print(f"\n{B}{C}=== 5. sg_is_uint_range: overflow and negative ==={N}")
 # ─────────────────────────────────────────────────────────────────────────────

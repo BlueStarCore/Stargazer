@@ -331,10 +331,16 @@ static void add_user_to_group(const char *username, const char *groupname)
 	FILE *out = fdopen(tfd, "w");
 	if (!out) { close(tfd); unlink(tmppath); fclose(fp); return; }
 
-	char line[MAX_LINE];
+	/* getline (dynamic buffer): a fixed fgets(line, MAX_LINE) buffer
+	 * splits a group line longer than the buffer into two fgets reads,
+	 * and the rewrite below would then write a truncated entry plus an
+	 * orphan tail line — corrupting /etc/group. The stargazer group line
+	 * grows with every admin, so this is reachable over time. */
+	char *line = NULL;
+	size_t linecap = 0;
 	size_t glen = strlen(groupname);
 
-	while (fgets(line, sizeof(line), fp)) {
+	while (getline(&line, &linecap, fp) != -1) {
 		if (strncmp(line, groupname, glen) == 0 && line[glen] == ':') {
 			/* Found the group line — check if user already in it */
 			size_t len = strlen(line);
@@ -378,6 +384,7 @@ static void add_user_to_group(const char *username, const char *groupname)
 		}
 	}
 
+	free(line);
 	fclose(fp);
 	fclose(out);
 	rename(tmppath, "/etc/group");

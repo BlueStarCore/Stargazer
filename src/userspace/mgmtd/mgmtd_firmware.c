@@ -37,7 +37,9 @@
 #define FW_STATE_FILE_TMP "/tmp/sg-fw-upgrade.state.tmp"
 #define FW_CANCEL_FILE    "/tmp/sg-fw-cancel"
 #define FW_DL_FILE        "/tmp/sg-fw-download/firmware.tar.gz"
-#define FW_UPLOAD_FILE    "/tmp/sg-fw-upload.tar.gz"
+/* webd stages each upload at a unique mkstemp path "/tmp/sg-fw-upload.*"
+ * passed in the IPC payload; handle_upgrade_from_file validates it by
+ * prefix (no fixed shared name — see the race fix). */
 
 /*
  * Write firmware upgrade progress to state file atomically.
@@ -955,7 +957,7 @@ int handle_upgrade_cancel(int client_fd, const char *user,
 
 /*
  * handle_upgrade_from_file — install firmware already written by webd to
- * FW_UPLOAD_FILE.  The child moves it to FW_DL_FILE, then runs steps 2-6
+ * a per-upload staging file.  The child moves it to FW_DL_FILE, then runs steps 2-6
  * via fw_child_upgrade_steps().
  */
 int handle_upgrade_from_file(int client_fd, const char *user,
@@ -969,14 +971,25 @@ int handle_upgrade_from_file(int client_fd, const char *user,
 		return 0;
 	}
 
-	/* Validate that the upload path is the expected staging file */
+	/* Validate the upload path: it must be one of webd's staging files,
+	 * i.e. "/tmp/sg-fw-upload.<suffix>" with no further '/' and no ".."
+	 * (webd now uses mkstemp per upload, so the exact name varies). This
+	 * accepts the legacy fixed FW_UPLOAD_FILE too. Reject anything else
+	 * so the path cannot point outside the staging area. */
 	char path[256] = {0};
 	if (payload && hdr->payload_len > 0)
 		extract_val(payload, "path", path, sizeof(path));
-	if (strcmp(path, FW_UPLOAD_FILE) != 0) {
-		send_error(client_fd, SG_ERR_INVALID_ARG,
-			   "Invalid firmware path");
-		return 0;
+	{
+		static const char PFX[] = "/tmp/sg-fw-upload.";
+		size_t pfxlen = sizeof(PFX) - 1;
+		if (strncmp(path, PFX, pfxlen) != 0 ||
+		    path[pfxlen] == '\0' ||
+		    strstr(path, "..") != NULL ||
+		    strchr(path + pfxlen, '/') != NULL) {
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "Invalid firmware path");
+			return 0;
+		}
 	}
 
 	if (access(path, F_OK) != 0) {
@@ -995,6 +1008,9 @@ int handle_upgrade_from_file(int client_fd, const char *user,
 			state_check[rd] = '\0';
 			fclose(sf);
 			if (strstr(state_check, "status=running")) {
+				/* Drop this upload's staging file — the
+				 * in-progress upgrade owns its own. */
+				unlink(path);
 				send_error(client_fd, SG_ERR_IN_USE,
 					   "Firmware upgrade already in progress");
 				return 0;
@@ -1047,13 +1063,17 @@ int handle_upgrade_from_file(int client_fd, const char *user,
 	fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
 	fw_run_cmd_ignore("mkdir -p /tmp/sg-fw-download /tmp/sg-fw-staged");
 
-	/* Move uploaded file to expected download path */
-	if (rename(FW_UPLOAD_FILE, FW_DL_FILE) != 0) {
-		/* rename fails across filesystems — fall back to cp+rm */
-		char cpcmd[512];
+	/* Move THIS request's uploaded file (validated above) to the expected
+	 * download path. Using the per-request path, not a shared constant,
+	 * is what makes concurrent uploads independent. */
+	if (rename(path, FW_DL_FILE) != 0) {
+		/* rename fails across filesystems — fall back to cp+rm.
+		 * cpcmd must hold the validated path (<=255) twice plus the
+		 * fixed dest and shell text. */
+		char cpcmd[768];
 		snprintf(cpcmd, sizeof(cpcmd),
 			 "cp -f '%s' '%s' && rm -f '%s'",
-			 FW_UPLOAD_FILE, FW_DL_FILE, FW_UPLOAD_FILE);
+			 path, FW_DL_FILE, path);
 		fw_run_cmd_ignore(cpcmd);
 	}
 
