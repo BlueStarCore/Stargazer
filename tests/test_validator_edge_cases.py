@@ -514,6 +514,12 @@ _fw2 = rd("src/userspace/mgmtd/mgmtd_firmware.c")
 chk("M3: mgmtd validates upload path by prefix and consumes that exact path",
     '"/tmp/sg-fw-upload."' in _fw2 and "rename(path, FW_DL_FILE)" in _fw2
     and "#define FW_UPLOAD_FILE" not in _fw2)  # fixed-path macro removed
+# Re-verify follow-up: the staging-path suffix must be strict [A-Za-z0-9]
+# (mkstemp charset) so it cannot carry shell metacharacters into the cp
+# fallback command — the loose ".."/"/" check alone left an injection.
+chk("M3+: upload path suffix restricted to mkstemp charset (no shell metachars)",
+    "*s >= 'A' && *s <= 'Z'" in _fw2 and "*s >= '0' && *s <= '9'" in _fw2
+    and 'strstr(path, "..")' not in _fw2)
 # M4/M5: direct NAT path honors protocol + is idempotent.
 _cl = rd("src/userspace/usr/libexec/stargazer/config_lib.sh")
 chk("M4: direct NAT reads protocol and is in valid keys",
@@ -521,7 +527,14 @@ chk("M4: direct NAT reads protocol and is in valid keys",
     and "type srcintf dstintf protocol srcaddr" in _cl)
 chk("M4: direct DNAT no longer hardcodes -p tcp (honors tcp/udp/tcp+udp/all)",
     'iptables -t nat -A PREROUTING -p tcp --dport "$_dstport"' not in _cl
-    and '-p "$_protocol" --dport' in _cl)
+    and '_dnat_proto "$_protocol"' in _cl)
+# Re-verify follow-up: a tcp/udp DNAT with no dstport must still emit a
+# -p rule (mirrors mgmtd emit_dnat_rule) instead of silently dropping it.
+chk("M4+: DNAT emits -p rule even without dstport (parity with mgmtd)",
+    'else\n\t\t\t\t\t\t\t\t_nat_add PREROUTING -p "$1" -j DNAT' in _cl)
+chk("M4+: protocol listed in NAT help and has enum validation",
+    'protocol     tcp | udp | tcp+udp | all' in _cl
+    and 'network_nat:protocol) echo "enum:tcp,udp,tcp+udp,all"' in _cl)
 chk("M5: direct NAT is idempotent (check-then-add, no duplicate accumulation)",
     'iptables -t nat -C "$_c" "$@" 2>/dev/null ||' in _cl)
 

@@ -1051,6 +1051,7 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 
 				if (webd_pool_enqueue(&item) != 0) {
 					free(upayload);
+					unlink(stage); /* mgmtd never got the path */
 					reply_json(c, 503,
 						   "{\"error\":\"Server busy\"}");
 					return -1;

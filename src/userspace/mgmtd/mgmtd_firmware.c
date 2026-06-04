@@ -971,21 +971,27 @@ int handle_upgrade_from_file(int client_fd, const char *user,
 		return 0;
 	}
 
-	/* Validate the upload path: it must be one of webd's staging files,
-	 * i.e. "/tmp/sg-fw-upload.<suffix>" with no further '/' and no ".."
-	 * (webd now uses mkstemp per upload, so the exact name varies). This
-	 * accepts the legacy fixed FW_UPLOAD_FILE too. Reject anything else
-	 * so the path cannot point outside the staging area. */
+	/* Validate the upload path: it must be one of webd's mkstemp staging
+	 * files, "/tmp/sg-fw-upload.<suffix>" where <suffix> is non-empty and
+	 * strictly [A-Za-z0-9] (exactly what mkstemp produces). The strict
+	 * charset rules out path traversal, extra '/', AND shell
+	 * metacharacters — the path is later interpolated into a cp fallback
+	 * command, so anything looser would be a command-injection vector. */
 	char path[256] = {0};
 	if (payload && hdr->payload_len > 0)
 		extract_val(payload, "path", path, sizeof(path));
 	{
 		static const char PFX[] = "/tmp/sg-fw-upload.";
 		size_t pfxlen = sizeof(PFX) - 1;
-		if (strncmp(path, PFX, pfxlen) != 0 ||
-		    path[pfxlen] == '\0' ||
-		    strstr(path, "..") != NULL ||
-		    strchr(path + pfxlen, '/') != NULL) {
+		int valid = (strncmp(path, PFX, pfxlen) == 0) &&
+			    (path[pfxlen] != '\0');
+		for (const char *s = path + pfxlen; valid && *s; s++) {
+			if (!((*s >= 'A' && *s <= 'Z') ||
+			      (*s >= 'a' && *s <= 'z') ||
+			      (*s >= '0' && *s <= '9')))
+				valid = 0;
+		}
+		if (!valid) {
 			send_error(client_fd, SG_ERR_INVALID_ARG,
 				   "Invalid firmware path");
 			return 0;
@@ -1037,6 +1043,7 @@ int handle_upgrade_from_file(int client_fd, const char *user,
 		mgmt_log("ERROR", "firmware upgrade (upload) fork failed: %s",
 			 strerror(errno));
 		fw_write_state(0, 6, "error", "Internal error: fork failed", "");
+		unlink(path);	/* no child will consume the staging file */
 		return 0;
 	}
 

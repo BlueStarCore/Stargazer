@@ -1407,6 +1407,7 @@ cfg_value_kind() {
 		system_password-policy:min-length) echo "uint:0:128" ;;
 		system_password-policy:min-uppercase|system_password-policy:min-lowercase|system_password-policy:min-digit|system_password-policy:min-special) echo "uint:0:128" ;;
 		network_nat:type) echo "enum:snat,dnat" ;;
+		network_nat:protocol) echo "enum:tcp,udp,tcp+udp,all" ;;
 		network_nat:srcaddr|network_nat:dstaddr) echo "cidr-or:any,all" ;;
 		network_nat:dstport|network_nat:mapped-port) echo "uint:1:65535" ;;
 		system_interface:status) echo "enum:up,down" ;;
@@ -1666,6 +1667,7 @@ _show_valid_keys() {
 			echo "    type         snat | dnat"
 			echo "    srcintf      Source interface (for SNAT)"
 			echo "    dstintf      Destination interface"
+			echo "    protocol     tcp | udp | tcp+udp | all"
 			echo "    srcaddr      Source address/mask"
 			echo "    dstaddr      Destination address/mask"
 			echo "    dstport      Destination port (for DNAT)"
@@ -1873,23 +1875,30 @@ _apply_config_direct() {
 					if [ -n "$_mapped_ip" ]; then
 						_target="$_mapped_ip"
 						[ -n "$_mapped_port" ] && _target="${_target}:${_mapped_port}"
-						# Honor the configured protocol (was hardcoded
-						# tcp, diverging from the mgmtd apply path).
+						# Emit one DNAT rule for a protocol, adding --dport
+						# only when a dstport is set — mirrors mgmtd's
+						# emit_dnat_rule (mgmtd_apply_nat.c), which always
+						# installs the -p rule and treats dstport as
+						# optional. (The earlier version dropped the rule
+						# entirely when dstport was empty.)
+						_dnat_proto() {
+							if [ -n "$_dstport" ]; then
+								_nat_add PREROUTING -p "$1" --dport "$_dstport" -j DNAT --to-destination "$_target"
+							else
+								_nat_add PREROUTING -p "$1" -j DNAT --to-destination "$_target"
+							fi
+						}
 						case "$_protocol" in
 							all)
 								# 1:1 NAT, all protocols (dstport ignored)
 								_nat_add PREROUTING -j DNAT --to-destination "$_target"
 								;;
 							tcp+udp)
-								if [ -n "$_dstport" ]; then
-									_nat_add PREROUTING -p tcp --dport "$_dstport" -j DNAT --to-destination "$_target"
-									_nat_add PREROUTING -p udp --dport "$_dstport" -j DNAT --to-destination "$_target"
-								fi
+								_dnat_proto tcp
+								_dnat_proto udp
 								;;
 							tcp|udp)
-								if [ -n "$_dstport" ]; then
-									_nat_add PREROUTING -p "$_protocol" --dport "$_dstport" -j DNAT --to-destination "$_target"
-								fi
+								_dnat_proto "$_protocol"
 								;;
 						esac
 						echo "  DNAT rule $_apply_id applied."
