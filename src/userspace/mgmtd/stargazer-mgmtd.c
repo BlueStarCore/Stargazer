@@ -334,6 +334,16 @@ int ipt_exec(const char *const argv[])
 				cmd[pos++] = ' ';
 			int n = snprintf(cmd + pos, sizeof(cmd) - (size_t)pos,
 					 "%s", argv[i]);
+			/* snprintf returns the untruncated length; a long argv
+			 * element would push pos past cmd and make the
+			 * cmd[pos]='\0' below an out-of-bounds write. Stop at a
+			 * full buffer instead. */
+			if (n < 0)
+				break;
+			if ((size_t)n >= sizeof(cmd) - (size_t)pos) {
+				pos = (int)sizeof(cmd) - 1;
+				break;
+			}
 			pos += n;
 		}
 		cmd[pos] = '\0';
@@ -871,6 +881,37 @@ int handle_diag_stargazer_log(int client_fd, const char *user,
 }
 
 /*
+ * rsp_appendf — bounded formatted append into a fixed response buffer.
+ *
+ * Returns the new offset, never advancing past cap-1. A raw
+ * "pos += snprintf(buf+pos, cap-pos, ...)" is unsafe: snprintf returns
+ * the untruncated length, so once it truncates, pos overshoots cap and
+ * the next "cap - pos" underflows to a huge size_t with buf+pos past the
+ * allocation. This stops cleanly at a full buffer instead.
+ */
+static size_t rsp_appendf(char *buf, size_t cap, size_t pos,
+			  const char *fmt, ...)
+	__attribute__((format(printf, 4, 5)));
+
+static size_t rsp_appendf(char *buf, size_t cap, size_t pos,
+			  const char *fmt, ...)
+{
+	va_list ap;
+	int n;
+
+	if (pos >= cap)
+		return cap ? cap - 1 : 0;
+	va_start(ap, fmt);
+	n = vsnprintf(buf + pos, cap - pos, fmt, ap);
+	va_end(ap);
+	if (n < 0)
+		return pos;
+	if ((size_t)n >= cap - pos)
+		return cap - 1;		/* truncated: buffer full */
+	return pos + (size_t)n;
+}
+
+/*
  * handle_diag_storage — Show storage device and mount status.
  * Reports partition devices, mount points, blkid info, and database status.
  */
@@ -894,44 +935,44 @@ int handle_diag_storage(int client_fd, const char *user,
 	size_t pos = 0;
 
 	/* Storage devices */
-	pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+	pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 			"Storage devices:\n");
 	const char *argv1[] = {"sh", "-c",
 			       "/bin/ls -la /dev/mmcblk0p* 2>/dev/null || echo '  No eMMC partitions found'",
 			       NULL};
 	char *out1 = safe_exec(argv1);
 	if (out1) {
-		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos, "%s", out1);
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos, "%s", out1);
 		free(out1);
 	}
 
 	/* Mount points */
-	pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+	pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 			"\nStorage mount points:\n");
 	const char *argv2[] = {"sh", "-c",
 			       "/bin/mount | /bin/grep -E 'stargazer|mmcblk'",
 			       NULL};
 	char *out2 = safe_exec(argv2);
 	if (out2 && out2[0]) {
-		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos, "%s", out2);
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos, "%s", out2);
 		free(out2);
 	} else {
-		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 				"  No stargazer/mmcblk mounts found\n");
 		free(out2);
 	}
 
 	/* Partition info */
-	pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+	pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 			"\nPartition info:\n");
 	const char *argv3[] = {"blkid", "/dev/mmcblk0p5", NULL};
 	char *out3 = safe_exec(argv3);
 	if (out3 && out3[0]) {
-		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 				"/dev/mmcblk0p5: %s", out3);
 		free(out3);
 	} else {
-		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 				"/dev/mmcblk0p5: not found or unformatted\n");
 		free(out3);
 	}
@@ -939,24 +980,24 @@ int handle_diag_storage(int client_fd, const char *user,
 	const char *argv4[] = {"blkid", "/dev/mmcblk0p6", NULL};
 	char *out4 = safe_exec(argv4);
 	if (out4 && out4[0]) {
-		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 				"/dev/mmcblk0p6: %s", out4);
 		free(out4);
 	} else {
-		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 				"/dev/mmcblk0p6: not found or unformatted\n");
 		free(out4);
 	}
 
 	/* Database status */
-	pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+	pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 			"\nConfig database:\n");
 	const char *argv5[] = {"sh", "-c",
 			       "/bin/ls -lh /etc/stargazer/stargazer.db 2>/dev/null || echo '  Database not found'",
 			       NULL};
 	char *out5 = safe_exec(argv5);
 	if (out5) {
-		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos, "%s", out5);
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos, "%s", out5);
 		free(out5);
 	}
 
@@ -1045,7 +1086,7 @@ int handle_diag_dhcp_client(int client_fd, const char *user,
 	}
 
 	if (iface_count == 0) {
-		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 				"No DHCP client interfaces configured.\n");
 		send_ok(client_fd, NULL, buf);
 		free(buf);
@@ -1054,7 +1095,7 @@ int handle_diag_dhcp_client(int client_fd, const char *user,
 
 	for (int i = 0; i < iface_count; i++) {
 		const char *iface = iface_list[i];
-		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 				"Interface: %s\n", iface);
 
 		/* ── Supervisor status ─────────────────────────────── */
@@ -1064,17 +1105,17 @@ int handle_diag_dhcp_client(int client_fd, const char *user,
 		int   ucnt = supervisor_get_restart_count(sup_name);
 
 		if (upid > 0) {
-			pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+			pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 					"  udhcpc:     running (pid %d,"
 					" restarts %d)\n",
 					(int)upid, ucnt);
 		} else if (ucnt == -1) {
-			pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+			pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 					"  udhcpc:     NOT running"
 					" (not tracked — restart limit hit"
 					" or never started)\n");
 		} else {
-			pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+			pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 					"  udhcpc:     NOT running"
 					" (restarts %d)\n", ucnt);
 		}
@@ -1115,9 +1156,10 @@ int handle_diag_dhcp_client(int client_fd, const char *user,
 							pid_t op =
 							  (pid_t)atoi(
 							    pe->d_name);
-							pos += snprintf(
-							  buf + pos,
-							  SG_RESPONSE_MAX - pos,
+							pos = rsp_appendf(
+							  buf,
+							  SG_RESPONSE_MAX,
+							  pos,
 							  "  orphan:     "
 							  "pid %d (not"
 							  " supervisor-"
@@ -1148,13 +1190,12 @@ int handle_diag_dhcp_client(int client_fd, const char *user,
 					line[llen-1] == '\r'))
 					line[--llen] = '\0';
 				if (!line[0]) continue;
-				pos += snprintf(buf + pos,
-						SG_RESPONSE_MAX - pos,
-						"  %s\n", line);
+				pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
+						  "  %s\n", line);
 			}
 			fclose(fp);
 		} else {
-			pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+			pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 					"  lease:      (no status file)\n");
 		}
 
@@ -1169,23 +1210,21 @@ int handle_diag_dhcp_client(int client_fd, const char *user,
 				inet_p += 5;
 				char *sp = strchr(inet_p, ' ');
 				if (sp) *sp = '\0';
-				pos += snprintf(buf + pos,
-						SG_RESPONSE_MAX - pos,
-						"  ip:         %s\n",
-						inet_p);
+				pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
+						  "  ip:         %s\n",
+						  inet_p);
 			} else {
-				pos += snprintf(buf + pos,
-						SG_RESPONSE_MAX - pos,
-						"  ip:         (none)\n");
+				pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
+						  "  ip:         (none)\n");
 			}
 		} else {
-			pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+			pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 					"  ip:         (none)\n");
 		}
 		free(ipout);
 
 		if (i + 1 < iface_count)
-			pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+			pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 					"\n");
 		free(iface_list[i]);
 	}

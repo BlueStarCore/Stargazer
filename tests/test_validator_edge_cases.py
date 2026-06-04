@@ -477,6 +477,21 @@ chk("1B: dhcp lease handler gates on the verified peer UID",
 chk("1B: peer UID is captured from SO_PEERCRED per connection",
     "g_peer_uid = cred.uid" in _mg)
 
+# Adversarial re-verification of the HIGH fixes found two siblings the
+# first pass missed (same snprintf-return root cause), now fixed:
+#  - ipt_exec joined argv with "pos += snprintf" then wrote cmd[pos]='\0'
+#    → out-of-bounds STACK WRITE when an argv element truncated.
+#  - the storage-diag handler accumulated "pos += snprintf(buf+pos,
+#    cap-pos,...)" with no clamp → cap-pos underflow past a 64KB buffer.
+chk("1A+: ipt_exec stops at a full cmd buffer (no OOB write on cmd[pos])",
+    "pos = (int)sizeof(cmd) - 1;" in _mg and ">= sizeof(cmd) - (size_t)pos" in _mg)
+chk("1A+: bounded response-append helper exists",
+    "static size_t rsp_appendf(" in _mg)
+chk("1A+: rsp_appendf carries printf format attribute (-Wformat covers callers)",
+    "__attribute__((format(printf, 4, 5)))" in _mg)
+chk("1A+: no raw 'pos += snprintf' accumulation remains in mgmtd",
+    "pos += snprintf" not in _re.sub(r'\* .*snprintf.*\n', '', _mg))
+
 # ─────────────────────────────────────────────────────────────────────────────
 print(f"\n{B}{C}=== 5. sg_is_uint_range: overflow and negative ==={N}")
 # ─────────────────────────────────────────────────────────────────────────────
