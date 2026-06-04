@@ -8,23 +8,25 @@
 
 ## Phase documentation
 Each phase has a detailed design document in `Phase/`:
-- `Phase/phase2.md` — Session tracking: RCU hash table, TCP state machine, procfs, CLI diagnostics.
+- `Phase/phase2.md` — Connection-state tracking on `nf_conntrack`, anomaly screening, per-flow ML features, connmark policy re-evaluation.
 
 ## Core Architecture
 
 ### Kernel data-plane
-- **`pkt_forward.ko`** — Netfilter `NF_INET_FORWARD` hook. Validates IPv4, does session lookup/create/update, enforces `SESS_BLOCKED`. SMP-safe with atomic counters.
-- **`session.ko`** — RCU hash table of 5-tuple sessions. TCP state machine (non-SYN drop, RST sequence validation, per-state timeouts). Exports API to `pkt_forward.ko`.
-- **`session_test.ko`** — Kernel self-test module. Exercises session API without a network stack; writes results to `/proc/stargazer/session_test`.
-- **Planned**: IPS module + ML scoring daemon, feed score via netlink.
+- **`nf_conntrack`** (stock kernel) — owns all per-flow connection state and NAT. The single source of truth for flows; everything else reads or annotates it. No custom session table.
+- **`pkt_forward.ko`** — Netfilter `NF_INET_FORWARD` hook. Stateless anomaly screen + feature tap: validates IPv4, drops L3/L4 attack patterns (Land, source routing, NULL/XMAS/FIN scans, SYN-with-data, Ping of Death), then accounts per-flow ML features into the conntrack `NF_CT_EXT_ML` extension (`ml_account()`). Holds no per-session state, enforces no blocks. SMP-safe atomic counters; stats at `/proc/stargazer/pkt_forward_stats`.
+- **Kernel patches** (in `../stargazer-kernel`, see below) — `struct nf_conn_ml` / `NF_CT_EXT_ML` conntrack extension (`include/net/netfilter/nf_conntrack_ml.h`), allocated on every flow in `init_conntrack`, exported as binary attribute `CTA_ML` (=27) on the ctnetlink dump path. Userspace mirrors the struct as `sg_nf_conn_ml` in `mgmtd_diag.c` — **keep the two layouts field-for-field identical**.
+- **Policy re-evaluation** — firewall policy is enforced by iptables; each flow carries a connmark `policy_id` (bits 8–31) + DIRTY bit (bit 0). On policy change mgmtd marks the affected flows dirty via ctnetlink (`conntrack_mark_dirty_by_policy`), falling back to a full conntrack flush — never leave stale fast-path flows (fail-closed).
+- **Planned**: IPS module + ML scoring daemon (see Phase 3).
 
-### Load order
-`session.ko` → `pkt_forward.ko` (enforced by `MODULE_SOFTDEP`). `session_test.ko` loaded/unloaded on demand by mgmtd.
+### Module loading
+`pkt_forward.ko` softdeps on `nf_defrag_ipv4` (`MODULE_SOFTDEP`). Boot modules listed in `/etc/modules-load.d/stargazer.conf` (`af_packet`, `pkt_forward`), loaded by `/etc/init.d/stargazer`.
 
 ## Target & Build
 - **Target**: BPI-R4 (MT7988A, ARM64).
 - **Host**: Ubuntu 22.04 x86_64, cross-compile with `aarch64-linux-gnu-gcc`.
 - **Build**: root `Makefile` (kernel → modules → rootfs → iso).
+- **Kernel tree**: sibling checkout at `../stargazer-kernel` (`make kernel-source` fetches it). Carries the Stargazer conntrack-ML patches: `nf_conntrack_ml.h`, `NF_CT_EXT_ML` registration in `nf_conntrack_extend.{h,c}`, ext alloc in `nf_conntrack_core.c`, `CTA_ML` dump in `nf_conntrack_netlink.c`.
 
 ### Key commands
 ```
@@ -61,10 +63,9 @@ make all | make kernel | make modules | make rootfs | make iso | make test
 ## Key source files
 | File | Role |
 |---|---|
-| `src/modules/pkt_forward.c` | Netfilter FORWARD hook — data plane |
-| `src/modules/session.c` | Session table: RCU hash, TCP state machine, reaper |
-| `src/modules/session.h` | Shared API between session.ko and pkt_forward.ko |
-| `src/modules/session_test.c` | Kernel self-test for session API |
+| `src/modules/pkt_forward.c` | Netfilter FORWARD hook — anomaly screen + ML feature tap |
+| `../stargazer-kernel/include/net/netfilter/nf_conntrack_ml.h` | `struct nf_conn_ml` — per-flow ML feature vector (kernel side) |
+| `src/userspace/mgmtd/mgmtd_apply_firewall.c` | iptables policy apply + connmark dirty-flow re-evaluation |
 | `src/userspace/cli/cli_readline.c` | Zero-fork readline with abbreviation resolution |
 | `src/userspace/cli/cli_configure.c` | Interactive config contexts (table/entry/single) |
 | `src/userspace/cli/cli_cmd_table.c` | All CLI command handlers |
@@ -75,8 +76,8 @@ make all | make kernel | make modules | make rootfs | make iso | make test
 
 ## Constraints
 - The firewall is always in a dangerous position — honesty first. Tests verify real behavior. Errors say what is actually wrong. Outputs show actual data. Buffers are always checked. A build that silently breaks is broken.
-- No floats in kernel code (use fixed-point or integer arithmetic).
-- RCU for read-heavy session tables; per-session spinlock for mutations.
+- No floats in kernel code (use fixed-point or integer arithmetic; ML features stored as sums/sums-of-squares so consumers derive mean/variance).
+- Flow state belongs to `nf_conntrack` — annotate it (extensions, connmark), never duplicate it. ML extension mutations under `ct->lock` (`spin_lock_bh`).
 - Cross-compile only; QEMU for kernel/module tests.
 - Create a plan and explain why before making changes.
 
@@ -86,7 +87,7 @@ make all | make kernel | make modules | make rootfs | make iso | make test
 - Do not add `Co-Authored-By` lines.
 
 ## Next (Phase 3)
-- Netlink family to export session table to ML scoring daemon.
-- ML daemon reads sessions, writes `ml_score` and `SESS_BLOCKED` flag back.
-- IPS module: signature-based payload inspection, hooks into session on match.
+- Flow export to the ML daemon already works: ctnetlink dump carries `CTA_ML` (consumed today by `handle_session_ml`, SG_CMD_SESSION_ML).
+- ML scoring daemon: read `CTA_ML` dumps, write `ml_score` back into the extension, block flagged flows.
+- IPS module: signature-based payload inspection, flags the flow's conntrack entry on match.
 - `diagnose session list/filter` with field-level filtering.

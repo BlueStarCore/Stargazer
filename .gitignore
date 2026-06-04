@@ -45,3 +45,6 @@ docs/*.pdf
 
 # AI conversation exchange
 ai-conversation/
+
+# Local code-intelligence index (codegraph MCP)
+.codegraph/
