@@ -1125,6 +1125,41 @@ static int cmd_diag_nat_policy(const char *args, const char *permissions)
 	return 0;
 }
 
+static int cmd_diag_fw_ipset(const char *args, const char *permissions)
+{
+	(void)permissions;
+
+	const char *p = args ? args : "";
+	while (*p == ' ')
+		p++;
+	if (!*p) {
+		printf("  Usage: execute diagnose firewall ipset <address-object>\n");
+		return 0;
+	}
+
+	char payload[SG_PAYLOAD_MAX];
+	snprintf(payload, sizeof(payload), "name=%s\n", p);
+
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_DIAG_FW_IPSET, payload, &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+
+	if (resp.status != SG_OK) {
+		print_ipc_error("Failed", &resp);
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	if (resp.payload && resp.payload_len > 0)
+		printf("%s", resp.payload);
+
+	ipc_resp_free(&resp);
+	return 0;
+}
+
 static int cmd_diag_fw_conntrack(const char *args, const char *permissions)
 {
 	(void)args;

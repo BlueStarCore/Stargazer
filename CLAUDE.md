@@ -9,6 +9,7 @@
 ## Phase documentation
 Each phase has a detailed design document in `Phase/`:
 - `Phase/phase2.md` — Connection-state tracking on `nf_conntrack`, anomaly screening, per-flow ML features, connmark policy re-evaluation.
+- `Phase/fqdn.md` — FQDN address objects: per-object `hash:ip` ipsets, accumulate-mode DNS refresh, `fqdn-ttl`, fail-closed ledger, debugging runbook.
 
 ## Core Architecture
 
@@ -49,6 +50,7 @@ make all | make kernel | make modules | make rootfs | make iso | make test
 - **IPC protocol**: binary request/response defined in `stargazer_ipc.h`.
 - **Config backend**: `sg_db.c` — SQLite database at `/etc/stargazer/stargazer.db`.
 - Schema: `src/userspace/usr/libexec/stargazer/db_schema.sql`.
+- **FQDN address objects**: each fqdn-type `firewall_address` owns one `hash:ip` ipset with per-entry timeouts (`mgmtd_ipset.c`, raw netlink — no ipset binary). FORWARD rules match it via `-m set --match-set`; `mgmtd_fqdn.c` re-resolves every 60s in a detached worker (+ a kick after every chain rebuild) and **merges** answers into the set — round-robin DNS returns one answer per query, so swap-replace would make deny rules flicker. Entries not re-confirmed within `fqdn-ttl` seconds expire (`config system settings`, 60–86400, default 3600 — stamped per-entry on every ADD, change re-stamps existing members via `fqdn_restamp_all`); bounded over-blocking, never under-blocking. Resolve failure re-adds current members to keep their timeouts alive (an emptied set would silently un-match DENY rules). `execute diagnose firewall ipset <object>` dumps membership + expiry. Wildcards rejected at validation — they need DNS snooping (Phase 3). NAT rules cannot use fqdn objects (fail-closed skip).
 
 ### logind (`src/userspace/logind/`)
 - **Login daemon**: `stargazer-logind` — password auth, policy enforcement, audit logging via SQLite.
@@ -90,4 +92,5 @@ make all | make kernel | make modules | make rootfs | make iso | make test
 - Flow export to the ML daemon already works: ctnetlink dump carries `CTA_ML` (consumed today by `handle_session_ml`, SG_CMD_SESSION_ML).
 - ML scoring daemon: read `CTA_ML` dumps, write `ml_score` back into the extension, block flagged flows.
 - IPS module: signature-based payload inspection, flags the flow's conntrack entry on match.
+- Wildcard FQDN (`*.example.com`): DNS-response snooping (NFQUEUE on UDP/53) feeding the same ipsets — shares payload-inspection infrastructure with the IPS module.
 - `diagnose session list/filter` with field-level filtering.

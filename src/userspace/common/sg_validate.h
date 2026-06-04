@@ -56,6 +56,7 @@ int sg_is_safe_id(const char *s);
 int sg_is_net_target(const char *s);
 int sg_is_ipv4(const char *s);
 int sg_is_cidr(const char *s);
+int sg_is_fqdn(const char *s);
 int sg_is_iface_name(const char *s);
 int sg_is_uint_range(const char *s, int min, int max);
 int sg_is_tz_token(const char *s);
@@ -132,6 +133,12 @@ int sg_reg_validate_value(const char *type_name, const char *key, const char *va
 
 /* Validate an entry ID. Returns 1 if valid, 0 if not. */
 int sg_reg_validate_entry_id(const char *type_name, const char *id);
+
+/* Cross-field semantic check on a FULL entry ("key=val\n" form), e.g.
+ * firewall_address type↔subnet/fqdn consistency.  Returns 0 if OK,
+ * -1 with a message in errbuf otherwise. */
+int sg_check_entry_semantics(const char *type_name, const char *data,
+                             char *errbuf, size_t errsz);
 
 /* ── Reference metadata ──────────────────────────────────────────────── */
 

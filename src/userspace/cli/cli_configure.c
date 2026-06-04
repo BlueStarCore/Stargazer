@@ -1042,6 +1042,22 @@ static int context_entry(const char *type_name, const char *label,
 					fprintf(stderr,
 						"[CFG-DBG] save:"
 						" required fields OK\n");
+				/* Cross-field semantics (e.g. address
+				 * type ipmask↔subnet, fqdn↔fqdn).
+				 * mgmtd re-checks on CFG_SET; this is
+				 * the instant local feedback. */
+				{
+					char sem[2048], semerr[160];
+					kv_serialize(&data, sem,
+						     sizeof(sem));
+					if (sg_check_entry_semantics(
+						type_name, sem, semerr,
+						sizeof(semerr)) != 0) {
+						printf("  Error: %s\n",
+						       semerr);
+						continue;
+					}
+				}
 				/* New admin must have password */
 				if (is_new &&
 				    strcmp(type_name, "system_admin") == 0 &&

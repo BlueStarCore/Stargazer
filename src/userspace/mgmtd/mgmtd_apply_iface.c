@@ -33,9 +33,10 @@ sg_status_t apply_settings(const char *id, const char *data,
 			   char *result, size_t rsize)
 {
 	(void)id;
-	char hostname[VALBUFSZ], ipfwd[VALBUFSZ];
+	char hostname[VALBUFSZ], ipfwd[VALBUFSZ], fqdnttl[VALBUFSZ];
 	extract_val(data, "hostname", hostname, sizeof(hostname));
 	extract_val(data, "ip-forward", ipfwd, sizeof(ipfwd));
+	extract_val(data, "fqdn-ttl", fqdnttl, sizeof(fqdnttl));
 
 	if (hostname[0]) {
 		if (!sg_is_safe_id(hostname)) {
@@ -56,6 +57,21 @@ sg_status_t apply_settings(const char *id, const char *data,
 	} else if (strcmp(ipfwd, "disable") == 0) {
 		FILE *fp = fopen("/proc/sys/net/ipv4/ip_forward", "w");
 		if (fp) { fprintf(fp, "0\n"); fclose(fp); }
+	}
+
+	if (fqdnttl[0]) {
+		/* Registry validated the range (uint:60:86400) at CFG_SET;
+		 * re-check here so a corrupt DB cannot zero the timeout
+		 * (0 = permanent entries — unbounded over-blocking). */
+		long ttl = strtol(fqdnttl, NULL, 10);
+		if (ttl >= 60 && ttl <= 86400 &&
+		    (uint32_t)ttl != sg_ipset_entry_timeout()) {
+			sg_ipset_set_entry_timeout((uint32_t)ttl);
+			/* Apply to existing members now — otherwise each
+			 * keeps its old TTL until a resolve re-confirms it. */
+			fqdn_restamp_all();
+			mgmt_log("INFO", "fqdn-ttl set to %lds", ttl);
+		}
 	}
 
 	snprintf(result, rsize, "System settings applied.");

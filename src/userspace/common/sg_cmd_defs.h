@@ -110,6 +110,7 @@ X("execute diagnose firewall",              "Firewall diagnostics",             
 X("execute diagnose firewall policy",       "Show firewall policy and rules",          "admin",           1,  cmd_diag_fw_policy)
 X("execute diagnose firewall policy nat",   "Show NAT rules",                          "admin",           0,  NULL)
 X("execute diagnose firewall conntrack",    "Show connection tracking entries",         "admin",           0,  cmd_diag_fw_conntrack)
+X("execute diagnose firewall ipset",        "Show FQDN object ipset membership",        "admin",           1,  cmd_diag_fw_ipset)
 
 X("execute diagnose system",                "System diagnostics",                      "monitor",         0,  NULL)
 X("execute diagnose system bootlog",        "Show kernel boot log (dmesg)",            "monitor",         0,  cmd_diagnose_system_bootlog)

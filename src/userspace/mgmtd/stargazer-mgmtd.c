@@ -3998,6 +3998,12 @@ sg_status_t validate_cfg_data(const char *type, const char *data,
 		}
 	}
 
+	/* Part 3: cross-field semantics (e.g. firewall_address type ipmask
+	 * needs subnet, type fqdn needs fqdn).  Full payload only — partial
+	 * CFG_APPLY data goes through validate_cfg_fields() and skips this. */
+	if (sg_check_entry_semantics(type, data, errbuf, errsz) != 0)
+		return SG_ERR_INVALID_ARG;
+
 	return SG_OK;
 }
 
@@ -4947,6 +4953,20 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 					rebuild_nat_chains(rb, sizeof(rb));
 				}
 
+				/* fqdn object renamed → its set name changed
+				 * with it.  The rebuild above already emits
+				 * rules for the new set; drop the old one and
+				 * kick a resolve so the new set fills fast. */
+				if (strcmp(db_type, "firewall_address") == 0) {
+					char at[VALBUFSZ];
+					extract_val(clean, "type", at,
+						    sizeof(at));
+					if (strcmp(at, "fqdn") == 0) {
+						fqdn_object_removed(db_id);
+						fqdn_refresh_kick();
+					}
+				}
+
 				free(existing);
 				send_ok(client_fd, "Config saved", NULL);
 				return 0;
@@ -5273,6 +5293,18 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			/* Stop udhcpd daemon, remove firewall rule and
 			 * runtime files for this DHCP pool. */
 			unapply_dhcp(db_id);
+		} else if (strcmp(db_type, "firewall_address") == 0) {
+			/* fqdn-type objects own an ipset — destroy it so it
+			 * doesn't leak.  The reference check above guarantees
+			 * no FORWARD rule still matches the set. */
+			char *adata = sg_db_get(db_type, db_id);
+			if (adata) {
+				char at[VALBUFSZ];
+				extract_val(adata, "type", at, sizeof(at));
+				if (strcmp(at, "fqdn") == 0)
+					fqdn_object_removed(db_id);
+				free(adata);
+			}
 		}
 		/* Firewall/NAT: no per-rule unapply needed — atomic
 		 * rebuild after DB delete handles everything. */
@@ -5935,6 +5967,94 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		return 0;
 	}
 
+	case SG_CMD_DIAG_FW_IPSET: {
+		const char *perms = get_user_permissions(user);
+		if (!has_permission(perms, "monitor")) {
+			mgmt_log("WARN", "user '%s' denied FW_IPSET (no monitor perm)", user);
+			send_error(client_fd, SG_ERR_PERM_DENIED,
+				   "Requires 'monitor' permission");
+			return 0;
+		}
+
+		char name[VALBUFSZ] = "";
+		if (payload && payload[0])
+			extract_val(payload, "name", name, sizeof(name));
+		if (!name[0]) {
+			send_error(client_fd, SG_ERR_MISSING_ARG,
+				   "Usage: diagnose firewall ipset <address-object>");
+			return 0;
+		}
+
+		/* The object must exist and be fqdn-type — only those own
+		 * an ipset.  This also turns a typo into a clear error
+		 * instead of a misleading "set not found". */
+		char *data = sg_db_get("firewall_address", name);
+		if (!data) {
+			send_error(client_fd, SG_ERR_ENTRY_NOT_FOUND,
+				   "No such firewall address object");
+			return 0;
+		}
+		char atype[VALBUFSZ], fqdn[SG_NET_TARGET_MAX + 1];
+		extract_val(data, "type", atype, sizeof(atype));
+		extract_val(data, "fqdn", fqdn, sizeof(fqdn));
+		free(data);
+		if (strcmp(atype, "fqdn") != 0) {
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "Not an fqdn-type object — only fqdn "
+				   "objects own an ipset");
+			return 0;
+		}
+
+		char set[64];
+		sg_fqdn_set_name(name, set, sizeof(set));
+
+		size_t msz = 32768;
+		char *members = malloc(msz);
+		char *out = malloc(msz + 512);
+		if (!members || !out) {
+			free(members);
+			free(out);
+			send_error(client_fd, SG_ERR_INTERNAL, "Out of memory");
+			return 0;
+		}
+
+		int n = sg_ipset_list(set, members, msz);
+		if (n == -ENOENT) {
+			snprintf(out, msz + 512,
+				 "  Object : %s\n"
+				 "  FQDN   : %s\n"
+				 "  ipset  : %s\n\n"
+				 "  Set does not exist in the kernel — no "
+				 "FORWARD rule references this object yet\n"
+				 "  (rules are built on policy apply).\n",
+				 name, fqdn, set);
+			send_ok(client_fd, NULL, out);
+		} else if (n < 0) {
+			char err[160];
+			snprintf(err, sizeof(err),
+				 "ipset list failed: %s (%d)",
+				 n > -4096 ? strerror(-n) : "ipset error", -n);
+			mgmt_log("ERROR", "FW_IPSET %s: %s", set, err);
+			send_error(client_fd, SG_ERR_INTERNAL, err);
+		} else {
+			snprintf(out, msz + 512,
+				 "  Object : %s\n"
+				 "  FQDN   : %s\n"
+				 "  ipset  : %s\n"
+				 "  TTL    : %us (system settings fqdn-ttl)\n"
+				 "  Members: %d%s\n\n%s",
+				 name, fqdn, set, sg_ipset_entry_timeout(), n,
+				 n == 0 ? "  (empty set matches NOTHING — "
+					  "resolver worker has not populated "
+					  "it; check mgmtd log)" : "",
+				 members);
+			send_ok(client_fd, NULL, out);
+		}
+		free(members);
+		free(out);
+		return 0;
+	}
+
 	case SG_CMD_DIAG_ROUTES: {
 		const char *perms = get_user_permissions(user);
 		if (!has_permission(perms, "monitor")) {
@@ -6328,6 +6448,10 @@ int main(void)
 			g_child_died = 0;
 			reap_children();
 		}
+
+		/* Periodic FQDN re-resolve (detached worker, never blocks
+		 * this loop — see mgmtd_fqdn.c) */
+		fqdn_refresh_tick();
 
 		struct pollfd pfds[2];
 		int nfds = 0;

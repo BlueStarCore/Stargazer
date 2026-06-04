@@ -1562,6 +1562,27 @@
         }, 150);
     }
 
+    /* Address form: exactly one value field is active per type —
+     * subnet for ipmask, fqdn for fqdn.  The inactive row is hidden;
+     * buildPayloadFromForm skips hidden rows, so the payload never
+     * carries the wrong field (mgmtd rejects mixed entries). */
+    function syncAddressFormRows() {
+        var form = document.getElementById('form-address');
+        if (!form) return;
+        var sel = form.querySelector('.form-row[data-key="type"] select');
+        var sub = form.querySelector('.form-row[data-key="subnet"]');
+        var fq  = form.querySelector('.form-row[data-key="fqdn"]');
+        if (!sel || !sub || !fq) return;
+        var isFqdn = sel.value === 'fqdn';
+        sub.style.display = isFqdn ? 'none' : '';
+        fq.style.display  = isFqdn ? '' : 'none';
+    }
+    (function () {
+        var form = document.getElementById('form-address');
+        var sel = form ? form.querySelector('.form-row[data-key="type"] select') : null;
+        if (sel) sel.addEventListener('change', syncAddressFormRows);
+    })();
+
     /* Bind all toggle buttons */
     document.querySelectorAll('[data-toggle-form]').forEach(function (btn) {
         btn.addEventListener('click', function () {
@@ -1586,6 +1607,9 @@
                 populateAddrSelects();
                 populateSvcSelects();
                 openModal(id);
+                /* closeModal reset the type select — re-sync the
+                 * type-dependent rows (address form: subnet vs fqdn) */
+                syncAddressFormRows();
             }
         });
     });
@@ -1720,7 +1744,10 @@
             fields: [
                 { label: 'Name',        key: 'name',    col: 0, bulkEditable: false },
                 { label: 'Type',        key: 'type',    col: 1, bulkEditable: false },
-                { label: 'Subnet / IP', key: 'subnet',  col: 2, bulkEditable: false },
+                /* The ADDRESS column shows whichever value field the
+                 * type uses: subnet (ipmask) or fqdn. */
+                { label: 'Subnet / IP', key: 'subnet',  altKey: 'fqdn', col: 2, bulkEditable: false },
+                { label: 'FQDN',        key: 'fqdn',    col: -1, bulkEditable: false },
                 { label: 'Comment',     key: 'comment', col: 3, bulkEditable: false }
             ]
         },
@@ -2288,6 +2315,10 @@
                 });
             });
         }
+
+        /* Editing sets the type select programmatically (no change
+         * event) — re-sync type-dependent rows (address: subnet/fqdn) */
+        syncAddressFormRows();
     }
 
     /* Extract clean text from a table cell (strip status dots, tags, etc.) */
@@ -3042,7 +3073,9 @@
 
             config.fields.forEach(function (f) {
                 if (f.col === -1) return;
-                var val = row[f.key] || '';
+                /* altKey: alternate source field for type-dependent
+                 * columns (e.g. address objects: subnet OR fqdn). */
+                var val = row[f.key] || (f.altKey ? row[f.altKey] : '') || '';
                 if (f.key === 'status' && config.hasStatus) {
                     tr.appendChild(buildStatusCell(val, config.statusLabels));
                 } else {
@@ -3596,7 +3629,7 @@
      * Field keys must match data-key attributes on the .form-row. */
     var SETTINGS_MAP = {
         'system': [
-            { configType: 'system_settings',   fields: ['hostname', 'ip-forward', 'timezone'] },
+            { configType: 'system_settings',   fields: ['hostname', 'ip-forward', 'timezone', 'fqdn-ttl'] },
             { configType: 'system_ntp',        fields: ['server'] },
             { configType: 'network_dns',       fields: ['primary', 'secondary'] },
             { configType: 'system_session-ttl', fields: ['tcp-syn-sent', 'tcp-syn-recv', 'tcp-established', 'tcp-fin-wait', 'tcp-close-wait', 'tcp-last-ack', 'tcp-time-wait', 'tcp-close', 'udp', 'icmp', 'other'] }

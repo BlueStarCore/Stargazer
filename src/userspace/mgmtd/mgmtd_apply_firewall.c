@@ -45,53 +45,100 @@
 /* ── Address / Service resolution ───────────────────────────────────────── */
 
 /*
- * resolve_address — Resolve a policy/NAT address field to a CIDR string.
+ * resolve_address_ex — Resolve a policy/NAT address field.
  *
- * Returns:
- *   pointer to out  — resolved CIDR (caller uses it)
- *   NULL            — match-all (0.0.0.0/0), omit -s/-d flag
- *   "SKIP"          — object not found, skip the entire rule (fail-closed)
+ *   ADDR_MATCH_ALL — any/all/0.0.0.0/0: omit the -s/-d flag
+ *   ADDR_CIDR      — out holds a CIDR for -s/-d
+ *   ADDR_IPSET     — out holds an ipset name for -m set --match-set
+ *                    (fqdn-type objects; the set is created here so the
+ *                    emitted rule always references an existing set —
+ *                    membership is filled by the FQDN refresh engine)
+ *   ADDR_SKIP      — dangling/unenforceable: skip the rule (fail-closed)
  */
-const char *resolve_address(const char *val, char *out, size_t outsz)
+enum addr_kind resolve_address_ex(const char *val, char *out, size_t outsz)
 {
 	if (!val || !val[0])
-		return NULL;
+		return ADDR_MATCH_ALL;
 
 	/* "any" and "all" are match-all keywords — no DB lookup needed */
 	if (strcmp(val, "any") == 0 || strcmp(val, "all") == 0)
-		return NULL;
+		return ADDR_MATCH_ALL;
 
 	/* Raw CIDR passthrough (backward compat for NAT legacy data) */
 	if (sg_is_cidr(val)) {
 		if (strcmp(val, "0.0.0.0/0") == 0)
-			return NULL;  /* match-all → omit flag */
+			return ADDR_MATCH_ALL;
 		snprintf(out, outsz, "%s", val);
-		return out;
+		return ADDR_CIDR;
 	}
 
 	/* Look up firewall_address entry */
 	char *data = sg_db_get("firewall_address", val);
 	if (!data) {
 		mgmt_log("ERROR", "resolve_address: '%s' not found", val);
-		return "SKIP";
+		return ADDR_SKIP;
 	}
 
-	char subnet[VALBUFSZ];
+	char atype[VALBUFSZ], subnet[VALBUFSZ];
+	extract_val(data, "type",   atype,  sizeof(atype));
 	extract_val(data, "subnet", subnet, sizeof(subnet));
 	free(data);
+
+	if (strcmp(atype, "fqdn") == 0) {
+		if (!sg_ipset_available()) {
+			mgmt_log("ERROR", "resolve_address: '%s' is an FQDN "
+				 "object but the kernel lacks ipset support "
+				 "— rule skipped (fail-closed)", val);
+			return ADDR_SKIP;
+		}
+		sg_fqdn_set_name(val, out, outsz);
+		if (sg_ipset_ensure(out) != 0) {
+			mgmt_log("ERROR", "resolve_address: cannot create "
+				 "ipset %s for '%s' — rule skipped "
+				 "(fail-closed)", out, val);
+			return ADDR_SKIP;
+		}
+		return ADDR_IPSET;
+	}
 
 	if (!subnet[0] || !sg_is_cidr(subnet)) {
 		mgmt_log("ERROR", "resolve_address: '%s' invalid subnet",
 			 val);
-		return "SKIP";
+		return ADDR_SKIP;
 	}
 
 	/* 0.0.0.0/0 = match-all → omit flag for cleaner rules */
 	if (strcmp(subnet, "0.0.0.0/0") == 0)
-		return NULL;
+		return ADDR_MATCH_ALL;
 
 	snprintf(out, outsz, "%s", subnet);
-	return out;
+	return ADDR_CIDR;
+}
+
+/*
+ * resolve_address — legacy single-CIDR resolver, kept for the NAT path.
+ *
+ * Returns:
+ *   pointer to out  — resolved CIDR (caller uses it)
+ *   NULL            — match-all (0.0.0.0/0), omit -s/-d flag
+ *   "SKIP"          — not found, or an fqdn-type object: NAT rules
+ *                     cannot match a DNS-derived set (fail-closed)
+ */
+const char *resolve_address(const char *val, char *out, size_t outsz)
+{
+	switch (resolve_address_ex(val, out, outsz)) {
+	case ADDR_MATCH_ALL:
+		return NULL;
+	case ADDR_CIDR:
+		return out;
+	case ADDR_IPSET:
+		mgmt_log("ERROR", "resolve_address: FQDN object '%s' is not "
+			 "supported in NAT rules — rule skipped", val);
+		return "SKIP";
+	case ADDR_SKIP:
+	default:
+		return "SKIP";
+	}
 }
 
 /*
@@ -283,24 +330,45 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 				dbuf_printf(&buf, " -i %s", srcintf);
 			if (dstintf[0] && strcmp(dstintf, "any") != 0)
 				dbuf_printf(&buf, " -o %s", dstintf);
-			/* Resolve address objects */
+			/* Resolve address objects.  CIDR objects emit -s/-d;
+			 * fqdn objects emit an ipset match — the rule then
+			 * follows DNS changes via set membership without
+			 * ever rebuilding the chain. */
 			{
 				char resolved[VALBUFSZ];
-				const char *src = resolve_address(
-					srcaddr, resolved, sizeof(resolved));
-				if (src && strcmp(src, "SKIP") == 0)
+				switch (resolve_address_ex(srcaddr, resolved,
+							   sizeof(resolved))) {
+				case ADDR_SKIP:
 					goto skip_rule;
-				if (src)
-					dbuf_printf(&buf, " -s %s", src);
+				case ADDR_CIDR:
+					dbuf_printf(&buf, " -s %s", resolved);
+					break;
+				case ADDR_IPSET:
+					dbuf_printf(&buf, " -m set"
+						    " --match-set %s src",
+						    resolved);
+					break;
+				case ADDR_MATCH_ALL:
+					break;
+				}
 			}
 			{
 				char resolved[VALBUFSZ];
-				const char *dst = resolve_address(
-					dstaddr, resolved, sizeof(resolved));
-				if (dst && strcmp(dst, "SKIP") == 0)
+				switch (resolve_address_ex(dstaddr, resolved,
+							   sizeof(resolved))) {
+				case ADDR_SKIP:
 					goto skip_rule;
-				if (dst)
-					dbuf_printf(&buf, " -d %s", dst);
+				case ADDR_CIDR:
+					dbuf_printf(&buf, " -d %s", resolved);
+					break;
+				case ADDR_IPSET:
+					dbuf_printf(&buf, " -m set"
+						    " --match-set %s dst",
+						    resolved);
+					break;
+				case ADDR_MATCH_ALL:
+					break;
+				}
 			}
 
 			/* Resolve service object */
@@ -421,6 +489,12 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 
 	free(out);
 	free(buf.data);
+
+	/* Newly created fqdn sets are empty until their first resolve —
+	 * kick the refresh worker now so they converge in well under a
+	 * second instead of waiting for the periodic tick.  Detached
+	 * worker: never blocks the apply (or boot replay) on DNS. */
+	fqdn_refresh_kick();
 
 	/* NOTE: rebuild only rewrites the rules. Applying the change to LIVE flows
 	 * (marking them dirty so they re-traverse, or flushing in the no-connmark

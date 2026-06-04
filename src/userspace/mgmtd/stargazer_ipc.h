@@ -116,6 +116,7 @@ typedef enum {
 	SG_CMD_DIAG_FW_POLICY    = 631,  /* Show INPUT chain policy+rules    */
 	SG_CMD_DIAG_FW_CONNTRACK = 632,  /* Show conntrack entries            */
 	SG_CMD_DIAG_ROUTES       = 633,  /* Show IPv4+IPv6 routing tables     */
+	SG_CMD_DIAG_FW_IPSET     = 634,  /* Dump an FQDN object's ipset       */
 
 	/* System diagnostics (64x) — served by mgmtd_diag.c */
 	SG_CMD_DIAG_CPU          = 640,  /* CPU jiffies + thermal readings     */

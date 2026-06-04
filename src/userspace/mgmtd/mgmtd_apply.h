@@ -16,6 +16,7 @@
 #include "sg_validate.h"
 
 #include <stddef.h>
+#include <stdint.h>
 #include <sys/types.h>
 
 /* ── Shared constants ───────────────────────────────────────────────────── */
@@ -96,8 +97,47 @@ char *pipe_exec_stdin(const char *const argv[],
 /* ── Address resolution (shared by firewall + NAT) ─────────────────────── */
 
 /* Resolve address field value → CIDR.  Returns NULL (match-all),
- * pointer to out (resolved CIDR), or "SKIP" (fail-closed). */
+ * pointer to out (resolved CIDR), or "SKIP" (fail-closed).
+ * fqdn-type objects resolve to SKIP here — only resolve_address_ex()
+ * callers (FORWARD chain) can match them, via ipset. */
 const char *resolve_address(const char *val, char *out, size_t outsz);
+
+/* Extended resolver for the FORWARD chain.  Return values:
+ *   ADDR_MATCH_ALL  — no -s/-d flag (any/all/0.0.0.0/0)
+ *   ADDR_CIDR       — out = CIDR for -s/-d
+ *   ADDR_IPSET      — out = ipset name for -m set --match-set
+ *   ADDR_SKIP       — dangling/unenforceable → skip rule (fail-closed) */
+enum addr_kind { ADDR_MATCH_ALL, ADDR_CIDR, ADDR_IPSET, ADDR_SKIP };
+enum addr_kind resolve_address_ex(const char *val, char *out, size_t outsz);
+
+/* ── ipset management (mgmtd_ipset.c — in-process netlink) ─────────────── */
+
+int  sg_ipset_available(void);                /* kernel hash:ip support?   */
+void sg_fqdn_set_name(const char *obj, char *out, size_t outsz);
+int  sg_ipset_ensure(const char *set);        /* create hash:ip (timeout
+					       * support) if missing       */
+int  sg_ipset_add(const char *set, const uint32_t *addrs_be, int n);
+					      /* merge members; re-add
+					       * refreshes entry timeout    */
+int  sg_ipset_destroy(const char *set);       /* ENOENT tolerated          */
+int  sg_ipset_list(const char *set, char *out, size_t outsz);
+					      /* dump members + expiry, one
+					       * per line; returns member
+					       * count or -errno            */
+int  sg_ipset_members(const char *set, uint32_t *addrs_be, int max);
+					      /* raw be32 members; returns
+					       * member count or -errno     */
+void     sg_ipset_set_entry_timeout(uint32_t sec);  /* system settings
+						     * fqdn-ttl            */
+uint32_t sg_ipset_entry_timeout(void);
+
+/* ── FQDN refresh engine (mgmtd_fqdn.c) ────────────────────────────────── */
+
+void fqdn_refresh_tick(void);                 /* main-loop periodic check  */
+void fqdn_refresh_kick(void);                 /* immediate worker run      */
+void fqdn_restamp_all(void);                  /* re-stamp members with the
+					       * current entry timeout     */
+void fqdn_object_removed(const char *obj_name);  /* destroy object's set   */
 
 /* ── Atomic chain rebuild (firewall + NAT) ─────────────────────────────── */
 sg_status_t rebuild_forward_chain(char *result, size_t rsize);

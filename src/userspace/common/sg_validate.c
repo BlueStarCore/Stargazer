@@ -91,6 +91,7 @@ static const struct field_entry field_table[] = {
 	{ "system_settings", "hostname",   "safe-id",             0, "stargazer", "System hostname", 0 },
 	{ "system_settings", "ip-forward", "enum:enable,disable", 0, "enable",    "IPv4 packet forwarding", 0 },
 	{ "system_settings", "timezone",   "tz-token",            0, "UTC",       "System timezone", 0 },
+	{ "system_settings", "fqdn-ttl",   "uint:60:86400",       0, "3600",      "FQDN object resolved-IP lifetime in ipsets (seconds)", 0 },
 
 	/* network_dns — always on, no status field */
 	{ "network_dns", "primary",   "ipv4", 0, "1.1.1.1", "Primary DNS server", 0 },
@@ -137,11 +138,15 @@ static const struct field_entry field_table[] = {
 	{ "firewall_policy", "sequence", "uint:1:9999",                     1, NULL,     "Priority (higher = checked first)", 0 },
 	{ "firewall_policy", "cmkid",    "uint:1:16777215",                 1, NULL,     "Connmark id stamped on permitted flows (internal)", SG_FLD_HIDDEN },
 
-	/* firewall_address */
-	{ "firewall_address", "name",    "safe-id",                  0, NULL,     "Address object name", 0 },
-	{ "firewall_address", "subnet",  "cidr",                     0, NULL,     "Network address and mask", 0 },
-	{ "firewall_address", "type",    "enum:ipmask,iprange,fqdn", 0, "ipmask", "Address type", 0 },
-	{ "firewall_address", "comment", "string",                   1, NULL,     "Optional description", 0 },
+	/* firewall_address
+	 * subnet/fqdn are registry-optional: which one is required depends on
+	 * type (ipmask → subnet, fqdn → fqdn). The cross-field rule lives in
+	 * sg_check_entry_semantics(), enforced on every full-entry save. */
+	{ "firewall_address", "name",    "safe-id",          0, NULL,     "Address object name", 0 },
+	{ "firewall_address", "subnet",  "cidr",             1, NULL,     "Network address and mask (type ipmask)", 0 },
+	{ "firewall_address", "fqdn",    "fqdn",             1, NULL,     "Fully qualified domain name (type fqdn)", 0 },
+	{ "firewall_address", "type",    "enum:ipmask,fqdn", 0, "ipmask", "Address type", 0 },
+	{ "firewall_address", "comment", "string",           1, NULL,     "Optional description", 0 },
 
 	/* firewall_service */
 	{ "firewall_service", "name",       "safe-id",           0, NULL,  "Service object name", 0 },
@@ -328,6 +333,63 @@ sg_is_cidr(const char *s)
 
 	/* Validate mask */
 	return sg_is_uint_range(slash + 1, 0, 32);
+}
+
+/*
+ * sg_is_fqdn — strict RFC-1123 hostname for FQDN address objects.
+ *
+ * Rules: dot-separated labels of [A-Za-z0-9-], no leading/trailing hyphen,
+ * label 1-63 chars, total ≤253, at least one dot, and the last label is not
+ * all-digits (rejects bare IPv4 like "8.8.8.8" — that belongs in subnet).
+ *
+ * Wildcards ("*.facebook.com") are rejected deliberately: matching a
+ * wildcard requires observing DNS responses (DNS snooping), which the
+ * refresh engine cannot do — accepting one here would create an object
+ * that silently never matches.
+ */
+int
+sg_is_fqdn(const char *s)
+{
+	if (!s || !*s)
+		return 0;
+	if (strlen(s) > SG_NET_TARGET_MAX)
+		return 0;
+
+	int label_len = 0, dots = 0, last_label_digits = 1;
+
+	for (const char *p = s; *p; p++) {
+		if (*p == '.') {
+			if (label_len == 0 || p[-1] == '-')
+				return 0;        /* empty label / trailing '-' */
+			if (p[1] == '\0')
+				return 0;        /* trailing dot */
+			dots++;
+			label_len = 0;
+			last_label_digits = 1;
+			continue;
+		}
+		if (*p == '-') {
+			if (label_len == 0)
+				return 0;        /* leading '-' in label */
+			last_label_digits = 0;
+		} else if (isdigit((unsigned char)*p)) {
+			/* digits allowed; tracked for the all-digit TLD check */
+		} else if (isalpha((unsigned char)*p)) {
+			last_label_digits = 0;
+		} else {
+			return 0;                /* '*', '_', etc. */
+		}
+		if (++label_len > 63)
+			return 0;
+	}
+
+	if (label_len == 0 || s[strlen(s) - 1] == '-')
+		return 0;
+	if (dots == 0)
+		return 0;                        /* require qualified name */
+	if (last_label_digits)
+		return 0;                        /* numeric TLD → looks like an IP */
+	return 1;
 }
 
 int
@@ -770,6 +832,8 @@ sg_reg_value_rule(const char *type_name, const char *key)
 		return "CIDR (A.B.C.D/len)";
 	if (strcmp(kind, "ipv4") == 0)
 		return "IPv4";
+	if (strcmp(kind, "fqdn") == 0)
+		return "FQDN (e.g. www.example.com — no wildcard)";
 	if (strcmp(kind, "iface") == 0)
 		return "interface name";
 	if (strcmp(kind, "safe-id") == 0)
@@ -1018,6 +1082,10 @@ sg_reg_validate_value(const char *type_name, const char *key, const char *val)
 	/* cidr-or:a,b */
 	if (strncmp(kind, "cidr-or:", 8) == 0)
 		return sg_match_csv_option(kind + 8, val) || sg_is_cidr(val);
+
+	/* fqdn */
+	if (strcmp(kind, "fqdn") == 0)
+		return sg_is_fqdn(val);
 
 	/* safe-id */
 	if (strcmp(kind, "safe-id") == 0)
@@ -1347,4 +1415,67 @@ sg_reg_scrub_value(const char *type, const char *key, const char *val,
 		out[dlen] = '\0';
 	}
 	return 1;
+}
+
+/* ── Cross-field entry semantics ─────────────────────────────────────────── */
+
+/*
+ * sg_check_entry_semantics — type-conditional rules that single-field
+ * validation cannot express.  Operates on a FULL entry in "key=val\n"
+ * form (CFG_SET payload / serialized CLI buffer) — never on partial data.
+ *
+ * firewall_address: the value field must match the type —
+ *   type=ipmask → subnet required, fqdn forbidden
+ *   type=fqdn   → fqdn required, subnet forbidden
+ *
+ * Returns 0 if consistent; -1 with a message in errbuf otherwise.
+ */
+int
+sg_check_entry_semantics(const char *type_name, const char *data,
+			 char *errbuf, size_t errsz)
+{
+	if (errbuf && errsz > 0)
+		errbuf[0] = '\0';
+	if (!type_name || !data)
+		return 0;
+
+	if (strcmp(type_name, "firewall_address") == 0) {
+		char atype[32];
+
+		sg_kv_get(data, "type", atype, sizeof(atype));
+		if (!atype[0])  /* default applied on save */
+			snprintf(atype, sizeof(atype), "%s",
+				 sg_reg_field_default(type_name, "type"));
+
+		int has_subnet = sg_kv_has_key(data, "subnet");
+		int has_fqdn   = sg_kv_has_key(data, "fqdn");
+
+		if (strcmp(atype, "fqdn") == 0) {
+			if (!has_fqdn) {
+				snprintf(errbuf, errsz,
+					 "type fqdn requires 'fqdn' to be set");
+				return -1;
+			}
+			if (has_subnet) {
+				snprintf(errbuf, errsz,
+					 "'subnet' is not valid for type fqdn"
+					 " (unset it or use type ipmask)");
+				return -1;
+			}
+		} else {  /* ipmask */
+			if (!has_subnet) {
+				snprintf(errbuf, errsz,
+					 "type ipmask requires 'subnet' to be set");
+				return -1;
+			}
+			if (has_fqdn) {
+				snprintf(errbuf, errsz,
+					 "'fqdn' is not valid for type ipmask"
+					 " (unset it or use type fqdn)");
+				return -1;
+			}
+		}
+	}
+
+	return 0;
 }

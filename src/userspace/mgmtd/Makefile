@@ -31,7 +31,8 @@ MGMTD_APPLY_SRCS := mgmtd_apply_route.c mgmtd_apply_iface.c \
                      mgmtd_apply_firewall.c mgmtd_apply_ntp.c \
                      mgmtd_sequence.c
 
-MGMTD_SRCS := mgmtd_user.c mgmtd_firmware.c mgmtd_network.c mgmtd_diag.c
+MGMTD_SRCS := mgmtd_user.c mgmtd_firmware.c mgmtd_network.c mgmtd_diag.c \
+              mgmtd_ipset.c mgmtd_fqdn.c
 
 $(BUILD_DIR)/stargazer-mgmtd: stargazer-mgmtd.c stargazer_ipc.h mgmtd_apply.h \
                                mgmtd_internal.h mgmtd_sequence.h \

@@ -126,6 +126,48 @@ def sg_is_cidr(s):
         return False
     return sg_is_uint_range(s[slash+1:], 0, 32)
 
+def sg_is_fqdn(s):
+    """C: RFC-1123 labels [A-Za-z0-9-], 1-63 each, total <=253, >=1 dot,
+    no leading/trailing hyphen per label, last label not all-digits,
+    wildcard rejected (no '*')"""
+    if not s:
+        return False
+    if len(s) > SG_NET_TARGET_MAX:
+        return False
+    label_len = 0
+    dots = 0
+    last_label_digits = True
+    for i, c in enumerate(s):
+        if c == '.':
+            if label_len == 0 or s[i-1] == '-':
+                return False
+            if i + 1 == len(s):
+                return False
+            dots += 1
+            label_len = 0
+            last_label_digits = True
+            continue
+        if c == '-':
+            if label_len == 0:
+                return False
+            last_label_digits = False
+        elif c in '0123456789':
+            pass
+        elif c.isascii() and c.isalpha():
+            last_label_digits = False
+        else:
+            return False
+        label_len += 1
+        if label_len > 63:
+            return False
+    if label_len == 0 or s[-1] == '-':
+        return False
+    if dots == 0:
+        return False
+    if last_label_digits:
+        return False
+    return True
+
 def sg_is_iface_name(s):
     """C: alphanum + [_.:- ], non-empty"""
     if not s:
@@ -289,6 +331,116 @@ chk("cidr: IPv6 rejected",                 not sg_is_cidr("2001:db8::/32"))
 chk("cidr: leading zero prefix (024=24) accepted", sg_is_cidr("10.0.0.0/024"))
 
 # ─────────────────────────────────────────────────────────────────────────────
+print(f"\n{B}{C}=== 4b. sg_is_fqdn: FQDN address objects ==={N}")
+# ─────────────────────────────────────────────────────────────────────────────
+
+chk("fqdn: www.example.com accepted",      sg_is_fqdn("www.example.com"))
+chk("fqdn: example.com accepted",          sg_is_fqdn("example.com"))
+chk("fqdn: digit-leading label accepted",  sg_is_fqdn("1.example.com"))
+chk("fqdn: hyphen inside label accepted",  sg_is_fqdn("my-host.example.com"))
+chk("fqdn: single label rejected (unqualified)", not sg_is_fqdn("localhost"))
+chk("fqdn: wildcard rejected (needs DNS snooping)", not sg_is_fqdn("*.facebook.com"))
+chk("fqdn: bare IPv4 rejected (belongs in subnet)", not sg_is_fqdn("8.8.8.8"))
+chk("fqdn: numeric TLD rejected",          not sg_is_fqdn("example.123"))
+chk("fqdn: trailing dot rejected",         not sg_is_fqdn("example.com."))
+chk("fqdn: leading dot rejected",          not sg_is_fqdn(".example.com"))
+chk("fqdn: empty label rejected",          not sg_is_fqdn("a..com"))
+chk("fqdn: label leading hyphen rejected", not sg_is_fqdn("-bad.example.com"))
+chk("fqdn: label trailing hyphen rejected", not sg_is_fqdn("bad-.example.com"))
+chk("fqdn: trailing hyphen rejected",      not sg_is_fqdn("example.com-"))
+chk("fqdn: underscore rejected (strict RFC-1123)", not sg_is_fqdn("_dmarc.example.com"))
+chk("fqdn: space rejected",                not sg_is_fqdn("exa mple.com"))
+chk("fqdn: empty rejected",                not sg_is_fqdn(""))
+chk("fqdn: 63-char label accepted",        sg_is_fqdn("a" * 63 + ".com"))
+chk("fqdn: 64-char label rejected",        not sg_is_fqdn("a" * 64 + ".com"))
+chk("fqdn: 253-char total accepted",
+    sg_is_fqdn(("a" * 63 + ".") * 3 + "a" * 61))
+chk("fqdn: 254-char total rejected",
+    not sg_is_fqdn(("a" * 63 + ".") * 3 + "a" * 62))
+
+# Source-consistency: the C side must wire the same rules
+_vc = rd("src/userspace/common/sg_validate.c")
+chk("fqdn: C validator exists",            "sg_is_fqdn" in _vc)
+chk("fqdn: kind wired in dispatcher",      'strcmp(kind, "fqdn") == 0' in _vc)
+chk("fqdn: firewall_address has fqdn field",
+    '"firewall_address", "fqdn"' in _vc)
+chk("fqdn: iprange dropped from type enum (was never implemented)",
+    "enum:ipmask,iprange,fqdn" not in _vc and "enum:ipmask,fqdn" in _vc)
+_fw = rd("src/userspace/mgmtd/mgmtd_apply_firewall.c")
+chk("fqdn: FORWARD chain emits ipset match", "--match-set" in _fw)
+
+# Membership visibility: the box has no ipset binary, so the diagnose
+# command is the only way to see what a deny rule actually matches.
+_ips = rd("src/userspace/mgmtd/mgmtd_ipset.c")
+chk("fqdn: ipset membership dump exists (sg_ipset_list)",
+    "int sg_ipset_list(" in _ips and "SG_IPSET_CMD_LIST" in _ips)
+
+# Accumulate mode: round-robin DNS hands out one answer per query, so a
+# swap-replace deny set only matches the latest answer (blocking
+# flickers — observed live on-device).  The set must MERGE resolves
+# and let the kernel expire entries via per-entry timeout.
+chk("fqdn: sets are created with entry timeouts",
+    "SG_IPSET_ENTRY_TIMEOUT_SEC" in _ips and "SG_IPSET_ATTR_TIMEOUT" in _ips)
+chk("fqdn: membership merges (sg_ipset_add), swap-replace removed",
+    "int sg_ipset_add(" in _ips and "sg_ipset_replace" not in _ips
+    and "IPSET_CMD_SWAP" not in _ips)
+_fq = rd("src/userspace/mgmtd/mgmtd_fqdn.c")
+chk("fqdn: worker merges resolves into the set",
+    "sg_ipset_add(" in _fq and "sg_ipset_replace" not in _fq)
+chk("fqdn: resolve failure keep-alives current members (no drain)",
+    "sg_ipset_members(" in _fq)
+
+# fqdn-ttl: the entry lifetime is a global system setting, stamped onto
+# every ADD so a change reaches existing sets without recreating them.
+chk("fqdn-ttl: registered in system_settings (60-86400, default 3600)",
+    '"system_settings", "fqdn-ttl",   "uint:60:86400",       0, "3600"' in _vc)
+chk("fqdn-ttl: every ADD stamps the current timeout",
+    _ips.count("SG_IPSET_ATTR_TIMEOUT | SG_NLA_F_NET_BYTEORDER") >= 2)
+_st = rd("src/userspace/mgmtd/mgmtd_apply_iface.c")
+chk("fqdn-ttl: apply_settings wires the runtime value",
+    "sg_ipset_set_entry_timeout(" in _st)
+chk("fqdn-ttl: change re-stamps existing members immediately",
+    "fqdn_restamp_all(" in _st and "void fqdn_restamp_all(void)" in _fq)
+chk("fqdn-ttl: apply re-checks range (corrupt DB cannot zero the ttl)",
+    "ttl >= 60" in _st)
+# The kernel answers EEXIST when CREATE meets a same-name set whose
+# create params differ — which is every set that predates a fqdn-ttl
+# change.  ensure() must tolerate it or all updates fail after the
+# change and the next rebuild SKIPs fqdn rules (fail-open).
+chk("fqdn-ttl: ensure tolerates create-param clash (EEXIST)",
+    "ips_transact(buf, off, EEXIST)" in _ips)
+
+# Multi-agent review findings (2026-06): regression locks.
+_mg = rd("src/userspace/mgmtd/stargazer-mgmtd.c")
+# 1. The validator accepts FQDNs up to 253 chars; reading them through a
+#    VALBUFSZ (128) buffer truncates silently and resolves the wrong
+#    name — DENY set stays empty (fail-open).
+chk("review: worker carries full-length FQDN (no VALBUFSZ truncation)",
+    "fq[SG_NET_TARGET_MAX + 1]" in _fq)
+chk("review: diag handler carries full-length FQDN",
+    "fqdn[SG_NET_TARGET_MAX + 1]" in _mg)
+# 2. Workers self-serialize via flock — a slow resolver run can outlast
+#    the 60s tick and pile up otherwise (parent can't waitpid a child
+#    reparented to init).
+chk("review: refresh workers gate on a lock file",
+    "flock(lk, LOCK_EX | LOCK_NB)" in _fq)
+# 3. A successful resolve with zero A records must keep-alive like a
+#    failure — never trust an answer that would empty a DENY set.
+chk("review: zero-A-record resolve keep-alives (n <= 0)",
+    _fq.count("if (n <= 0) {") >= 1 and "returned no IPv4 addresses" in _fq)
+# 4. The set-name cap is expressed via SG_IPSET_MAXNAMELEN (was a dead
+#    define + stale temp-set comment).
+chk("review: name cap uses SG_IPSET_MAXNAMELEN, temp-set comment gone",
+    "SG_IPSET_MAXNAMELEN - 2" in _ips and '"<name>T"' not in _ips)
+_ipc = rd("src/userspace/mgmtd/stargazer_ipc.h")
+chk("fqdn: SG_CMD_DIAG_FW_IPSET wired in IPC", "SG_CMD_DIAG_FW_IPSET" in _ipc)
+_cd = rd("src/userspace/common/sg_cmd_defs.h")
+chk("fqdn: diagnose firewall ipset CLI command registered",
+    '"execute diagnose firewall ipset"' in _cd)
+chk("fqdn: mgmtd handler rejects non-fqdn objects",
+    "Not an fqdn-type object" in _mg)
+
+# ─────────────────────────────────────────────────────────────────────────────
 print(f"\n{B}{C}=== 5. sg_is_uint_range: overflow and negative ==={N}")
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -446,35 +598,41 @@ chk("No strtol base-0 calls (no octal misparse risk)",
     .replace("strtol(end + 1, &end, 10)", ""))
 
 # ─────────────────────────────────────────────────────────────────────────────
-print(f"\n{B}{C}=== 13. Firewall apply: address object resolution gap ==={N}")
+print(f"\n{B}{C}=== 13. Firewall apply: address/service resolution ==={N}")
 # ─────────────────────────────────────────────────────────────────────────────
+# (Rewritten: the original section asserted the OLD build_forward_argv
+#  gaps — named objects skipped, services ignored.  Both gaps have been
+#  fixed since; the section now verifies the fixed behavior.)
 
 fw_apply = rd("src/userspace/mgmtd/mgmtd_apply_firewall.c")
 
-# Named address objects (safe-id) are silently skipped — iptables rule has no -s/-d
-chk("build_forward_argv: -s/-d only added for valid CIDR values",
-    "sg_is_cidr(srcaddr)" in fw_apply and
-    "sg_is_cidr(dstaddr)" in fw_apply)
+# Named address objects are resolved from the DB; dangling refs skip the
+# rule fail-closed instead of emitting a broader-than-intended rule.
+chk("resolve_address resolves named objects",
+    "sg_db_get(\"firewall_address\"" in fw_apply)
+chk("dangling address ref skips rule (fail-closed)",
+    "ADDR_SKIP" in fw_apply and "skip_rule" in fw_apply)
 
-# The comment explicitly documents this design choice
-chk("Comment documents named-object skip behavior",
-    "skip address" in fw_apply and "object" in fw_apply)
+# fqdn-type objects emit an ipset match, never a raw -s/-d
+chk("fqdn objects emit -m set --match-set",
+    "--match-set" in fw_apply)
+chk("fqdn without kernel ipset support skips rule (fail-closed)",
+    "sg_ipset_available" in fw_apply)
 
-# Service objects are NOT included in iptables rules (port/protocol not passed)
-chk("build_forward_argv: no service/port in iptables rule (gap: service objects silently ignored)",
-    "service" not in fw_apply.split("build_forward_argv")[1].split(")")[0] and
-    "--dport" not in fw_apply and "-p tcp" not in fw_apply)
+# Service objects ARE included in rules (protocol + port)
+chk("service objects emit -p/--dport",
+    "--dport" in fw_apply and "resolve_service" in fw_apply)
 
 # FORWARD -P DROP is set in mgmtd (good)
 mgmtd = rd("src/userspace/mgmtd/stargazer-mgmtd.c")
 chk("mgmtd_init_firewall sets iptables -P FORWARD DROP",
     '"-P", "FORWARD", "DROP"' in mgmtd)
 
-# But init does NOT set FORWARD DROP — gap: window before mgmtd starts
+# ATK-J-02 (fixed): init sets FORWARD DROP before mgmtd starts, so there
+# is no fail-open window between boot and policy replay.
 init = rd("src/userspace/init")
-chk("ATK-J-02: init does NOT set FORWARD DROP (window before mgmtd)",
-    "FORWARD" not in init,  # confirms the gap exists
-    "Gap: FORWARD chain default is ACCEPT between init and mgmtd startup")
+chk("ATK-J-02 fixed: init sets FORWARD DROP before mgmtd",
+    "iptables -P FORWARD DROP" in init)
 
 # init sets INPUT DROP (good)
 chk("Init sets INPUT DROP before mgmtd starts",
