@@ -440,6 +440,43 @@ chk("fqdn: diagnose firewall ipset CLI command registered",
 chk("fqdn: mgmtd handler rejects non-fqdn objects",
     "Not an fqdn-type object" in _mg)
 
+# ── Audit HIGH fixes (2026-06) — regression locks ──────────────────────────
+import re as _re
+# HIGH-1A: snprintf returns the UNtruncated length; never copy that many
+# bytes out of a fixed local buffer (out-of-bounds read). kv_to_json must
+# build straight into the growing heap buffer (json_appendf), and every
+# other "copy by (size_t)n from a fixed buffer" site must clamp to the
+# buffer size. These check the specific siblings the blast-radius mapped,
+# including the two the original audit sweep missed (J_APP/IL_APP frag).
+_wp = rd("src/userspace/webd/webd_pool.c")
+chk("1A: kv_to_json drops the fixed frag/id_frag buffers (grow-to-fit)",
+    "frag[2048]" not in _wp and "id_frag[512]" not in _wp
+    and "json_appendf(&buf" in _wp)
+chk("1A: kv_to_json no longer copies a raw snprintf return into a local buf",
+    not _re.search(r'APPEND\((?:id_)?frag, ?\(size_t\)n\)', _wp))
+chk("1A: proctop/iface JSON builders clamp n to the source buffer",
+    _wp.count("< sizeof(frag) ? (size_t)fn") >= 2
+    and "< sizeof(hdr) ? (size_t)hn" in _wp)
+chk("1A: interface-row builder clamps the uncapped description length",
+    "(size_t)n >= sizeof(line)" in _mg)
+_fwc = rd("src/userspace/mgmtd/mgmtd_firmware.c")
+chk("1A: firmware step log clamps message length before memcpy",
+    "(size_t)n >= sizeof(entry)" in _fwc)
+_rl = rd("src/userspace/cli/cli_readline.c")
+chk("1A: history payload clamps the user= header length",
+    "(size_t)n < SG_PAYLOAD_MAX)" in _rl)
+_dg = rd("src/userspace/mgmtd/mgmtd_diag.c")
+chk("1A: session-flow line clamps n to its buffer before append",
+    "(size_t)n < sizeof(l) ? (size_t)n : sizeof(l) - 1" in _dg)
+
+# HIGH-1B: the session-tag-exempt DHCP lease handler mutates routing as
+# root and must authorize on the kernel-verified peer UID (root only),
+# not on group-socket access.
+chk("1B: dhcp lease handler gates on the verified peer UID",
+    "g_peer_uid != 0" in _mg and "DHCP_LEASE_EVENT from non-root" in _mg)
+chk("1B: peer UID is captured from SO_PEERCRED per connection",
+    "g_peer_uid = cred.uid" in _mg)
+
 # ─────────────────────────────────────────────────────────────────────────────
 print(f"\n{B}{C}=== 5. sg_is_uint_range: overflow and negative ==={N}")
 # ─────────────────────────────────────────────────────────────────────────────

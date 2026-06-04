@@ -15,6 +15,7 @@
 #include "stargazer_ipc.h"
 
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -154,6 +155,47 @@ static void send_ipc_error(unsigned long conn_id, uint32_t status,
 /* ── Helper: parse key=value payload into JSON object ────────────────── */
 
 /*
+ * json_appendf — grow-to-fit formatted append into a heap buffer.
+ *
+ * Measures the formatted length first, grows *buf so the whole result
+ * fits, then writes it. This avoids the over-read class where a fixed
+ * local buffer is filled by a truncating snprintf and then copied using
+ * snprintf's (un-truncated) return value as the length; it also never
+ * truncates a value mid-byte, so the emitted JSON stays well-formed even
+ * for arbitrarily long config values.
+ *
+ * Returns 0 on success, -1 on OOM (the caller still owns *buf and must
+ * free it).
+ */
+static int json_appendf(char **buf, size_t *cap, size_t *len,
+			const char *fmt, ...)
+{
+	va_list ap;
+	int need;
+
+	va_start(ap, fmt);
+	need = vsnprintf(NULL, 0, fmt, ap);
+	va_end(ap);
+	if (need < 0)
+		return -1;
+
+	while (*len + (size_t)need + 1 > *cap) {
+		size_t ncap = *cap * 2;
+		char *tmp = realloc(*buf, ncap);
+		if (!tmp)
+			return -1;
+		*buf = tmp;
+		*cap = ncap;
+	}
+
+	va_start(ap, fmt);
+	vsnprintf(*buf + *len, *cap - *len, fmt, ap);
+	va_end(ap);
+	*len += (size_t)need;
+	return 0;
+}
+
+/*
  * Convert "key=val\nkey2=val2\n" to JSON object string.
  * If id is provided, prepends "id" field.
  * Returns heap-allocated string, caller frees.
@@ -182,11 +224,10 @@ static char *kv_to_json(const char *kv, const char *id)
 	if (id && id[0]) {
 		char *esc_id = json_escape(id);
 		if (esc_id) {
-			char id_frag[512];
-			int n = snprintf(id_frag, sizeof(id_frag),
-					 "\"id\":\"%s\"", esc_id);
+			int rc = json_appendf(&buf, &cap, &len,
+					      "\"id\":\"%s\"", esc_id);
 			free(esc_id);
-			if (n > 0) APPEND(id_frag, (size_t)n);
+			if (rc != 0) { free(buf); return NULL; }
 		}
 	}
 
@@ -231,13 +272,12 @@ static char *kv_to_json(const char *kv, const char *id)
 				p = nl ? nl + 1 : p + line_len;
 				continue;
 			}
-			char frag[2048];
-			int n = snprintf(frag, sizeof(frag),
-					 "\"%s\":\"%s\"",
-					 esc_key, esc_val);
+			int rc = json_appendf(&buf, &cap, &len,
+					      "\"%s\":\"%s\"",
+					      esc_key, esc_val);
 			free(esc_key);
 			free(esc_val);
-			if (n > 0) APPEND(frag, (size_t)n);
+			if (rc != 0) { free(buf); return NULL; }
 
 			p = nl ? nl + 1 : p + line_len;
 		}
@@ -1254,7 +1294,9 @@ static void flow_res_proctop(work_item_t *item)
 			  "{\"uptime\":\"%s\",\"mem_total_kb\":%ld,"
 			  "\"mem_avail_kb\":%ld,\"procs\":[",
 			  uptime, mem_total_kb, mem_avail_kb);
-	if (hn > 0) J_APP(hdr, (size_t)hn);
+	/* clamp to the source buffer: snprintf returns the untruncated
+	 * length, copying that many bytes would over-read hdr */
+	if (hn > 0) J_APP(hdr, (size_t)hn < sizeof(hdr) ? (size_t)hn : sizeof(hdr) - 1);
 
 	/* Parse proc lines */
 	int first = 1;
@@ -1283,7 +1325,7 @@ static void flow_res_proctop(work_item_t *item)
 					pid, ec ? ec : comm, st,
 					ut + stm, rss);
 				free(ec);
-				if (fn > 0) J_APP(frag, (size_t)fn);
+				if (fn > 0) J_APP(frag, (size_t)fn < sizeof(frag) ? (size_t)fn : sizeof(frag) - 1);
 				first = 0;
 			}
 
@@ -1573,7 +1615,7 @@ static void flow_iface_live(work_item_t *item)
 				  "%s{\"name\":\"%s\",\"status\":\"%s\",\"ip\":\"%s\"}",
 				  first ? "" : ",", en, es, ei);
 		free(en); free(es); free(ei);
-		if (fn > 0) IL_APP(frag, (size_t)fn);
+		if (fn > 0) IL_APP(frag, (size_t)fn < sizeof(frag) ? (size_t)fn : sizeof(frag) - 1);
 		first = 0;
 
 		p = nl ? nl + 1 : p + llen;

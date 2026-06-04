@@ -942,7 +942,10 @@ void cli_hist_save_ipc(const char *username)
 	size_t pos = 0;
 
 	int n = snprintf(payload, SG_PAYLOAD_MAX, "user=%s\n", username);
-	if (n > 0)
+	/* snprintf returns the untruncated length; clamp so an over-long
+	 * username cannot push pos past the buffer for the loop below
+	 * (same guard the per-line append already applies). */
+	if (n > 0 && (size_t)n < SG_PAYLOAD_MAX)
 		pos = (size_t)n;
 
 	for (int i = 0; i < nhist; i++) {

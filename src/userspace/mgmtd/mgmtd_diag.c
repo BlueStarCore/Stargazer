@@ -1714,8 +1714,10 @@ static int ct_emit_line(char *line, struct dynbuf *out,
 			 "proto=%s state=%s src=%s:%u dst=%s:%u pkts=%llu bytes=%llu policy=%s iif=%s oif=%s\n",
 			 proto, state[0] ? state : "-",
 			 src, sport, dst, dport, pkts, bytes, policy, iifn, oifn);
+	/* snprintf returns the untruncated length; clamp to the source
+	 * buffer before using it as the append length. */
 	if (n > 0)
-		dbuf_append(out, l, (size_t)n);
+		dbuf_append(out, l, (size_t)n < sizeof(l) ? (size_t)n : sizeof(l) - 1);
 	return 0;
 }
 

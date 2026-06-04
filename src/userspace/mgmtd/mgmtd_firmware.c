@@ -62,6 +62,10 @@ static void fw_write_state(int step, int total, const char *status,
 		char entry[256];
 		int n = snprintf(entry, sizeof(entry), "[%d/%d] %s\n",
 				 step, total, message);
+		/* snprintf returns the untruncated length; clamp to what
+		 * entry holds so a long message cannot make memcpy over-read. */
+		if (n > 0 && (size_t)n >= sizeof(entry))
+			n = (int)sizeof(entry) - 1;
 		if (n > 0 && fw_steps_log_len + (size_t)n < FW_STEPS_LOG_MAX) {
 			memcpy(fw_steps_log + fw_steps_log_len, entry, (size_t)n);
 			fw_steps_log_len += (size_t)n;

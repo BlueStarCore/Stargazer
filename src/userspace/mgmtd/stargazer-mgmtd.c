@@ -103,6 +103,16 @@ static volatile sig_atomic_t g_running = 1;
 static volatile sig_atomic_t g_child_died = 0;
 int g_listen_fd = -1;  /* listen socket fd, for child to close after fork */
 
+/*
+ * Kernel-verified UID of the current request's peer, set from SO_PEERCRED
+ * once per connection in the accept loop before handle_request() runs.
+ * Safe as file-scope state because the daemon services one request at a
+ * time (single-threaded poll loop). Handlers that must restrict a command
+ * to a specific caller (e.g. root-only events) read this. (uid_t)-1 means
+ * "not yet established".
+ */
+static uid_t g_peer_uid = (uid_t)-1;
+
 /* ── Process supervisor ────────────────────────────────────────────────── */
 
 /*
@@ -2813,6 +2823,11 @@ static char *mgmtd_show_interfaces(void)
 		char line[256];
 		int n = snprintf(line, sizeof(line), "%-16s %-8s %-21s %s\n",
 				 nics[i], state, ip, desc ? desc : "");
+		/* snprintf returns the untruncated length; the config
+		 * 'description' is uncapped, so clamp to what line actually
+		 * holds before it is used as a copy length below. */
+		if (n > 0 && (size_t)n >= sizeof(line))
+			n = (int)sizeof(line) - 1;
 
 		/* Grow buffer if needed */
 		while (used + (size_t)n + 1 > bufsz) {
@@ -3105,6 +3120,24 @@ static int handle_dhcp_lease_event(int client_fd, const char *user,
 				   const sg_request_hdr_t *hdr)
 {
 	(void)user; (void)hdr;
+
+	/*
+	 * This command mutates the live routing table (flush / replay) and
+	 * is exempt from session-tag validation because its real caller is
+	 * udhcpc, which runs as root with no login session. Authorize on the
+	 * kernel-verified peer UID instead: only root may trigger it. Without
+	 * this, any process whose UID is in the stargazer group (the socket
+	 * is 0660 root:stargazer) — e.g. a monitor-only admin — could flush
+	 * every static route. Fail closed.
+	 */
+	if (g_peer_uid != 0) {
+		mgmt_log("WARN", "DHCP_LEASE_EVENT from non-root uid %u denied",
+			 (unsigned)g_peer_uid);
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "Requires root (udhcpc)");
+		return 0;
+	}
+
 	char iface[IFNAMSIZ], action[16];
 	extract_val(payload, "iface",  iface,  sizeof(iface));
 	extract_val(payload, "action", action, sizeof(action));
@@ -6546,6 +6579,7 @@ int main(void)
 			socklen_t cred_len = sizeof(cred);
 			if (getsockopt(cfd, SOL_SOCKET, SO_PEERCRED,
 				       &cred, &cred_len) == 0) {
+				g_peer_uid = cred.uid;
 				/*
 				 * Verify the client-claimed username matches
 				 * the kernel-verified UID. If the claimed user
@@ -6592,6 +6626,10 @@ int main(void)
 				continue;
 			}
 		}
+#else
+		/* Test harness has no SO_PEERCRED; treat the peer as root
+		 * so root-gated handlers remain exercisable under test. */
+		g_peer_uid = 0;
 #endif
 
 		/* Handle request (with verified username)
