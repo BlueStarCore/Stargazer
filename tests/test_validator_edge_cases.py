@@ -508,8 +508,13 @@ chk("M2: add_user_to_group uses getline (no fixed-buffer truncation)",
     "getline(&line, &linecap, fp)" in _us)
 # M3: per-upload staging path (mkstemp), validated by prefix; no shared file.
 _wa = rd("src/userspace/webd/webd_api.c")
-chk("M3: webd stages firmware via mkstemp (unique path, no race)",
-    'mkstemp(stage)' in _wa and '"/tmp/sg-fw-upload.tar.gz"' not in _wa)
+chk("M3: webd stages firmware at a unique per-upload path (no shared race)",
+    'O_WRONLY | O_CREAT | O_EXCL' in _wa and '"/tmp/sg-fw-upload.tar.gz"' not in _wa)
+# Re-verify (component trace) follow-up: mkstemp opens O_RDWR, which the
+# webd seccomp filter KILLs — staging must use O_WRONLY. The suffix stays
+# alnum so mgmtd's strict path check still accepts it.
+chk("M3+: webd staging is seccomp-safe (O_WRONLY, not mkstemp/O_RDWR)",
+    'mkstemp(stage)' not in _wa and 'A36[v % 36]' in _wa)
 _fw2 = rd("src/userspace/mgmtd/mgmtd_firmware.c")
 chk("M3: mgmtd validates upload path by prefix and consumes that exact path",
     '"/tmp/sg-fw-upload."' in _fw2 and "rename(path, FW_DL_FILE)" in _fw2

@@ -1638,7 +1638,7 @@ il_done:
 
 static void flow_firmware_upload(work_item_t *item)
 {
-	/* item->payload = "path=/tmp/sg-fw-upload.tar.gz\n" */
+	/* item->payload = "path=/tmp/sg-fw-upload.<rand>\n" (per-upload file) */
 	webd_ipc_response_t resp;
 	if (webd_ipc_send(SG_CMD_UPGRADE_FROM_FILE, item->username,
 			  item->session_tag,

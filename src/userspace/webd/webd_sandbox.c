@@ -169,8 +169,9 @@ int webd_sandbox_install(void)
 		SC_ALLOW(SC_getsockopt),
 
 		/* ── openat: O_RDONLY (file serving) and O_WRONLY (firmware
-		 *    upload staging to /tmp/sg-fw-upload.tar.gz); O_RDWR
-		 *    is never required and remains blocked. */
+		 *    upload staging to /tmp/sg-fw-upload.<rand>, opened
+		 *    O_WRONLY|O_CREAT|O_EXCL — NOT mkstemp, which is O_RDWR);
+		 *    O_RDWR is never required and remains blocked. */
 		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SC_openat, 0, 6),
 		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_ARG2),
 		BPF_STMT(BPF_ALU | BPF_AND | BPF_K, O_ACCMODE_MASK),

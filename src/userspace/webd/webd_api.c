@@ -14,6 +14,8 @@
 #include "stargazer_ipc.h"
 #include "sg_validate.h"
 
+#include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -992,16 +994,37 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 					return -1;
 				}
 
-				/* Write to a UNIQUE staging file (mkstemp): a
-				 * fixed shared path let two concurrent uploads
-				 * race — one client's bytes could be flashed
-				 * under another's request. Each upload now gets
-				 * its own file, named so mgmtd can validate it
-				 * by prefix. */
+				/* Write to a UNIQUE staging file so two concurrent
+				 * uploads cannot race on a shared path (one
+				 * client's bytes flashed under another's request).
+				 * NOT mkstemp(): it opens O_RDWR, which the webd
+				 * seccomp filter kills (only O_RDONLY/O_WRONLY are
+				 * allowed). Generate an [A-Za-z0-9] suffix — which
+				 * also satisfies mgmtd's strict path check — and
+				 * open O_WRONLY|O_CREAT|O_EXCL so creation is atomic
+				 * against collisions. */
+				static const char A36[] =
+					"abcdefghijklmnopqrstuvwxyz0123456789";
+				static unsigned long stage_seq;
 				char stage[64];
-				snprintf(stage, sizeof(stage),
-					 "/tmp/sg-fw-upload.XXXXXX");
-				int sfd = mkstemp(stage);
+				int sfd = -1;
+				for (int att = 0; att < 128 && sfd < 0; att++) {
+					unsigned long v =
+						(stage_seq++ + (unsigned long)att)
+							* 2654435761UL
+						^ (unsigned long)(uintptr_t)&att;
+					char suf[11];
+					for (int i = 0; i < 10; i++) {
+						suf[i] = A36[v % 36];
+						v /= 36;
+					}
+					suf[10] = '\0';
+					snprintf(stage, sizeof(stage),
+						 "/tmp/sg-fw-upload.%s", suf);
+					sfd = open(stage,
+						   O_WRONLY | O_CREAT | O_EXCL,
+						   0600);
+				}
 				if (sfd < 0) {
 					reply_json(c, 500,
 						   "{\"error\":\"Cannot create firmware staging file\"}");
