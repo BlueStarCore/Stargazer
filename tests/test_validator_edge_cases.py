@@ -656,6 +656,13 @@ chk("rollback3: prune called after commit AND after rollback restore",
 chk("rollback3: fqdn teardown keys on 'still fqdn?', not just row existence",
     'sg_db_get_val("firewall_address", id, "type")' in _mg
     and "still_fqdn" in _mg)
+# Round 3 follow-up: splitting prune out of create dropped its transaction;
+# a torn prune could orphan rows / make a 0-row revision. Re-wrap the two
+# prune DELETEs in begin/commit (rollback on failure).
+chk("rollback4: prune is atomic again (both DELETEs in one transaction)",
+    "void sg_db_revision_prune(int keep)" in _db
+    and "if (sg_db_begin() != 0)\n\t\treturn;" in _db
+    and "sg_db_rollback();\t/* keep history consistent on failure */" in _db)
 
 # ─────────────────────────────────────────────────────────────────────────────
 print(f"\n{B}{C}=== 5. sg_is_uint_range: overflow and negative ==={N}")

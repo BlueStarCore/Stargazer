@@ -923,21 +923,33 @@ void sg_db_revision_prune(int keep)
 {
 	if (!g_db || keep < 0)
 		return;
+	/* Both DELETEs must commit together: a torn prune could otherwise
+	 * leave a revisions row whose snapshot rows are gone (a 0-row
+	 * revision that a later rollback would restore as an empty config),
+	 * or orphan revision_config rows the OFFSET prune can never reclaim. */
+	if (sg_db_begin() != 0)
+		return;
 	char sql[192];
 	char *errmsg = NULL;
+	int ok = 1;
 	snprintf(sql, sizeof(sql),
 		 "DELETE FROM revision_config WHERE rev IN "
 		 "(SELECT rev FROM revisions ORDER BY rev DESC LIMIT -1 OFFSET %d);",
 		 keep);
-	sqlite3_exec(g_db, sql, NULL, NULL, &errmsg);
-	if (errmsg) sqlite3_free(errmsg);
-	errmsg = NULL;
+	if (sqlite3_exec(g_db, sql, NULL, NULL, &errmsg) != SQLITE_OK)
+		ok = 0;
+	if (errmsg) { sqlite3_free(errmsg); errmsg = NULL; }
 	snprintf(sql, sizeof(sql),
 		 "DELETE FROM revisions WHERE rev IN "
 		 "(SELECT rev FROM revisions ORDER BY rev DESC LIMIT -1 OFFSET %d);",
 		 keep);
-	sqlite3_exec(g_db, sql, NULL, NULL, &errmsg);
+	if (sqlite3_exec(g_db, sql, NULL, NULL, &errmsg) != SQLITE_OK)
+		ok = 0;
 	if (errmsg) sqlite3_free(errmsg);
+	if (ok)
+		sg_db_commit();
+	else
+		sg_db_rollback();	/* keep history consistent on failure */
 }
 
 /*
