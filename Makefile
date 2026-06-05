@@ -648,8 +648,25 @@ $(ROOTFS_DIR)/.stamp: modules busybox dash iptables logind mgmtd cli webd tools
 	# Create stargazer config directory (mgmtd seeds defaults on first boot)
 	@mkdir -p $(ROOTFS_DIR)/etc/stargazer
 
+	# Architecture guard: every ELF in the rootfs MUST be aarch64. A host
+	# (x86) binary leaking into the image — e.g. a stray cp or a build-tree
+	# contamination — would silently brick the device (login exec fails with
+	# "Exec format error"). Fail the build loudly instead of shipping it.
+	@bad=$$(find $(ROOTFS_DIR) -type f | while read -r f; do \
+		d=$$(file -b "$$f" 2>/dev/null); \
+		case "$$d" in \
+			*ELF*aarch64*) ;; \
+			*ELF*) echo "$$f [$$d]" ;; \
+		esac; \
+	done); \
+	if [ -n "$$bad" ]; then \
+		echo "[ERROR] non-aarch64 ELF binaries in rootfs:"; \
+		echo "$$bad"; \
+		exit 1; \
+	fi
+
 	@touch $@
-	@echo "[4/5] Rootfs ready: $(ROOTFS_DIR)"
+	@echo "[4/5] Rootfs ready: $(ROOTFS_DIR) (all ELF binaries verified aarch64)"
 
 # =============================================================================
 # 5. ISO Image
