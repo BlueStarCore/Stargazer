@@ -554,6 +554,12 @@ chk("NATparity: direct path resolves address objects to -s/-d (fail-closed on fq
     and 'skipped (unresolved or fqdn address' in _cl)
 chk("NATparity: DNAT binds incoming interface (-i srcintf)",
     '_imatch="$_imatch -i $_srcintf"' in _cl)
+# Early rejection: NAT referencing an fqdn address object is refused at
+# config-set time (validate_nat) instead of silently skipped at apply.
+_na = rd("src/userspace/mgmtd/mgmtd_apply_nat.c")
+chk("NAT: fqdn address object rejected at set time (not silent apply-skip)",
+    "nat_addr_is_fqdn_obj(" in _na
+    and "NAT cannot use fqdn address object" in _na)
 
 # ─────────────────────────────────────────────────────────────────────────────
 print(f"\n{B}{C}=== 5. sg_is_uint_range: overflow and negative ==={N}")

@@ -38,6 +38,28 @@ static int is_any_or_all(const char *val)
 }
 
 /*
+ * nat_addr_is_fqdn_obj — true if `val` names a fqdn-type firewall_address.
+ *
+ * NAT needs a fixed IP/subnet; an fqdn object is an ipset of rotating DNS
+ * answers, which has no meaning as a NAT source/destination. The apply
+ * path already skips such a rule fail-closed, but that is silent — reject
+ * it here (config time) so the user is told instead of finding a dead
+ * port-forward later. Keywords and raw CIDRs are never fqdn objects.
+ */
+static int nat_addr_is_fqdn_obj(const char *val)
+{
+	if (is_any_or_all(val) || sg_is_cidr(val))
+		return 0;
+	char *data = sg_db_get("firewall_address", val);
+	if (!data)
+		return 0;	/* missing/dangling ref reported elsewhere */
+	char atype[VALBUFSZ];
+	extract_val(data, "type", atype, sizeof(atype));
+	free(data);
+	return strcmp(atype, "fqdn") == 0;
+}
+
+/*
  * Append optional -s/-d flags.  Same pattern as firewall rebuild
  * (mgmtd_apply_firewall.c): skip "any"/"all", validate CIDR before use.
  */
@@ -275,6 +297,20 @@ sg_status_t validate_nat(const char *id, const char *data,
 	if (dstaddr[0] && !is_any_or_all(dstaddr) &&
 	    !sg_is_cidr(dstaddr) && !sg_is_safe_id(dstaddr)) {
 		snprintf(result, rsize, "Invalid dstaddr '%s'", dstaddr);
+		return SG_ERR_INVALID_VAL;
+	}
+	if (nat_addr_is_fqdn_obj(srcaddr)) {
+		snprintf(result, rsize,
+			 "NAT cannot use fqdn address object '%s' — use an "
+			 "IP/subnet (fqdn objects are for firewall policy)",
+			 srcaddr);
+		return SG_ERR_INVALID_VAL;
+	}
+	if (nat_addr_is_fqdn_obj(dstaddr)) {
+		snprintf(result, rsize,
+			 "NAT cannot use fqdn address object '%s' — use an "
+			 "IP/subnet (fqdn objects are for firewall policy)",
+			 dstaddr);
 		return SG_ERR_INVALID_VAL;
 	}
 	if (mapped_ip[0] && !sg_is_ipv4(mapped_ip)) {
