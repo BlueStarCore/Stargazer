@@ -3352,6 +3352,46 @@ static void mgmtd_replay_config(void)
 	g_replaying = 0;
 }
 
+/*
+ * Rollback reconcile helpers.  mgmtd_replay_config() is apply-only — it
+ * re-applies entries still in the DB but never tears down ones a rollback
+ * dropped.  These run AFTER restore, BEFORE replay, to remove the runtime
+ * state of entries that existed before the rollback but not after.
+ * old_list is the newline-separated id list captured before the restore
+ * (strtok_r mutates it; the caller passes a throwaway copy).
+ */
+static void rollback_reconcile_dhcp(char *old_list)
+{
+	if (!old_list)
+		return;
+	char *save = NULL;
+	for (char *id = strtok_r(old_list, "\n", &save); id;
+	     id = strtok_r(NULL, "\n", &save)) {
+		char *d = sg_db_get("network_dhcp-server", id);
+		if (d) { free(d); continue; }	/* still present after rollback */
+		unapply_dhcp(id);		/* pool removed → stop its dhcpd */
+	}
+}
+
+static void rollback_reconcile_admins(char *old_list)
+{
+	if (!old_list)
+		return;
+	char *save = NULL;
+	for (char *id = strtok_r(old_list, "\n", &save); id;
+	     id = strtok_r(NULL, "\n", &save)) {
+		char *d = sg_db_get("system_admin", id);
+		if (d)
+			free(d);	/* survives — replay refreshes it */
+		else
+			delete_system_user(id);	/* removed → drop OS account */
+		/* Every pre-rollback admin's permissions/password may have
+		 * changed; purge their sessions so they re-authenticate (the
+		 * acting user was an admin before, so this can log them out). */
+		session_tag_purge_user(id);
+	}
+}
+
 /* ── Session tag table ──────────────────────────────────────────────────── */
 
 /*
@@ -5955,10 +5995,15 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		 * kernel. The current config is snapshotted first so the
 		 * rollback is itself reversible. */
 		const char *perms = get_user_permissions(user);
-		if (!has_permission(perms, "configure") &&
-		    !has_permission(perms, "admin")) {
+		/* Requires 'admin': a rollback restores the WHOLE config table,
+		 * including admin-gated types (system_admin, admin-profile,
+		 * password-policy) that CFG_SET/CFG_DEL require 'admin' to
+		 * change. Gating at 'configure' would let a configure-only user
+		 * reinstate old admins / weaken policy via rollback. */
+		if (!has_permission(perms, "admin")) {
 			send_error(client_fd, SG_ERR_PERM_DENIED,
-				   "Requires 'configure' permission");
+				   "Requires 'admin' permission "
+				   "(rollback can restore admin accounts/policy)");
 			return 0;
 		}
 		if (!payload || !payload[0]) {
@@ -5968,7 +6013,11 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		}
 		char *endp = NULL;
 		long rev = strtol(payload, &endp, 10);
-		if (endp == payload || rev <= 0 || rev > 0x7fffffff) {
+		while (endp && (*endp == ' ' || *endp == '\t' ||
+				*endp == '\n' || *endp == '\r'))
+			endp++;
+		if (endp == payload || *endp != '\0' ||
+		    rev <= 0 || rev > 0x7fffffff) {
 			send_error(client_fd, SG_ERR_INVALID_ARG,
 				   "Invalid revision number");
 			return 0;
@@ -5989,15 +6038,34 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 				   "Failed to snapshot current config; rollback aborted");
 			return 0;
 		}
+		/* Capture the entries that exist BEFORE the restore for the
+		 * types whose runtime state replay cannot tear down (it only
+		 * re-applies surviving entries). After the restore we reconcile
+		 * the ones the rollback removed. */
+		char *old_dhcp   = sg_db_list("network_dhcp-server");
+		char *old_admins = sg_db_list("system_admin");
+
 		/* Restore the config table (atomic). */
 		if (sg_db_revision_restore((int)rev) != 0) {
+			free(old_dhcp);
+			free(old_admins);
 			send_error(client_fd, SG_ERR_IO_FAIL,
 				   "Failed to restore revision; config unchanged");
 			return 0;
 		}
+
+		/* Tear down runtime state of entries the rollback removed
+		 * (stop orphaned dhcpd pools; delete OS accounts for admins no
+		 * longer in config; purge sessions of every pre-rollback admin
+		 * so changed/removed privileges force re-authentication). */
+		rollback_reconcile_dhcp(old_dhcp);
+		rollback_reconcile_admins(old_admins);
+		free(old_dhcp);
+		free(old_admins);
+
 		/* Reconcile the kernel to the restored DB: this flushes and
-		 * rebuilds firewall/NAT/routes and re-applies every type,
-		 * exactly as boot replay does. */
+		 * rebuilds firewall/NAT/routes and re-applies every surviving
+		 * type, exactly as boot replay does. */
 		mgmtd_replay_config();
 		/* Re-evaluate live flows against the rolled-back policy. */
 		conntrack_reeval_after_policy_change(0);

@@ -616,6 +616,20 @@ _ipc2 = rd("src/userspace/mgmtd/stargazer_ipc.h")
 chk("rollback: IPC opcodes no longer marked (stub)",
     "Rollback to revision (stub)" not in _ipc2)
 
+# Re-verify follow-up: rollback restores the whole config (incl admin-gated
+# types) and re-applies it; it must require admin, tear down runtime state
+# of entries it removed (replay is apply-only), and purge sessions.
+chk("rollback+: ROLLBACK requires admin (restores admin-gated config)",
+    'rollback can restore admin accounts/policy' in _mg)
+chk("rollback+: rev parse rejects trailing junk (strict *endp)",
+    "*endp != '\\0'" in _mg)
+chk("rollback+: removed dhcp pools / admins torn down after restore",
+    "rollback_reconcile_dhcp(old_dhcp)" in _mg
+    and "rollback_reconcile_admins(old_admins)" in _mg
+    and "unapply_dhcp(id)" in _mg and "delete_system_user(id)" in _mg)
+chk("rollback+: pre-rollback admins' sessions purged (re-auth)",
+    "session_tag_purge_user(id)" in _mg)
+
 # ─────────────────────────────────────────────────────────────────────────────
 print(f"\n{B}{C}=== 5. sg_is_uint_range: overflow and negative ==={N}")
 # ─────────────────────────────────────────────────────────────────────────────
