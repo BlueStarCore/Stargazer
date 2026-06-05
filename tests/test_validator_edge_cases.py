@@ -591,6 +591,31 @@ chk("dirB: cfg_replay no longer calls _apply_config_direct inline",
 chk("dirB: rollback snapshots current config before overwriting (reversible)",
     'cfg_record_revision "pre-rollback snapshot' in _cl)
 
+# Real rollback now implemented in mgmtd (C), DB-backed — the CLI
+# configure commit/revisions/rollback opcodes were previously stubs.
+_db = rd("src/userspace/mgmtd/sg_db.c")
+_dbh = rd("src/userspace/mgmtd/sg_db.h")
+chk("rollback: DB revision API declared + implemented",
+    "sg_db_revision_create" in _dbh and "sg_db_revision_restore" in _dbh
+    and "int sg_db_revision_create(" in _db)
+chk("rollback: schema has revisions + revision_config tables",
+    "CREATE TABLE IF NOT EXISTS revisions" in _db
+    and "CREATE TABLE IF NOT EXISTS revision_config" in _db)
+chk("rollback: restore replaces config (DELETE + INSERT from snapshot) — drops post-rev entries",
+    "DELETE FROM config;" in _db
+    and "INSERT INTO config(type,id,key,value) " in _db)
+chk("rollback: mgmtd COMMIT/REVISIONS/ROLLBACK handlers implemented (not stub)",
+    "case SG_CMD_COMMIT:" in _mg and "case SG_CMD_ROLLBACK:" in _mg
+    and "case SG_CMD_REVISIONS:" in _mg)
+chk("rollback: ROLLBACK snapshots current, restores, replays, re-evals flows",
+    "sg_db_revision_create(user, snapmsg)" in _mg
+    and "sg_db_revision_restore((int)rev)" in _mg
+    and "mgmtd_replay_config();" in _mg
+    and "conntrack_reeval_after_policy_change(0)" in _mg)
+_ipc2 = rd("src/userspace/mgmtd/stargazer_ipc.h")
+chk("rollback: IPC opcodes no longer marked (stub)",
+    "Rollback to revision (stub)" not in _ipc2)
+
 # ─────────────────────────────────────────────────────────────────────────────
 print(f"\n{B}{C}=== 5. sg_is_uint_range: overflow and negative ==={N}")
 # ─────────────────────────────────────────────────────────────────────────────

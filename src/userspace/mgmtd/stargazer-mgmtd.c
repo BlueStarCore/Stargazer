@@ -5903,6 +5903,114 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		return 0;
 	}
 
+	case SG_CMD_COMMIT: {
+		/* Snapshot the current config as a named revision. */
+		const char *perms = get_user_permissions(user);
+		if (!has_permission(perms, "configure") &&
+		    !has_permission(perms, "admin")) {
+			send_error(client_fd, SG_ERR_PERM_DENIED,
+				   "Requires 'configure' permission");
+			return 0;
+		}
+		char msg[256] = "";
+		if (payload && payload[0])
+			snprintf(msg, sizeof(msg), "%s", payload);
+		int rev = sg_db_revision_create(user, msg);
+		if (rev < 0) {
+			send_error(client_fd, SG_ERR_IO_FAIL,
+				   "Failed to record revision");
+			return 0;
+		}
+		char out[64];
+		snprintf(out, sizeof(out), "Saved revision %d\n", rev);
+		mgmt_log("INFO", "config commit: rev %d by %s", rev, user);
+		send_ok(client_fd, NULL, out);
+		return 0;
+	}
+
+	case SG_CMD_REVISIONS: {
+		const char *perms = get_user_permissions(user);
+		if (!has_permission(perms, "monitor")) {
+			send_error(client_fd, SG_ERR_PERM_DENIED,
+				   "Requires 'monitor' permission");
+			return 0;
+		}
+		char *list = sg_db_revision_list();
+		if (!list) {
+			send_ok(client_fd, "empty", "  No revisions.\n");
+			return 0;
+		}
+		if (!list[0]) {
+			free(list);
+			send_ok(client_fd, "empty", "  No revisions.\n");
+			return 0;
+		}
+		send_ok(client_fd, NULL, list);
+		free(list);
+		return 0;
+	}
+
+	case SG_CMD_ROLLBACK: {
+		/* Restore the config to a revision and re-apply it to the
+		 * kernel. The current config is snapshotted first so the
+		 * rollback is itself reversible. */
+		const char *perms = get_user_permissions(user);
+		if (!has_permission(perms, "configure") &&
+		    !has_permission(perms, "admin")) {
+			send_error(client_fd, SG_ERR_PERM_DENIED,
+				   "Requires 'configure' permission");
+			return 0;
+		}
+		if (!payload || !payload[0]) {
+			send_error(client_fd, SG_ERR_MISSING_ARG,
+				   "Usage: configure rollback <revision>");
+			return 0;
+		}
+		char *endp = NULL;
+		long rev = strtol(payload, &endp, 10);
+		if (endp == payload || rev <= 0 || rev > 0x7fffffff) {
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "Invalid revision number");
+			return 0;
+		}
+		if (!sg_db_revision_exists((int)rev)) {
+			send_error(client_fd, SG_ERR_NOT_FOUND,
+				   "Revision not found");
+			return 0;
+		}
+		/* Reversible: snapshot current state before overwriting it. */
+		char snapmsg[96];
+		snprintf(snapmsg, sizeof(snapmsg),
+			 "pre-rollback snapshot (before rollback to rev %ld)",
+			 rev);
+		int snap = sg_db_revision_create(user, snapmsg);
+		if (snap < 0) {
+			send_error(client_fd, SG_ERR_IO_FAIL,
+				   "Failed to snapshot current config; rollback aborted");
+			return 0;
+		}
+		/* Restore the config table (atomic). */
+		if (sg_db_revision_restore((int)rev) != 0) {
+			send_error(client_fd, SG_ERR_IO_FAIL,
+				   "Failed to restore revision; config unchanged");
+			return 0;
+		}
+		/* Reconcile the kernel to the restored DB: this flushes and
+		 * rebuilds firewall/NAT/routes and re-applies every type,
+		 * exactly as boot replay does. */
+		mgmtd_replay_config();
+		/* Re-evaluate live flows against the rolled-back policy. */
+		conntrack_reeval_after_policy_change(0);
+		mgmt_log("INFO", "config rollback to rev %ld by %s "
+			 "(current saved as rev %d)", rev, user, snap);
+		char out[96];
+		snprintf(out, sizeof(out),
+			 "Rolled back to revision %ld (current saved as rev %d)\n",
+			 rev, snap);
+		send_ok(client_fd, NULL, out);
+		return 0;
+	}
+
 	case SG_CMD_WHOAMI: {
 		/* Return caller's profile and permissions from database */
 		char *udata = sg_db_get("system_admin", user);

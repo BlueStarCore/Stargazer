@@ -88,9 +88,9 @@ typedef enum {
 	SG_CMD_SESSION_TAG_DEL = 401, /* Release session tag (logout)    */
 
 	/* Config revision management (5xx) — CLI sends these, mgmtd not yet implemented */
-	SG_CMD_COMMIT        = 500,   /* Record config revision (stub)   */
-	SG_CMD_REVISIONS     = 501,   /* List revisions (stub)           */
-	SG_CMD_ROLLBACK      = 502,   /* Rollback to revision (stub)     */
+	SG_CMD_COMMIT        = 500,   /* Snapshot config as a revision   */
+	SG_CMD_REVISIONS     = 501,   /* List config revisions           */
+	SG_CMD_ROLLBACK      = 502,   /* Restore + re-apply a revision   */
 
 	/* System operations (6xx) */
 	SG_CMD_SYS_POWEROFF  = 600,

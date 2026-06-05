@@ -173,4 +173,20 @@ int sg_db_begin(void);
 int sg_db_commit(void);
 int sg_db_rollback(void);
 
+/* ── Config revisions (configure commit / revisions / rollback) ──────────── *
+ * A revision is a full snapshot of the config table. */
+
+/* Snapshot the current config as a new revision. Returns rev (>0) or -1. */
+int sg_db_revision_create(const char *author, const char *message);
+
+/* 1 if the revision exists, 0 otherwise. */
+int sg_db_revision_exists(int rev);
+
+/* Newest-first list "rev\tts\tauthor\tmessage\n"... (heap, caller frees). */
+char *sg_db_revision_list(void);
+
+/* Replace the config table with revision `rev`'s snapshot (atomic).
+ * Returns 0 on success, -1 on failure / unknown rev. Caller must re-apply. */
+int sg_db_revision_restore(int rev);
+
 #endif /* SG_DB_H */

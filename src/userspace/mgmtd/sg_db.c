@@ -24,8 +24,8 @@ static sqlite3 *g_db;
 
 /* ── Schema version & hash ───────────────────────────────────────────────── */
 
-#define SG_SCHEMA_VERSION  1
-#define SG_SCHEMA_HASH     "d68116e6"
+#define SG_SCHEMA_VERSION  2
+#define SG_SCHEMA_HASH     "8ed796ca"
 
 /* ── Schema ──────────────────────────────────────────────────────────────── */
 
@@ -45,6 +45,22 @@ static const char *SCHEMA_SQL =
 	"  fail_count   INTEGER NOT NULL DEFAULT 0,"
 	"  locked_until INTEGER NOT NULL DEFAULT 0,"
 	"  updated_at   TEXT NOT NULL DEFAULT (datetime('now'))"
+	");"
+	/* Config revisions: each revision is a full snapshot of the config
+	 * table, used by configure commit/revisions/rollback. */
+	"CREATE TABLE IF NOT EXISTS revisions ("
+	"  rev     INTEGER PRIMARY KEY AUTOINCREMENT,"
+	"  ts      TEXT NOT NULL DEFAULT (datetime('now')),"
+	"  author  TEXT NOT NULL DEFAULT '',"
+	"  message TEXT NOT NULL DEFAULT ''"
+	");"
+	"CREATE TABLE IF NOT EXISTS revision_config ("
+	"  rev   INTEGER NOT NULL,"
+	"  type  TEXT NOT NULL,"
+	"  id    TEXT NOT NULL,"
+	"  key   TEXT NOT NULL,"
+	"  value TEXT NOT NULL DEFAULT '',"
+	"  PRIMARY KEY (rev, type, id, key)"
 	");";
 
 /* ── Schema hash safety check ────────────────────────────────────────────── */
@@ -848,4 +864,147 @@ int sg_db_rollback(void)
 	if (!g_db) return -1;
 	return sqlite3_exec(g_db, "ROLLBACK;", NULL, NULL, NULL) == SQLITE_OK
 		? 0 : -1;
+}
+
+/* ── Config revisions (configure commit / revisions / rollback) ──────────── *
+ *
+ * A revision is a full snapshot of the `config` table tagged with a rev id.
+ * sg_db_revision_create() snapshots the current config; sg_db_revision_restore()
+ * replaces the config table with a revision's snapshot (atomic). The caller
+ * (mgmtd) re-applies the restored DB to the kernel via mgmtd_replay_config().
+ */
+
+/*
+ * sg_db_revision_create — snapshot the current config table as a new revision.
+ * Returns the new rev number (> 0) on success, -1 on failure. Atomic.
+ */
+int sg_db_revision_create(const char *author, const char *message)
+{
+	if (!g_db) return -1;
+	if (sg_db_begin() != 0) return -1;
+
+	sqlite3_stmt *st;
+	if (sqlite3_prepare_v2(g_db,
+		"INSERT INTO revisions(author,message) VALUES(?1,?2);",
+		-1, &st, NULL) != SQLITE_OK) {
+		sg_db_rollback();
+		return -1;
+	}
+	sqlite3_bind_text(st, 1, author ? author : "", -1, SQLITE_STATIC);
+	sqlite3_bind_text(st, 2, message ? message : "", -1, SQLITE_STATIC);
+	int rc = sqlite3_step(st);
+	sqlite3_finalize(st);
+	if (rc != SQLITE_DONE) { sg_db_rollback(); return -1; }
+
+	long long rev = sqlite3_last_insert_rowid(g_db);
+
+	char *errmsg = NULL;
+	char sql[160];
+	snprintf(sql, sizeof(sql),
+		 "INSERT INTO revision_config(rev,type,id,key,value) "
+		 "SELECT %lld,type,id,key,value FROM config;", rev);
+	if (sqlite3_exec(g_db, sql, NULL, NULL, &errmsg) != SQLITE_OK) {
+		sqlite3_free(errmsg);
+		sg_db_rollback();
+		return -1;
+	}
+
+	if (sg_db_commit() != 0) { sg_db_rollback(); return -1; }
+	return (int)rev;
+}
+
+/*
+ * sg_db_revision_exists — 1 if the revision id exists, 0 otherwise.
+ */
+int sg_db_revision_exists(int rev)
+{
+	if (!g_db) return 0;
+	sqlite3_stmt *st;
+	if (sqlite3_prepare_v2(g_db, "SELECT 1 FROM revisions WHERE rev=?1;",
+			       -1, &st, NULL) != SQLITE_OK)
+		return 0;
+	sqlite3_bind_int(st, 1, rev);
+	int found = (sqlite3_step(st) == SQLITE_ROW);
+	sqlite3_finalize(st);
+	return found ? 1 : 0;
+}
+
+/*
+ * sg_db_revision_list — newest-first list of revisions, one per line:
+ *   "rev\tts\tauthor\tmessage\n"
+ * Returns a heap string (caller frees), or NULL on error.
+ */
+char *sg_db_revision_list(void)
+{
+	if (!g_db) return NULL;
+	sqlite3_stmt *st;
+	if (sqlite3_prepare_v2(g_db,
+		"SELECT rev,ts,author,message FROM revisions "
+		"ORDER BY rev DESC LIMIT 100;", -1, &st, NULL) != SQLITE_OK)
+		return NULL;
+
+	size_t cap = 1024, len = 0;
+	char *buf = malloc(cap);
+	if (!buf) { sqlite3_finalize(st); return NULL; }
+	buf[0] = '\0';
+
+	while (sqlite3_step(st) == SQLITE_ROW) {
+		int rev = sqlite3_column_int(st, 0);
+		const char *ts  = (const char *)sqlite3_column_text(st, 1);
+		const char *au  = (const char *)sqlite3_column_text(st, 2);
+		const char *msg = (const char *)sqlite3_column_text(st, 3);
+		char line[512];
+		int n = snprintf(line, sizeof(line), "%d\t%s\t%s\t%s\n",
+				 rev, ts ? ts : "", au ? au : "", msg ? msg : "");
+		if (n < 0) continue;
+		if ((size_t)n >= sizeof(line)) n = (int)sizeof(line) - 1;
+		if (len + (size_t)n + 1 > cap) {
+			while (len + (size_t)n + 1 > cap) cap *= 2;
+			char *nb = realloc(buf, cap);
+			if (!nb) { free(buf); sqlite3_finalize(st); return NULL; }
+			buf = nb;
+		}
+		memcpy(buf + len, line, (size_t)n);
+		len += (size_t)n;
+		buf[len] = '\0';
+	}
+	sqlite3_finalize(st);
+	return buf;
+}
+
+/*
+ * sg_db_revision_restore — replace the config table with the snapshot stored
+ * for `rev`. Atomic (all-or-nothing). Returns 0 on success, -1 on failure or
+ * if the revision does not exist. The caller must re-apply the restored config
+ * to the kernel afterwards.
+ */
+int sg_db_revision_restore(int rev)
+{
+	if (!g_db) return -1;
+	if (!sg_db_revision_exists(rev)) return -1;
+	if (sg_db_begin() != 0) return -1;
+
+	char *errmsg = NULL;
+	if (sqlite3_exec(g_db, "DELETE FROM config;", NULL, NULL, &errmsg)
+	    != SQLITE_OK) {
+		sqlite3_free(errmsg);
+		sg_db_rollback();
+		return -1;
+	}
+
+	sqlite3_stmt *st;
+	if (sqlite3_prepare_v2(g_db,
+		"INSERT INTO config(type,id,key,value) "
+		"SELECT type,id,key,value FROM revision_config WHERE rev=?1;",
+		-1, &st, NULL) != SQLITE_OK) {
+		sg_db_rollback();
+		return -1;
+	}
+	sqlite3_bind_int(st, 1, rev);
+	int rc = sqlite3_step(st);
+	sqlite3_finalize(st);
+	if (rc != SQLITE_DONE) { sg_db_rollback(); return -1; }
+
+	if (sg_db_commit() != 0) { sg_db_rollback(); return -1; }
+	return 0;
 }
