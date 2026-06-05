@@ -570,6 +570,13 @@ _na = rd("src/userspace/mgmtd/mgmtd_apply_nat.c")
 chk("NAT: fqdn address object rejected at set time (not silent apply-skip)",
     "nat_addr_is_fqdn_obj(" in _na
     and "NAT cannot use fqdn address object" in _na)
+# protocol=all + mapped-port would emit "--to-destination IP:PORT" with no
+# -p, which iptables rejects and aborts the whole nat rebuild. Reject at set
+# time, and emit a plain destination defensively for proto=all.
+chk("NAT: mapped-port requires a protocol (not 'all') — rejected at set",
+    "mapped-port requires protocol" in _na)
+chk("NAT: emit_dnat_rule drops port for proto=all (no invalid IP:PORT)",
+    "if (proto && mapped_port[0])" in _na)
 
 # Direction-B: rollback/replay applies each section through mgmtd (CFG_SET =
 # write DB + full apply incl firewall_policy + sequence) when available, so a

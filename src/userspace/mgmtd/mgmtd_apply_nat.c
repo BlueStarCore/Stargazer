@@ -10,10 +10,10 @@
  * Disabled entries are skipped.
  *
  * SNAT (overload):
- *   -A POSTROUTING [-s srcaddr] [-d dstaddr] -o <srcintf> -j MASQUERADE
+ *   -A POSTROUTING [-s srcaddr] [-d dstaddr] -o <dstintf> -j MASQUERADE
  *
  * DNAT:
- *   -A PREROUTING [-s srcaddr] [-d dstaddr] [-i dstintf]
+ *   -A PREROUTING [-s srcaddr] [-d dstaddr] [-i srcintf]
  *       [-p proto [--dport port]] -j DNAT --to-destination ip[:port]
  *
  * protocol=tcp+udp generates two separate rules (one per protocol),
@@ -111,7 +111,11 @@ static int emit_dnat_rule(struct dynbuf *buf,
 		if (dstport[0])
 			dbuf_printf(buf, " --dport %s", dstport);
 	}
-	if (mapped_port[0])
+	/* Port translation only with a protocol: for proto=all (1:1 NAT) a
+	 * ":port" target is invalid and would abort the whole nat rebuild, so
+	 * emit a plain destination even if mapped_port is set on a stray
+	 * entry. validate_nat rejects this combination at config time. */
+	if (proto && mapped_port[0])
 		dbuf_printf(buf, " -j DNAT --to-destination %s:%s\n",
 			    mapped_ip, mapped_port);
 	else
@@ -330,6 +334,15 @@ sg_status_t validate_nat(const char *id, const char *data,
 	if (dstport[0] && protocol[0] && strcmp(protocol, "all") == 0) {
 		snprintf(result, rsize,
 			 "dstport requires protocol tcp, udp, or tcp+udp");
+		return SG_ERR_INVALID_VAL;
+	}
+	/* Cross-field: port translation needs a protocol. protocol=all with a
+	 * mapped-port would emit "--to-destination IP:PORT" without -p, which
+	 * iptables rejects — failing the whole atomic nat rebuild. Reject it
+	 * here (and emit_dnat_rule drops the port for proto=all defensively). */
+	if (mapped_port[0] && protocol[0] && strcmp(protocol, "all") == 0) {
+		snprintf(result, rsize,
+			 "mapped-port requires protocol tcp, udp, or tcp+udp");
 		return SG_ERR_INVALID_VAL;
 	}
 
