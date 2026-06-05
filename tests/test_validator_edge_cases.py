@@ -515,6 +515,12 @@ chk("M3: webd stages firmware at a unique per-upload path (no shared race)",
 # alnum so mgmtd's strict path check still accepts it.
 chk("M3+: webd staging is seccomp-safe (O_WRONLY, not mkstemp/O_RDWR)",
     'mkstemp(stage)' not in _wa and 'A36[v % 36]' in _wa)
+# The staging error paths call unlink() = unlinkat(#35) on aarch64; the
+# webd seccomp filter must allow it or those paths kill the worker.
+_wsb = rd("src/userspace/webd/webd_sandbox.c")
+chk("M3+: webd seccomp allows unlinkat (staging cleanup not killed)",
+    "#define SC_unlinkat         35" in _wsb and "SC_ALLOW(SC_unlinkat)" in _wsb
+    and "unlink(stage)" in _wa)
 _fw2 = rd("src/userspace/mgmtd/mgmtd_firmware.c")
 chk("M3: mgmtd validates upload path by prefix and consumes that exact path",
     '"/tmp/sg-fw-upload."' in _fw2 and "rename(path, FW_DL_FILE)" in _fw2

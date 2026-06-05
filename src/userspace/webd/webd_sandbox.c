@@ -28,6 +28,7 @@
 /* aarch64 syscall numbers (asm-generic/unistd.h) */
 #define SC_openat           56
 #define SC_close            57
+#define SC_unlinkat         35
 #define SC_lseek            62
 #define SC_read             63
 #define SC_write            64
@@ -236,6 +237,12 @@ int webd_sandbox_install(void)
 		/* ── Misc ────────────────────────────────────────── */
 		SC_ALLOW(SC_fcntl),
 		SC_ALLOW(SC_newfstatat),
+		/* unlinkat: clean up this process's own firmware staging temp
+		 * (/tmp/sg-fw-upload.*) on the upload error paths. unlink() is
+		 * unlinkat on aarch64; without this, an upload error path would
+		 * be killed by the filter. Bounded: webd can already create and
+		 * O_TRUNC files it owns, so deleting its own temps adds little. */
+		SC_ALLOW(SC_unlinkat),
 		SC_ALLOW(SC_exit_group),
 
 		/* ── ioctl: SIOCGIFADDR only ─────────────────────
