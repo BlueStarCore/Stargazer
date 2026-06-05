@@ -14,6 +14,7 @@
 #include "stargazer_ipc.h"
 #include "sg_validate.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1030,20 +1031,28 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 						   "{\"error\":\"Cannot create firmware staging file\"}");
 					return -1;
 				}
-				FILE *ufp = fdopen(sfd, "wb");
-				if (!ufp) {
-					close(sfd);
-					unlink(stage);
-					reply_json(c, 500,
-						   "{\"error\":\"Cannot create firmware staging file\"}");
-					return -1;
+				/* Write with raw write(2), NOT stdio: fdopen() on a
+				 * writable stream issues ioctl(TIOCGWINSZ) (musl
+				 * line-buffering probe) which the webd seccomp
+				 * filter does not allow and would KILL the worker.
+				 * The body is one contiguous buffer. */
+				const char *wbuf = part.body.buf;
+				size_t wtot = part.body.len, woff = 0;
+				int wok = 1;
+				while (woff < wtot) {
+					ssize_t wn = write(sfd, wbuf + woff,
+							   wtot - woff);
+					if (wn < 0) {
+						if (errno == EINTR)
+							continue;
+						wok = 0;
+						break;
+					}
+					woff += (size_t)wn;
 				}
-				size_t wr = fwrite(part.body.buf, 1,
-						   part.body.len, ufp);
-				int uferr = ferror(ufp);
-				fclose(ufp);
-
-				if (uferr || wr != part.body.len) {
+				if (close(sfd) != 0)
+					wok = 0;
+				if (!wok) {
 					unlink(stage);
 					reply_json(c, 500,
 						   "{\"error\":\"Failed to write firmware staging file\"}");

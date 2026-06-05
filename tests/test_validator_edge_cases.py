@@ -521,6 +521,10 @@ _wsb = rd("src/userspace/webd/webd_sandbox.c")
 chk("M3+: webd seccomp allows unlinkat (staging cleanup not killed)",
     "#define SC_unlinkat         35" in _wsb and "SC_ALLOW(SC_unlinkat)" in _wsb
     and "unlink(stage)" in _wa)
+# fdopen() on a writable stream issues ioctl(TIOCGWINSZ), which the webd
+# seccomp filter kills — so the staging write must use raw write(2).
+chk("M3+: webd staging uses raw write(2), not fdopen (no TIOCGWINSZ ioctl)",
+    "fdopen(sfd" not in _wa and "write(sfd, wbuf + woff" in _wa)
 _fw2 = rd("src/userspace/mgmtd/mgmtd_firmware.c")
 chk("M3: mgmtd validates upload path by prefix and consumes that exact path",
     '"/tmp/sg-fw-upload."' in _fw2 and "rename(path, FW_DL_FILE)" in _fw2
