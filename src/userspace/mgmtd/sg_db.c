@@ -909,6 +909,21 @@ int sg_db_revision_create(const char *author, const char *message)
 		return -1;
 	}
 
+	/* Prune to the most recent 50 revisions so the history (and its
+	 * per-rev config snapshots) cannot grow without bound. */
+	errmsg = NULL;
+	sqlite3_exec(g_db,
+		"DELETE FROM revision_config WHERE rev IN "
+		"(SELECT rev FROM revisions ORDER BY rev DESC LIMIT -1 OFFSET 50);",
+		NULL, NULL, &errmsg);
+	if (errmsg) sqlite3_free(errmsg);
+	errmsg = NULL;
+	sqlite3_exec(g_db,
+		"DELETE FROM revisions WHERE rev IN "
+		"(SELECT rev FROM revisions ORDER BY rev DESC LIMIT -1 OFFSET 50);",
+		NULL, NULL, &errmsg);
+	if (errmsg) sqlite3_free(errmsg);
+
 	if (sg_db_commit() != 0) { sg_db_rollback(); return -1; }
 	return (int)rev;
 }

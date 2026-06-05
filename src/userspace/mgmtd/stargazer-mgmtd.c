@@ -3205,9 +3205,13 @@ static int handle_dhcp_lease_event(int client_fd, const char *user,
 	return 0;
 }
 
-static void mgmtd_replay_config(void)
+/* Re-apply the whole DB to the kernel. Returns the number of per-type
+ * apply failures (0 = full success). Boot ignores the count (best-effort);
+ * rollback surfaces it so a partial re-apply is not reported as success. */
+static int mgmtd_replay_config(void)
 {
 	char result[512];
+	int fails = 0;
 
 	/* Single config types (id="0").
 	 * Order: settings first, then services that depend on them. */
@@ -3237,9 +3241,11 @@ static void mgmtd_replay_config(void)
 			if (rc == SG_OK)
 				fprintf(stderr, "[mgmtd] replay %s: %s\n",
 					single_types[i], result);
-			else
+			else {
 				fprintf(stderr, "[mgmtd] replay FAIL %s: %s\n",
 					single_types[i], result);
+				fails++;
+			}
 			free(data);
 		}
 	}
@@ -3269,6 +3275,7 @@ static void mgmtd_replay_config(void)
 			fprintf(stderr, "[mgmtd] replay firewall_policy: %s%s\n",
 				rc == SG_OK ? "" : "FAIL ",
 				rb_result);
+			if (rc != SG_OK) fails++;
 			continue;
 		}
 		if (strcmp(table_types[i], "network_nat") == 0) {
@@ -3278,6 +3285,7 @@ static void mgmtd_replay_config(void)
 			fprintf(stderr, "[mgmtd] replay network_nat: %s%s\n",
 				rc == SG_OK ? "" : "FAIL ",
 				rb_result);
+			if (rc != SG_OK) fails++;
 			continue;
 		}
 
@@ -3336,9 +3344,11 @@ static void mgmtd_replay_config(void)
 				if (rc == SG_OK)
 					fprintf(stderr, "[mgmtd] replay %s:%s: %s\n",
 						table_types[i], id, result);
-				else
+				else {
 					fprintf(stderr, "[mgmtd] replay FAIL %s:%s: %s\n",
 						table_types[i], id, result);
+					fails++;
+				}
 				free(data);
 			}
 
@@ -3350,6 +3360,7 @@ static void mgmtd_replay_config(void)
 
 	/* Enable ref existence checks now that all config is loaded */
 	g_replaying = 0;
+	return fails;
 }
 
 /*
@@ -3389,6 +3400,65 @@ static void rollback_reconcile_admins(char *old_list)
 		 * changed; purge their sessions so they re-authenticate (the
 		 * acting user was an admin before, so this can log them out). */
 		session_tag_purge_user(id);
+	}
+}
+
+/*
+ * collect_fqdn_address_ids — newline-separated ids of fqdn-type
+ * firewall_address objects currently in the DB. Captured BEFORE a restore
+ * so the rollback can destroy the ipsets of fqdn objects it removes (their
+ * type is gone from the DB after the restore). Heap string, caller frees.
+ */
+static char *collect_fqdn_address_ids(void)
+{
+	char *list = sg_db_list("firewall_address");
+	if (!list)
+		return NULL;
+	size_t cap = 256, len = 0;
+	char *out = malloc(cap);
+	if (!out) { free(list); return NULL; }
+	out[0] = '\0';
+	char *save = NULL;
+	for (char *id = strtok_r(list, "\n", &save); id;
+	     id = strtok_r(NULL, "\n", &save)) {
+		char *t = sg_db_get_val("firewall_address", id, "type");
+		int is_fqdn = (t && strcmp(t, "fqdn") == 0);
+		free(t);
+		if (!is_fqdn)
+			continue;
+		size_t n = strlen(id);
+		if (len + n + 2 > cap) {
+			while (len + n + 2 > cap) cap *= 2;
+			char *nb = realloc(out, cap);
+			if (!nb) { free(out); free(list); return NULL; }
+			out = nb;
+		}
+		memcpy(out + len, id, n);
+		len += n;
+		out[len++] = '\n';
+		out[len] = '\0';
+	}
+	free(list);
+	return out;
+}
+
+/*
+ * rollback_reconcile_fqdn — destroy the ipset of every fqdn address object
+ * that a rollback removed. old_list is the pre-restore fqdn id list from
+ * collect_fqdn_address_ids (strtok_r mutates it). An fqdn object owns a
+ * runtime hash:ip set that neither replay nor the FORWARD rebuild destroys;
+ * without this the set leaks until reboot (the normal teardown is on CFG_DEL).
+ */
+static void rollback_reconcile_fqdn(char *old_list)
+{
+	if (!old_list)
+		return;
+	char *save = NULL;
+	for (char *id = strtok_r(old_list, "\n", &save); id;
+	     id = strtok_r(NULL, "\n", &save)) {
+		char *d = sg_db_get("firewall_address", id);
+		if (d) { free(d); continue; }	/* still present after rollback */
+		fqdn_object_removed(id);	/* removed → destroy its ipset */
 	}
 }
 
@@ -6044,11 +6114,13 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		 * the ones the rollback removed. */
 		char *old_dhcp   = sg_db_list("network_dhcp-server");
 		char *old_admins = sg_db_list("system_admin");
+		char *old_fqdn   = collect_fqdn_address_ids();
 
 		/* Restore the config table (atomic). */
 		if (sg_db_revision_restore((int)rev) != 0) {
 			free(old_dhcp);
 			free(old_admins);
+			free(old_fqdn);
 			send_error(client_fd, SG_ERR_IO_FAIL,
 				   "Failed to restore revision; config unchanged");
 			return 0;
@@ -6056,25 +6128,39 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 
 		/* Tear down runtime state of entries the rollback removed
 		 * (stop orphaned dhcpd pools; delete OS accounts for admins no
-		 * longer in config; purge sessions of every pre-rollback admin
-		 * so changed/removed privileges force re-authentication). */
+		 * longer in config + purge every pre-rollback admin's sessions
+		 * so changed/removed privileges force re-auth; destroy ipsets of
+		 * removed fqdn address objects). Replay only re-applies survivors;
+		 * firewall/NAT/routes are fully flush-rebuilt from the DB by it. */
 		rollback_reconcile_dhcp(old_dhcp);
 		rollback_reconcile_admins(old_admins);
+		rollback_reconcile_fqdn(old_fqdn);
 		free(old_dhcp);
 		free(old_admins);
+		free(old_fqdn);
 
 		/* Reconcile the kernel to the restored DB: this flushes and
 		 * rebuilds firewall/NAT/routes and re-applies every surviving
 		 * type, exactly as boot replay does. */
-		mgmtd_replay_config();
+		int replay_fails = mgmtd_replay_config();
 		/* Re-evaluate live flows against the rolled-back policy. */
 		conntrack_reeval_after_policy_change(0);
 		mgmt_log("INFO", "config rollback to rev %ld by %s "
-			 "(current saved as rev %d)", rev, user, snap);
-		char out[96];
-		snprintf(out, sizeof(out),
-			 "Rolled back to revision %ld (current saved as rev %d)\n",
-			 rev, snap);
+			 "(current saved as rev %d, %d apply failure(s))",
+			 rev, user, snap, replay_fails);
+		char out[160];
+		if (replay_fails > 0)
+			/* DB is restored correctly, but some components did not
+			 * re-apply to the kernel — do not report clean success. */
+			snprintf(out, sizeof(out),
+				 "Rolled back to revision %ld (current saved as rev %d) "
+				 "with %d component(s) failing to apply — see log; "
+				 "a reboot fully reconciles\n",
+				 rev, snap, replay_fails);
+		else
+			snprintf(out, sizeof(out),
+				 "Rolled back to revision %ld (current saved as rev %d)\n",
+				 rev, snap);
 		send_ok(client_fd, NULL, out);
 		return 0;
 	}

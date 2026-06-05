@@ -629,6 +629,19 @@ chk("rollback+: removed dhcp pools / admins torn down after restore",
     and "unapply_dhcp(id)" in _mg and "delete_system_user(id)" in _mg)
 chk("rollback+: pre-rollback admins' sessions purged (re-auth)",
     "session_tag_purge_user(id)" in _mg)
+# Loop-verify round 2: rollback also destroys ipsets of removed fqdn
+# address objects (replay/rebuild never does), bounds revision history, and
+# surfaces a partial kernel re-apply instead of reporting clean success.
+chk("rollback++: removed fqdn address ipsets torn down on rollback",
+    "rollback_reconcile_fqdn(old_fqdn)" in _mg
+    and "fqdn_object_removed(id)" in _mg
+    and "collect_fqdn_address_ids()" in _mg)
+chk("rollback++: revision history pruned (no unbounded growth)",
+    "LIMIT -1 OFFSET 50" in _db)
+chk("rollback++: replay returns failure count; rollback reports partial apply",
+    "static int mgmtd_replay_config(void)" in _mg
+    and "replay_fails = mgmtd_replay_config()" in _mg
+    and "failing to apply" in _mg)
 
 # ─────────────────────────────────────────────────────────────────────────────
 print(f"\n{B}{C}=== 5. sg_is_uint_range: overflow and negative ==={N}")
