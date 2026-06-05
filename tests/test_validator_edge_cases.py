@@ -536,12 +536,24 @@ chk("M4: direct DNAT no longer hardcodes -p tcp (honors tcp/udp/tcp+udp/all)",
 # Re-verify follow-up: a tcp/udp DNAT with no dstport must still emit a
 # -p rule (mirrors mgmtd emit_dnat_rule) instead of silently dropping it.
 chk("M4+: DNAT emits -p rule even without dstport (parity with mgmtd)",
-    'else\n\t\t\t\t\t\t\t\t_nat_add PREROUTING -p "$1" -j DNAT' in _cl)
+    '_nat_add PREROUTING $_imatch -p "$1" -j DNAT --to-destination "$_target"' in _cl)
 chk("M4+: protocol listed in NAT help and has enum validation",
     'protocol     tcp | udp | tcp+udp | all' in _cl
     and 'network_nat:protocol) echo "enum:tcp,udp,tcp+udp,all"' in _cl)
 chk("M5: direct NAT is idempotent (check-then-add, no duplicate accumulation)",
     'iptables -t nat -C "$_c" "$@" 2>/dev/null ||' in _cl)
+# Direction A: the direct NAT path now mirrors mgmtd_apply_nat.c — SNAT
+# binds the OUTGOING interface (dstintf, not srcintf), DNAT binds the
+# incoming interface, both emit -s/-d from resolved address objects, and
+# an fqdn/unresolvable address fails the rule closed.
+chk("NATparity: SNAT binds dstintf (-o) like mgmtd, not srcintf",
+    '_nat_add POSTROUTING $_match -o "$_dstintf" -j MASQUERADE' in _cl
+    and '-o "$_srcintf" -j MASQUERADE' not in _cl)
+chk("NATparity: direct path resolves address objects to -s/-d (fail-closed on fqdn)",
+    "_resolve_nat_addr()" in _cl and '_match="$_match -s $_sa"' in _cl
+    and 'skipped (unresolved or fqdn address' in _cl)
+chk("NATparity: DNAT binds incoming interface (-i srcintf)",
+    '_imatch="$_imatch -i $_srcintf"' in _cl)
 
 # ─────────────────────────────────────────────────────────────────────────────
 print(f"\n{B}{C}=== 5. sg_is_uint_range: overflow and negative ==={N}")

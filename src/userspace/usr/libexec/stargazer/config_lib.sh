@@ -1827,6 +1827,9 @@ _apply_config_direct() {
 		network_nat)
 			_type=$(grep '^type=' "$_apply_file" 2>/dev/null | cut -d= -f2-)
 			_srcintf=$(grep '^srcintf=' "$_apply_file" 2>/dev/null | cut -d= -f2-)
+			_dstintf=$(grep '^dstintf=' "$_apply_file" 2>/dev/null | cut -d= -f2-)
+			_srcaddr=$(grep '^srcaddr=' "$_apply_file" 2>/dev/null | cut -d= -f2-)
+			_dstaddr=$(grep '^dstaddr=' "$_apply_file" 2>/dev/null | cut -d= -f2-)
 			_protocol=$(grep '^protocol=' "$_apply_file" 2>/dev/null | cut -d= -f2-)
 			_dstport=$(grep '^dstport=' "$_apply_file" 2>/dev/null | cut -d= -f2-)
 			_mapped_ip=$(grep '^mapped-ip=' "$_apply_file" 2>/dev/null | cut -d= -f2-)
@@ -1841,6 +1844,11 @@ _apply_config_direct() {
 			esac
 			[ -n "$_srcintf" ] && ! _is_iface_name "$_srcintf" && {
 				echo "  Error: invalid srcintf '$_srcintf'"
+				return 1
+			}
+			[ -n "$_dstintf" ] && [ "$_dstintf" != any ] && [ "$_dstintf" != all ] \
+				&& ! _is_iface_name "$_dstintf" && {
+				echo "  Error: invalid dstintf '$_dstintf'"
 				return 1
 			}
 			[ -n "$_dstport" ] && ! _is_uint_range "$_dstport" 1 65535 && {
@@ -1866,32 +1874,76 @@ _apply_config_direct() {
 				iptables -t nat -C "$_c" "$@" 2>/dev/null || \
 					iptables -t nat -A "$_c" "$@" 2>&1 | sed 's/^/  /'
 			}
+			# Resolve a NAT srcaddr/dstaddr to a CIDR for -s/-d, mirroring
+			# mgmtd resolve_address(): empty/any/all/0.0.0.0/0 -> match-all
+			# (echo ""), a raw CIDR -> itself, a named firewall_address ->
+			# its subnet (looked up in the same DB mgmtd reads). An fqdn
+			# object or any unresolvable/invalid reference -> "SKIP" so the
+			# caller drops the whole rule (fail-closed, as mgmtd does).
+			_resolve_nat_addr() {
+				case "$1" in
+					""|any|all|0.0.0.0/0) echo ""; return 0 ;;
+				esac
+				if _is_cidr "$1"; then
+					[ "$1" = "0.0.0.0/0" ] && { echo ""; return 0; }
+					echo "$1"; return 0
+				fi
+				command -v sqlite3 >/dev/null 2>&1 && [ -f "$STARGAZER_DB_PATH" ] || {
+					echo "SKIP"; return 0; }
+				_rna_q=$(printf '%s' "$1" | sed "s/'/''/g")
+				_rna_t=$(sqlite3 "$STARGAZER_DB_PATH" "SELECT value FROM config WHERE type='firewall_address' AND id='${_rna_q}' AND key='type' LIMIT 1;" 2>/dev/null)
+				[ "$_rna_t" = fqdn ] && { echo "SKIP"; return 0; }
+				_rna_s=$(sqlite3 "$STARGAZER_DB_PATH" "SELECT value FROM config WHERE type='firewall_address' AND id='${_rna_q}' AND key='subnet' LIMIT 1;" 2>/dev/null)
+				{ [ -z "$_rna_s" ] || ! _is_cidr "$_rna_s"; } && { echo "SKIP"; return 0; }
+				[ "$_rna_s" = "0.0.0.0/0" ] && { echo ""; return 0; }
+				echo "$_rna_s"; return 0
+			}
+			_sa=$(_resolve_nat_addr "$_srcaddr")
+			_da=$(_resolve_nat_addr "$_dstaddr")
+			if [ "$_sa" = SKIP ] || [ "$_da" = SKIP ]; then
+				echo "  NAT rule $_apply_id skipped (unresolved or fqdn address — fail-closed)"
+				return 0
+			fi
+			# Build the -s/-d match prefix (resolved CIDRs only — safe to
+			# pass unquoted). Same -s/-d that mgmtd's append_addr_match emits.
+			_match=""
+			[ -n "$_sa" ] && _match="$_match -s $_sa"
+			[ -n "$_da" ] && _match="$_match -d $_da"
 			case "$_type" in
 				snat)
-					[ -n "$_srcintf" ] && _nat_add POSTROUTING -o "$_srcintf" -j MASQUERADE
-					echo "  SNAT rule $_apply_id applied."
+					# SNAT/MASQUERADE binds to the OUTGOING interface
+					# (dstintf), like mgmtd — not srcintf. mgmtd also only
+					# emits SNAT when dstintf is a real interface.
+					if [ -n "$_dstintf" ] && [ "$_dstintf" != any ] && [ "$_dstintf" != all ]; then
+						_nat_add POSTROUTING $_match -o "$_dstintf" -j MASQUERADE
+						echo "  SNAT rule $_apply_id applied."
+					else
+						echo "  SNAT rule $_apply_id skipped (no outgoing interface)"
+					fi
 					;;
 				dnat)
 					if [ -n "$_mapped_ip" ]; then
 						_target="$_mapped_ip"
 						[ -n "$_mapped_port" ] && _target="${_target}:${_mapped_port}"
+						# DNAT binds to the incoming interface (srcintf) when set.
+						_imatch="$_match"
+						[ -n "$_srcintf" ] && [ "$_srcintf" != any ] && [ "$_srcintf" != all ] \
+							&& _imatch="$_imatch -i $_srcintf"
 						# Emit one DNAT rule for a protocol, adding --dport
 						# only when a dstport is set — mirrors mgmtd's
 						# emit_dnat_rule (mgmtd_apply_nat.c), which always
-						# installs the -p rule and treats dstport as
-						# optional. (The earlier version dropped the rule
-						# entirely when dstport was empty.)
+						# installs the -p rule and treats dstport as optional.
 						_dnat_proto() {
 							if [ -n "$_dstport" ]; then
-								_nat_add PREROUTING -p "$1" --dport "$_dstport" -j DNAT --to-destination "$_target"
+								_nat_add PREROUTING $_imatch -p "$1" --dport "$_dstport" -j DNAT --to-destination "$_target"
 							else
-								_nat_add PREROUTING -p "$1" -j DNAT --to-destination "$_target"
+								_nat_add PREROUTING $_imatch -p "$1" -j DNAT --to-destination "$_target"
 							fi
 						}
 						case "$_protocol" in
 							all)
 								# 1:1 NAT, all protocols (dstport ignored)
-								_nat_add PREROUTING -j DNAT --to-destination "$_target"
+								_nat_add PREROUTING $_imatch -j DNAT --to-destination "$_target"
 								;;
 							tcp+udp)
 								_dnat_proto tcp
