@@ -668,6 +668,12 @@ cfg_rollback_revision() {
 		return 1
 	}
 
+	# Snapshot the CURRENT running config as a new revision BEFORE overwriting
+	# it, so the rollback is itself reversible (a bad rollback can be rolled
+	# back). Without this, the pre-rollback state is lost.
+	_rb_saved=$(cfg_record_revision "pre-rollback snapshot (before rollback to rev ${_rb_rev})" 2>/dev/null | tail -n1)
+	[ -n "$_rb_saved" ] && echo "  Saved current config as revision $_rb_saved"
+
 	sqlite3 -separator '|' "$STARGAZER_DB_PATH" "SELECT domain_file, content FROM config_revision_files WHERE rev=${_rb_rev};" \
 	| while IFS='|' read -r _f _c; do
 		_tmp="${_f}.rollback.$$"
@@ -888,6 +894,34 @@ cfg_list_types() {
 # Parse all sections and call _apply_config_direct for each.
 # Used for boot-time replay of saved configuration (runs as root).
 
+# ── _replay_apply_section(section, datafile) ─────────────────────────────────
+# Apply one replayed config section. Prefer mgmtd via CFG_SET (200): that
+# writes the DB and runs the SAME apply a normal "set" does — full FORWARD
+# chain rebuild in sequence order, NAT in sequence order, conntrack
+# re-evaluation — so a rollback/replay through mgmtd reproduces the firewall
+# exactly, with one source of truth. Only when mgmtd is down (recovery) fall
+# back to the degraded direct path (no firewall_policy, conf-driven). The raw
+# section header ("type" or "type:id") is what CFG_SET expects.
+_replay_apply_section() {
+	_ras_section="$1"
+	_ras_file="$2"
+	if _ipc_available; then
+		# Same CFG_SET payload as cfg_set(): "section\ndata\n".
+		_ras_payload=$(printf '%s\n' "$_ras_section"; cat "$_ras_file"; printf '\n')
+		ipc_send 200 "$_ras_payload"
+		if [ "$IPC_RC" -ne 0 ]; then
+			echo "  apply '$_ras_section' failed: ${IPC_EXTRA:-error}"
+			return 1
+		fi
+		return 0
+	fi
+	# Fallback: mgmtd unavailable (recovery) — degraded direct apply.
+	_ras_type="${_ras_section%%:*}"
+	_ras_id="${_ras_section#*:}"
+	[ "$_ras_type" = "$_ras_id" ] && _ras_id="0"
+	_apply_config_direct "$_ras_type" "$_ras_id" "$_ras_file" 2>/dev/null
+}
+
 cfg_replay() {
 	_cr_file="$1"
 	[ ! -f "$_cr_file" ] && return
@@ -899,10 +933,7 @@ cfg_replay() {
 			"["*"]")
 				# Apply previous section if any
 				if [ -n "$_cr_section" ] && [ -s "$_cr_tmp" ]; then
-					_cr_type="${_cr_section%%:*}"
-					_cr_id="${_cr_section#*:}"
-					[ "$_cr_type" = "$_cr_id" ] && _cr_id="0"
-					_apply_config_direct "$_cr_type" "$_cr_id" "$_cr_tmp" 2>/dev/null
+					_replay_apply_section "$_cr_section" "$_cr_tmp"
 				fi
 				# Start new section
 				_cr_section="${_cr_line#\[}"
@@ -920,10 +951,7 @@ cfg_replay() {
 
 	# Apply last section
 	if [ -n "$_cr_section" ] && [ -s "$_cr_tmp" ]; then
-		_cr_type="${_cr_section%%:*}"
-		_cr_id="${_cr_section#*:}"
-		[ "$_cr_type" = "$_cr_id" ] && _cr_id="0"
-		_apply_config_direct "$_cr_type" "$_cr_id" "$_cr_tmp" 2>/dev/null
+		_replay_apply_section "$_cr_section" "$_cr_tmp"
 	fi
 
 	rm -f "$_cr_tmp"

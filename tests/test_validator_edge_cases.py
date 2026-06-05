@@ -571,6 +571,19 @@ chk("NAT: fqdn address object rejected at set time (not silent apply-skip)",
     "nat_addr_is_fqdn_obj(" in _na
     and "NAT cannot use fqdn address object" in _na)
 
+# Direction-B: rollback/replay applies each section through mgmtd (CFG_SET =
+# write DB + full apply incl firewall_policy + sequence) when available, so a
+# rollback reproduces the firewall exactly; direct path is the mgmtd-down
+# fallback. And rollback snapshots the current config first so it is
+# reversible.
+chk("dirB: replay routes through mgmtd CFG_SET with direct fallback",
+    "_replay_apply_section()" in _cl and "ipc_send 200" in _cl
+    and "_apply_config_direct" in _cl)  # fallback retained
+chk("dirB: cfg_replay no longer calls _apply_config_direct inline",
+    "_replay_apply_section \"$_cr_section\"" in _cl)
+chk("dirB: rollback snapshots current config before overwriting (reversible)",
+    'cfg_record_revision "pre-rollback snapshot' in _cl)
+
 # ─────────────────────────────────────────────────────────────────────────────
 print(f"\n{B}{C}=== 5. sg_is_uint_range: overflow and negative ==={N}")
 # ─────────────────────────────────────────────────────────────────────────────
