@@ -637,11 +637,25 @@ chk("rollback++: removed fqdn address ipsets torn down on rollback",
     and "fqdn_object_removed(id)" in _mg
     and "collect_fqdn_address_ids()" in _mg)
 chk("rollback++: revision history pruned (no unbounded growth)",
-    "LIMIT -1 OFFSET 50" in _db)
+    "LIMIT -1 OFFSET %d" in _db)
 chk("rollback++: replay returns failure count; rollback reports partial apply",
     "static int mgmtd_replay_config(void)" in _mg
     and "replay_fails = mgmtd_replay_config()" in _mg
     and "failing to apply" in _mg)
+# Loop-verify round 3: the prune must not run inside create() (the
+# pre-rollback snapshot could otherwise evict the very revision being
+# restored — TOCTOU); prune is now explicit, after commit/after restore.
+# And fqdn teardown must trigger on a type change (fqdn->ipmask), not only
+# on row removal.
+chk("rollback3: revision prune split out of create (no TOCTOU evict of target)",
+    "void sg_db_revision_prune(int keep)" in _db
+    and "LIMIT -1 OFFSET 50" not in _db   # the hardcoded in-create prune is gone
+    and "sg_db_revision_prune(50)" in _mg)
+chk("rollback3: prune called after commit AND after rollback restore",
+    _mg.count("sg_db_revision_prune(50)") >= 2)
+chk("rollback3: fqdn teardown keys on 'still fqdn?', not just row existence",
+    'sg_db_get_val("firewall_address", id, "type")' in _mg
+    and "still_fqdn" in _mg)
 
 # ─────────────────────────────────────────────────────────────────────────────
 print(f"\n{B}{C}=== 5. sg_is_uint_range: overflow and negative ==={N}")

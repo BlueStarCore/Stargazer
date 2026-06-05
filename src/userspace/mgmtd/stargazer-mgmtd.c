@@ -3456,9 +3456,16 @@ static void rollback_reconcile_fqdn(char *old_list)
 	char *save = NULL;
 	for (char *id = strtok_r(old_list, "\n", &save); id;
 	     id = strtok_r(NULL, "\n", &save)) {
-		char *d = sg_db_get("firewall_address", id);
-		if (d) { free(d); continue; }	/* still present after rollback */
-		fqdn_object_removed(id);	/* removed → destroy its ipset */
+		/* Keep the ipset only if the object still exists AND is still
+		 * fqdn-type. If the rollback removed it OR reverted its type
+		 * (e.g. fqdn -> ipmask), the set is orphaned and must go —
+		 * a surviving row with a changed type would otherwise leak. */
+		char *t = sg_db_get_val("firewall_address", id, "type");
+		int still_fqdn = (t && strcmp(t, "fqdn") == 0);
+		free(t);
+		if (still_fqdn)
+			continue;
+		fqdn_object_removed(id);
 	}
 }
 
@@ -6031,6 +6038,7 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 				   "Failed to record revision");
 			return 0;
 		}
+		sg_db_revision_prune(50);	/* bound history after the commit */
 		char out[64];
 		snprintf(out, sizeof(out), "Saved revision %d\n", rev);
 		mgmt_log("INFO", "config commit: rev %d by %s", rev, user);
@@ -6145,6 +6153,9 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		int replay_fails = mgmtd_replay_config();
 		/* Re-evaluate live flows against the rolled-back policy. */
 		conntrack_reeval_after_policy_change(0);
+		/* Bound history only NOW — after the target was consumed — so the
+		 * pre-rollback snapshot could never evict the restore target. */
+		sg_db_revision_prune(50);
 		mgmt_log("INFO", "config rollback to rev %ld by %s "
 			 "(current saved as rev %d, %d apply failure(s))",
 			 rev, user, snap, replay_fails);

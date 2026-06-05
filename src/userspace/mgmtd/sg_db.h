@@ -189,4 +189,9 @@ char *sg_db_revision_list(void);
  * Returns 0 on success, -1 on failure / unknown rev. Caller must re-apply. */
 int sg_db_revision_restore(int rev);
 
+/* Keep only the most recent `keep` revisions. Call AFTER a commit, and
+ * after a rollback has consumed its target — never from create(), so a
+ * pre-rollback snapshot cannot evict the revision being restored. */
+void sg_db_revision_prune(int keep);
+
 #endif /* SG_DB_H */

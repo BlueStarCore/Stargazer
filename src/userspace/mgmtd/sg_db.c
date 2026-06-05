@@ -909,23 +909,35 @@ int sg_db_revision_create(const char *author, const char *message)
 		return -1;
 	}
 
-	/* Prune to the most recent 50 revisions so the history (and its
-	 * per-rev config snapshots) cannot grow without bound. */
-	errmsg = NULL;
-	sqlite3_exec(g_db,
-		"DELETE FROM revision_config WHERE rev IN "
-		"(SELECT rev FROM revisions ORDER BY rev DESC LIMIT -1 OFFSET 50);",
-		NULL, NULL, &errmsg);
-	if (errmsg) sqlite3_free(errmsg);
-	errmsg = NULL;
-	sqlite3_exec(g_db,
-		"DELETE FROM revisions WHERE rev IN "
-		"(SELECT rev FROM revisions ORDER BY rev DESC LIMIT -1 OFFSET 50);",
-		NULL, NULL, &errmsg);
-	if (errmsg) sqlite3_free(errmsg);
-
 	if (sg_db_commit() != 0) { sg_db_rollback(); return -1; }
 	return (int)rev;
+}
+
+/*
+ * sg_db_revision_prune — keep only the most recent `keep` revisions
+ * (and their config snapshots). Called explicitly AFTER a commit, and after
+ * a rollback has already consumed its target — NOT from create(), so that
+ * the pre-rollback snapshot can never evict the revision being restored.
+ */
+void sg_db_revision_prune(int keep)
+{
+	if (!g_db || keep < 0)
+		return;
+	char sql[192];
+	char *errmsg = NULL;
+	snprintf(sql, sizeof(sql),
+		 "DELETE FROM revision_config WHERE rev IN "
+		 "(SELECT rev FROM revisions ORDER BY rev DESC LIMIT -1 OFFSET %d);",
+		 keep);
+	sqlite3_exec(g_db, sql, NULL, NULL, &errmsg);
+	if (errmsg) sqlite3_free(errmsg);
+	errmsg = NULL;
+	snprintf(sql, sizeof(sql),
+		 "DELETE FROM revisions WHERE rev IN "
+		 "(SELECT rev FROM revisions ORDER BY rev DESC LIMIT -1 OFFSET %d);",
+		 keep);
+	sqlite3_exec(g_db, sql, NULL, NULL, &errmsg);
+	if (errmsg) sqlite3_free(errmsg);
 }
 
 /*
