@@ -1643,16 +1643,28 @@ il_done:
 
 static void flow_firmware_upload(work_item_t *item)
 {
-	/* item->payload = "path=/tmp/sg-fw-upload.<rand>\n" (per-upload file) */
+	/* item->payload = "path=/tmp/sg-fw-upload.<rand>\n" (per-upload file).
+	 * On the success path mgmtd consumes and removes the staged file; on a
+	 * failure path it may never have received or finished it, so remove it
+	 * here. Parse the path out for the failure cleanup. */
+	char stage[96] = {0};
+	if (item->payload && strncmp(item->payload, "path=", 5) == 0) {
+		snprintf(stage, sizeof(stage), "%s", item->payload + 5);
+		char *nl = strchr(stage, '\n');
+		if (nl) *nl = '\0';
+	}
+
 	webd_ipc_response_t resp;
 	if (webd_ipc_send(SG_CMD_UPGRADE_FROM_FILE, item->username,
 			  item->session_tag,
 			  item->payload ? item->payload : "", &resp) != 0) {
+		if (stage[0]) unlink(stage);	/* mgmtd never got the file */
 		char *json = json_error("Backend unavailable", NULL);
 		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
 		return;
 	}
 	if (resp.status != SG_OK) {
+		if (stage[0]) unlink(stage);	/* upgrade rejected/failed */
 		send_ipc_error(item->conn_id, resp.status, resp.extra);
 		webd_ipc_resp_free(&resp);
 		return;

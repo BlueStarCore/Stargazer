@@ -449,6 +449,9 @@ import re as _re
 # buffer size. These check the specific siblings the blast-radius mapped,
 # including the two the original audit sweep missed (J_APP/IL_APP frag).
 _wp = rd("src/userspace/webd/webd_pool.c")
+chk("firmware: worker unlinks the /tmp stage file on IPC/upgrade failure",
+    "flow_firmware_upload" in _wp
+    and _wp.count("unlink(stage)") >= 2)
 chk("1A: kv_to_json drops the fixed frag/id_frag buffers (grow-to-fit)",
     "frag[2048]" not in _wp and "id_frag[512]" not in _wp
     and "json_appendf(&buf" in _wp)
