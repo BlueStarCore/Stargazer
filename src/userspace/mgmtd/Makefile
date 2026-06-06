@@ -3,7 +3,8 @@
 
 CC           := $(CROSS_COMPILE)gcc
 COMMON_DIR   := ../common
-CFLAGS       := -Wall -Wextra -Werror -Os -static -I. -I$(COMMON_DIR)
+VERSION      ?= dev
+CFLAGS       := -Wall -Wextra -Werror -Os -static -I. -I$(COMMON_DIR) -DVERSION=\"$(VERSION)\"
 LDFLAGS      := -static
 BUILD_DIR    ?= ../../../build/mgmtd
 

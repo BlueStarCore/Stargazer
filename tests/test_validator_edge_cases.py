@@ -469,15 +469,32 @@ chk("fwsig: mgmtd verifies Ed25519 signature before flashing (fail-closed)",
     "fw_verify_signature" in _fwc
     and "crypto_sign_open" in _fwc
     and "Firmware signature verification failed" in _fwc
-    and _fwc.index("fw_verify_signature()") < _fwc.index('"dd if=/tmp/sg-fw-staged/stargazer.itb'))
+    and _fwc.index("fw_verify_signature(FW_STAGED_MANIFEST)") < _fwc.index('"dd if=/tmp/sg-fw-staged/stargazer.itb'))
+chk("fwsig: signs/verifies the manifest (authenticates version + fit_sha256)",
+    "fw_verify_signature(FW_STAGED_MANIFEST)" in _fwc)
+# TOCTOU: staging dir must be root-only + freshly created (not 'mkdir -p' in
+# world-writable /tmp), so a non-root process can't swap the .itb between
+# verify and dd.
+chk("fwsig: staging dirs created root-only/fail-closed (no mkdir -p in /tmp)",
+    "fw_make_staging_dirs" in _fwc
+    and 'mkdir("/tmp/sg-fw-staged", 0700)' in _fwc
+    and "mkdir -p /tmp/sg-fw" not in _fwc)
+# Anti-rollback: refuse an older (authenticated) version than the running one.
+chk("fwsig: anti-rollback blocks older firmware (authenticated version)",
+    "fw_version_cmp" in _fwc
+    and "firmware downgrade blocked" in _fwc
+    and "#ifdef VERSION" in _fwc)
 chk("fwsig: public key compiled in; private key never in tree",
     "firmware_pubkey[32]" in rd("src/userspace/mgmtd/firmware_pubkey.h")
     and 'firmware-signing.pem' in rd("keys/.gitignore"))
 _mk = rd("Makefile")
-chk("fwsig: build signs the FIT and packages firmware.sig; fails without key",
+chk("fwsig: build signs the manifest and packages firmware.sig; fails without key",
     "openssl pkeyutl -sign" in _mk
+    and "-in $(BUILD_DIR)/firmware/manifest.txt" in _mk
     and "manifest.txt stargazer.itb firmware.sig" in _mk
     and "no firmware-signing key" in _mk)
+chk("fwsig: pubkey-header generation rejects a bad/empty key (no zero pubkey)",
+    'if [ $${#_hex} -ne 64 ]' in _mk)
 
 _wp = rd("src/userspace/webd/webd_pool.c")
 chk("firmware: worker unlinks the /tmp stage file on IPC/upgrade failure",

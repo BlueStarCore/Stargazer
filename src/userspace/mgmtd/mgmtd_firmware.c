@@ -48,8 +48,9 @@ void randombytes(unsigned char *p, unsigned long long n)
 #define FW_STATE_FILE_TMP "/tmp/sg-fw-upgrade.state.tmp"
 #define FW_CANCEL_FILE    "/tmp/sg-fw-cancel"
 #define FW_DL_FILE        "/tmp/sg-fw-download/firmware.tar.gz"
-#define FW_STAGED_ITB     "/tmp/sg-fw-staged/stargazer.itb"
-#define FW_STAGED_SIG     "/tmp/sg-fw-staged/firmware.sig"
+#define FW_STAGED_ITB      "/tmp/sg-fw-staged/stargazer.itb"
+#define FW_STAGED_SIG      "/tmp/sg-fw-staged/firmware.sig"
+#define FW_STAGED_MANIFEST "/tmp/sg-fw-staged/manifest.txt"
 /* webd stages each upload at a unique mkstemp path "/tmp/sg-fw-upload.*"
  * passed in the IPC payload; handle_upgrade_from_file validates it by
  * prefix (no fixed shared name — see the race fix). */
@@ -305,7 +306,7 @@ int handle_upgrade_status(int client_fd, const char *user,
  * crypto_sign_open verifies an attached message sm = signature(64) || message,
  * so we concatenate the signature and the image, then check the result.
  */
-static int fw_verify_signature(void)
+static int fw_verify_signature(const char *path)
 {
 	unsigned char sig[crypto_sign_BYTES];	/* 64 */
 	FILE *sf = fopen(FW_STAGED_SIG, "rb");
@@ -318,32 +319,76 @@ static int fw_verify_signature(void)
 		return -1;
 
 	struct stat st;
-	if (stat(FW_STAGED_ITB, &st) != 0 || st.st_size <= 0)
+	if (stat(path, &st) != 0 || st.st_size <= 0)
 		return -1;
-	size_t isz = (size_t)st.st_size;
+	size_t dsz = (size_t)st.st_size;
 
-	FILE *inf = fopen(FW_STAGED_ITB, "rb");
+	FILE *inf = fopen(path, "rb");
 	if (!inf)
 		return -1;
-	unsigned char *itb = malloc(isz);
-	if (!itb) { fclose(inf); return -1; }
-	size_t got = fread(itb, 1, isz, inf);
+	unsigned char *data = malloc(dsz);
+	if (!data) { fclose(inf); return -1; }
+	size_t got = fread(data, 1, dsz, inf);
 	fclose(inf);
-	if (got != isz) { free(itb); return -1; }
+	if (got != dsz) { free(data); return -1; }
 
-	unsigned long long smlen = (unsigned long long)sizeof(sig) + isz;
+	unsigned long long smlen = (unsigned long long)sizeof(sig) + dsz;
 	unsigned char *sm = malloc(smlen);
 	unsigned char *m  = malloc(smlen);
-	if (!sm || !m) { free(itb); free(sm); free(m); return -1; }
+	if (!sm || !m) { free(data); free(sm); free(m); return -1; }
 	memcpy(sm, sig, sizeof(sig));
-	memcpy(sm + sizeof(sig), itb, isz);
-	free(itb);
+	memcpy(sm + sizeof(sig), data, dsz);
+	free(data);
 
 	unsigned long long mlen = 0;
 	int rc = crypto_sign_open(m, &mlen, sm, smlen, firmware_pubkey);
 	free(sm);
 	free(m);
 	return rc == 0 ? 0 : -1;
+}
+
+/*
+ * fw_version_cmp — compare two dotted numeric versions ("0.2.4"). Returns
+ * <0 / 0 / >0 by the first differing numeric component (so 0.2.3 < 0.2.10).
+ * Stops cleanly on any non-numeric component (the signed manifest's version
+ * is always numeric from the build).
+ */
+static int fw_version_cmp(const char *a, const char *b)
+{
+	while (*a || *b) {
+		char *ea = (char *)a, *eb = (char *)b;
+		long na = strtol(a, &ea, 10);
+		long nb = strtol(b, &eb, 10);
+		if (na != nb)
+			return na < nb ? -1 : 1;
+		if (ea == a && eb == b)		/* neither advanced: junk */
+			break;
+		a = (*ea == '.') ? ea + 1 : ea;
+		b = (*eb == '.') ? eb + 1 : eb;
+	}
+	return 0;
+}
+
+/*
+ * fw_make_staging_dirs — (re)create the firmware staging directories root-only
+ * (mode 0700) and freshly. /tmp is world-writable+sticky, so a non-root
+ * process could otherwise swap the staged stargazer.itb between signature
+ * verification and the dd flash (TOCTOU). Removing then mkdir()-ing without -p
+ * means a pre-existing (attacker-created) directory is detected (EEXIST) and we
+ * fail closed rather than reuse an attacker-owned dir. Returns 0 / -1.
+ */
+static int fw_make_staging_dirs(void)
+{
+	fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+	if (mkdir("/tmp/sg-fw-download", 0700) != 0)
+		return -1;
+	if (mkdir("/tmp/sg-fw-staged", 0700) != 0)
+		return -1;
+	/* Force 0700 regardless of umask so only root can read/replace staged
+	 * files between verification and flashing. */
+	chmod("/tmp/sg-fw-download", 0700);
+	chmod("/tmp/sg-fw-staged", 0700);
+	return 0;
 }
 
 /*
@@ -410,8 +455,12 @@ fw_child_upgrade_steps(const char *fw_user, const char *source_label)
 	/* Step 3a: Verify the firmware signature (authenticity) before the
 	 * checksum. Only packages signed with the matching private key are
 	 * accepted; a tampered or unsigned image is rejected before any write. */
+	/* The signature is over manifest.txt, which carries both the version and
+	 * fit_sha256. Verifying it authenticates the version (for the rollback
+	 * check below) and the expected FIT hash; the checksum step then binds
+	 * the actual stargazer.itb to that authenticated hash. */
 	fw_write_state(3, 6, "running", "Verifying firmware signature...", "");
-	if (fw_verify_signature() != 0) {
+	if (fw_verify_signature(FW_STAGED_MANIFEST) != 0) {
 		mgmt_log("ERROR", "firmware signature verification failed");
 		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
 		fw_write_state(3, 6, "error",
@@ -419,6 +468,22 @@ fw_child_upgrade_steps(const char *fw_user, const char *source_label)
 		sg_db_close();
 		_exit(1);
 	}
+
+#ifdef VERSION
+	/* Anti-rollback: refuse to install a firmware older than the running one.
+	 * fw_version comes from the now-authenticated manifest, so it cannot be
+	 * forged. Re-installing the same version (recovery) and upgrading are
+	 * allowed; only a strictly older version is blocked. */
+	if (fw_version_cmp(fw_version, VERSION) < 0) {
+		mgmt_log("ERROR", "firmware downgrade blocked: staged %s < running %s",
+			 fw_version, VERSION);
+		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+		fw_write_state(3, 6, "error",
+			       "Firmware downgrade blocked (older than running version)", "");
+		sg_db_close();
+		_exit(1);
+	}
+#endif
 
 	/* Step 3b: Verify FIT image checksum */
 	fw_write_state(3, 6, "running", "Verifying FIT image checksum...", "");
@@ -681,9 +746,13 @@ int handle_upgrade_start(int client_fd, const char *user, const char *payload, c
 	if (sg_db_open(SG_DB_PATH) != 0)
 		mgmt_log("WARN", "firmware child: failed to reopen db");
 
-	/* Prepare working directories */
-	fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
-	fw_run_cmd_ignore("mkdir -p /tmp/sg-fw-download /tmp/sg-fw-staged");
+	/* Prepare working directories (root-only, fail-closed) */
+	if (fw_make_staging_dirs() != 0) {
+		fw_write_state(0, 6, "error",
+			       "Failed to create secure staging directory", "");
+		sg_db_close();
+		_exit(1);
+	}
 
 	/* Determine protocol label for progress messages */
 	const char *proto_label;
@@ -1063,8 +1132,12 @@ int handle_upgrade_from_file(int client_fd, const char *user,
 	if (sg_db_open(SG_DB_PATH) != 0)
 		mgmt_log("WARN", "firmware child: failed to reopen db");
 
-	fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
-	fw_run_cmd_ignore("mkdir -p /tmp/sg-fw-download /tmp/sg-fw-staged");
+	if (fw_make_staging_dirs() != 0) {
+		fw_write_state(0, 6, "error",
+			       "Failed to create secure staging directory", "");
+		sg_db_close();
+		_exit(1);
+	}
 
 	/* Move THIS request's uploaded file (validated above) to the expected
 	 * download path. Using the per-request path, not a shared constant,
