@@ -1948,6 +1948,18 @@ static int mgmtd_first_boot_seed(void)
 {
 	mgmt_log("INFO", "first boot — seeding default configuration");
 
+	/* Seed the WHOLE default config in ONE transaction so a failure at
+	 * any point — including the final seeded-flag stamp — rolls back every
+	 * write. Otherwise the critical tables (committed as separate writes)
+	 * would survive a failed flag stamp, and the next boot would see
+	 * populated-tables-with-no-flag → BOOT_COMPROMISED → permanent refusal.
+	 * Rolling back leaves the DB empty → next boot is BOOT_FIRST → retry.
+	 * (sg_db_set is nesting-aware, so its calls join this transaction.) */
+	if (sg_db_begin() != 0) {
+		mgmt_log("ERROR", "first-boot seed: cannot begin transaction");
+		return -1;
+	}
+
 	/* ── Admin profiles ─────────────────────────────────────────── */
 	if (sg_db_set("system_admin-profile", "read-write",
 		      "permissions=monitor,configure,admin\n"
@@ -2016,18 +2028,25 @@ static int mgmtd_first_boot_seed(void)
 		if (sg_db_count(critical_tables[i]) == 0) {
 			mgmt_log("ERROR", "seed verify: %s has 0 entries",
 				 critical_tables[i]);
+			sg_db_rollback();
 			return -1;
 		}
 	}
 
-	/* Stamp the seeded flag LAST. This write MUST be checked: if the
-	 * tables seeded but the flag stamp fails, the next boot sees populated
-	 * critical tables with no flag → check_boot_integrity returns
-	 * BOOT_COMPROMISED and main() refuses to start permanently (the
-	 * opposite of self-healing). Surface the failure here instead. */
+	/* Stamp the seeded flag LAST, inside the same transaction. If it
+	 * fails, the rollback below drops the whole seed so the next boot
+	 * retries as BOOT_FIRST (no half-seeded BOOT_COMPROMISED state). */
 	if (sg_db_set_val("system_meta", "0", "seeded", "1") != 0) {
 		mgmt_log("ERROR", "first-boot seed: failed to stamp seeded "
-			 "flag; treating seeding as failed");
+			 "flag; rolling back the whole seed");
+		sg_db_rollback();
+		return -1;
+	}
+
+	/* Commit the entire seed atomically. */
+	if (sg_db_commit() != 0) {
+		mgmt_log("ERROR", "first-boot seed: commit failed; rolling back");
+		sg_db_rollback();
 		return -1;
 	}
 
@@ -2036,6 +2055,7 @@ static int mgmtd_first_boot_seed(void)
 
 fail:
 	mgmt_log("ERROR", "seed failed — database write error");
+	sg_db_rollback();
 	return -1;
 }
 
@@ -5125,7 +5145,8 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 								    refs, 16);
 				int need_fw_rebuild  = 0;
 				int need_nat_rebuild = 0;
-				for (int i = 0; i < nrefs; i++) {
+				int cascade_ok = 1;
+				for (int i = 0; i < nrefs && cascade_ok; i++) {
 					char *found = sg_db_find_referencing(
 						refs[i].type, refs[i].key,
 						db_id);
@@ -5140,9 +5161,16 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 						sg_db_parse_section(
 							e, et, sizeof(et),
 							eid, sizeof(eid));
-						sg_db_set_val(et, eid,
+						/* A failed cascade write must
+						 * abort the whole rename — else
+						 * COMMIT would persist a partial
+						 * (dangling/duplicate) rename. */
+						if (sg_db_set_val(et, eid,
 							      refs[i].key,
-							      new_name);
+							      new_name) != 0) {
+							cascade_ok = 0;
+							break;
+						}
 						if (strcmp(et, "firewall_policy")
 						    == 0)
 							need_fw_rebuild = 1;
@@ -5164,10 +5192,12 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 					free(found);
 				}
 
-				sg_db_del(db_type, db_id);
-
-				/* Commit the whole rename atomically. */
-				if (sg_db_commit() != 0) {
+				/* Delete the old key and commit — but only if
+				 * the cascade fully succeeded; otherwise roll the
+				 * entire rename back (atomicity contract). */
+				if (!cascade_ok ||
+				    sg_db_del(db_type, db_id) != 0 ||
+				    sg_db_commit() != 0) {
 					sg_db_rollback();
 					free(existing);
 					send_error(client_fd, SG_ERR_IO_FAIL,

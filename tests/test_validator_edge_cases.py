@@ -664,6 +664,21 @@ chk("rollback4: prune is atomic again (both DELETEs in one transaction)",
     and "if (sg_db_begin() != 0)\n\t\treturn;" in _db
     and "sg_db_rollback();\t/* keep history consistent on failure */" in _db)
 
+# LOW-sweep verify follow-up: two gaps the loop found in the sweep's own fixes.
+# #15 the whole first-boot seed must be ONE transaction so a failed flag stamp
+# rolls back the critical tables (else next boot = BOOT_COMPROMISED, permanent
+# refusal — not retryable as claimed).
+chk("lowsweep: first-boot seed wrapped in a transaction (retryable on failure)",
+    "first-boot seed: cannot begin transaction" in _mg
+    and "rolling back the whole seed" in _mg)
+# #18 the rename cascade must check sg_db_set_val/sg_db_del returns and roll
+# back, else COMMIT could persist a partial rename on a mid-tx write error.
+chk("lowsweep: rename cascade checks writes and rolls back partial rename",
+    "int cascade_ok = 1;" in _mg
+    and "i < nrefs && cascade_ok" in _mg
+    and "!cascade_ok ||" in _mg
+    and "sg_db_del(db_type, db_id) != 0 ||" in _mg)
+
 # ─────────────────────────────────────────────────────────────────────────────
 print(f"\n{B}{C}=== 5. sg_is_uint_range: overflow and negative ==={N}")
 # ─────────────────────────────────────────────────────────────────────────────
