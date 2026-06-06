@@ -448,6 +448,12 @@ import re as _re
 # other "copy by (size_t)n from a fixed buffer" site must clamp to the
 # buffer size. These check the specific siblings the blast-radius mapped,
 # including the two the original audit sweep missed (J_APP/IL_APP frag).
+_bbfrag = rd("configs/busybox.config.fragment")
+chk("firmware: busybox tar has real gzip support (SEAMLESS_GZ + GUNZIP)",
+    "CONFIG_FEATURE_SEAMLESS_GZ=y" in _bbfrag
+    and "CONFIG_GUNZIP=y" in _bbfrag
+    and "CONFIG_FEATURE_TAR_GZIP=y" not in _bbfrag)  # non-existent symbol
+
 _wp = rd("src/userspace/webd/webd_pool.c")
 chk("firmware: worker unlinks the /tmp stage file on IPC/upgrade failure",
     "flow_firmware_upload" in _wp

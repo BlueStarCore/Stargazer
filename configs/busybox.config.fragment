@@ -86,11 +86,14 @@ CONFIG_FEATURE_TFTP_BLOCKSIZE=y
 CONFIG_LOGGER=y
 
 # `tar` — firmware package extraction (mgmtd_firmware.c: fw_child_upgrade_steps)
-# FEATURE_TAR_GZIP: required for -z (gzip) support on .tar.gz firmware packages
+# FEATURE_SEAMLESS_GZ + GUNZIP: provide the gzip decompressor so `tar -xzf`
+#   can unpack the .tar.gz firmware package (busybox has no separate
+#   FEATURE_TAR_GZIP symbol; tar's -z support is FEATURE_SEAMLESS_GZ).
 # FEATURE_TAR_LONG_OPTIONS: required for --strip-components (reserved for future
 #   firmware package formats that wrap content in a subdirectory)
 CONFIG_TAR=y
-CONFIG_FEATURE_TAR_GZIP=y
+CONFIG_FEATURE_SEAMLESS_GZ=y
+CONFIG_GUNZIP=y
 CONFIG_FEATURE_TAR_LONG_OPTIONS=y
 CONFIG_FEATURE_TAR_GNU_EXTENSIONS=y
 CONFIG_FEATURE_TAR_CREATE=y
