@@ -47,10 +47,10 @@ void randombytes(unsigned char *p, unsigned long long n)
 #define FW_STATE_FILE     "/tmp/sg-fw-upgrade.state"
 #define FW_STATE_FILE_TMP "/tmp/sg-fw-upgrade.state.tmp"
 #define FW_CANCEL_FILE    "/tmp/sg-fw-cancel"
-#define FW_DL_FILE        "/tmp/sg-fw-download/firmware.tar.gz"
-#define FW_STAGED_ITB      "/tmp/sg-fw-staged/stargazer.itb"
-#define FW_STAGED_SIG      "/tmp/sg-fw-staged/firmware.sig"
-#define FW_STAGED_MANIFEST "/tmp/sg-fw-staged/manifest.txt"
+#define FW_DL_FILE        "/run/sg-fw-download/firmware.tar.gz"
+#define FW_STAGED_ITB      "/run/sg-fw-staged/stargazer.itb"
+#define FW_STAGED_SIG      "/run/sg-fw-staged/firmware.sig"
+#define FW_STAGED_MANIFEST "/run/sg-fw-staged/manifest.txt"
 /* webd stages each upload at a unique mkstemp path "/tmp/sg-fw-upload.*"
  * passed in the IPC payload; handle_upgrade_from_file validates it by
  * prefix (no fixed shared name — see the race fix). */
@@ -144,7 +144,7 @@ static void fw_run_cmd_ignore(const char *cmd)
  */
 static void fw_cancel_cleanup(void)
 {
-	fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+	fw_run_cmd_ignore("rm -rf /run/sg-fw-download /run/sg-fw-staged");
 	unlink(FW_CANCEL_FILE);
 }
 
@@ -214,7 +214,7 @@ int handle_upgrade_status(int client_fd, const char *user,
 				"  Kernel version: %s\n", uts.release);
 
 	/* Check for staged firmware */
-	FILE *mf = fopen("/tmp/sg-fw-staged/manifest.txt", "r");
+	FILE *mf = fopen("/run/sg-fw-staged/manifest.txt", "r");
 	if (mf) {
 		char line[256];
 		char staged_ver[256] = {0};
@@ -297,14 +297,17 @@ int handle_upgrade_status(int client_fd, const char *user,
 }
 
 /*
- * fw_verify_signature — Ed25519-verify the staged FIT image (stargazer.itb)
- * against the detached signature firmware.sig in the package, using the public
- * key compiled into this binary (firmware_pubkey). Returns 0 only when the
- * signature is valid for the exact bytes of stargazer.itb; -1 on any problem
- * (missing/wrong-size signature, unreadable image, or verification failure).
+ * fw_verify_signature — Ed25519-verify the bytes of `path` against the detached
+ * signature firmware.sig, using the public key compiled into this binary
+ * (firmware_pubkey). The caller passes the manifest (FW_STAGED_MANIFEST), which
+ * carries the version and fit_sha256; verifying it authenticates the version
+ * (for the anti-rollback check) and the expected FIT hash, and the separate
+ * sha256(itb)==fit_sha256 check then binds the actual FIT image. Returns 0 only
+ * when the signature is valid for the exact bytes of `path`; -1 on any problem
+ * (missing/wrong-size signature, unreadable file, or verification failure).
  *
  * crypto_sign_open verifies an attached message sm = signature(64) || message,
- * so we concatenate the signature and the image, then check the result.
+ * so we concatenate the signature and the file bytes, then check the result.
  */
 static int fw_verify_signature(const char *path)
 {
@@ -379,15 +382,15 @@ static int fw_version_cmp(const char *a, const char *b)
  */
 static int fw_make_staging_dirs(void)
 {
-	fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
-	if (mkdir("/tmp/sg-fw-download", 0700) != 0)
+	fw_run_cmd_ignore("rm -rf /run/sg-fw-download /run/sg-fw-staged");
+	if (mkdir("/run/sg-fw-download", 0700) != 0)
 		return -1;
-	if (mkdir("/tmp/sg-fw-staged", 0700) != 0)
+	if (mkdir("/run/sg-fw-staged", 0700) != 0)
 		return -1;
 	/* Force 0700 regardless of umask so only root can read/replace staged
 	 * files between verification and flashing. */
-	chmod("/tmp/sg-fw-download", 0700);
-	chmod("/tmp/sg-fw-staged", 0700);
+	chmod("/run/sg-fw-download", 0700);
+	chmod("/run/sg-fw-staged", 0700);
 	return 0;
 }
 
@@ -406,12 +409,12 @@ fw_child_upgrade_steps(const char *fw_user, const char *source_label)
 	/* Step 2: Extract firmware package */
 	fw_write_state(2, 6, "running", "Extracting firmware package...", "");
 	char *exout = fw_run_cmd("tar -xzf " FW_DL_FILE
-				 " -C /tmp/sg-fw-staged/ 2>&1");
-	if (access("/tmp/sg-fw-staged/manifest.txt", F_OK) != 0) {
+				 " -C /run/sg-fw-staged/ 2>&1");
+	if (access("/run/sg-fw-staged/manifest.txt", F_OK) != 0) {
 		mgmt_log("ERROR", "firmware extract failed or missing manifest: %s",
 			 exout ? exout : "(no output)");
 		free(exout);
-		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+		fw_run_cmd_ignore("rm -rf /run/sg-fw-download /run/sg-fw-staged");
 		fw_write_state(2, 6, "error",
 			       "Invalid firmware package (missing manifest.txt)", "");
 		sg_db_close();
@@ -421,7 +424,7 @@ fw_child_upgrade_steps(const char *fw_user, const char *source_label)
 
 	/* Read manifest */
 	char manifest[2048] = {0};
-	FILE *mf = fopen("/tmp/sg-fw-staged/manifest.txt", "r");
+	FILE *mf = fopen("/run/sg-fw-staged/manifest.txt", "r");
 	if (mf) {
 		size_t rd = fread(manifest, 1, sizeof(manifest) - 1, mf);
 		manifest[rd] = '\0';
@@ -433,7 +436,7 @@ fw_child_upgrade_steps(const char *fw_user, const char *source_label)
 	extract_val(manifest, "fit_sha256", fit_sha, sizeof(fit_sha));
 
 	if (!fw_version[0] || !fit_sha[0]) {
-		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+		fw_run_cmd_ignore("rm -rf /run/sg-fw-download /run/sg-fw-staged");
 		fw_write_state(2, 6, "error",
 			       "Incomplete manifest (missing version or fit_sha256)", "");
 		sg_db_close();
@@ -441,8 +444,8 @@ fw_child_upgrade_steps(const char *fw_user, const char *source_label)
 	}
 
 	/* Verify stargazer.itb exists */
-	if (access("/tmp/sg-fw-staged/stargazer.itb", F_OK) != 0) {
-		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+	if (access("/run/sg-fw-staged/stargazer.itb", F_OK) != 0) {
+		fw_run_cmd_ignore("rm -rf /run/sg-fw-download /run/sg-fw-staged");
 		fw_write_state(2, 6, "error",
 			       "Invalid firmware package (missing stargazer.itb)", "");
 		sg_db_close();
@@ -462,7 +465,7 @@ fw_child_upgrade_steps(const char *fw_user, const char *source_label)
 	fw_write_state(3, 6, "running", "Verifying firmware signature...", "");
 	if (fw_verify_signature(FW_STAGED_MANIFEST) != 0) {
 		mgmt_log("ERROR", "firmware signature verification failed");
-		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+		fw_run_cmd_ignore("rm -rf /run/sg-fw-download /run/sg-fw-staged");
 		fw_write_state(3, 6, "error",
 			       "Firmware signature verification failed", "");
 		sg_db_close();
@@ -477,7 +480,7 @@ fw_child_upgrade_steps(const char *fw_user, const char *source_label)
 	if (fw_version_cmp(fw_version, VERSION) < 0) {
 		mgmt_log("ERROR", "firmware downgrade blocked: staged %s < running %s",
 			 fw_version, VERSION);
-		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+		fw_run_cmd_ignore("rm -rf /run/sg-fw-download /run/sg-fw-staged");
 		fw_write_state(3, 6, "error",
 			       "Firmware downgrade blocked (older than running version)", "");
 		sg_db_close();
@@ -487,7 +490,7 @@ fw_child_upgrade_steps(const char *fw_user, const char *source_label)
 
 	/* Step 3b: Verify FIT image checksum */
 	fw_write_state(3, 6, "running", "Verifying FIT image checksum...", "");
-	char *fsum = fw_run_cmd("sha256sum /tmp/sg-fw-staged/stargazer.itb 2>/dev/null "
+	char *fsum = fw_run_cmd("sha256sum /run/sg-fw-staged/stargazer.itb 2>/dev/null "
 			     "| cut -d' ' -f1");
 
 	if (fsum) { char *nl = strchr(fsum, '\n'); if (nl) *nl = '\0'; }
@@ -497,7 +500,7 @@ fw_child_upgrade_steps(const char *fw_user, const char *source_label)
 			 "fit=%s (expect %s)",
 			 fsum ? fsum : "null", fit_sha);
 		free(fsum);
-		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+		fw_run_cmd_ignore("rm -rf /run/sg-fw-download /run/sg-fw-staged");
 		fw_write_state(3, 6, "error",
 			       "Firmware checksum verification failed", "");
 		sg_db_close();
@@ -552,7 +555,7 @@ fw_child_upgrade_steps(const char *fw_user, const char *source_label)
 	}
 
 	if (!kpart[0]) {
-		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+		fw_run_cmd_ignore("rm -rf /run/sg-fw-download /run/sg-fw-staged");
 		fw_write_state(4, 6, "error",
 			       "Firmware partition not found "
 			       "(expected \"firmware\" or \"kernel\")", "");
@@ -573,7 +576,7 @@ fw_child_upgrade_steps(const char *fw_user, const char *source_label)
 
 	char ddcmd[512];
 	snprintf(ddcmd, sizeof(ddcmd),
-		 "dd if=/tmp/sg-fw-staged/stargazer.itb of='%s' bs=512k 2>&1",
+		 "dd if=/run/sg-fw-staged/stargazer.itb of='%s' bs=512k 2>&1",
 		 kpart);
 	char *ddout = fw_run_cmd(ddcmd);
 	if (ddout)
@@ -583,8 +586,8 @@ fw_child_upgrade_steps(const char *fw_user, const char *source_label)
 	/* Verify: read back and compare sha256 */
 	{
 		struct stat fit_st;
-		if (stat("/tmp/sg-fw-staged/stargazer.itb", &fit_st) != 0) {
-			fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+		if (stat("/run/sg-fw-staged/stargazer.itb", &fit_st) != 0) {
+			fw_run_cmd_ignore("rm -rf /run/sg-fw-download /run/sg-fw-staged");
 			fw_write_state(5, 6, "error", "Cannot stat FIT image", "");
 			sg_db_close();
 			_exit(1);
@@ -604,7 +607,7 @@ fw_child_upgrade_steps(const char *fw_user, const char *source_label)
 				 "got=%s expected=%s",
 				 vfysum ? vfysum : "null", fit_sha);
 			free(vfysum);
-			fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+			fw_run_cmd_ignore("rm -rf /run/sg-fw-download /run/sg-fw-staged");
 			fw_write_state(5, 6, "error",
 				       "FIT image write verification failed", "");
 			sg_db_close();
@@ -616,7 +619,7 @@ fw_child_upgrade_steps(const char *fw_user, const char *source_label)
 	/* Step 6: Sync and finalize */
 	fw_write_state(6, 6, "running", "Syncing...", "");
 	fw_run_cmd_ignore("sync");
-	fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download");
+	fw_run_cmd_ignore("rm -rf /run/sg-fw-download");
 
 	/* Audit log */
 	char audit_msg[1200];
@@ -785,7 +788,7 @@ int handle_upgrade_start(int client_fd, const char *user, const char *payload, c
 		const char *hp = url + 7;
 		const char *slash = strchr(hp, '/');
 		if (!slash || !slash[1]) {
-			fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+			fw_run_cmd_ignore("rm -rf /run/sg-fw-download /run/sg-fw-staged");
 			fw_write_state(1, 6, "error",
 				       "TFTP URL must be tftp://host/path", "");
 			sg_db_close();
@@ -826,7 +829,7 @@ int handle_upgrade_start(int client_fd, const char *user, const char *payload, c
 	}
 
 	if (dl_pid < 0) {
-		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+		fw_run_cmd_ignore("rm -rf /run/sg-fw-download /run/sg-fw-staged");
 		fw_write_state(1, 6, "error", "Download fork failed", "");
 		sg_db_close();
 		_exit(1);
@@ -884,7 +887,7 @@ int handle_upgrade_start(int client_fd, const char *user, const char *payload, c
 		}
 		mgmt_log("ERROR", "firmware download failed (exit=%d): %s",
 			 dl_exit, dl_err[0] ? dl_err : "(no output)");
-		fw_run_cmd_ignore("rm -rf /tmp/sg-fw-download /tmp/sg-fw-staged");
+		fw_run_cmd_ignore("rm -rf /run/sg-fw-download /run/sg-fw-staged");
 		char errmsg[384];
 		if (dl_err[0])
 			snprintf(errmsg, sizeof(errmsg),

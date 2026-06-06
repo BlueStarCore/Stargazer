@@ -469,16 +469,18 @@ chk("fwsig: mgmtd verifies Ed25519 signature before flashing (fail-closed)",
     "fw_verify_signature" in _fwc
     and "crypto_sign_open" in _fwc
     and "Firmware signature verification failed" in _fwc
-    and _fwc.index("fw_verify_signature(FW_STAGED_MANIFEST)") < _fwc.index('"dd if=/tmp/sg-fw-staged/stargazer.itb'))
+    and _fwc.index("fw_verify_signature(FW_STAGED_MANIFEST)") < _fwc.index('"dd if=/run/sg-fw-staged/stargazer.itb'))
 chk("fwsig: signs/verifies the manifest (authenticates version + fit_sha256)",
     "fw_verify_signature(FW_STAGED_MANIFEST)" in _fwc)
 # TOCTOU: staging dir must be root-only + freshly created (not 'mkdir -p' in
 # world-writable /tmp), so a non-root process can't swap the .itb between
 # verify and dd.
-chk("fwsig: staging dirs created root-only/fail-closed (no mkdir -p in /tmp)",
+chk("fwsig: staging in root-only /run (not world-writable /tmp), fail-closed mkdir",
     "fw_make_staging_dirs" in _fwc
-    and 'mkdir("/tmp/sg-fw-staged", 0700)' in _fwc
-    and "mkdir -p /tmp/sg-fw" not in _fwc)
+    and 'mkdir("/run/sg-fw-staged", 0700)' in _fwc
+    and "/tmp/sg-fw-staged" not in _fwc
+    and "/tmp/sg-fw-download" not in _fwc
+    and "mkdir -p /run/sg-fw" not in _fwc)
 # Anti-rollback: refuse an older (authenticated) version than the running one.
 chk("fwsig: anti-rollback blocks older firmware (authenticated version)",
     "fw_version_cmp" in _fwc
