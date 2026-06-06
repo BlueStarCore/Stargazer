@@ -453,6 +453,8 @@ chk("firmware: busybox tar has real gzip support (SEAMLESS_GZ + GUNZIP)",
     "CONFIG_FEATURE_SEAMLESS_GZ=y" in _bbfrag
     and "CONFIG_GUNZIP=y" in _bbfrag
     and "CONFIG_FEATURE_TAR_GZIP=y" not in _bbfrag)  # non-existent symbol
+chk("firmware: busybox has sha256sum (FIT checksum verify step)",
+    "CONFIG_SHA256SUM=y" in _bbfrag)
 
 _wp = rd("src/userspace/webd/webd_pool.c")
 chk("firmware: worker unlinks the /tmp stage file on IPC/upgrade failure",

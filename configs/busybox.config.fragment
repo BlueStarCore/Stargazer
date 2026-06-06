@@ -137,6 +137,13 @@ CONFIG_FEATURE_DD_IBS_OBS=y
 # `sync` — shutdown.sh syncs disks before halt/reboot
 CONFIG_SYNC=y
 
+# `sha256sum` — firmware upgrade verifies the FIT image against the
+# manifest's fit_sha256 before flashing, and reads the partition back and
+# re-checks it after (mgmtd_firmware.c steps 3 and 5). Without it the
+# verify command produces no output and the upgrade aborts with
+# "Firmware checksum verification failed".
+CONFIG_SHA256SUM=y
+
 # Note: e2fsck is intentionally NOT enabled (BusyBox has no e2fsck applet
 # anyway — `### config E2FSCK` is commented out in busybox-src). The init
 # script's `_sg_fsck` helper guards with `command -v e2fsck` and skips when
