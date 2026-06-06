@@ -1159,6 +1159,10 @@ int handle_upgrade_from_file(int client_fd, const char *user,
 	if (access(FW_DL_FILE, F_OK) != 0) {
 		fw_write_state(1, 6, "error",
 			       "Failed to stage uploaded firmware file", "");
+		/* /tmp and /run are different filesystems, so the rename above
+		 * takes the cp+rm fallback; if cp failed, the validated upload
+		 * drop file is still in /tmp — remove it rather than leak it. */
+		unlink(path);
 		sg_db_close();
 		_exit(1);
 	}
