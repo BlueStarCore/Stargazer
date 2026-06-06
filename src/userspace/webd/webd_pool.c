@@ -616,6 +616,9 @@ static void flow_config_list(work_item_t *item)
 	/* Optional search filter from payload */
 	const char *search = item->payload;
 	int first = 1;
+	/* Hoisted so the BUF_APPEND OOM goto (which jumps to list_done) does
+	 * not leak the current entry_json — list_done frees it (NULL-safe). */
+	char *entry_json = NULL;
 
 	for (int i = 0; i < nids; i++) {
 		char get_payload[512];
@@ -659,7 +662,7 @@ static void flow_config_list(work_item_t *item)
 			}
 		}
 
-		char *entry_json = kv_to_json(entry_resp.payload, ids[i]);
+		entry_json = kv_to_json(entry_resp.payload, ids[i]);
 		webd_ipc_resp_free(&entry_resp);
 
 		if (entry_json) {
@@ -667,6 +670,7 @@ static void flow_config_list(work_item_t *item)
 			size_t elen = strlen(entry_json);
 			BUF_APPEND(entry_json, elen);
 			free(entry_json);
+			entry_json = NULL;
 			first = 0;
 		}
 	}
@@ -675,6 +679,7 @@ static void flow_config_list(work_item_t *item)
 	BUF_APPEND("\0", 1);
 
 list_done:
+	free(entry_json);	/* NULL unless a BUF_APPEND OOM jumped here */
 	for (int i = 0; i < nids; i++) free(ids[i]);
 #undef BUF_APPEND
 
