@@ -913,6 +913,9 @@ image: rootfs bpi-r4-bootloader
 	@echo "   dd if=bl2_emmc.img of=/dev/mmcblk0boot0"
 	@echo "   dd if=$(notdir $(IMG_FILE)) of=/dev/mmcblk0 bs=4M"
 	@echo "   sync && reboot -f"
+	@_blk=$$(( ($$(stat -c %s $(IMG_FILE)) + 511) / 512 )); \
+	 printf " Flash from U-Boot (load full image to 0x50000000 first):\n"; \
+	 printf "   mmc write 0x50000000 0x0 0x%X   (=%d blocks, the WHOLE image)\n" $$_blk $$_blk
 	@echo "============================================"
 
 # =============================================================================
