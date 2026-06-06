@@ -622,10 +622,8 @@
         }
     }
 
-    /* (No module-level esc helper: every server-data sink builds DOM nodes
-     * with textContent, so an unused SgCommon.escHTML alias would only imply
-     * an escaping safety net that isn't actually applied. SgCommon.escHTML
-     * remains available for any future innerHTML use.) */
+    /* Server data is rendered via textContent / DOM nodes, not innerHTML.
+     * SgCommon.escHTML is available if an innerHTML sink is ever needed. */
 
     /* Cache element references by id — getElementById hits DOM
      * lookup tables; on a 5s poll cycle this is wasted work because

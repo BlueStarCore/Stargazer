@@ -253,11 +253,11 @@ static int cmd_fw_upgrade(const char *args, const char *permissions)
 		if (ipc_stream_interrupted()) {
 			if (have_inline)
 				printf("\n");
-			/* Send cancel to mgmtd so the child process stops */
+			/* Send cancel to mgmtd so the child process stops.
+			 * Check the send return: ipc_send zero-fills cr and
+			 * SG_OK==0, so cr.status alone cannot distinguish a real
+			 * OK from a failed connection. */
 			struct ipc_response cr;
-			/* ipc_send zero-fills the response, and SG_OK==0, so a
-			 * connection failure would leave cr.status==SG_OK and be
-			 * misread as a successful cancel. Check the send itself. */
 			if (ipc_send_str(SG_CMD_UPGRADE_CANCEL, "", &cr) != 0) {
 				printf("  Could not deliver cancel to mgmtd; "
 				       "upgrade may still be running.\n");

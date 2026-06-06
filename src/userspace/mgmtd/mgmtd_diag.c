@@ -3014,12 +3014,11 @@ int handle_diag_ntp(int client_fd, const char *user,
 /*
  * json_escape_field — escape a string for a JSON double-quoted value.
  *
- * Escapes the metacharacters " and \ and any control byte (< 0x20). The
- * DHCP hostname is DHCP option-12 — fully attacker-controlled by any LAN
- * client — and was previously interpolated raw, letting a quote break out
- * of the JSON string and forge/poison the leases response. Writes at most
- * outsz-1 chars + NUL; stops early (never truncates mid-escape) if the
- * escaped form would not fit.
+ * Escapes the metacharacters " and \ and any control byte (< 0x20), so
+ * untrusted input (e.g. the DHCP option-12 hostname, controlled by any LAN
+ * client) cannot break out of the JSON string. Writes at most outsz-1 chars
+ * + NUL; stops early (never truncates mid-escape) if the escaped form would
+ * not fit.
  */
 static void json_escape_field(const char *in, char *out, size_t outsz)
 {

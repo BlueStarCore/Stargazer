@@ -1948,13 +1948,11 @@ static int mgmtd_first_boot_seed(void)
 {
 	mgmt_log("INFO", "first boot — seeding default configuration");
 
-	/* Seed the WHOLE default config in ONE transaction so a failure at
-	 * any point — including the final seeded-flag stamp — rolls back every
-	 * write. Otherwise the critical tables (committed as separate writes)
-	 * would survive a failed flag stamp, and the next boot would see
-	 * populated-tables-with-no-flag → BOOT_COMPROMISED → permanent refusal.
-	 * Rolling back leaves the DB empty → next boot is BOOT_FIRST → retry.
-	 * (sg_db_set is nesting-aware, so its calls join this transaction.) */
+	/* Seed the whole default config in one transaction: every write below
+	 * (and the final seeded-flag stamp) either all commit or all roll back.
+	 * On failure the DB is left empty, so the next boot is BOOT_FIRST and
+	 * re-seeds rather than seeing a half-seeded state. sg_db_set joins this
+	 * transaction (it owns BEGIN/COMMIT only at top level). */
 	if (sg_db_begin() != 0) {
 		mgmt_log("ERROR", "first-boot seed: cannot begin transaction");
 		return -1;
@@ -3397,12 +3395,11 @@ static int mgmtd_replay_config(void)
 }
 
 /*
- * Rollback reconcile helpers.  mgmtd_replay_config() is apply-only — it
- * re-applies entries still in the DB but never tears down ones a rollback
- * dropped.  These run AFTER restore, BEFORE replay, to remove the runtime
- * state of entries that existed before the rollback but not after.
- * old_list is the newline-separated id list captured before the restore
- * (strtok_r mutates it; the caller passes a throwaway copy).
+ * Rollback reconcile helpers. Run after a revision restore and before
+ * mgmtd_replay_config() (which only re-applies entries still in the DB) to
+ * tear down the runtime state of entries that existed before the rollback
+ * but not after. old_list is the newline-separated id list captured before
+ * the restore (strtok_r mutates it; the caller passes a throwaway copy).
  */
 static void rollback_reconcile_dhcp(char *old_list)
 {
@@ -3476,11 +3473,11 @@ static char *collect_fqdn_address_ids(void)
 }
 
 /*
- * rollback_reconcile_fqdn — destroy the ipset of every fqdn address object
- * that a rollback removed. old_list is the pre-restore fqdn id list from
- * collect_fqdn_address_ids (strtok_r mutates it). An fqdn object owns a
- * runtime hash:ip set that neither replay nor the FORWARD rebuild destroys;
- * without this the set leaks until reboot (the normal teardown is on CFG_DEL).
+ * rollback_reconcile_fqdn — destroy the runtime hash:ip ipset of every fqdn
+ * address object that the restore removed or changed away from fqdn type.
+ * old_list is the pre-restore fqdn id list from collect_fqdn_address_ids
+ * (strtok_r mutates it). The ipset is owned by the fqdn object and is not
+ * touched by replay or the FORWARD rebuild, so it must be destroyed here.
  */
 static void rollback_reconcile_fqdn(char *old_list)
 {
@@ -5118,13 +5115,13 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 					return 0;
 				}
 
-				/* Atomic rename: write new key, cascade the
-				 * referencing fields, delete old key — all in
-				 * ONE transaction. Without it, a crash between
-				 * the new-key write and the old-key delete would
-				 * leave BOTH objects (duplicate firewall entity,
-				 * both emitted on next replay). sg_db_set/_set_val
-				 * nest inside this transaction (autocommit-aware). */
+				/* Rename in one transaction: write the new key,
+				 * cascade the new name into every referencing
+				 * field, delete the old key — all commit together
+				 * or all roll back, so the entry never exists under
+				 * both names. sg_db_set/_set_val join this
+				 * transaction (they own BEGIN/COMMIT only at top
+				 * level). */
 				if (sg_db_begin() != 0) {
 					free(existing);
 					send_error(client_fd, SG_ERR_IO_FAIL,
@@ -6253,8 +6250,9 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		int replay_fails = mgmtd_replay_config();
 		/* Re-evaluate live flows against the rolled-back policy. */
 		conntrack_reeval_after_policy_change(0);
-		/* Bound history only NOW — after the target was consumed — so the
-		 * pre-rollback snapshot could never evict the restore target. */
+		/* Prune the revision history after the restore has consumed the
+		 * target revision (so pruning cannot remove a revision still in
+		 * use by this rollback). */
 		sg_db_revision_prune(50);
 		mgmt_log("INFO", "config rollback to rev %ld by %s "
 			 "(current saved as rev %d, %d apply failure(s))",

@@ -631,10 +631,7 @@ int handle_upgrade_start(int client_fd, const char *user, const char *payload, c
 	}
 	mgmt_log("INFO", "firmware upgrade: downloading from %s", url);
 
-	/* (No HTTP HEAD size probe: the progress loop below reports on-disk
-	 * KB only — the previously-probed Content-Length was never consumed,
-	 * so the extra wget --spider fork was pure latency. Removed.) */
-
+	/* Download progress is reported as on-disk KB by the poll loop below. */
 	pid_t dl_pid = -1;
 
 	if (strncmp(url, "tftp://", 7) == 0) {

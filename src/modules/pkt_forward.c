@@ -208,15 +208,9 @@ static void ml_account(struct sk_buff *skb, u8 proto, int iif, int oif)
 
 	spin_lock_bh(&ct->lock);
 	/* Record the flow's in/out interfaces from the original direction only
-	 * (reply packets traverse FORWARD with in/out swapped). Set once.
-	 *
-	 * iif/oif are u16 in struct nf_conn_ml (kept narrow for the CTA_ML
-	 * wire layout). The kernel ifindex is a full 32-bit int, so guard the
-	 * narrowing: only store when both fit in u16, otherwise leave the
-	 * fields at 0 (feature absent) rather than record a truncated, wrong
-	 * ifindex. On BPI-R4 ifindexes are small so this never triggers; the
-	 * guard just keeps the data honest if that ever changes. (Widening the
-	 * fields to u32 would change the CTA_ML ABI + userspace mirror.) */
+	 * (reply packets traverse FORWARD with in/out swapped). Set once. The
+	 * ml->iif/oif fields are u16, so store only when the kernel ifindex
+	 * fits; otherwise leave them 0 (unset) rather than a truncated value. */
 	if (dir == IP_CT_DIR_ORIGINAL && ml->iif == 0 &&
 	    iif <= U16_MAX && oif <= U16_MAX) {
 		ml->iif = (u16)iif;

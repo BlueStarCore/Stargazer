@@ -844,9 +844,8 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 		/* PATCH /api/config/{type}/{id}/move — reorder entry */
 		if (nseg >= 4 && strcmp(segs[3], "move") == 0 &&
 		    mg_str_eq(hm->method, "PATCH")) {
-			/* Validate the entry id before it reaches mgmtd, exactly
-			 * as the GET/PUT/DELETE single-entry routes do — this
-			 * /move branch previously skipped the check. */
+			/* Validate the entry id before it reaches mgmtd, like the
+			 * GET/PUT/DELETE single-entry routes. */
 			if (!sg_is_safe_id(segs[2])) {
 				reply_json(c, 400,
 					   "{\"error\":\"Invalid id\"}");

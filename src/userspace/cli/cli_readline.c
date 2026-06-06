@@ -1194,8 +1194,7 @@ const char *cli_readline(const char *prompt)
 		int rfd = tty_fd;
 		char ch;
 		/* Continue after any paste fragment already seeded into buf
-		 * above (pos/cursor), rather than overwriting it from 0 —
-		 * otherwise the first pasted fragment is silently dropped. */
+		 * above (pos/cursor) rather than overwriting it from 0. */
 		int bpos = (pos > 0 && pos < CLI_MAX_LINE - 1) ? pos : 0;
 
 		tty_write(tty_fd, prompt, strlen(prompt));

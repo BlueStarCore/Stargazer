@@ -792,10 +792,8 @@ sg_reg_all_keys_defaults(const char *type_name)
 	for (const struct field_entry *f = field_table; f->type; f++) {
 		if (strcmp(f->type, type_name) != 0)
 			continue;
-		/* Skip internal-only keys: SG_FLD_HIDDEN fields plus the
-		 * interactive "password" field (never emitted as a default).
-		 * ("builtin"/"password-hash" were dead comparisons — no
-		 * field_table row uses those keys.) */
+		/* Skip internal-only keys: SG_FLD_HIDDEN fields and the
+		 * interactive "password" field are never emitted as defaults. */
 		if ((f->flags & SG_FLD_HIDDEN) ||
 		    strcmp(f->key, "password") == 0)
 			continue;

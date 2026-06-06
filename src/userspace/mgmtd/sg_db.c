@@ -390,12 +390,10 @@ int sg_db_set(const char *type, const char *id, const char *data)
 {
 	if (!g_db || !type || !id) return -1;
 
-	/* Nest safely: only own (BEGIN/COMMIT) the transaction when not
-	 * already inside one. This lets a caller compose several mutations
-	 * into one atomic unit via sg_db_begin()/sg_db_commit() — e.g. the
-	 * rename cascade — without sg_db_set's own BEGIN failing as a nested
-	 * transaction. When owned==0 a failure leaves the rollback to the
-	 * outer owner (we return -1 so it can roll back). */
+	/* Own the transaction (BEGIN/COMMIT) only when not already inside one.
+	 * Called at top level (autocommit on) it is self-contained; called
+	 * between sg_db_begin()/sg_db_commit() it joins that transaction and
+	 * leaves commit/rollback to the owner (returning -1 on failure). */
 	int owned = sqlite3_get_autocommit(g_db) ? 1 : 0;
 	if (owned && sqlite3_exec(g_db, "BEGIN;", NULL, NULL, NULL) != SQLITE_OK)
 		return -1;
@@ -921,19 +919,17 @@ int sg_db_revision_create(const char *author, const char *message)
 }
 
 /*
- * sg_db_revision_prune — keep only the most recent `keep` revisions
- * (and their config snapshots). Called explicitly AFTER a commit, and after
- * a rollback has already consumed its target — NOT from create(), so that
- * the pre-rollback snapshot can never evict the revision being restored.
+ * sg_db_revision_prune — keep only the most recent `keep` revisions and
+ * their config snapshots, deleting all older ones. Call after a commit or
+ * after a rollback has consumed its target revision.
  */
 void sg_db_revision_prune(int keep)
 {
 	if (!g_db || keep < 0)
 		return;
-	/* Both DELETEs must commit together: a torn prune could otherwise
-	 * leave a revisions row whose snapshot rows are gone (a 0-row
-	 * revision that a later rollback would restore as an empty config),
-	 * or orphan revision_config rows the OFFSET prune can never reclaim. */
+	/* Both DELETEs run in one transaction so the revisions table and its
+	 * revision_config snapshots stay consistent (no revisions row left
+	 * without its snapshot rows, and no orphan snapshot rows). */
 	if (sg_db_begin() != 0)
 		return;
 	char sql[192];
