@@ -622,10 +622,10 @@
         }
     }
 
-    /* HTML-escape API data before injecting into innerHTML / attributes.
-     * Delegates to SgCommon.escHTML which also escapes single-quote and
-     * is shared with login.js. */
-    var esc = SgCommon.escHTML;
+    /* (No module-level esc helper: every server-data sink builds DOM nodes
+     * with textContent, so an unused SgCommon.escHTML alias would only imply
+     * an escaping safety net that isn't actually applied. SgCommon.escHTML
+     * remains available for any future innerHTML use.) */
 
     /* Cache element references by id — getElementById hits DOM
      * lookup tables; on a 5s poll cycle this is wasted work because
@@ -4234,7 +4234,13 @@
                 if (!data || !data.loaded) {
                     summaryEl.innerHTML = '<span style="color:var(--status-disabled)">Connection tracking not available</span>';
                 } else {
-                    summaryEl.innerHTML = 'Active: <strong>' + (data.active || 0) + '</strong>';
+                    /* Build with DOM nodes so server-supplied data.active
+                     * can never reach innerHTML unescaped (XSS-safe, matching
+                     * the rest of this file's textContent discipline). */
+                    summaryEl.textContent = 'Active: ';
+                    var strongEl = document.createElement('strong');
+                    strongEl.textContent = String(parseInt(data.active, 10) || 0);
+                    summaryEl.appendChild(strongEl);
                 }
             }
             sessionData = (data && data.sessions) || [];
