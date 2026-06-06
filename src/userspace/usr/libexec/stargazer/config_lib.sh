@@ -750,10 +750,16 @@ _cfg_set_direct() {
 			"[${_cs_section}]")
 				_cs_found=1
 				_cs_skip=1
-				echo "[${_cs_section}]" >> "$_cs_tmp"
-				cat "$_cs_data" >> "$_cs_tmp"
-				echo "" >> "$_cs_tmp"
-				_cs_wrote=1
+				# Emit the replacement only for the FIRST match; if
+				# the file already holds a duplicate of this section
+				# (partial earlier write / hand-edit), skip the extra
+				# occurrences instead of writing the payload twice.
+				if [ "$_cs_wrote" -eq 0 ]; then
+					echo "[${_cs_section}]" >> "$_cs_tmp"
+					cat "$_cs_data" >> "$_cs_tmp"
+					echo "" >> "$_cs_tmp"
+					_cs_wrote=1
+				fi
 				continue
 				;;
 			"["*)

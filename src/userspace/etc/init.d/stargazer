@@ -17,15 +17,23 @@ log() { echo "[$NAME] $1"; }
 # Secure boot: set default firewall policies before mgmtd starts
 # --------------------------------------------------------------------------
 harden_firewall() {
+    # Returns 0 only if the IPv4 FORWARD default-deny was actually
+    # established. The caller MUST NOT enable IP forwarding otherwise —
+    # forwarding with no FORWARD filter is fail-open (router passes all
+    # traffic). rc tracks that guarantee.
+    _hf_rc=1
     # IPv4: Default deny on FORWARD chain (fail-closed)
     if command -v iptables >/dev/null 2>&1; then
         if iptables -P FORWARD DROP 2>/dev/null; then
             log "Set iptables -P FORWARD DROP"
+            _hf_rc=0
         else
             log "WARNING: Could not set FORWARD policy to DROP"
         fi
         # Flush any existing FORWARD rules (policy DROP protects us)
         iptables -F FORWARD 2>/dev/null
+    else
+        log "WARNING: iptables not found — cannot establish FORWARD deny"
     fi
     # IPv6: Explicitly deny all forwarding and drop all packets
     if command -v ip6tables >/dev/null 2>&1; then
@@ -43,6 +51,7 @@ harden_firewall() {
         ip6tables -A INPUT -i lo -j ACCEPT 2>/dev/null
         ip6tables -A OUTPUT -o lo -j ACCEPT 2>/dev/null
     fi
+    return "$_hf_rc"
 }
 
 load_modules() {
@@ -90,7 +99,22 @@ harden_perms() {
 }
 
 case "$1" in
-    start)   log "Starting..."; harden_perms; harden_firewall; apply_sysctl; load_modules; log "Started" ;;
+    start)
+        log "Starting..."
+        harden_perms
+        if harden_firewall; then _fw_ok=1; else _fw_ok=0; fi
+        apply_sysctl
+        # Fail-closed: never enable forwarding without a FORWARD filter in
+        # place. If hardening could not set the default-deny (e.g. iptables
+        # missing), force forwarding OFF even though sysctl.d requests it on.
+        if [ "$_fw_ok" -ne 1 ]; then
+            log "CRITICAL: FORWARD deny not established — disabling IP forwarding (fail-closed)"
+            echo 0 > /proc/sys/net/ipv4/ip_forward 2>/dev/null
+            echo 0 > /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null
+        fi
+        load_modules
+        log "Started"
+        ;;
     stop)    log "Stopping..."; unload_modules; log "Stopped" ;;
     restart) $0 stop; sleep 1; $0 start ;;
     status)  lsmod | grep -q pkt_forward && log "Running" || log "Not running" ;;
