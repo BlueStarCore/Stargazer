@@ -456,6 +456,29 @@ chk("firmware: busybox tar has real gzip support (SEAMLESS_GZ + GUNZIP)",
 chk("firmware: busybox has sha256sum (FIT checksum verify step)",
     "CONFIG_SHA256SUM=y" in _bbfrag)
 
+# Firmware signing (Ed25519, plan B). Verify the vendored TweetNaCl is the
+# pinned upstream (not silently swapped), the device verifies the signature
+# fail-closed BEFORE writing, and the build signs + ships firmware.sig.
+import hashlib as _hl
+_tnc = rd("src/userspace/mgmtd/tweetnacl.c")
+chk("fwsig: vendored tweetnacl.c matches pinned upstream sha256",
+    _hl.sha256(_tnc.encode()).hexdigest()
+    == "02e65bc3013ff2168983365e55906bc783c4c7e0a60d8100f17bb303a17175c4")
+_fwc = rd("src/userspace/mgmtd/mgmtd_firmware.c")
+chk("fwsig: mgmtd verifies Ed25519 signature before flashing (fail-closed)",
+    "fw_verify_signature" in _fwc
+    and "crypto_sign_open" in _fwc
+    and "Firmware signature verification failed" in _fwc
+    and _fwc.index("fw_verify_signature()") < _fwc.index('"dd if=/tmp/sg-fw-staged/stargazer.itb'))
+chk("fwsig: public key compiled in; private key never in tree",
+    "firmware_pubkey[32]" in rd("src/userspace/mgmtd/firmware_pubkey.h")
+    and 'firmware-signing.pem' in rd("keys/.gitignore"))
+_mk = rd("Makefile")
+chk("fwsig: build signs the FIT and packages firmware.sig; fails without key",
+    "openssl pkeyutl -sign" in _mk
+    and "manifest.txt stargazer.itb firmware.sig" in _mk
+    and "no firmware-signing key" in _mk)
+
 _wp = rd("src/userspace/webd/webd_pool.c")
 chk("firmware: worker unlinks the /tmp stage file on IPC/upgrade failure",
     "flow_firmware_upload" in _wp
