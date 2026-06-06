@@ -255,7 +255,18 @@ static int cmd_fw_upgrade(const char *args, const char *permissions)
 				printf("\n");
 			/* Send cancel to mgmtd so the child process stops */
 			struct ipc_response cr;
-			ipc_send_str(SG_CMD_UPGRADE_CANCEL, "", &cr);
+			/* ipc_send zero-fills the response, and SG_OK==0, so a
+			 * connection failure would leave cr.status==SG_OK and be
+			 * misread as a successful cancel. Check the send itself. */
+			if (ipc_send_str(SG_CMD_UPGRADE_CANCEL, "", &cr) != 0) {
+				printf("  Could not deliver cancel to mgmtd; "
+				       "upgrade may still be running.\n");
+				ipc_resp_free(&cr);
+				ipc_clear_interrupt();
+				have_inline = 0;
+				usleep(500000);
+				continue;
+			}
 			if (cr.status != SG_OK) {
 				/* Cancel rejected (e.g. past point of no return) */
 				printf("  %s\n",
@@ -560,6 +571,7 @@ static int cmd_diag_top(const char *args, const char *permissions)
 		if (*p) {
 			interval = atoi(p);
 			if (interval < 1) interval = 1;
+			if (interval > 3600) interval = 3600;	/* avoid *1000 int overflow */
 			/* Skip to next arg */
 			while (*p && *p != ' ') p++;
 			while (*p == ' ') p++;

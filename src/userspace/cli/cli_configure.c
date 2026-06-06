@@ -749,6 +749,10 @@ static int handle_password(const char *entry_id, struct kv_buf *b)
 			printf("  Error [%u]: %s\n", resp.status, msg);
 			ipc_resp_free(&resp);
 			explicit_bzero(policy_payload, sizeof(policy_payload));
+			/* Same contract as the other return paths: do not leave
+			 * the plaintext password in the stack frame. */
+			explicit_bzero(pw1, sizeof(pw1));
+			explicit_bzero(pw2, sizeof(pw2));
 			return -1;
 		}
 		ipc_resp_free(&resp);

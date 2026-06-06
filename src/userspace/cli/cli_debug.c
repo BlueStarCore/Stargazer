@@ -448,9 +448,10 @@ int cmd_debug_flow(const char *args, const char *permissions)
 		}
 	}
 
-	printf("  Debug flow trace %sd.\n", act);
+	printf("  Debug flow trace flag %sd.\n", act);
 	if (strcmp(act, "enable") == 0)
-		printf("  Flow tracing enabled (session module not yet wired"
-		       " — no output until session.c is connected)\n");
+		printf("  Note: per-flow state now lives in nf_conntrack; this"
+		       " flag is recorded but has no consumer yet — flow-trace"
+		       " output arrives with the Phase 3 ML scoring daemon.\n");
 	return 0;
 }

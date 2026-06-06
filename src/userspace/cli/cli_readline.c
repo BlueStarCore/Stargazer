@@ -60,6 +60,7 @@ static char hist[CLI_MAX_HIST][CLI_MAX_LINE];
 static int nhist = 0;
 
 static struct termios orig_termios;
+static int have_orig = 0;	/* orig_termios captured? (else don't restore) */
 static int raw_mode = 0;
 static int tty_fd = -1;
 
@@ -134,6 +135,7 @@ static int enable_raw(void)
 		return -1;
 	if (tcgetattr(tty_fd, &orig_termios) != 0)
 		return -1;
+	have_orig = 1;
 
 	t = orig_termios;
 	t.c_iflag &= ~(unsigned)(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
@@ -264,6 +266,12 @@ int cli_term_init(void)
 	 * Without this, stale keystrokes echo into the first prompt. */
 	tcflush(tty_fd, TCIFLUSH);
 
+	/* Capture the true original termios now so cli_term_cleanup() can
+	 * always restore a real setting — even if the process exits before
+	 * enable_raw() ever ran (sandbox failure, early WHOAMI exit). */
+	if (tcgetattr(tty_fd, &orig_termios) == 0)
+		have_orig = 1;
+
 	current_comps.count = 0;
 	stack_depth = 0;
 	return 0;
@@ -271,9 +279,12 @@ int cli_term_init(void)
 
 void cli_term_cleanup(void)
 {
-	/* Restore true original terminal settings (with ECHO) on exit */
+	/* Restore true original terminal settings (with ECHO) on exit —
+	 * but only if we actually captured them, else we'd apply a zeroed
+	 * termios and leave the parent shell in a degraded state. */
 	if (tty_fd >= 0) {
-		tcsetattr(tty_fd, TCSANOW, &orig_termios);
+		if (have_orig)
+			tcsetattr(tty_fd, TCSANOW, &orig_termios);
 		close(tty_fd);
 		tty_fd = -1;
 	}
@@ -1182,9 +1193,14 @@ const char *cli_readline(const char *prompt)
 		}
 		int rfd = tty_fd;
 		char ch;
-		int bpos = 0;
+		/* Continue after any paste fragment already seeded into buf
+		 * above (pos/cursor), rather than overwriting it from 0 —
+		 * otherwise the first pasted fragment is silently dropped. */
+		int bpos = (pos > 0 && pos < CLI_MAX_LINE - 1) ? pos : 0;
 
 		tty_write(tty_fd, prompt, strlen(prompt));
+		if (bpos > 0)
+			tty_write(tty_fd, buf, (size_t)bpos);
 		while (bpos < CLI_MAX_LINE - 1) {
 			if (read(rfd, &ch, 1) <= 0)
 				break;
@@ -1361,7 +1377,16 @@ const char *cli_readline(const char *prompt)
 
 		case 27: { /* ESC sequence */
 			char seq[2];
+			/* A lone Escape press sends only 0x1b. With VMIN=1 a
+			 * blocking read() would hang until the next keystroke,
+			 * appearing frozen. Poll briefly for the CSI/SS3
+			 * continuation; if none arrives, treat ESC as a no-op. */
+			struct pollfd epf = { .fd = tty_fd, .events = POLLIN };
+			if (poll(&epf, 1, 50) <= 0 || !(epf.revents & POLLIN))
+				break;
 			if (read(tty_fd, &seq[0], 1) <= 0)
+				break;
+			if (poll(&epf, 1, 50) <= 0 || !(epf.revents & POLLIN))
 				break;
 			if (read(tty_fd, &seq[1], 1) <= 0)
 				break;
