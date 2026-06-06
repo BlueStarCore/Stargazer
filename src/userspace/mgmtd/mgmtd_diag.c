@@ -2065,14 +2065,17 @@ static void ct_ml_emit(const struct nlmsghdr *nh, struct dynbuf *out, long *coun
 		l = 0;
 		pr = sg_nla_find(tup, tlen, SG_CTA_TUPLE_PROTO, &l);
 		if (pr) {
-			int pl = 0;
-			const void *pn = sg_nla_find(pr, l, SG_CTA_PROTO_NUM, &pl);
-			const void *sp = sg_nla_find(pr, l, SG_CTA_PROTO_SRC_PORT, &pl);
-			const void *dp = sg_nla_find(pr, l, SG_CTA_PROTO_DST_PORT, &pl);
+			int pnl = 0, spl = 0, dpl = 0;
+			const void *pn = sg_nla_find(pr, l, SG_CTA_PROTO_NUM, &pnl);
+			const void *sp = sg_nla_find(pr, l, SG_CTA_PROTO_SRC_PORT, &spl);
+			const void *dp = sg_nla_find(pr, l, SG_CTA_PROTO_DST_PORT, &dpl);
 
-			if (pn) proto = *(const uint8_t *)pn;
-			if (sp) sport = ntohs(*(const uint16_t *)sp);
-			if (dp) dport = ntohs(*(const uint16_t *)dp);
+			/* Gate each read on the attribute's own payload length —
+			 * sg_nla_find only proves the attr fits the parent, not
+			 * that its payload is wide enough to deref. */
+			if (pn && pnl >= 1) proto = *(const uint8_t *)pn;
+			if (sp && spl >= 2) sport = ntohs(*(const uint16_t *)sp);
+			if (dp && dpl >= 2) dport = ntohs(*(const uint16_t *)dp);
 		}
 	}
 
@@ -2323,16 +2326,17 @@ static int ct_iface_map_build(struct ct_iface_ent **out)
 				l = 0;
 				pr = sg_nla_find(tup, tlen, SG_CTA_TUPLE_PROTO, &l);
 				if (pr) {
-					int pl = 0;
+					int pnl = 0, spl = 0, dpl = 0;
 					const void *pn = sg_nla_find(pr, l,
-							SG_CTA_PROTO_NUM, &pl);
+							SG_CTA_PROTO_NUM, &pnl);
 					const void *sp = sg_nla_find(pr, l,
-							SG_CTA_PROTO_SRC_PORT, &pl);
+							SG_CTA_PROTO_SRC_PORT, &spl);
 					const void *dp = sg_nla_find(pr, l,
-							SG_CTA_PROTO_DST_PORT, &pl);
-					if (pn) pname = ct_proto_name(*(const uint8_t *)pn);
-					if (sp) sport = ntohs(*(const uint16_t *)sp);
-					if (dp) dport = ntohs(*(const uint16_t *)dp);
+							SG_CTA_PROTO_DST_PORT, &dpl);
+					/* Gate each deref on its own payload width. */
+					if (pn && pnl >= 1) pname = ct_proto_name(*(const uint8_t *)pn);
+					if (sp && spl >= 2) sport = ntohs(*(const uint16_t *)sp);
+					if (dp && dpl >= 2) dport = ntohs(*(const uint16_t *)dp);
 				}
 			}
 			if (!pname || !src[0])

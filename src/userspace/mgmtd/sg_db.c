@@ -390,21 +390,28 @@ int sg_db_set(const char *type, const char *id, const char *data)
 {
 	if (!g_db || !type || !id) return -1;
 
-	if (sqlite3_exec(g_db, "BEGIN;", NULL, NULL, NULL) != SQLITE_OK)
+	/* Nest safely: only own (BEGIN/COMMIT) the transaction when not
+	 * already inside one. This lets a caller compose several mutations
+	 * into one atomic unit via sg_db_begin()/sg_db_commit() — e.g. the
+	 * rename cascade — without sg_db_set's own BEGIN failing as a nested
+	 * transaction. When owned==0 a failure leaves the rollback to the
+	 * outer owner (we return -1 so it can roll back). */
+	int owned = sqlite3_get_autocommit(g_db) ? 1 : 0;
+	if (owned && sqlite3_exec(g_db, "BEGIN;", NULL, NULL, NULL) != SQLITE_OK)
 		return -1;
 
 	/* Delete existing rows for this entry */
 	sqlite3_stmt *del;
 	const char *del_sql = "DELETE FROM config WHERE type=?1 AND id=?2;";
 	if (sqlite3_prepare_v2(g_db, del_sql, -1, &del, NULL) != SQLITE_OK) {
-		sqlite3_exec(g_db, "ROLLBACK;", NULL, NULL, NULL);
+		if (owned) sqlite3_exec(g_db, "ROLLBACK;", NULL, NULL, NULL);
 		return -1;
 	}
 	sqlite3_bind_text(del, 1, type, -1, SQLITE_STATIC);
 	sqlite3_bind_text(del, 2, id, -1, SQLITE_STATIC);
 	if (sqlite3_step(del) != SQLITE_DONE) {
 		sqlite3_finalize(del);
-		sqlite3_exec(g_db, "ROLLBACK;", NULL, NULL, NULL);
+		if (owned) sqlite3_exec(g_db, "ROLLBACK;", NULL, NULL, NULL);
 		return -1;
 	}
 	sqlite3_finalize(del);
@@ -416,19 +423,19 @@ int sg_db_set(const char *type, const char *id, const char *data)
 			"INSERT INTO config(type, id, key, value) "
 			"VALUES(?1, ?2, ?3, ?4);";
 		if (sqlite3_prepare_v2(g_db, ins_sql, -1, &ins, NULL) != SQLITE_OK) {
-			sqlite3_exec(g_db, "ROLLBACK;", NULL, NULL, NULL);
+			if (owned) sqlite3_exec(g_db, "ROLLBACK;", NULL, NULL, NULL);
 			return -1;
 		}
 
 		if (sg_insert_ordered(ins, type, id, data) != 0) {
 			sqlite3_finalize(ins);
-			sqlite3_exec(g_db, "ROLLBACK;", NULL, NULL, NULL);
+			if (owned) sqlite3_exec(g_db, "ROLLBACK;", NULL, NULL, NULL);
 			return -1;
 		}
 		sqlite3_finalize(ins);
 	}
 
-	if (sqlite3_exec(g_db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+	if (owned && sqlite3_exec(g_db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
 		sqlite3_exec(g_db, "ROLLBACK;", NULL, NULL, NULL);
 		return -1;
 	}

@@ -663,6 +663,10 @@ int handle_admin_create(int client_fd, const char *user,
 		 "profile=%s\nenforce-change-password=enable\n"
 		 "enforce-password-policy=enable\n", newprof);
 	if (sg_db_set("system_admin", newuser, cfgdata) != 0) {
+		/* Roll back the just-created OS account so it doesn't persist
+		 * without a config row (it would have a login shell but never
+		 * appear in admin listings). */
+		delete_system_user(newuser);
 		send_error(client_fd, SG_ERR_IO_FAIL, "config write failed");
 		return 0;
 	}
@@ -872,9 +876,14 @@ int handle_admin_set_enf(int client_fd, const char *user,
 				  "enforce-change-password=%s\n", val);
 	newdata[ndoff] = '\0';
 
-	sg_db_set("system_admin", target, newdata);
+	int wrc = sg_db_set("system_admin", target, newdata);
 	free(existing);
 	free(newdata);
+	if (wrc != 0) {
+		/* Do not report a security flag applied when the write failed. */
+		send_error(client_fd, SG_ERR_IO_FAIL, "config write failed");
+		return 0;
+	}
 	admin_notify_change(target);
 	send_ok(client_fd, "Enforce policy updated", NULL);
 	return 0;
@@ -1102,10 +1111,13 @@ int handle_auth_login(int client_fd, const char *user,
 	if (!sp) {
 		/* User not found — fail after crypt (timing constant) */
 	} else if (sp->sp_pwdp[0] == '!' || sp->sp_pwdp[0] == '*') {
-		/* Locked account (shadow-level lock, e.g. passwd -l) */
-		explicit_bzero(password, sizeof(password));
-		send_error(client_fd, SG_ERR_LOCKED, "Account is locked");
-		return 0;
+		/* Shadow-locked account (passwd -l, or a freshly-created admin
+		 * whose password is unset). Do NOT early-return a distinct
+		 * status: that would leak account existence/state via a unique
+		 * error code and a faster (no-compare) response. crypt() already
+		 * ran above for timing parity; leave auth_ok=0 so this falls
+		 * through to the same "Invalid credentials" + lockout path as a
+		 * wrong password. (A '!'/'*' hash can never equal a crypt result.) */
 	} else if (sp->sp_pwdp[0] == '\0' && password[0] == '\0') {
 		/* Empty password (first-login) */
 		auth_ok = 1;

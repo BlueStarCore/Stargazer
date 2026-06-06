@@ -285,6 +285,12 @@ char *pipe_exec_stdin(const char *const argv[],
 	ssize_t n;
 	char tmp[1024];
 	while ((n = read(out_fd[0], tmp, sizeof(tmp))) > 0) {
+		/* Same exhaustion cap as safe_exec: a misbehaving child must
+		 * not be able to grow the single-threaded daemon without bound. */
+		if (used + (size_t)n + 1 > SAFE_EXEC_MAX_OUTPUT) {
+			free(buf); close(out_fd[0]); waitpid(pid, NULL, 0);
+			return NULL;
+		}
 		while (used + (size_t)n + 1 > bufsz) {
 			bufsz *= 2;
 			char *nb = realloc(buf, bufsz);
@@ -2014,9 +2020,16 @@ static int mgmtd_first_boot_seed(void)
 		}
 	}
 
-	/* Stamp the seeded flag LAST — if seeding partially fails,
-	 * next boot retries as BOOT_FIRST (no flag, all tables empty). */
-	sg_db_set_val("system_meta", "0", "seeded", "1");
+	/* Stamp the seeded flag LAST. This write MUST be checked: if the
+	 * tables seeded but the flag stamp fails, the next boot sees populated
+	 * critical tables with no flag → check_boot_integrity returns
+	 * BOOT_COMPROMISED and main() refuses to start permanently (the
+	 * opposite of self-healing). Surface the failure here instead. */
+	if (sg_db_set_val("system_meta", "0", "seeded", "1") != 0) {
+		mgmt_log("ERROR", "first-boot seed: failed to stamp seeded "
+			 "flag; treating seeding as failed");
+		return -1;
+	}
 
 	mgmt_log("INFO", "default configuration seeded successfully");
 	return 0;
@@ -4337,6 +4350,13 @@ static int handle_supervisor_test(int client_fd, const char *user,
 	     tok = strtok_r(NULL, "\n", &sp))
 		lines[nlines++] = tok;
 
+	if (nlines == 0) {
+		/* A newline-only payload passes the !payload[0] guard but
+		 * yields zero tokens — lines[0] would be uninitialized. */
+		send_error(client_fd, SG_ERR_MISSING_ARG, "No operation");
+		return 0;
+	}
+
 	const char *op = lines[0];
 
 	if (strcmp(op, "start") == 0 && nlines >= 2) {
@@ -5078,7 +5098,21 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 					return 0;
 				}
 
+				/* Atomic rename: write new key, cascade the
+				 * referencing fields, delete old key — all in
+				 * ONE transaction. Without it, a crash between
+				 * the new-key write and the old-key delete would
+				 * leave BOTH objects (duplicate firewall entity,
+				 * both emitted on next replay). sg_db_set/_set_val
+				 * nest inside this transaction (autocommit-aware). */
+				if (sg_db_begin() != 0) {
+					free(existing);
+					send_error(client_fd, SG_ERR_IO_FAIL,
+						   "Rename failed");
+					return 0;
+				}
 				if (sg_db_set(db_type, new_name, clean) != 0) {
+					sg_db_rollback();
 					free(existing);
 					send_error(client_fd, SG_ERR_IO_FAIL,
 						   "Rename failed");
@@ -5131,6 +5165,15 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 				}
 
 				sg_db_del(db_type, db_id);
+
+				/* Commit the whole rename atomically. */
+				if (sg_db_commit() != 0) {
+					sg_db_rollback();
+					free(existing);
+					send_error(client_fd, SG_ERR_IO_FAIL,
+						   "Rename failed");
+					return 0;
+				}
 
 				if (need_fw_rebuild) {
 					char rb[512];

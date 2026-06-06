@@ -631,85 +631,9 @@ int handle_upgrade_start(int client_fd, const char *user, const char *payload, c
 	}
 	mgmt_log("INFO", "firmware upgrade: downloading from %s", url);
 
-	/* Pre-flight: probe remote file size via HTTP HEAD request.
-	 * Uses wget --spider -S to get Content-Length header.
-	 * Falls back to -1 (unknown) for TFTP or if --spider
-	 * is unsupported (minimal BusyBox builds). */
-	long total_bytes = -1;
-	if (strncmp(url, "http", 4) == 0) {
-		int hp[2];
-		if (pipe(hp) == 0) {
-			pid_t hpid = fork();
-			if (hpid == 0) {
-				close(hp[0]);
-				dup2(hp[1], STDOUT_FILENO);
-				dup2(hp[1], STDERR_FILENO);
-				close(hp[1]);
-				execlp("wget", "wget", "--spider",
-				       "-S", "-T", "5", url, NULL);
-				_exit(127);
-			}
-			if (hpid > 0) {
-				close(hp[1]);
-				char hbuf[4096];
-				size_t hused = 0;
-				/* Read with timeout — don't block forever */
-				struct pollfd pfd;
-				pfd.fd = hp[0];
-				pfd.events = POLLIN;
-				while (hused < sizeof(hbuf) - 1 &&
-				       poll(&pfd, 1, 6000) > 0 &&
-				       (pfd.revents & POLLIN)) {
-					ssize_t r = read(hp[0], hbuf + hused,
-							 sizeof(hbuf) - 1 - hused);
-					if (r <= 0) break;
-					hused += (size_t)r;
-				}
-				hbuf[hused] = '\0';
-				close(hp[0]);
-				/* Kill wget --spider if it outlived the read
-				 * timeout (slow server, no -T support in this
-				 * BusyBox build).  Without this, waitpid blocks
-				 * indefinitely, freezing the firmware child and
-				 * preventing any further state file updates. */
-				kill(hpid, SIGTERM);
-				/* Wait up to 1s for SIGTERM, then force-kill */
-				{
-					int k, reaped = 0;
-					for (k = 0; k < 10 && !reaped; k++) {
-						if (waitpid(hpid, NULL, WNOHANG) != 0)
-							reaped = 1;
-						else
-							usleep(100000);
-					}
-					if (!reaped) {
-						kill(hpid, SIGKILL);
-						waitpid(hpid, NULL, 0);
-					}
-				}
-				/* Parse Content-Length (case-insensitive) */
-				const char *scan = hbuf;
-				while (*scan) {
-					if ((*scan == 'C' || *scan == 'c') &&
-					    strncasecmp(scan, "Content-Length:", 15) == 0) {
-						const char *v = scan + 15;
-						while (*v == ' ') v++;
-						long cl = atol(v);
-						if (cl > 0)
-							total_bytes = cl;
-						break;
-					}
-					scan++;
-				}
-				if (total_bytes > 0)
-					mgmt_log("INFO", "firmware size: %ld bytes",
-						 total_bytes);
-			} else {
-				close(hp[0]);
-				close(hp[1]);
-			}
-		}
-	}
+	/* (No HTTP HEAD size probe: the progress loop below reports on-disk
+	 * KB only — the previously-probed Content-Length was never consumed,
+	 * so the extra wget --spider fork was pure latency. Removed.) */
 
 	pid_t dl_pid = -1;
 
@@ -766,10 +690,8 @@ int handle_upgrade_start(int client_fd, const char *user, const char *payload, c
 	}
 
 	/* Poll download file size while wget/tftp runs */
-	(void)total_bytes;  /* size probe kept for future use */
 	int dl_status = 0;
 	for (;;) {
-		/* Update progress first so the final iteration shows 100% */
 		struct stat st;
 		long kb = 0;
 		if (stat(FW_DL_FILE, &st) == 0)
