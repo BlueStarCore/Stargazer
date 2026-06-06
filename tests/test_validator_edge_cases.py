@@ -678,6 +678,13 @@ chk("lowsweep: rename cascade checks writes and rolls back partial rename",
     and "i < nrefs && cascade_ok" in _mg
     and "!cascade_ok ||" in _mg
     and "sg_db_del(db_type, db_id) != 0 ||" in _mg)
+# Follow-up #2: cascade audit lines must be buffered and emitted only AFTER
+# commit (audit_log writes a flat file outside the txn; logging inside the
+# loop would record "updated" for refs a rollback then discards).
+chk("lowsweep: rename cascade audit deferred until after commit",
+    "char **caud = NULL;" in _mg
+    and 'audit_log("__cascade", "200", caud[a]);' in _mg
+    and _mg.index("char **caud = NULL;") < _mg.index('audit_log("__cascade", "200", caud[a]);'))
 
 # ─────────────────────────────────────────────────────────────────────────────
 print(f"\n{B}{C}=== 5. sg_is_uint_range: overflow and negative ==={N}")

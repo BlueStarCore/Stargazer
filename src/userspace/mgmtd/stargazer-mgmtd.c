@@ -5146,6 +5146,13 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 				int need_fw_rebuild  = 0;
 				int need_nat_rebuild = 0;
 				int cascade_ok = 1;
+				/* Buffer cascade audit lines and emit them only
+				 * AFTER commit succeeds — audit_log writes to a
+				 * flat file outside the transaction, so logging
+				 * inside the loop would record "updated" for refs
+				 * that a later rollback discards. */
+				char **caud = NULL;
+				int n_caud = 0, cap_caud = 0;
 				for (int i = 0; i < nrefs && cascade_ok; i++) {
 					char *found = sg_db_find_referencing(
 						refs[i].type, refs[i].key,
@@ -5186,8 +5193,17 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 							 et, eid, db_type,
 							 db_id, new_name,
 							 refs[i].key);
-						audit_log("__cascade",
-							  "200", amsg);
+						/* Defer: buffer now, log post-commit. */
+						if (n_caud == cap_caud) {
+							int ncap = cap_caud ? cap_caud * 2 : 8;
+							char **nb = realloc(caud,
+								(size_t)ncap * sizeof(*caud));
+							if (nb) { caud = nb; cap_caud = ncap; }
+						}
+						if (n_caud < cap_caud) {
+							char *dup = strdup(amsg);
+							if (dup) caud[n_caud++] = dup;
+						}
 					}
 					free(found);
 				}
@@ -5199,11 +5215,22 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 				    sg_db_del(db_type, db_id) != 0 ||
 				    sg_db_commit() != 0) {
 					sg_db_rollback();
+					for (int a = 0; a < n_caud; a++)
+						free(caud[a]);
+					free(caud);
 					free(existing);
 					send_error(client_fd, SG_ERR_IO_FAIL,
 						   "Rename failed");
 					return 0;
 				}
+
+				/* Commit succeeded — now the cascade audit lines
+				 * reflect persisted state, so emit them. */
+				for (int a = 0; a < n_caud; a++) {
+					audit_log("__cascade", "200", caud[a]);
+					free(caud[a]);
+				}
+				free(caud);
 
 				if (need_fw_rebuild) {
 					char rb[512];
