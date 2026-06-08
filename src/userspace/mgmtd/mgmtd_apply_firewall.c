@@ -589,11 +589,10 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 				if (strcmp(target, "ACCEPT") == 0) {
 					/*
 					 * ACCEPT policy có thể emit 1-3 rule dùng chung
-					 * match prefix (đã có trong buf từ rule_start đến
-					 * buf.used). Kỹ thuật: lưu prefix_end, append target,
-					 * rồi truncate buf.used về prefix_end để tái dùng
-					 * prefix cho rule tiếp theo — không dùng saved_pfx
-					 * (saved_pfx gây lệch khi nhiều block cùng chạy).
+					 * match prefix. Lưu prefix ONCE vào saved_pfx, rồi
+					 * sau mỗi sub-rule APPEND lại saved_pfx để tạo prefix
+					 * cho rule tiếp theo — KHÔNG truncate buf.used (làm
+					 * thế sẽ xóa mất rule vừa emit).
 					 *
 					 * Thứ tự (FortiGate-style, theo ips-profile):
 					 *   [IPS]  <match> connbytes 0:(N-1) → NFQUEUE
@@ -607,9 +606,15 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 					 * flow đi thẳng qua CONNMARK+ACCEPT. Không loop.
 					 * Không --queue-bypass: ipsd chết → fail-closed.
 					 */
-					size_t prefix_end = buf.used;
+					size_t pfx_len = buf.used - rule_start;
+					char saved_pfx[256];
+					int pfx_ok = (pfx_len < sizeof(saved_pfx));
+					if (pfx_ok)
+						memcpy(saved_pfx,
+						       buf.data + rule_start,
+						       pfx_len);
 
-					if (ips_on &&
+					if (pfx_ok && ips_on &&
 					    strcmp(ips_profile, "default") == 0) {
 						dbuf_printf(&buf,
 							" -m connbytes"
@@ -620,17 +625,19 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 							" --queue-num %d\n",
 							ips_snap - 1, ips_q);
 						rule_count++;
-						buf.used = prefix_end;
+						/* re-append prefix for next rule */
+						dbuf_append(&buf, saved_pfx, pfx_len);
 					}
 
-					if (cmk && cmkid > 0) {
+					if (pfx_ok && cmk && cmkid > 0) {
 						dbuf_printf(&buf,
 							" -j CONNMARK --set-xmark"
 							" 0x%lx/0x%x\n",
 							(cmkid << SG_CMK_PID_SHIFT),
 							SG_CMK_STAMP_MASK);
 						rule_count++;
-						buf.used = prefix_end;
+						/* re-append prefix for ACCEPT */
+						dbuf_append(&buf, saved_pfx, pfx_len);
 					}
 				}
 				dbuf_printf(&buf, " -j %s\n", target);
