@@ -227,6 +227,41 @@ static int connmark_supported(void)
 }
 
 /*
+ * connbytes_supported — probe xt_connbytes availability (cached).
+ *
+ * xt_connbytes cần CONFIG_NETFILTER_XT_MATCH_CONNBYTES=y/m + module load.
+ * Nếu không có: NFQUEUE rule fallback về --ctstate NEW (chỉ gói SYN, giống
+ * cách cũ). Fallback ít hiệu quả hơn (không thấy payload data packets) nhưng
+ * pipeline ML + L1 vẫn chạy, không crash.
+ */
+static int connbytes_supported(void)
+{
+	static int cached = -1;
+	if (cached >= 0)
+		return cached;
+
+	const char *newc[]   = {"iptables", "-N", "SG_CB_PROBE", NULL};
+	const char *addc[]   = {"iptables", "-A", "SG_CB_PROBE",
+				"-m", "connbytes",
+				"--connbytes-dir", "original",
+				"--connbytes-mode", "packets",
+				"--connbytes", "0:7", "-j", "RETURN", NULL};
+	const char *flushc[] = {"iptables", "-F", "SG_CB_PROBE", NULL};
+	const char *delc[]   = {"iptables", "-X", "SG_CB_PROBE", NULL};
+
+	ipt_exec(newc);
+	cached = (ipt_exec(addc) == 0) ? 1 : 0;
+	ipt_exec(flushc);
+	ipt_exec(delc);
+
+	mgmt_log("INFO", "xt_connbytes %s; IPS NFQUEUE rule uses %s",
+		 cached ? "available" : "unavailable",
+		 cached ? "connbytes (N-packet gate)"
+			: "--ctstate NEW (SYN-only fallback)");
+	return cached;
+}
+
+/*
  * Per-flow connmark layout (FortiGate-style dirty-session):
  *   bit 0      DIRTY     — set on flows that must re-traverse the policy chain
  *   bits 1-7   reserved  (kept 0)
@@ -616,14 +651,30 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 
 					if (pfx_ok && ips_on &&
 					    strcmp(ips_profile, "default") == 0) {
-						dbuf_printf(&buf,
-							" -m connbytes"
-							" --connbytes-dir original"
-							" --connbytes-mode packets"
-							" --connbytes 0:%d"
-							" -j NFQUEUE"
-							" --queue-num %d\n",
-							ips_snap - 1, ips_q);
+						if (connbytes_supported()) {
+							/* N-packet gate: inspect first
+							 * snapshot_n packets/direction */
+							dbuf_printf(&buf,
+								" -m connbytes"
+								" --connbytes-dir original"
+								" --connbytes-mode packets"
+								" --connbytes 0:%d"
+								" -j NFQUEUE"
+								" --queue-num %d\n",
+								ips_snap - 1, ips_q);
+						} else {
+							/* Fallback: only SYN (NEW) — ML
+							 * + L1 rules still work; L2 payload
+							 * signature sees empty payload on TCP.
+							 * Add CONFIG_NETFILTER_XT_MATCH_CONNBYTES
+							 * to kernel for full inspection. */
+							dbuf_printf(&buf,
+								" -m conntrack"
+								" --ctstate NEW"
+								" -j NFQUEUE"
+								" --queue-num %d\n",
+								ips_q);
+						}
 						rule_count++;
 						/* re-append prefix for next rule */
 						dbuf_append(&buf, saved_pfx, pfx_len);
