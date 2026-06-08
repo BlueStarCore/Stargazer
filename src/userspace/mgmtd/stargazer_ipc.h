@@ -167,6 +167,13 @@ typedef enum {
 	/* DHCP lease events (udhcpc script → mgmtd) */
 	SG_CMD_DHCP_LEASE_EVENT  = 682,  /* payload: iface=<name> action=bound|renew|deconfig */
 
+	/* SSL inspection: trả CA cert (PEM) cho client tải về cài */
+	SG_CMD_SSL_CACERT        = 683,
+
+	/* IPS daemon status + alert log */
+	SG_CMD_IPS_STATUS        = 684,   /* trạng thái ipsd + counters   */
+	SG_CMD_IPS_ALERTS        = 685,   /* N dòng cuối ips-alert.log    */
+
 	/* Keepalive / ping (9xx) */
 	SG_CMD_PING          = 900,
 	SG_CMD_DEBUG_FETCH   = 901,   /* Fetch buffered debug traces    */

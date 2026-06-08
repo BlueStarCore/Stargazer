@@ -218,8 +218,9 @@ $(BUILD_DIR)/modules/$(MODULE_NAME).ko &: $(KERNEL_IMAGE) $(SRC_WATCH)
 		[ -f $(KERNEL_DIR)/net/netfilter/$$m ] && \
 		cp $(KERNEL_DIR)/net/netfilter/$$m $(BUILD_DIR)/modules/ || true; \
 	done
-	# Copy af_packet.ko — CONFIG_PACKET=m; required for udhcpc PF_PACKET sockets
-	cp $(KERNEL_DIR)/net/packet/af_packet.ko $(BUILD_DIR)/modules/
+	# Copy af_packet.ko — only when CONFIG_PACKET=m (skip if built-in =y)
+	@[ -f $(KERNEL_DIR)/net/packet/af_packet.ko ] && \
+		cp $(KERNEL_DIR)/net/packet/af_packet.ko $(BUILD_DIR)/modules/ || true
 	@echo "[2/5] Module ready: $@"
 
 # =============================================================================
@@ -954,7 +955,39 @@ firmware: rootfs
 # Test in QEMU
 # =============================================================================
 
-test-build: modules busybox dash iptables logind mgmtd cli webd tools uboot
+IPSD_DIR       := $(PROJECT_ROOT)/src/userspace/ipsd
+IPSD_SRCS      := $(IPSD_DIR)/main.c $(IPSD_DIR)/nfq.c $(IPSD_DIR)/ctdump.c \
+                  $(IPSD_DIR)/feature.c $(IPSD_DIR)/flow_rule.c \
+                  $(IPSD_DIR)/sig_rule.c $(IPSD_DIR)/sig_reload.c \
+                  $(IPSD_DIR)/ac.c $(IPSD_DIR)/rule_gen.c \
+                  $(IPSD_DIR)/engine.c $(IPSD_DIR)/fusion.c \
+                  $(IPSD_DIR)/ips_model.c \
+                  $(IPSD_DIR)/model/predict.c
+IPSD_BIN       := $(BUILD_DIR)/ipsd/stargazer-ipsd
+
+ipsd: $(IPSD_BIN)
+
+$(IPSD_BIN): $(IPSD_SRCS)
+	@mkdir -p $(BUILD_DIR)/ipsd
+	@echo "[ipsd] Cross-compiling stargazer-ipsd (ARM64)..."
+	@# Dùng musl nếu có, ngược lại dùng aarch64-linux-gnu-gcc (đủ cho QEMU test)
+	$(eval IPSD_CC := $(shell \
+	    if [ -x "$(MUSL_CC)" ]; then echo "$(MUSL_CC) -static"; \
+	    elif command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then \
+	        echo "aarch64-linux-gnu-gcc"; \
+	    else echo ""; fi))
+	@if [ -z "$(IPSD_CC)" ]; then \
+	    echo "ERROR: no ARM64 cross-compiler found"; \
+	    echo "Run: make musl-toolchain   OR   sudo apt install gcc-aarch64-linux-gnu"; \
+	    exit 1; fi
+	$(IPSD_CC) -O2 -Wall -std=c11 \
+	    -I$(IPSD_DIR) \
+	    $(IPSD_SRCS) \
+	    -lpthread -lm \
+	    -o $(IPSD_BIN)
+	@echo "[ipsd] Built: $(IPSD_BIN)"
+
+test-build: modules busybox dash iptables logind mgmtd cli webd tools uboot ipsd
 	@echo "Building test initramfs..."
 	@mkdir -p $(BUILD_DIR)/test
 
@@ -1072,6 +1105,20 @@ test-build: modules busybox dash iptables logind mgmtd cli webd tools uboot
 
 	# Create stargazer config directory (mgmtd seeds defaults on first boot)
 	@mkdir -p $(BUILD_DIR)/test/initramfs/etc/stargazer
+
+	# Install IPS daemon + default rules
+	cp $(IPSD_BIN) $(BUILD_DIR)/test/initramfs/sbin/stargazer-ipsd
+	@chmod +x $(BUILD_DIR)/test/initramfs/sbin/stargazer-ipsd
+	@mkdir -p $(BUILD_DIR)/test/initramfs/etc/stargazer/ips/rules
+	@if [ -f $(IPSD_DIR)/rules/emerging-scan.rules ]; then \
+		cp $(IPSD_DIR)/rules/emerging-scan.rules \
+		   $(BUILD_DIR)/test/initramfs/etc/stargazer/ips/rules/; \
+	fi
+	@# "active.rules" = symlink tới bộ rule mặc định
+	@ln -sf emerging-scan.rules \
+	    $(BUILD_DIR)/test/initramfs/etc/stargazer/ips/rules/active.rules 2>/dev/null || true
+	@mkdir -p $(BUILD_DIR)/test/initramfs/etc/stargazer/logs
+	@echo "[ipsd] IPS daemon + rules installed in initramfs"
 
 	# Pack initramfs
 	cd $(BUILD_DIR)/test/initramfs && find . | sort | cpio -o -H newc 2>/dev/null | gzip -n -9 > $(BUILD_DIR)/test/initramfs.gz

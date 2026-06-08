@@ -1160,6 +1160,67 @@ static int cmd_diag_fw_ipset(const char *args, const char *permissions)
 	return 0;
 }
 
+static int cmd_diag_ips_status(const char *args, const char *permissions)
+{
+	(void)args; (void)permissions;
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_IPS_STATUS, "", &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+	if (resp.status != SG_OK) {
+		print_ipc_error("Failed", &resp);
+	} else if (resp.payload && resp.payload_len > 0) {
+		printf("%s", resp.payload);
+	}
+	ipc_resp_free(&resp);
+	return 0;
+}
+
+static int cmd_diag_ips_alerts(const char *args, const char *permissions)
+{
+	(void)permissions;
+	char payload[64] = "";
+	if (args && args[0])
+		snprintf(payload, sizeof(payload), "lines=%s\n", args);
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_IPS_ALERTS, payload, &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+	if (resp.status != SG_OK)
+		print_ipc_error("Failed", &resp);
+	else if (resp.payload && resp.payload_len > 0)
+		printf("%s", resp.payload);
+	ipc_resp_free(&resp);
+	return 0;
+}
+
+static int cmd_ssl_cacert(const char *args, const char *permissions)
+{
+	(void)args;
+	(void)permissions;
+
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_SSL_CACERT, "", &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+	if (resp.status != SG_OK) {
+		print_ipc_error("Failed", &resp);
+		ipc_resp_free(&resp);
+		return 0;
+	}
+	/* In nguyên PEM ra stdout — admin copy/scp về cài vào client trust store */
+	if (resp.payload && resp.payload_len > 0)
+		printf("%s", resp.payload);
+	ipc_resp_free(&resp);
+	return 0;
+}
+
 static int cmd_diag_fw_conntrack(const char *args, const char *permissions)
 {
 	(void)args;

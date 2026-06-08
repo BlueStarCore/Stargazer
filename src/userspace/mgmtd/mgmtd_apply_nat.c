@@ -209,6 +209,11 @@ sg_status_t rebuild_nat_chains(char *result, size_t rsize)
 		free(list);
 	}
 
+	/* SSL inspection: REDIRECT forwarded HTTPS into stargazer-ssld.
+	 * Emitted into the same *nat restore so the table stays atomic.
+	 * No-op if security_ssl-inspection is absent/disabled. */
+	emit_ssl_steering(&buf);
+
 	dbuf_append(&buf, "COMMIT\n", 7);
 
 	/* Flush both NAT chains.  During this window, no NAT translation

@@ -34,6 +34,8 @@ static const sg_type_info_t type_table[] = {
 	{ "firewall_policy",        CFG_TABLE,  "configure", "Configure firewall policies"         },
 	{ "firewall_address",       CFG_TABLE,  "configure", "Configure address objects"           },
 	{ "firewall_service",       CFG_TABLE,  "configure", "Configure service objects"           },
+	{ "security_ips",           CFG_SINGLE, "configure", "Configure IPS (signature + ML inspection)" },
+	{ "security_ssl-inspection",CFG_SINGLE, "configure", "Configure SSL/TLS inspection (MITM)" },
 	{ "system_password-policy", CFG_SINGLE, "admin",     "Configure global password policy"    },
 	{ "system_admin-profile",   CFG_TABLE,  "admin",     "Configure admin permission profiles" },
 	{ "system_admin",           CFG_TABLE,  "admin",     "Configure admin accounts"            },
@@ -78,6 +80,21 @@ static const struct field_entry field_table[] = {
 	{ "network_nat", "mapped-port", "uint:1:65535",          1, NULL,     "Translated port", 0 },
 	{ "network_nat", "status",      "enum:enable,disable",   0, "enable", "Enable or disable this rule", 0 },
 	{ "network_nat", "sequence",    "uint:1:9999",           1, NULL,     "Priority (higher = checked first)", 0 },
+
+	/* security_ips (CFG_SINGLE) — IPS signature/ML inspection.
+	 * Off by default; when on, mgmtd đẩy gói NEW lên stargazer-ipsd qua NFQUEUE. */
+	{ "security_ips", "status",     "enum:enable,disable", 0, "disable", "Enable IPS inspection", 0 },
+	{ "security_ips", "mode",       "enum:detect,prevent", 0, "prevent", "detect = chỉ alert; prevent = chặn", 0 },
+	{ "security_ips", "queue-num",  "uint:0:65535",        0, "0",       "NFQUEUE number nối với ipsd", 0 },
+	{ "security_ips", "snapshot-n", "uint:1:64",           0, "8",       "Số gói đầu mỗi flow đưa vào NFQUEUE để inspect (connbytes)", 0 },
+
+	/* security_ssl-inspection (CFG_SINGLE) — MITM TLS inspection steering.
+	 * Off by default; steers forwarded HTTPS into stargazer-ssld. */
+	{ "security_ssl-inspection", "status",      "enum:enable,disable",               0, "disable", "Enable SSL/TLS inspection", 0 },
+	{ "security_ssl-inspection", "srcintf",     "ref-iface-or:system_interface:any", 1, NULL,      "Internal interface to inspect (LAN)", 0 },
+	{ "security_ssl-inspection", "ports",       "string",                            0, "443",     "TCP dest ports to inspect (e.g. 443 or 443,8443)", 0 },
+	{ "security_ssl-inspection", "listen-port", "uint:1:65535",                      0, "8443",    "stargazer-ssld proxy listen port", 0 },
+	{ "security_ssl-inspection", "no-sni",      "enum:bump,splice",                  0, "bump",    "Action for TLS flows without SNI", 0 },
 
 	/* system_interface */
 	{ "system_interface", "mode",        "enum:static,dhcp", 0, "static", "Addressing mode", 0 },
@@ -137,6 +154,9 @@ static const struct field_entry field_table[] = {
 	{ "firewall_policy", "comment",  "string",                          1, NULL,     "Optional description", 0 },
 	{ "firewall_policy", "sequence", "uint:1:9999",                     1, NULL,     "Priority (higher = checked first)", 0 },
 	{ "firewall_policy", "cmkid",    "uint:1:16777215",                 1, NULL,     "Connmark id stamped on permitted flows (internal)", SG_FLD_HIDDEN },
+	/* ips-profile: chỉ có nghĩa khi action=accept; validation bắt lỗi nếu
+	 * đặt trên policy deny/drop (giống FortiGate — DENY không cần inspect L7). */
+	{ "firewall_policy", "ips-profile", "enum:none,default",           0, "none",   "IPS security profile (accept-only policies)", 0 },
 
 	/* firewall_address
 	 * subnet/fqdn are registry-optional: which one is required depends on

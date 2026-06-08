@@ -141,6 +141,12 @@ int handle_diag_ram(int client_fd, const char *user,
 		    const char *payload, const sg_request_hdr_t *hdr);
 int handle_diag_disk(int client_fd, const char *user,
 		     const char *payload, const sg_request_hdr_t *hdr);
+int handle_ssl_cacert(int client_fd, const char *user,
+		      const char *payload, const sg_request_hdr_t *hdr);
+int handle_ips_status(int client_fd, const char *user,
+		      const char *payload, const sg_request_hdr_t *hdr);
+int handle_ips_alerts(int client_fd, const char *user,
+		      const char *payload, const sg_request_hdr_t *hdr);
 int handle_diag_iface_stats(int client_fd, const char *user,
 			    const char *payload, const sg_request_hdr_t *hdr);
 int handle_diag_proctop(int client_fd, const char *user,

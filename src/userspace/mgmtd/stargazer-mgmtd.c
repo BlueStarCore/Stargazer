@@ -2398,7 +2398,8 @@ static int read_sysfs_int(const char *path)
 	if (!f)
 		return -1;
 	int val = -1;
-	fscanf(f, "%d", &val);
+	if (fscanf(f, "%d", &val) != 1)
+		val = -1;
 	fclose(f);
 	return val;
 }
@@ -4978,12 +4979,22 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		 * must be in the DB before we can generate the chain.
 		 * If rebuild fails, we rollback the DB change. */
 		if (strcmp(db_type, "firewall_policy") == 0 ||
-		    strcmp(db_type, "network_nat") == 0) {
+		    strcmp(db_type, "network_nat") == 0 ||
+		    strcmp(db_type, "security_ssl-inspection") == 0 ||
+		    strcmp(db_type, "security_ips") == 0) {
 			/* Validate fields without touching the kernel */
 			char val_result[512];
 			sg_status_t val_rc;
 			if (strcmp(db_type, "firewall_policy") == 0)
 				val_rc = validate_firewall_policy(
+					db_id, clean,
+					val_result, sizeof(val_result));
+			else if (strcmp(db_type, "security_ssl-inspection") == 0)
+				val_rc = validate_ssl_inspection(
+					db_id, clean,
+					val_result, sizeof(val_result));
+			else if (strcmp(db_type, "security_ips") == 0)
+				val_rc = validate_ips(
 					db_id, clean,
 					val_result, sizeof(val_result));
 			else
@@ -5006,10 +5017,13 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 				return 0;
 			}
 
-			/* Atomic rebuild from DB */
+			/* Atomic rebuild from DB. SSL-inspection steering lives in
+			 * the *nat table (emit_ssl_steering inside rebuild_nat_chains),
+			 * so it rebuilds the NAT chains like network_nat does. */
 			char rb_result[512];
 			sg_status_t rb_rc;
-			if (strcmp(db_type, "firewall_policy") == 0)
+			if (strcmp(db_type, "firewall_policy") == 0 ||
+			    strcmp(db_type, "security_ips") == 0)
 				rb_rc = rebuild_forward_chain(
 					rb_result, sizeof(rb_result));
 			else
@@ -6116,6 +6130,15 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		return handle_diag_ram(client_fd, user, payload, hdr);
 	case SG_CMD_DIAG_DISK:
 		return handle_diag_disk(client_fd, user, payload, hdr);
+
+	case SG_CMD_SSL_CACERT:
+		return handle_ssl_cacert(client_fd, user, payload, hdr);
+
+	case SG_CMD_IPS_STATUS:
+		return handle_ips_status(client_fd, user, payload, hdr);
+
+	case SG_CMD_IPS_ALERTS:
+		return handle_ips_alerts(client_fd, user, payload, hdr);
 	case SG_CMD_DIAG_IFACE_STATS:
 		return handle_diag_iface_stats(client_fd, user, payload, hdr);
 	case SG_CMD_DIAG_PROCTOP:

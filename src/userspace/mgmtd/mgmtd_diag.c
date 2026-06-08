@@ -365,6 +365,127 @@ int handle_diag_disk(int client_fd, const char *user,
 	return 0;
 }
 
+/* ── SG_CMD_SSL_CACERT (683) ───────────────────────────────────────────── */
+
+/*
+ * Trả nội dung CA cert (PEM) cho client tải về cài vào trust store. Chỉ trả
+ * CERT công khai — KHÔNG bao giờ trả private key. CA do stargazer-ssld sinh
+ * ở /etc/stargazer/ssl/ca-cert.pem khi SSL inspection lần đầu bật.
+ */
+int handle_ssl_cacert(int client_fd, const char *user,
+		      const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)payload; (void)hdr;
+
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "configure")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "configure permission required");
+		return 0;
+	}
+
+	char pem[8192];
+	ssize_t n = read_small_file("/etc/stargazer/ssl/ca-cert.pem",
+				    pem, sizeof(pem));
+	if (n <= 0) {
+		send_error(client_fd, SG_ERR_ENTRY_NOT_FOUND,
+			   "CA chưa tồn tại — bật SSL inspection để tạo "
+			   "(config security ssl-inspection / set status enable)");
+		return 0;
+	}
+	send_ok(client_fd, NULL, pem);
+	return 0;
+}
+
+/* ── SG_CMD_IPS_STATUS (684) ───────────────────────────────────────────── */
+
+int handle_ips_status(int client_fd, const char *user,
+		      const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)payload; (void)hdr;
+
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED, "monitor required");
+		return 0;
+	}
+
+	char resp[1024];
+	size_t pos = 0;
+	int n;
+
+	/* Đọc config từ DB */
+	char *status = sg_db_get_val("security_ips", "0", "status");
+	char *mode   = sg_db_get_val("security_ips", "0", "mode");
+	char *snap   = sg_db_get_val("security_ips", "0", "snapshot-n");
+	n = snprintf(resp + pos, sizeof(resp) - pos,
+		     "status=%s\nmode=%s\nsnapshot_n=%s\n",
+		     status ? status : "disable",
+		     mode   ? mode   : "prevent",
+		     snap   ? snap   : "8");
+	free(status); free(mode); free(snap);
+	if (n > 0) pos += (size_t)n;
+
+	/* Kiểm tra ipsd có đang chạy không qua pidof */
+	const char *chk[] = {"pidof", "stargazer-ipsd", NULL};
+	char *pidout = safe_exec(chk);
+	int running = (pidout && pidout[0] >= '1' && pidout[0] <= '9');
+	n = snprintf(resp + pos, sizeof(resp) - pos,
+		     "ipsd_running=%s\n",
+		     running ? "yes" : "no");
+	free(pidout);
+	if (n > 0) pos += (size_t)n;
+
+	/* Số dòng alert log */
+	const char *wc[] = {"wc", "-l",
+			    "/etc/stargazer/logs/ips-alert.log", NULL};
+	char *lines = safe_exec(wc);
+	n = snprintf(resp + pos, sizeof(resp) - pos,
+		     "alert_log_lines=%s",
+		     lines ? lines : "0");
+	free(lines);
+	if (n > 0) pos += (size_t)n;
+
+	send_ok(client_fd, NULL, resp);
+	return 0;
+}
+
+/* ── SG_CMD_IPS_ALERTS (685) ───────────────────────────────────────────── */
+
+int handle_ips_alerts(int client_fd, const char *user,
+		      const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)hdr;
+
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED, "monitor required");
+		return 0;
+	}
+
+	/* Số dòng muốn xem — mặc định 20 */
+	char nlines_s[16] = "20";
+	if (payload && payload[0])
+		extract_val(payload, "lines", nlines_s, sizeof(nlines_s));
+	int nlines = atoi(nlines_s);
+	if (nlines < 1 || nlines > 1000) nlines = 20;
+	char nlarg[16];
+	snprintf(nlarg, sizeof(nlarg), "%d", nlines);
+
+	const char *tail[] = {"tail", "-n", nlarg,
+			      "/etc/stargazer/logs/ips-alert.log", NULL};
+	char *out = safe_exec(tail);
+	if (!out || !out[0]) {
+		send_ok(client_fd, NULL,
+			"(ips-alert.log trống hoặc chưa có alert nào)\n");
+		free(out);
+		return 0;
+	}
+	send_ok(client_fd, NULL, out);
+	free(out);
+	return 0;
+}
+
 /* ── SG_CMD_DIAG_IFACE_STATS (643) ────────────────────────────────────── */
 
 int handle_diag_iface_stats(int client_fd, const char *user,

@@ -1,0 +1,4 @@
+build/
+# ruleset ET OPEN tải về (third-party, regenerate bằng `make rules-fetch`).
+# Giữ trên đĩa qua reboot nhưng không commit vào repo.
+rules/emerging-*.rules

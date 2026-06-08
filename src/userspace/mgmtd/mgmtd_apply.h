@@ -19,6 +19,8 @@
 #include <stdint.h>
 #include <sys/types.h>
 
+struct dynbuf;   /* mgmtd_dynbuf.h — fwd decl for emit_ssl_steering() */
+
 /* ── Shared constants ───────────────────────────────────────────────────── */
 
 #define VALBUFSZ 128
@@ -148,6 +150,20 @@ sg_status_t validate_firewall_policy(const char *id, const char *data,
 				     char *result, size_t rsize);
 sg_status_t validate_nat(const char *id, const char *data,
 			 char *result, size_t rsize);
+sg_status_t validate_ssl_inspection(const char *id, const char *data,
+				    char *result, size_t rsize);
+sg_status_t validate_ips(const char *id, const char *data,
+			 char *result, size_t rsize);
+
+/* ── SSL-inspection steering (mgmtd_apply_ssl.c) ────────────────────────── */
+/*
+ * Append the TLS REDIRECT rule(s) into a *nat restore buffer (PREROUTING),
+ * steering forwarded HTTPS into stargazer-ssld. Called from rebuild_nat_chains
+ * so the whole *nat table stays one atomic restore. No-op (returns 0) if the
+ * security_ssl-inspection config row is absent or disabled. Returns the number
+ * of rules emitted, or -1 on a sanitization failure (caller still proceeds —
+ * fail-safe = no steering, normal traffic). */
+int emit_ssl_steering(struct dynbuf *buf);
 
 /* ── Per-feature apply handlers ─────────────────────────────────────────── */
 

@@ -39,6 +39,10 @@ X("execute system shutdown",                "Shut down the system",             
 X("execute system reboot",                  "Reboot the system",                       "admin",           0,  cmd_sys_reboot)
 X("execute system factory-reboot",         "Factory reset and reboot",                "admin",           0,  cmd_sys_factory_reboot)
 X("execute system factory-shutdown",       "Factory reset and shutdown",              "admin",           0,  cmd_sys_factory_shutdown)
+X("execute system ssl-ca-cert",             "Print SSL-inspection CA cert (PEM) to install on clients", "configure,admin", 0, cmd_ssl_cacert)
+X("execute diagnose ips",                   "IPS engine diagnostics",                                   "admin",           0, NULL)
+X("execute diagnose ips status",            "IPS daemon status and configuration",                      "admin",           0, cmd_diag_ips_status)
+X("execute diagnose ips alerts",            "Show recent IPS alert log entries",                        "admin",           1, cmd_diag_ips_alerts)
 
 X("execute firmware",                       "Firmware management",                     "admin",           0,  NULL)
 X("execute firmware upgrade",               "Upgrade firmware from URL",               "admin",           1,  cmd_fw_upgrade)
