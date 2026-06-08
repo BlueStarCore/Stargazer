@@ -58,6 +58,6 @@ exec qemu-system-aarch64 \
     -drive file="$LOGS_IMG",format=raw,if=virtio \
     -nographic \
     -netdev tap,id=wan,ifname=tap-sg-wan,script=no,downscript=no \
-    -device virtio-net-pci,netdev=wan,mac=52:54:00:12:01:02 \
+    -device virtio-net-device,netdev=wan,mac=52:54:00:12:01:02 \
     -netdev tap,id=lan,ifname=tap-sg-lan,script=no,downscript=no \
-    -device virtio-net-pci,netdev=lan,mac=52:54:00:12:02:fe
+    -device virtio-net-device,netdev=lan,mac=52:54:00:12:02:fe
