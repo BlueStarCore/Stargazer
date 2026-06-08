@@ -1217,12 +1217,20 @@ static void flow_res_disk(work_item_t *item)
 	}
 
 	unsigned long blocks = 0, bavail = 0, frsize = 0;
+	unsigned long lblocks = 0, lbavail = 0, lfrsize = 0;
+	int logs_present = 0;
 	unsigned long long emmc_bytes = 0;
 	if (resp.payload) {
 		const char *p;
 		if ((p = strstr(resp.payload, "sgdata_blocks=")) != NULL) blocks = strtoul(p + 14, NULL, 10);
 		if ((p = strstr(resp.payload, "sgdata_bavail=")) != NULL) bavail = strtoul(p + 14, NULL, 10);
 		if ((p = strstr(resp.payload, "sgdata_frsize=")) != NULL) frsize = strtoul(p + 14, NULL, 10);
+		/* sglogs_* is only emitted when /etc/stargazer/logs is a distinct
+		 * mount (the large eMMC partition sg-partinit grows on first boot);
+		 * absent on dev hosts / before partinit. */
+		if ((p = strstr(resp.payload, "sglogs_blocks=")) != NULL) { lblocks = strtoul(p + 14, NULL, 10); logs_present = 1; }
+		if ((p = strstr(resp.payload, "sglogs_bavail=")) != NULL) lbavail = strtoul(p + 14, NULL, 10);
+		if ((p = strstr(resp.payload, "sglogs_frsize=")) != NULL) lfrsize = strtoul(p + 14, NULL, 10);
 		if ((p = strstr(resp.payload, "emmc_bytes=")) != NULL)    emmc_bytes = strtoull(p + 11, NULL, 10);
 	}
 	webd_ipc_resp_free(&resp);
@@ -1230,14 +1238,20 @@ static void flow_res_disk(work_item_t *item)
 	unsigned long total_mb = blocks * frsize / (1024 * 1024);
 	unsigned long free_mb = bavail * frsize / (1024 * 1024);
 	unsigned long used_mb = total_mb - free_mb;
+	unsigned long logs_total_mb = lblocks * lfrsize / (1024 * 1024);
+	unsigned long logs_free_mb = lbavail * lfrsize / (1024 * 1024);
+	unsigned long logs_used_mb = logs_total_mb - logs_free_mb;
 	unsigned long emmc_mb = (unsigned long)(emmc_bytes / (1024 * 1024));
 
-	char *json = malloc(256);
+	char *json = malloc(320);
 	if (json)
-		snprintf(json, 256,
+		snprintf(json, 320,
 			 "{\"total_mb\":%lu,\"used_mb\":%lu,\"free_mb\":%lu,"
-			 "\"emmc_mb\":%lu}",
-			 total_mb, used_mb, free_mb, emmc_mb);
+			 "\"emmc_mb\":%lu,\"logs_present\":%d,"
+			 "\"logs_total_mb\":%lu,\"logs_used_mb\":%lu,"
+			 "\"logs_free_mb\":%lu}",
+			 total_mb, used_mb, free_mb, emmc_mb, logs_present,
+			 logs_total_mb, logs_used_mb, logs_free_mb);
 	send_result(item->conn_id, 200, json, json ? strlen(json) : 0);
 }
 
@@ -1258,7 +1272,9 @@ static void flow_res_proctop(work_item_t *item)
 
 	/* Parse uptime and process list from kv response.
 	 * Format: uptime=X\nloadavg=X\nmem_total_kb=X\nmem_avail_kb=X\n
-	 *         proc PID COMM STATE UTIME STIME VSIZE RSS_KB\n... */
+	 *         proc=PID COMM STATE UTIME STIME VSIZE RSS_KB\n...
+	 * (process rows use the kv "proc=" prefix, matching mgmtd's
+	 *  handle_diag_proctop emitter — see mgmtd_diag.c). */
 	char uptime[64] = "0";
 	long mem_total_kb = 0, mem_avail_kb = 0;
 
@@ -1311,8 +1327,8 @@ static void flow_res_proctop(work_item_t *item)
 			const char *nl = strchr(line, '\n');
 			size_t llen = nl ? (size_t)(nl - line) : strlen(line);
 
-			if (llen > 5 && strncmp(line, "proc ", 5) == 0) {
-				/* proc PID COMM STATE UTIME STIME VSIZE RSS_KB */
+			if (llen > 5 && strncmp(line, "proc=", 5) == 0) {
+				/* proc=PID COMM STATE UTIME STIME VSIZE RSS_KB */
 				int pid = 0;
 				char comm[64] = "", st = '?';
 				unsigned long ut = 0, stm = 0, vsz = 0;
@@ -1342,6 +1358,126 @@ static void flow_res_proctop(work_item_t *item)
 	J_APP("\0", 1);
 
 pt_done:
+	webd_ipc_resp_free(&resp);
+#undef J_APP
+
+	if (json)
+		send_result(item->conn_id, 200, json, len > 0 ? len - 1 : 0);
+	else {
+		char *j = json_error("Out of memory", NULL);
+		send_result(item->conn_id, 500, j, j ? strlen(j) : 0);
+	}
+}
+
+/* GET /api/system/resources/percore — per-core jiffies, frequency, die temp.
+ *
+ * The mgmtd DIAG_CPU reply already carries the per-cpu /proc/stat lines
+ * (cpu0..cpuN) plus per-core cpufreq<N>= and thermal_zone0=. We forward
+ * the raw busy/total jiffie counters so the browser can compute an
+ * instantaneous per-core utilisation from the delta between polls, rather
+ * than a flat since-boot average. */
+static void flow_res_percore(work_item_t *item)
+{
+	webd_ipc_response_t resp;
+	if (webd_ipc_send(SG_CMD_DIAG_CPU, item->username,
+			  item->session_tag, "", &resp) != 0) {
+		char *json = json_error("Backend unavailable", NULL);
+		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
+		return;
+	}
+	if (resp.status != SG_OK) {
+		send_ipc_error(item->conn_id, resp.status, resp.extra);
+		webd_ipc_resp_free(&resp);
+		return;
+	}
+
+	/* Per-core current frequency (kHz), indexed by core number. */
+	long freq_khz[64];
+	for (int i = 0; i < 64; i++)
+		freq_khz[i] = 0;
+	/* SoC die temperature (m°C → °C); the A73 cluster shares one sensor. */
+	int temp_c = 0;
+
+	if (resp.payload) {
+		const char *p;
+		for (int i = 0; i < 64; i++) {
+			char key[16];
+			int kn = snprintf(key, sizeof(key), "cpufreq%d=", i);
+			if (kn > 0 && (p = strstr(resp.payload, key)) != NULL)
+				freq_khz[i] = atol(p + kn);
+		}
+		if ((p = strstr(resp.payload, "thermal_zone0=")) != NULL)
+			temp_c = atoi(p + 14) / 1000;
+	}
+
+	size_t cap = 4096, len = 0;
+	char *json = malloc(cap);
+	if (!json) {
+		webd_ipc_resp_free(&resp);
+		char *j = json_error("Out of memory", NULL);
+		send_result(item->conn_id, 500, j, j ? strlen(j) : 0);
+		return;
+	}
+
+#define J_APP(s, n) do { \
+	while (len + (n) >= cap) { \
+		cap *= 2; \
+		char *tmp = realloc(json, cap); \
+		if (!tmp) { free(json); json = NULL; goto pc_done; } \
+		json = tmp; \
+	} \
+	memcpy(json + len, (s), (n)); \
+	len += (n); \
+} while (0)
+
+	char hdr[64];
+	int hn = snprintf(hdr, sizeof(hdr),
+			  "{\"temp_c\":%d,\"cores\":[", temp_c);
+	if (hn > 0) J_APP(hdr, (size_t)hn < sizeof(hdr) ? (size_t)hn : sizeof(hdr) - 1);
+
+	int first = 1;
+	if (resp.payload) {
+		const char *line = resp.payload;
+		while (*line) {
+			const char *nl = strchr(line, '\n');
+			size_t llen = nl ? (size_t)(nl - line) : strlen(line);
+
+			/* Per-core line: "cpu<N> user nice system idle ..."
+			 * (skip the aggregate "cpu " line — no digit). */
+			if (llen > 3 && strncmp(line, "cpu", 3) == 0 &&
+			    isdigit((unsigned char)line[3])) {
+				int core = atoi(line + 3);
+				const char *f = line + 3;
+				while (*f && *f != ' ') f++;   /* past cpuN */
+				unsigned long u=0, n=0, s=0, idle=0, w=0,
+					      irq=0, sirq=0, steal=0;
+				sscanf(f, "%lu %lu %lu %lu %lu %lu %lu %lu",
+				       &u, &n, &s, &idle, &w, &irq, &sirq, &steal);
+				unsigned long total = u+n+s+idle+w+irq+sirq+steal;
+				unsigned long busy  = total - idle - w;
+
+				long fk = (core >= 0 && core < 64)
+					? freq_khz[core] : 0;
+				char frag[160];
+				int fn = snprintf(frag, sizeof(frag),
+					"%s{\"core\":%d,\"busy\":%lu,"
+					"\"total\":%lu,\"freq_mhz\":%ld,"
+					"\"temp_c\":%d}",
+					first ? "" : ",",
+					core, busy, total,
+					fk / 1000, temp_c);
+				if (fn > 0) J_APP(frag, (size_t)fn < sizeof(frag) ? (size_t)fn : sizeof(frag) - 1);
+				first = 0;
+			}
+
+			line = nl ? nl + 1 : line + llen;
+		}
+	}
+
+	J_APP("]}", 2);
+	J_APP("\0", 1);
+
+pc_done:
 	webd_ipc_resp_free(&resp);
 #undef J_APP
 
@@ -1957,6 +2093,7 @@ static void *worker_fn(void *arg)
 		case FLOW_RES_RAM:      flow_res_ram(&item);         break;
 		case FLOW_RES_DISK:     flow_res_disk(&item);        break;
 		case FLOW_RES_PROCTOP:  flow_res_proctop(&item);     break;
+		case FLOW_RES_PERCORE:  flow_res_percore(&item);     break;
 		case FLOW_ADMIN_CREATE: flow_admin_create(&item);    break;
 		case FLOW_CONFIG_MOVE:    flow_simple(&item);           break;
 		case FLOW_IFACE_LIVE:     flow_iface_live(&item);      break;

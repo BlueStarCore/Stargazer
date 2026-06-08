@@ -907,7 +907,7 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 	/* ── /api/system/... ─────────────────────────────────────────── */
 	if (strcmp(segs[0], "system") == 0 && nseg >= 2) {
 
-		/* GET /api/system/resources[/detail|ram|disk|proctop] */
+		/* GET /api/system/resources[/detail|ram|disk|proctop|percore] */
 		if (strcmp(segs[1], "resources") == 0 &&
 		    mg_str_eq(hm->method, "GET")) {
 			int flow = FLOW_RESOURCES;
@@ -920,6 +920,8 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 					flow = FLOW_RES_DISK;
 				else if (strcmp(segs[2], "proctop") == 0)
 					flow = FLOW_RES_PROCTOP;
+				else if (strcmp(segs[2], "percore") == 0)
+					flow = FLOW_RES_PERCORE;
 			}
 
 			work_item_t item;

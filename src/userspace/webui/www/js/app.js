@@ -779,6 +779,30 @@
         setText('disk-total',     d.total_mb + ' MB');
         setText('disk-used',      d.used_mb  + ' MB');
         setText('disk-free',      d.free_mb  + ' MB');
+
+        /* The DATA partition is intentionally small (~512 MiB); the bulk of
+         * the eMMC is the LOGS partition (sg-partinit grows it to fill the
+         * disk on first boot). Surface it so the eMMC size is accounted for. */
+        var logsCard = setEl('disk-logs-card');
+        if (d.logs_present) {
+            if (logsCard) logsCard.style.display = '';
+            setText('disk-logs-total', d.logs_total_mb + ' MB');
+            setText('disk-logs-used',  d.logs_used_mb  + ' MB');
+            setText('disk-logs-free',  d.logs_free_mb  + ' MB');
+            var bar = setEl('disk-logs-bar');
+            if (bar) {
+                var pct = d.logs_total_mb > 0
+                    ? Math.round(d.logs_used_mb / d.logs_total_mb * 100) : 0;
+                bar.style.width = pct + '%';
+            }
+        } else if (logsCard) {
+            logsCard.style.display = 'none';
+        }
+
+        /* Allocated = data + logs (+ small system partitions are not measured
+         * here). Shown against eMMC size so the difference is explained. */
+        var alloc = (d.total_mb || 0) + (d.logs_present ? (d.logs_total_mb || 0) : 0);
+        setText('disk-emmc-alloc', alloc + ' MB of ' + d.emmc_mb + ' MB partitioned');
     }
 
     /* Format uptime seconds → "1d 2h 3m 4s" */
@@ -801,22 +825,131 @@
         return tr;
     }
 
+    /* Top-processes table state: the full RSS-sorted list lives here so the
+     * search filter and pager operate on the data array (not on DOM rows that
+     * the 5s poll rebuilds). The page index survives polls — only a search or
+     * page-size change resets it to the first page. */
+    var procData = [];
+    var proctopState = { page: 0, pageSize: 10, search: '' };
+
     function renderProcTop(d) {
         if (d.uptime) setText('res-uptime', fmtUptime(parseFloat(d.uptime)));
 
-        var tbody = setEl('proctop-tbody');
-        if (!tbody || !d.procs) return;
-
-        var sorted = d.procs.slice().sort(function (a, b) {
+        if (!d.procs) return;
+        procData = d.procs.slice().sort(function (a, b) {
             return b.rss_kb - a.rss_kb;
         });
+        renderProcTopRows();
+    }
+
+    function renderProcTopRows() {
+        var tbody = setEl('proctop-tbody');
+        if (!tbody) return;
+
+        var filtered = procData;
+        if (proctopState.search) {
+            var q = proctopState.search.toLowerCase();
+            filtered = filtered.filter(function (p) {
+                return String(p.name || '').toLowerCase().indexOf(q) !== -1 ||
+                       String(p.pid).indexOf(q) !== -1 ||
+                       String(p.state || '').toLowerCase().indexOf(q) !== -1;
+            });
+        }
+
+        var total = filtered.length;
+        var totalPages = Math.max(1, Math.ceil(total / proctopState.pageSize));
+        if (proctopState.page >= totalPages) proctopState.page = totalPages - 1;
+        if (proctopState.page < 0) proctopState.page = 0;
+
+        var start = proctopState.page * proctopState.pageSize;
+        var end = Math.min(start + proctopState.pageSize, total);
+        var pageRows = filtered.slice(start, end);
+
         tbody.innerHTML = '';
-        if (sorted.length === 0) {
+        if (pageRows.length === 0) {
+            tbody.appendChild(buildEmptyRow(5));
+        } else {
+            var frag = document.createDocumentFragment();
+            pageRows.forEach(function (p) { frag.appendChild(proctopRowEl(p)); });
+            tbody.appendChild(frag);
+        }
+
+        var info = setEl('proctop-pager-info');
+        var pageNum = setEl('proctop-page-num');
+        var prevBtn = setEl('proctop-prev');
+        var nextBtn = setEl('proctop-next');
+        if (info) info.textContent = total === 0 ? 'No processes' :
+            'Showing ' + (start + 1) + '–' + end + ' of ' + total;
+        if (pageNum) pageNum.textContent = (proctopState.page + 1) + ' / ' + totalPages;
+        if (prevBtn) prevBtn.disabled = proctopState.page === 0;
+        if (nextBtn) nextBtn.disabled = proctopState.page >= totalPages - 1;
+    }
+
+    /* Bind top-processes pager + search controls */
+    (function () {
+        var prev = document.getElementById('proctop-prev');
+        var next = document.getElementById('proctop-next');
+        var size = document.getElementById('proctop-page-size');
+        var search = document.getElementById('proctop-search');
+        if (prev) prev.addEventListener('click', function () {
+            if (proctopState.page > 0) { proctopState.page--; renderProcTopRows(); }
+        });
+        if (next) next.addEventListener('click', function () {
+            proctopState.page++;
+            renderProcTopRows();
+        });
+        if (size) size.addEventListener('change', function () {
+            proctopState.pageSize = parseInt(this.value, 10) || 10;
+            proctopState.page = 0;
+            renderProcTopRows();
+        });
+        if (search) search.addEventListener('input', debounce(function () {
+            proctopState.search = search.value;
+            proctopState.page = 0;
+            renderProcTopRows();
+        }, 150));
+    })();
+
+    /* Per-core utilisation is a rate, so it needs the delta between two
+     * polls — remember each core's busy/total jiffie counters from the
+     * previous fetch.  The first poll has no baseline, so usage shows
+     * "—" until the second poll arrives. */
+    var lastCoreJiffies = {};
+
+    function percoreRowEl(c, pct) {
+        var tr = document.createElement('tr');
+        tr.appendChild(makeTd('Core ' + c.core));
+        tr.appendChild(makeTd(c.freq_mhz > 0 ? c.freq_mhz + ' MHz' : '—'));
+        tr.appendChild(makeTd(pct == null ? '—' : pct.toFixed(2) + '%'));
+        tr.appendChild(makeTd(c.temp_c > 0 ? c.temp_c + '°C' : '—'));
+        tr.appendChild(makeTd(''));
+        return tr;
+    }
+
+    function renderPerCore(d) {
+        var tbody = setEl('percore-tbody');
+        if (!tbody || !d.cores) return;
+
+        if (d.cores.length === 0) {
+            tbody.innerHTML = '';
             tbody.appendChild(buildEmptyRow(5));
             return;
         }
+
         var frag = document.createDocumentFragment();
-        sorted.forEach(function (p) { frag.appendChild(proctopRowEl(p)); });
+        d.cores.forEach(function (c) {
+            var pct = null;
+            var prev = lastCoreJiffies[c.core];
+            if (prev) {
+                var dt = c.total - prev.total;
+                var db = c.busy - prev.busy;
+                if (dt > 0)
+                    pct = Math.max(0, Math.min(100, db / dt * 100));
+            }
+            lastCoreJiffies[c.core] = { busy: c.busy, total: c.total };
+            frag.appendChild(percoreRowEl(c, pct));
+        });
+        tbody.innerHTML = '';
         tbody.appendChild(frag);
     }
 
@@ -824,7 +957,8 @@
         var ramP  = api('/system/resources/ram').then(function (d) { if (d) renderRamDetails(d); }).catch(function () {});
         var diskP = api('/system/resources/disk').then(function (d) { if (d) renderDiskDetails(d); }).catch(function () {});
         var procP = api('/system/resources/proctop').then(function (d) { if (d) renderProcTop(d); }).catch(function () {});
-        return Promise.all([ramP, diskP, procP]);
+        var coreP = api('/system/resources/percore').then(function (d) { if (d) renderPerCore(d); }).catch(function () {});
+        return Promise.all([ramP, diskP, procP, coreP]);
     }
 
     function renderResourceGauges() {
@@ -3104,7 +3238,7 @@
     }
 
     /* Wire up all toolbar-search and widget-search inputs */
-    document.querySelectorAll('.toolbar-search input, .widget-search input:not(#iface-search):not(#rf-search)').forEach(function (input) {
+    document.querySelectorAll('.toolbar-search input, .widget-search input:not(#iface-search):not(#rf-search):not(#proctop-search)').forEach(function (input) {
         var target = findTargetTable(input);
 
         /* Typing: client-side prefill filter (debounced) */

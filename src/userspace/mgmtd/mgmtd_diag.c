@@ -116,6 +116,28 @@ int handle_diag_cpu(int client_fd, const char *user,
 		}
 	}
 
+	/* Per-core current frequency (kHz) from cpufreq, when the
+	 * governor exposes it. Emitted as cpufreq<N>=<khz>; cores
+	 * without a cpufreq node are simply omitted. */
+	for (int c = 0; c < 64; c++) {
+		char fpath[128], fbuf[32];
+		snprintf(fpath, sizeof(fpath),
+			 "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq",
+			 c);
+		if (read_small_file(fpath, fbuf, sizeof(fbuf)) <= 0) {
+			snprintf(fpath, sizeof(fpath),
+				 "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_cur_freq",
+				 c);
+			if (read_small_file(fpath, fbuf, sizeof(fbuf)) <= 0)
+				continue;
+		}
+		size_t fl = strlen(fbuf);
+		while (fl > 0 && (fbuf[fl-1] == '\n' || fbuf[fl-1] == '\r'))
+			fbuf[--fl] = '\0';
+		buf_appendf(resp, sizeof(resp), &pos,
+			    "cpufreq%d=%s\n", c, fbuf);
+	}
+
 	/* Read thermal zones with type names */
 	char path[128], tbuf[32], ttype[64];
 	for (int z = 0; z < 16; z++) {
