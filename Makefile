@@ -218,6 +218,12 @@ $(BUILD_DIR)/modules/$(MODULE_NAME).ko &: $(KERNEL_IMAGE) $(SRC_WATCH)
 		[ -f $(KERNEL_DIR)/net/netfilter/$$m ] && \
 		cp $(KERNEL_DIR)/net/netfilter/$$m $(BUILD_DIR)/modules/ || true; \
 	done
+	# Copy NFQUEUE + connbytes modules (required for IPS userspace inspection)
+	@for m in nfnetlink_queue.ko xt_NFQUEUE.ko xt_connbytes.ko; do \
+		f=$$(find $(KERNEL_DIR) -name "$$m" 2>/dev/null | head -1); \
+		[ -n "$$f" ] && cp "$$f" $(BUILD_DIR)/modules/ && \
+			echo "[modules] copied $$m" || true; \
+	done
 	# Copy af_packet.ko — only when CONFIG_PACKET=m (skip if built-in =y)
 	@[ -f $(KERNEL_DIR)/net/packet/af_packet.ko ] && \
 		cp $(KERNEL_DIR)/net/packet/af_packet.ko $(BUILD_DIR)/modules/ || true
