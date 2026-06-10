@@ -2289,6 +2289,87 @@ static void mgmtd_reconcile_config(void)
 		}
 	}
 
+	/* ── Phase 2b: seed missing built-in IPS ruleset sources ─────
+	 *
+	 * INSERT-only: never overwrites existing entries so that the user's
+	 * enabled/disabled choice survives firmware upgrades.  Runs on every
+	 * boot, so rulesets added by new firmware land even when the DB was
+	 * originally seeded by an older build (BOOT_NORMAL path). */
+	{
+#define ET_BASE "https://rules.emergingthreats.net/open/snort-2.9.0/rules/"
+		static const struct { const char *id; const char *data; } ips_rs[] = {
+			{ "et-botcc",
+			  "description=ET open/botcc (Command-and-Control)\n"
+			  "url=" ET_BASE "emerging-botcc.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "et-botcc-portgrouped",
+			  "description=ET open/botcc.portgrouped\n"
+			  "url=" ET_BASE "emerging-botcc.portgrouped.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "et-compromised",
+			  "description=ET open/compromised (Known bad hosts)\n"
+			  "url=" ET_BASE "emerging-compromised.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "et-drop",
+			  "description=ET open/drop (Spamhaus DROP list)\n"
+			  "url=" ET_BASE "emerging-drop.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "et-dshield",
+			  "description=ET open/dshield (DShield blocklist)\n"
+			  "url=" ET_BASE "emerging-dshield.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "et-exploit",
+			  "description=ET open/exploit (Exploit kits)\n"
+			  "url=" ET_BASE "emerging-exploit.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "et-dos",
+			  "description=ET open/dos (Denial-of-Service)\n"
+			  "url=" ET_BASE "emerging-dos.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "et-trojan",
+			  "description=ET open/trojan (Trojan activity)\n"
+			  "url=" ET_BASE "emerging-trojan.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "et-scan",
+			  "description=ET open/scan (Port scan detection)\n"
+			  "url=" ET_BASE "emerging-scan.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "et-policy",
+			  "description=ET open/policy (Policy violations)\n"
+			  "url=" ET_BASE "emerging-policy.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "abuse-feodo",
+			  "description=abuse.ch/Feodo Tracker (botnet C2)\n"
+			  "url=https://feodotracker.abuse.ch/downloads/feodotracker.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "abuse-sslbl",
+			  "description=abuse.ch/SSL IP Blacklist\n"
+			  "url=https://sslbl.abuse.ch/blacklist/sslipblacklist.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "abuse-urlhaus",
+			  "description=abuse.ch/URLhaus (malware distribution)\n"
+			  "url=https://urlhaus.abuse.ch/downloads/urlhaus.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ NULL, NULL }
+		};
+#undef ET_BASE
+		for (int i = 0; ips_rs[i].id; i++) {
+			char *existing = sg_db_get("security_ips-ruleset",
+						   ips_rs[i].id);
+			if (existing) { free(existing); continue; }
+			if (sg_db_set("security_ips-ruleset",
+				      ips_rs[i].id, ips_rs[i].data) == 0) {
+				mgmt_log("INFO", "reconcile: seeded ruleset %s",
+					 ips_rs[i].id);
+				changes++;
+			} else {
+				mgmt_log("ERROR",
+					 "reconcile: failed to seed ruleset %s",
+					 ips_rs[i].id);
+			}
+		}
+	}
+
 	/* ── Phase 3: backfill missing keys on existing entries ───── */
 
 	for (const sg_type_info_t *t = types; t->name; t++) {
