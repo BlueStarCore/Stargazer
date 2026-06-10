@@ -14,12 +14,14 @@
 #include "stargazer_ipc.h"
 #include "sg_validate.h"
 
+#include <errno.h>
 #include <fcntl.h>
-#include <unistd.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 /* ── Login rate limiter ──────────────────────────────────────────────── */
 
@@ -843,6 +845,13 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 		/* PATCH /api/config/{type}/{id}/move — reorder entry */
 		if (nseg >= 4 && strcmp(segs[3], "move") == 0 &&
 		    mg_str_eq(hm->method, "PATCH")) {
+			/* Validate the entry id before it reaches mgmtd, like the
+			 * GET/PUT/DELETE single-entry routes. */
+			if (!sg_is_safe_id(segs[2])) {
+				reply_json(c, 400,
+					   "{\"error\":\"Invalid id\"}");
+				return -1;
+			}
 			/* Body: {"sequence": N} */
 			char *kv_raw = json_body_to_kv(hm->body);
 			if (!kv_raw) {
@@ -899,7 +908,7 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 	/* ── /api/system/... ─────────────────────────────────────────── */
 	if (strcmp(segs[0], "system") == 0 && nseg >= 2) {
 
-		/* GET /api/system/resources[/detail|ram|disk|proctop] */
+		/* GET /api/system/resources[/detail|ram|disk|proctop|percore] */
 		if (strcmp(segs[1], "resources") == 0 &&
 		    mg_str_eq(hm->method, "GET")) {
 			int flow = FLOW_RESOURCES;
@@ -912,6 +921,8 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 					flow = FLOW_RES_DISK;
 				else if (strcmp(segs[2], "proctop") == 0)
 					flow = FLOW_RES_PROCTOP;
+				else if (strcmp(segs[2], "percore") == 0)
+					flow = FLOW_RES_PERCORE;
 			}
 
 			work_item_t item;
@@ -994,28 +1005,76 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 					return -1;
 				}
 
-				/* Write to staging file */
-				FILE *ufp = fopen("/tmp/sg-fw-upload.tar.gz", "wb");
-				if (!ufp) {
+				/* Write to a UNIQUE staging file so two concurrent
+				 * uploads cannot race on a shared path (one
+				 * client's bytes flashed under another's request).
+				 * NOT mkstemp(): it opens O_RDWR, which the webd
+				 * seccomp filter kills (only O_RDONLY/O_WRONLY are
+				 * allowed). Generate an [A-Za-z0-9] suffix — which
+				 * also satisfies mgmtd's strict path check — and
+				 * open O_WRONLY|O_CREAT|O_EXCL so creation is atomic
+				 * against collisions. */
+				static const char A36[] =
+					"abcdefghijklmnopqrstuvwxyz0123456789";
+				static unsigned long stage_seq;
+				char stage[64];
+				int sfd = -1;
+				for (int att = 0; att < 128 && sfd < 0; att++) {
+					unsigned long v =
+						(stage_seq++ + (unsigned long)att)
+							* 2654435761UL
+						^ (unsigned long)(uintptr_t)&att;
+					char suf[11];
+					for (int i = 0; i < 10; i++) {
+						suf[i] = A36[v % 36];
+						v /= 36;
+					}
+					suf[10] = '\0';
+					snprintf(stage, sizeof(stage),
+						 "/tmp/sg-fw-upload.%s", suf);
+					sfd = open(stage,
+						   O_WRONLY | O_CREAT | O_EXCL,
+						   0600);
+				}
+				if (sfd < 0) {
 					reply_json(c, 500,
 						   "{\"error\":\"Cannot create firmware staging file\"}");
 					return -1;
 				}
-				size_t wr = fwrite(part.body.buf, 1,
-						   part.body.len, ufp);
-				int uferr = ferror(ufp);
-				fclose(ufp);
-
-				if (uferr || wr != part.body.len) {
+				/* Write with raw write(2), NOT stdio: fdopen() on a
+				 * writable stream issues ioctl(TIOCGWINSZ) (musl
+				 * line-buffering probe) which the webd seccomp
+				 * filter does not allow and would KILL the worker.
+				 * The body is one contiguous buffer. */
+				const char *wbuf = part.body.buf;
+				size_t wtot = part.body.len, woff = 0;
+				int wok = 1;
+				while (woff < wtot) {
+					ssize_t wn = write(sfd, wbuf + woff,
+							   wtot - woff);
+					if (wn < 0) {
+						if (errno == EINTR)
+							continue;
+						wok = 0;
+						break;
+					}
+					woff += (size_t)wn;
+				}
+				if (close(sfd) != 0)
+					wok = 0;
+				if (!wok) {
+					unlink(stage);
 					reply_json(c, 500,
 						   "{\"error\":\"Failed to write firmware staging file\"}");
 					return -1;
 				}
 
 				/* Dispatch IPC to mgmtd to process staged file */
-				char *upayload = strdup(
-					"path=/tmp/sg-fw-upload.tar.gz\n");
+				char upbuf[96];
+				snprintf(upbuf, sizeof(upbuf), "path=%s\n", stage);
+				char *upayload = strdup(upbuf);
 				if (!upayload) {
+					unlink(stage);
 					reply_json(c, 500,
 						   "{\"error\":\"Out of memory\"}");
 					return -1;
@@ -1034,6 +1093,7 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 
 				if (webd_pool_enqueue(&item) != 0) {
 					free(upayload);
+					unlink(stage); /* mgmtd never got the path */
 					reply_json(c, 503,
 						   "{\"error\":\"Server busy\"}");
 					return -1;

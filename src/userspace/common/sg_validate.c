@@ -851,12 +851,10 @@ sg_reg_all_keys_defaults(const char *type_name)
 	for (const struct field_entry *f = field_table; f->type; f++) {
 		if (strcmp(f->type, type_name) != 0)
 			continue;
-		/* Skip internal-only keys (SG_FLD_HIDDEN fields plus the
-		 * metadata keys that never appear as field_table rows). */
+		/* Skip internal-only keys: SG_FLD_HIDDEN fields and the
+		 * interactive "password" field are never emitted as defaults. */
 		if ((f->flags & SG_FLD_HIDDEN) ||
-		    strcmp(f->key, "builtin") == 0 ||
-		    strcmp(f->key, "password") == 0 ||
-		    strcmp(f->key, "password-hash") == 0)
+		    strcmp(f->key, "password") == 0)
 			continue;
 		const char *v = f->defval ? f->defval : "";
 		int n = snprintf(buf + pos, sizeof(buf) - pos,
@@ -893,8 +891,7 @@ sg_reg_value_rule(const char *type_name, const char *key)
 		return "IPv4";
 	if (strcmp(kind, "fqdn") == 0)
 		return "FQDN (e.g. www.example.com — no wildcard)";
-	if (strcmp(kind, "iface") == 0)
-		return "interface name";
+	/* (no bare "iface" kind: interface fields use "ref-iface[-or]:...") */
 	if (strcmp(kind, "safe-id") == 0)
 		return "safe identifier [A-Za-z0-9_.-]";
 	if (strcmp(kind, "tz-token") == 0)
@@ -1122,9 +1119,8 @@ sg_reg_validate_value(const char *type_name, const char *key, const char *val)
 	if (strcmp(kind, "ipv4") == 0)
 		return sg_is_ipv4(val);
 
-	/* iface */
-	if (strcmp(kind, "iface") == 0)
-		return sg_is_iface_name(val);
+	/* (no bare "iface" kind — interface fields route through the
+	 * "ref-iface"/"ref-iface-or:" branches below, not here.) */
 
 	/* uint:min:max */
 	if (strncmp(kind, "uint:", 5) == 0) {

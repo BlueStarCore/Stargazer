@@ -117,6 +117,28 @@ int handle_diag_cpu(int client_fd, const char *user,
 		}
 	}
 
+	/* Per-core current frequency (kHz) from cpufreq, when the
+	 * governor exposes it. Emitted as cpufreq<N>=<khz>; cores
+	 * without a cpufreq node are simply omitted. */
+	for (int c = 0; c < 64; c++) {
+		char fpath[128], fbuf[32];
+		snprintf(fpath, sizeof(fpath),
+			 "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq",
+			 c);
+		if (read_small_file(fpath, fbuf, sizeof(fbuf)) <= 0) {
+			snprintf(fpath, sizeof(fpath),
+				 "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_cur_freq",
+				 c);
+			if (read_small_file(fpath, fbuf, sizeof(fbuf)) <= 0)
+				continue;
+		}
+		size_t fl = strlen(fbuf);
+		while (fl > 0 && (fbuf[fl-1] == '\n' || fbuf[fl-1] == '\r'))
+			fbuf[--fl] = '\0';
+		buf_appendf(resp, sizeof(resp), &pos,
+			    "cpufreq%d=%s\n", c, fbuf);
+	}
+
 	/* Read thermal zones with type names */
 	char path[128], tbuf[32], ttype[64];
 	for (int z = 0; z < 16; z++) {
@@ -2087,8 +2109,10 @@ static int ct_emit_line(char *line, struct dynbuf *out,
 			 "proto=%s state=%s src=%s:%u dst=%s:%u pkts=%llu bytes=%llu policy=%s iif=%s oif=%s\n",
 			 proto, state[0] ? state : "-",
 			 src, sport, dst, dport, pkts, bytes, policy, iifn, oifn);
+	/* snprintf returns the untruncated length; clamp to the source
+	 * buffer before using it as the append length. */
 	if (n > 0)
-		dbuf_append(out, l, (size_t)n);
+		dbuf_append(out, l, (size_t)n < sizeof(l) ? (size_t)n : sizeof(l) - 1);
 	return 0;
 }
 
@@ -2436,14 +2460,17 @@ static void ct_ml_emit(const struct nlmsghdr *nh, struct dynbuf *out, long *coun
 		l = 0;
 		pr = sg_nla_find(tup, tlen, SG_CTA_TUPLE_PROTO, &l);
 		if (pr) {
-			int pl = 0;
-			const void *pn = sg_nla_find(pr, l, SG_CTA_PROTO_NUM, &pl);
-			const void *sp = sg_nla_find(pr, l, SG_CTA_PROTO_SRC_PORT, &pl);
-			const void *dp = sg_nla_find(pr, l, SG_CTA_PROTO_DST_PORT, &pl);
+			int pnl = 0, spl = 0, dpl = 0;
+			const void *pn = sg_nla_find(pr, l, SG_CTA_PROTO_NUM, &pnl);
+			const void *sp = sg_nla_find(pr, l, SG_CTA_PROTO_SRC_PORT, &spl);
+			const void *dp = sg_nla_find(pr, l, SG_CTA_PROTO_DST_PORT, &dpl);
 
-			if (pn) proto = *(const uint8_t *)pn;
-			if (sp) sport = ntohs(*(const uint16_t *)sp);
-			if (dp) dport = ntohs(*(const uint16_t *)dp);
+			/* Gate each read on the attribute's own payload length —
+			 * sg_nla_find only proves the attr fits the parent, not
+			 * that its payload is wide enough to deref. */
+			if (pn && pnl >= 1) proto = *(const uint8_t *)pn;
+			if (sp && spl >= 2) sport = ntohs(*(const uint16_t *)sp);
+			if (dp && dpl >= 2) dport = ntohs(*(const uint16_t *)dp);
 		}
 	}
 
@@ -2694,16 +2721,17 @@ static int ct_iface_map_build(struct ct_iface_ent **out)
 				l = 0;
 				pr = sg_nla_find(tup, tlen, SG_CTA_TUPLE_PROTO, &l);
 				if (pr) {
-					int pl = 0;
+					int pnl = 0, spl = 0, dpl = 0;
 					const void *pn = sg_nla_find(pr, l,
-							SG_CTA_PROTO_NUM, &pl);
+							SG_CTA_PROTO_NUM, &pnl);
 					const void *sp = sg_nla_find(pr, l,
-							SG_CTA_PROTO_SRC_PORT, &pl);
+							SG_CTA_PROTO_SRC_PORT, &spl);
 					const void *dp = sg_nla_find(pr, l,
-							SG_CTA_PROTO_DST_PORT, &pl);
-					if (pn) pname = ct_proto_name(*(const uint8_t *)pn);
-					if (sp) sport = ntohs(*(const uint16_t *)sp);
-					if (dp) dport = ntohs(*(const uint16_t *)dp);
+							SG_CTA_PROTO_DST_PORT, &dpl);
+					/* Gate each deref on its own payload width. */
+					if (pn && pnl >= 1) pname = ct_proto_name(*(const uint8_t *)pn);
+					if (sp && spl >= 2) sport = ntohs(*(const uint16_t *)sp);
+					if (dp && dpl >= 2) dport = ntohs(*(const uint16_t *)dp);
 				}
 			}
 			if (!pname || !src[0])
@@ -3378,6 +3406,42 @@ int handle_diag_ntp(int client_fd, const char *user,
 	return 0;
 }
 
+/*
+ * json_escape_field — escape a string for a JSON double-quoted value.
+ *
+ * Escapes the metacharacters " and \ and any control byte (< 0x20), so
+ * untrusted input (e.g. the DHCP option-12 hostname, controlled by any LAN
+ * client) cannot break out of the JSON string. Writes at most outsz-1 chars
+ * + NUL; stops early (never truncates mid-escape) if the escaped form would
+ * not fit.
+ */
+static void json_escape_field(const char *in, char *out, size_t outsz)
+{
+	size_t o = 0;
+
+	if (outsz == 0)
+		return;
+	for (size_t i = 0; in && in[i] && o + 7 < outsz; i++) {
+		unsigned char c = (unsigned char)in[i];
+
+		if (c == '"' || c == '\\') {
+			out[o++] = '\\';
+			out[o++] = (char)c;
+		} else if (c == '\n') {
+			out[o++] = '\\'; out[o++] = 'n';
+		} else if (c == '\r') {
+			out[o++] = '\\'; out[o++] = 'r';
+		} else if (c == '\t') {
+			out[o++] = '\\'; out[o++] = 't';
+		} else if (c < 0x20) {
+			o += (size_t)snprintf(out + o, outsz - o, "\\u%04x", c);
+		} else {
+			out[o++] = (char)c;
+		}
+	}
+	out[o] = '\0';
+}
+
 /* ─────────────────────────────────────────────────────────────────────────
  * handle_diag_dhcp_leases — active leases from all udhcpd pools.
  *
@@ -3523,23 +3587,31 @@ int handle_diag_dhcp_leases(int client_fd, const char *user,
 				char hostname[21];
 				memcpy(hostname, rec.hostname, 20);
 				hostname[20] = '\0';
-				/* Scrub non-printable bytes from hostname */
-				for (int i = 0; i < 20; i++)
-					if ((unsigned char)hostname[i] < 0x20)
-						hostname[i] = '\0';
+
+				/* hostname is DHCP option-12 (attacker-
+				 * controlled); pool_id is config-derived.
+				 * Escape both before interpolating into JSON
+				 * so a " or \ cannot break the structure. A
+				 * 20-byte hostname can expand ~6x when fully
+				 * escaped, so size the buffer for it. */
+				char host_esc[128], pool_esc[256];
+				json_escape_field(hostname, host_esc,
+						  sizeof(host_esc));
+				json_escape_field(pool_id, pool_esc,
+						  sizeof(pool_esc));
 
 				if (!first)
 					LEASE_JA(",", 1);
 				first = 0;
 
-				char entry[256];
+				char entry[512];
 				int elen = snprintf(entry, sizeof(entry),
 					"{\"pool\":\"%s\","
 					"\"ip\":\"%s\","
 					"\"mac\":\"%s\","
 					"\"hostname\":\"%s\","
 					"\"expires\":%lld}",
-					pool_id, ip_str, mac_str, hostname,
+					pool_esc, ip_str, mac_str, host_esc,
 					(long long)abs_exp);
 				if (elen > 0 && (size_t)elen < sizeof(entry))
 					LEASE_JA(entry, (size_t)elen);

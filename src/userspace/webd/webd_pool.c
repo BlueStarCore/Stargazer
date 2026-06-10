@@ -15,6 +15,7 @@
 #include "stargazer_ipc.h"
 
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -154,6 +155,47 @@ static void send_ipc_error(unsigned long conn_id, uint32_t status,
 /* ── Helper: parse key=value payload into JSON object ────────────────── */
 
 /*
+ * json_appendf — grow-to-fit formatted append into a heap buffer.
+ *
+ * Measures the formatted length first, grows *buf so the whole result
+ * fits, then writes it. This avoids the over-read class where a fixed
+ * local buffer is filled by a truncating snprintf and then copied using
+ * snprintf's (un-truncated) return value as the length; it also never
+ * truncates a value mid-byte, so the emitted JSON stays well-formed even
+ * for arbitrarily long config values.
+ *
+ * Returns 0 on success, -1 on OOM (the caller still owns *buf and must
+ * free it).
+ */
+static int json_appendf(char **buf, size_t *cap, size_t *len,
+			const char *fmt, ...)
+{
+	va_list ap;
+	int need;
+
+	va_start(ap, fmt);
+	need = vsnprintf(NULL, 0, fmt, ap);
+	va_end(ap);
+	if (need < 0)
+		return -1;
+
+	while (*len + (size_t)need + 1 > *cap) {
+		size_t ncap = *cap * 2;
+		char *tmp = realloc(*buf, ncap);
+		if (!tmp)
+			return -1;
+		*buf = tmp;
+		*cap = ncap;
+	}
+
+	va_start(ap, fmt);
+	vsnprintf(*buf + *len, *cap - *len, fmt, ap);
+	va_end(ap);
+	*len += (size_t)need;
+	return 0;
+}
+
+/*
  * Convert "key=val\nkey2=val2\n" to JSON object string.
  * If id is provided, prepends "id" field.
  * Returns heap-allocated string, caller frees.
@@ -182,11 +224,10 @@ static char *kv_to_json(const char *kv, const char *id)
 	if (id && id[0]) {
 		char *esc_id = json_escape(id);
 		if (esc_id) {
-			char id_frag[512];
-			int n = snprintf(id_frag, sizeof(id_frag),
-					 "\"id\":\"%s\"", esc_id);
+			int rc = json_appendf(&buf, &cap, &len,
+					      "\"id\":\"%s\"", esc_id);
 			free(esc_id);
-			if (n > 0) APPEND(id_frag, (size_t)n);
+			if (rc != 0) { free(buf); return NULL; }
 		}
 	}
 
@@ -231,13 +272,12 @@ static char *kv_to_json(const char *kv, const char *id)
 				p = nl ? nl + 1 : p + line_len;
 				continue;
 			}
-			char frag[2048];
-			int n = snprintf(frag, sizeof(frag),
-					 "\"%s\":\"%s\"",
-					 esc_key, esc_val);
+			int rc = json_appendf(&buf, &cap, &len,
+					      "\"%s\":\"%s\"",
+					      esc_key, esc_val);
 			free(esc_key);
 			free(esc_val);
-			if (n > 0) APPEND(frag, (size_t)n);
+			if (rc != 0) { free(buf); return NULL; }
 
 			p = nl ? nl + 1 : p + line_len;
 		}
@@ -576,6 +616,9 @@ static void flow_config_list(work_item_t *item)
 	/* Optional search filter from payload */
 	const char *search = item->payload;
 	int first = 1;
+	/* Hoisted so the BUF_APPEND OOM goto (which jumps to list_done) does
+	 * not leak the current entry_json — list_done frees it (NULL-safe). */
+	char *entry_json = NULL;
 
 	for (int i = 0; i < nids; i++) {
 		char get_payload[512];
@@ -619,7 +662,7 @@ static void flow_config_list(work_item_t *item)
 			}
 		}
 
-		char *entry_json = kv_to_json(entry_resp.payload, ids[i]);
+		entry_json = kv_to_json(entry_resp.payload, ids[i]);
 		webd_ipc_resp_free(&entry_resp);
 
 		if (entry_json) {
@@ -627,6 +670,7 @@ static void flow_config_list(work_item_t *item)
 			size_t elen = strlen(entry_json);
 			BUF_APPEND(entry_json, elen);
 			free(entry_json);
+			entry_json = NULL;
 			first = 0;
 		}
 	}
@@ -635,6 +679,7 @@ static void flow_config_list(work_item_t *item)
 	BUF_APPEND("\0", 1);
 
 list_done:
+	free(entry_json);	/* NULL unless a BUF_APPEND OOM jumped here */
 	for (int i = 0; i < nids; i++) free(ids[i]);
 #undef BUF_APPEND
 
@@ -1172,12 +1217,20 @@ static void flow_res_disk(work_item_t *item)
 	}
 
 	unsigned long blocks = 0, bavail = 0, frsize = 0;
+	unsigned long lblocks = 0, lbavail = 0, lfrsize = 0;
+	int logs_present = 0;
 	unsigned long long emmc_bytes = 0;
 	if (resp.payload) {
 		const char *p;
 		if ((p = strstr(resp.payload, "sgdata_blocks=")) != NULL) blocks = strtoul(p + 14, NULL, 10);
 		if ((p = strstr(resp.payload, "sgdata_bavail=")) != NULL) bavail = strtoul(p + 14, NULL, 10);
 		if ((p = strstr(resp.payload, "sgdata_frsize=")) != NULL) frsize = strtoul(p + 14, NULL, 10);
+		/* sglogs_* is only emitted when /etc/stargazer/logs is a distinct
+		 * mount (the large eMMC partition sg-partinit grows on first boot);
+		 * absent on dev hosts / before partinit. */
+		if ((p = strstr(resp.payload, "sglogs_blocks=")) != NULL) { lblocks = strtoul(p + 14, NULL, 10); logs_present = 1; }
+		if ((p = strstr(resp.payload, "sglogs_bavail=")) != NULL) lbavail = strtoul(p + 14, NULL, 10);
+		if ((p = strstr(resp.payload, "sglogs_frsize=")) != NULL) lfrsize = strtoul(p + 14, NULL, 10);
 		if ((p = strstr(resp.payload, "emmc_bytes=")) != NULL)    emmc_bytes = strtoull(p + 11, NULL, 10);
 	}
 	webd_ipc_resp_free(&resp);
@@ -1185,14 +1238,20 @@ static void flow_res_disk(work_item_t *item)
 	unsigned long total_mb = blocks * frsize / (1024 * 1024);
 	unsigned long free_mb = bavail * frsize / (1024 * 1024);
 	unsigned long used_mb = total_mb - free_mb;
+	unsigned long logs_total_mb = lblocks * lfrsize / (1024 * 1024);
+	unsigned long logs_free_mb = lbavail * lfrsize / (1024 * 1024);
+	unsigned long logs_used_mb = logs_total_mb - logs_free_mb;
 	unsigned long emmc_mb = (unsigned long)(emmc_bytes / (1024 * 1024));
 
-	char *json = malloc(256);
+	char *json = malloc(320);
 	if (json)
-		snprintf(json, 256,
+		snprintf(json, 320,
 			 "{\"total_mb\":%lu,\"used_mb\":%lu,\"free_mb\":%lu,"
-			 "\"emmc_mb\":%lu}",
-			 total_mb, used_mb, free_mb, emmc_mb);
+			 "\"emmc_mb\":%lu,\"logs_present\":%d,"
+			 "\"logs_total_mb\":%lu,\"logs_used_mb\":%lu,"
+			 "\"logs_free_mb\":%lu}",
+			 total_mb, used_mb, free_mb, emmc_mb, logs_present,
+			 logs_total_mb, logs_used_mb, logs_free_mb);
 	send_result(item->conn_id, 200, json, json ? strlen(json) : 0);
 }
 
@@ -1213,7 +1272,9 @@ static void flow_res_proctop(work_item_t *item)
 
 	/* Parse uptime and process list from kv response.
 	 * Format: uptime=X\nloadavg=X\nmem_total_kb=X\nmem_avail_kb=X\n
-	 *         proc PID COMM STATE UTIME STIME VSIZE RSS_KB\n... */
+	 *         proc=PID COMM STATE UTIME STIME VSIZE RSS_KB\n...
+	 * (process rows use the kv "proc=" prefix, matching mgmtd's
+	 *  handle_diag_proctop emitter — see mgmtd_diag.c). */
 	char uptime[64] = "0";
 	long mem_total_kb = 0, mem_avail_kb = 0;
 
@@ -1254,7 +1315,9 @@ static void flow_res_proctop(work_item_t *item)
 			  "{\"uptime\":\"%s\",\"mem_total_kb\":%ld,"
 			  "\"mem_avail_kb\":%ld,\"procs\":[",
 			  uptime, mem_total_kb, mem_avail_kb);
-	if (hn > 0) J_APP(hdr, (size_t)hn);
+	/* clamp to the source buffer: snprintf returns the untruncated
+	 * length, copying that many bytes would over-read hdr */
+	if (hn > 0) J_APP(hdr, (size_t)hn < sizeof(hdr) ? (size_t)hn : sizeof(hdr) - 1);
 
 	/* Parse proc lines */
 	int first = 1;
@@ -1264,8 +1327,8 @@ static void flow_res_proctop(work_item_t *item)
 			const char *nl = strchr(line, '\n');
 			size_t llen = nl ? (size_t)(nl - line) : strlen(line);
 
-			if (llen > 5 && strncmp(line, "proc ", 5) == 0) {
-				/* proc PID COMM STATE UTIME STIME VSIZE RSS_KB */
+			if (llen > 5 && strncmp(line, "proc=", 5) == 0) {
+				/* proc=PID COMM STATE UTIME STIME VSIZE RSS_KB */
 				int pid = 0;
 				char comm[64] = "", st = '?';
 				unsigned long ut = 0, stm = 0, vsz = 0;
@@ -1283,7 +1346,7 @@ static void flow_res_proctop(work_item_t *item)
 					pid, ec ? ec : comm, st,
 					ut + stm, rss);
 				free(ec);
-				if (fn > 0) J_APP(frag, (size_t)fn);
+				if (fn > 0) J_APP(frag, (size_t)fn < sizeof(frag) ? (size_t)fn : sizeof(frag) - 1);
 				first = 0;
 			}
 
@@ -1295,6 +1358,126 @@ static void flow_res_proctop(work_item_t *item)
 	J_APP("\0", 1);
 
 pt_done:
+	webd_ipc_resp_free(&resp);
+#undef J_APP
+
+	if (json)
+		send_result(item->conn_id, 200, json, len > 0 ? len - 1 : 0);
+	else {
+		char *j = json_error("Out of memory", NULL);
+		send_result(item->conn_id, 500, j, j ? strlen(j) : 0);
+	}
+}
+
+/* GET /api/system/resources/percore — per-core jiffies, frequency, die temp.
+ *
+ * The mgmtd DIAG_CPU reply already carries the per-cpu /proc/stat lines
+ * (cpu0..cpuN) plus per-core cpufreq<N>= and thermal_zone0=. We forward
+ * the raw busy/total jiffie counters so the browser can compute an
+ * instantaneous per-core utilisation from the delta between polls, rather
+ * than a flat since-boot average. */
+static void flow_res_percore(work_item_t *item)
+{
+	webd_ipc_response_t resp;
+	if (webd_ipc_send(SG_CMD_DIAG_CPU, item->username,
+			  item->session_tag, "", &resp) != 0) {
+		char *json = json_error("Backend unavailable", NULL);
+		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
+		return;
+	}
+	if (resp.status != SG_OK) {
+		send_ipc_error(item->conn_id, resp.status, resp.extra);
+		webd_ipc_resp_free(&resp);
+		return;
+	}
+
+	/* Per-core current frequency (kHz), indexed by core number. */
+	long freq_khz[64];
+	for (int i = 0; i < 64; i++)
+		freq_khz[i] = 0;
+	/* SoC die temperature (m°C → °C); the A73 cluster shares one sensor. */
+	int temp_c = 0;
+
+	if (resp.payload) {
+		const char *p;
+		for (int i = 0; i < 64; i++) {
+			char key[16];
+			int kn = snprintf(key, sizeof(key), "cpufreq%d=", i);
+			if (kn > 0 && (p = strstr(resp.payload, key)) != NULL)
+				freq_khz[i] = atol(p + kn);
+		}
+		if ((p = strstr(resp.payload, "thermal_zone0=")) != NULL)
+			temp_c = atoi(p + 14) / 1000;
+	}
+
+	size_t cap = 4096, len = 0;
+	char *json = malloc(cap);
+	if (!json) {
+		webd_ipc_resp_free(&resp);
+		char *j = json_error("Out of memory", NULL);
+		send_result(item->conn_id, 500, j, j ? strlen(j) : 0);
+		return;
+	}
+
+#define J_APP(s, n) do { \
+	while (len + (n) >= cap) { \
+		cap *= 2; \
+		char *tmp = realloc(json, cap); \
+		if (!tmp) { free(json); json = NULL; goto pc_done; } \
+		json = tmp; \
+	} \
+	memcpy(json + len, (s), (n)); \
+	len += (n); \
+} while (0)
+
+	char hdr[64];
+	int hn = snprintf(hdr, sizeof(hdr),
+			  "{\"temp_c\":%d,\"cores\":[", temp_c);
+	if (hn > 0) J_APP(hdr, (size_t)hn < sizeof(hdr) ? (size_t)hn : sizeof(hdr) - 1);
+
+	int first = 1;
+	if (resp.payload) {
+		const char *line = resp.payload;
+		while (*line) {
+			const char *nl = strchr(line, '\n');
+			size_t llen = nl ? (size_t)(nl - line) : strlen(line);
+
+			/* Per-core line: "cpu<N> user nice system idle ..."
+			 * (skip the aggregate "cpu " line — no digit). */
+			if (llen > 3 && strncmp(line, "cpu", 3) == 0 &&
+			    isdigit((unsigned char)line[3])) {
+				int core = atoi(line + 3);
+				const char *f = line + 3;
+				while (*f && *f != ' ') f++;   /* past cpuN */
+				unsigned long u=0, n=0, s=0, idle=0, w=0,
+					      irq=0, sirq=0, steal=0;
+				sscanf(f, "%lu %lu %lu %lu %lu %lu %lu %lu",
+				       &u, &n, &s, &idle, &w, &irq, &sirq, &steal);
+				unsigned long total = u+n+s+idle+w+irq+sirq+steal;
+				unsigned long busy  = total - idle - w;
+
+				long fk = (core >= 0 && core < 64)
+					? freq_khz[core] : 0;
+				char frag[160];
+				int fn = snprintf(frag, sizeof(frag),
+					"%s{\"core\":%d,\"busy\":%lu,"
+					"\"total\":%lu,\"freq_mhz\":%ld,"
+					"\"temp_c\":%d}",
+					first ? "" : ",",
+					core, busy, total,
+					fk / 1000, temp_c);
+				if (fn > 0) J_APP(frag, (size_t)fn < sizeof(frag) ? (size_t)fn : sizeof(frag) - 1);
+				first = 0;
+			}
+
+			line = nl ? nl + 1 : line + llen;
+		}
+	}
+
+	J_APP("]}", 2);
+	J_APP("\0", 1);
+
+pc_done:
 	webd_ipc_resp_free(&resp);
 #undef J_APP
 
@@ -1573,7 +1756,7 @@ static void flow_iface_live(work_item_t *item)
 				  "%s{\"name\":\"%s\",\"status\":\"%s\",\"ip\":\"%s\"}",
 				  first ? "" : ",", en, es, ei);
 		free(en); free(es); free(ei);
-		if (fn > 0) IL_APP(frag, (size_t)fn);
+		if (fn > 0) IL_APP(frag, (size_t)fn < sizeof(frag) ? (size_t)fn : sizeof(frag) - 1);
 		first = 0;
 
 		p = nl ? nl + 1 : p + llen;
@@ -1596,16 +1779,28 @@ il_done:
 
 static void flow_firmware_upload(work_item_t *item)
 {
-	/* item->payload = "path=/tmp/sg-fw-upload.tar.gz\n" */
+	/* item->payload = "path=/tmp/sg-fw-upload.<rand>\n" (per-upload file).
+	 * On the success path mgmtd consumes and removes the staged file; on a
+	 * failure path it may never have received or finished it, so remove it
+	 * here. Parse the path out for the failure cleanup. */
+	char stage[96] = {0};
+	if (item->payload && strncmp(item->payload, "path=", 5) == 0) {
+		snprintf(stage, sizeof(stage), "%s", item->payload + 5);
+		char *nl = strchr(stage, '\n');
+		if (nl) *nl = '\0';
+	}
+
 	webd_ipc_response_t resp;
 	if (webd_ipc_send(SG_CMD_UPGRADE_FROM_FILE, item->username,
 			  item->session_tag,
 			  item->payload ? item->payload : "", &resp) != 0) {
+		if (stage[0]) unlink(stage);	/* mgmtd never got the file */
 		char *json = json_error("Backend unavailable", NULL);
 		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
 		return;
 	}
 	if (resp.status != SG_OK) {
+		if (stage[0]) unlink(stage);	/* upgrade rejected/failed */
 		send_ipc_error(item->conn_id, resp.status, resp.extra);
 		webd_ipc_resp_free(&resp);
 		return;
@@ -1990,6 +2185,7 @@ static void *worker_fn(void *arg)
 		case FLOW_RES_RAM:      flow_res_ram(&item);         break;
 		case FLOW_RES_DISK:     flow_res_disk(&item);        break;
 		case FLOW_RES_PROCTOP:  flow_res_proctop(&item);     break;
+		case FLOW_RES_PERCORE:  flow_res_percore(&item);     break;
 		case FLOW_ADMIN_CREATE: flow_admin_create(&item);    break;
 		case FLOW_CONFIG_MOVE:    flow_simple(&item);           break;
 		case FLOW_IFACE_LIVE:     flow_iface_live(&item);      break;

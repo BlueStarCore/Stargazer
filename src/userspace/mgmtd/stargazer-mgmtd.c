@@ -103,6 +103,16 @@ static volatile sig_atomic_t g_running = 1;
 static volatile sig_atomic_t g_child_died = 0;
 int g_listen_fd = -1;  /* listen socket fd, for child to close after fork */
 
+/*
+ * Kernel-verified UID of the current request's peer, set from SO_PEERCRED
+ * once per connection in the accept loop before handle_request() runs.
+ * Safe as file-scope state because the daemon services one request at a
+ * time (single-threaded poll loop). Handlers that must restrict a command
+ * to a specific caller (e.g. root-only events) read this. (uid_t)-1 means
+ * "not yet established".
+ */
+static uid_t g_peer_uid = (uid_t)-1;
+
 /* ── Process supervisor ────────────────────────────────────────────────── */
 
 /*
@@ -275,6 +285,12 @@ char *pipe_exec_stdin(const char *const argv[],
 	ssize_t n;
 	char tmp[1024];
 	while ((n = read(out_fd[0], tmp, sizeof(tmp))) > 0) {
+		/* Same exhaustion cap as safe_exec: a misbehaving child must
+		 * not be able to grow the single-threaded daemon without bound. */
+		if (used + (size_t)n + 1 > SAFE_EXEC_MAX_OUTPUT) {
+			free(buf); close(out_fd[0]); waitpid(pid, NULL, 0);
+			return NULL;
+		}
 		while (used + (size_t)n + 1 > bufsz) {
 			bufsz *= 2;
 			char *nb = realloc(buf, bufsz);
@@ -324,6 +340,16 @@ int ipt_exec(const char *const argv[])
 				cmd[pos++] = ' ';
 			int n = snprintf(cmd + pos, sizeof(cmd) - (size_t)pos,
 					 "%s", argv[i]);
+			/* snprintf returns the untruncated length; a long argv
+			 * element would push pos past cmd and make the
+			 * cmd[pos]='\0' below an out-of-bounds write. Stop at a
+			 * full buffer instead. */
+			if (n < 0)
+				break;
+			if ((size_t)n >= sizeof(cmd) - (size_t)pos) {
+				pos = (int)sizeof(cmd) - 1;
+				break;
+			}
 			pos += n;
 		}
 		cmd[pos] = '\0';
@@ -861,6 +887,37 @@ int handle_diag_stargazer_log(int client_fd, const char *user,
 }
 
 /*
+ * rsp_appendf — bounded formatted append into a fixed response buffer.
+ *
+ * Returns the new offset, never advancing past cap-1. A raw
+ * "pos += snprintf(buf+pos, cap-pos, ...)" is unsafe: snprintf returns
+ * the untruncated length, so once it truncates, pos overshoots cap and
+ * the next "cap - pos" underflows to a huge size_t with buf+pos past the
+ * allocation. This stops cleanly at a full buffer instead.
+ */
+static size_t rsp_appendf(char *buf, size_t cap, size_t pos,
+			  const char *fmt, ...)
+	__attribute__((format(printf, 4, 5)));
+
+static size_t rsp_appendf(char *buf, size_t cap, size_t pos,
+			  const char *fmt, ...)
+{
+	va_list ap;
+	int n;
+
+	if (pos >= cap)
+		return cap ? cap - 1 : 0;
+	va_start(ap, fmt);
+	n = vsnprintf(buf + pos, cap - pos, fmt, ap);
+	va_end(ap);
+	if (n < 0)
+		return pos;
+	if ((size_t)n >= cap - pos)
+		return cap - 1;		/* truncated: buffer full */
+	return pos + (size_t)n;
+}
+
+/*
  * handle_diag_storage — Show storage device and mount status.
  * Reports partition devices, mount points, blkid info, and database status.
  */
@@ -884,44 +941,44 @@ int handle_diag_storage(int client_fd, const char *user,
 	size_t pos = 0;
 
 	/* Storage devices */
-	pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+	pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 			"Storage devices:\n");
 	const char *argv1[] = {"sh", "-c",
 			       "/bin/ls -la /dev/mmcblk0p* 2>/dev/null || echo '  No eMMC partitions found'",
 			       NULL};
 	char *out1 = safe_exec(argv1);
 	if (out1) {
-		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos, "%s", out1);
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos, "%s", out1);
 		free(out1);
 	}
 
 	/* Mount points */
-	pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+	pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 			"\nStorage mount points:\n");
 	const char *argv2[] = {"sh", "-c",
 			       "/bin/mount | /bin/grep -E 'stargazer|mmcblk'",
 			       NULL};
 	char *out2 = safe_exec(argv2);
 	if (out2 && out2[0]) {
-		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos, "%s", out2);
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos, "%s", out2);
 		free(out2);
 	} else {
-		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 				"  No stargazer/mmcblk mounts found\n");
 		free(out2);
 	}
 
 	/* Partition info */
-	pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+	pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 			"\nPartition info:\n");
 	const char *argv3[] = {"blkid", "/dev/mmcblk0p5", NULL};
 	char *out3 = safe_exec(argv3);
 	if (out3 && out3[0]) {
-		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 				"/dev/mmcblk0p5: %s", out3);
 		free(out3);
 	} else {
-		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 				"/dev/mmcblk0p5: not found or unformatted\n");
 		free(out3);
 	}
@@ -929,24 +986,24 @@ int handle_diag_storage(int client_fd, const char *user,
 	const char *argv4[] = {"blkid", "/dev/mmcblk0p6", NULL};
 	char *out4 = safe_exec(argv4);
 	if (out4 && out4[0]) {
-		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 				"/dev/mmcblk0p6: %s", out4);
 		free(out4);
 	} else {
-		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 				"/dev/mmcblk0p6: not found or unformatted\n");
 		free(out4);
 	}
 
 	/* Database status */
-	pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+	pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 			"\nConfig database:\n");
 	const char *argv5[] = {"sh", "-c",
 			       "/bin/ls -lh /etc/stargazer/stargazer.db 2>/dev/null || echo '  Database not found'",
 			       NULL};
 	char *out5 = safe_exec(argv5);
 	if (out5) {
-		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos, "%s", out5);
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos, "%s", out5);
 		free(out5);
 	}
 
@@ -1035,7 +1092,7 @@ int handle_diag_dhcp_client(int client_fd, const char *user,
 	}
 
 	if (iface_count == 0) {
-		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 				"No DHCP client interfaces configured.\n");
 		send_ok(client_fd, NULL, buf);
 		free(buf);
@@ -1044,7 +1101,7 @@ int handle_diag_dhcp_client(int client_fd, const char *user,
 
 	for (int i = 0; i < iface_count; i++) {
 		const char *iface = iface_list[i];
-		pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 				"Interface: %s\n", iface);
 
 		/* ── Supervisor status ─────────────────────────────── */
@@ -1054,17 +1111,17 @@ int handle_diag_dhcp_client(int client_fd, const char *user,
 		int   ucnt = supervisor_get_restart_count(sup_name);
 
 		if (upid > 0) {
-			pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+			pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 					"  udhcpc:     running (pid %d,"
 					" restarts %d)\n",
 					(int)upid, ucnt);
 		} else if (ucnt == -1) {
-			pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+			pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 					"  udhcpc:     NOT running"
 					" (not tracked — restart limit hit"
 					" or never started)\n");
 		} else {
-			pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+			pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 					"  udhcpc:     NOT running"
 					" (restarts %d)\n", ucnt);
 		}
@@ -1105,9 +1162,10 @@ int handle_diag_dhcp_client(int client_fd, const char *user,
 							pid_t op =
 							  (pid_t)atoi(
 							    pe->d_name);
-							pos += snprintf(
-							  buf + pos,
-							  SG_RESPONSE_MAX - pos,
+							pos = rsp_appendf(
+							  buf,
+							  SG_RESPONSE_MAX,
+							  pos,
 							  "  orphan:     "
 							  "pid %d (not"
 							  " supervisor-"
@@ -1138,13 +1196,12 @@ int handle_diag_dhcp_client(int client_fd, const char *user,
 					line[llen-1] == '\r'))
 					line[--llen] = '\0';
 				if (!line[0]) continue;
-				pos += snprintf(buf + pos,
-						SG_RESPONSE_MAX - pos,
-						"  %s\n", line);
+				pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
+						  "  %s\n", line);
 			}
 			fclose(fp);
 		} else {
-			pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+			pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 					"  lease:      (no status file)\n");
 		}
 
@@ -1159,23 +1216,21 @@ int handle_diag_dhcp_client(int client_fd, const char *user,
 				inet_p += 5;
 				char *sp = strchr(inet_p, ' ');
 				if (sp) *sp = '\0';
-				pos += snprintf(buf + pos,
-						SG_RESPONSE_MAX - pos,
-						"  ip:         %s\n",
-						inet_p);
+				pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
+						  "  ip:         %s\n",
+						  inet_p);
 			} else {
-				pos += snprintf(buf + pos,
-						SG_RESPONSE_MAX - pos,
-						"  ip:         (none)\n");
+				pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
+						  "  ip:         (none)\n");
 			}
 		} else {
-			pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+			pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 					"  ip:         (none)\n");
 		}
 		free(ipout);
 
 		if (i + 1 < iface_count)
-			pos += snprintf(buf + pos, SG_RESPONSE_MAX - pos,
+			pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
 					"\n");
 		free(iface_list[i]);
 	}
@@ -1893,6 +1948,16 @@ static int mgmtd_first_boot_seed(void)
 {
 	mgmt_log("INFO", "first boot — seeding default configuration");
 
+	/* Seed the whole default config in one transaction: every write below
+	 * (and the final seeded-flag stamp) either all commit or all roll back.
+	 * On failure the DB is left empty, so the next boot is BOOT_FIRST and
+	 * re-seeds rather than seeing a half-seeded state. sg_db_set joins this
+	 * transaction (it owns BEGIN/COMMIT only at top level). */
+	if (sg_db_begin() != 0) {
+		mgmt_log("ERROR", "first-boot seed: cannot begin transaction");
+		return -1;
+	}
+
 	/* ── Admin profiles ─────────────────────────────────────────── */
 	if (sg_db_set("system_admin-profile", "read-write",
 		      "permissions=monitor,configure,admin\n"
@@ -2007,19 +2072,34 @@ static int mgmtd_first_boot_seed(void)
 		if (sg_db_count(critical_tables[i]) == 0) {
 			mgmt_log("ERROR", "seed verify: %s has 0 entries",
 				 critical_tables[i]);
+			sg_db_rollback();
 			return -1;
 		}
 	}
 
-	/* Stamp the seeded flag LAST — if seeding partially fails,
-	 * next boot retries as BOOT_FIRST (no flag, all tables empty). */
-	sg_db_set_val("system_meta", "0", "seeded", "1");
+	/* Stamp the seeded flag LAST, inside the same transaction. If it
+	 * fails, the rollback below drops the whole seed so the next boot
+	 * retries as BOOT_FIRST (no half-seeded BOOT_COMPROMISED state). */
+	if (sg_db_set_val("system_meta", "0", "seeded", "1") != 0) {
+		mgmt_log("ERROR", "first-boot seed: failed to stamp seeded "
+			 "flag; rolling back the whole seed");
+		sg_db_rollback();
+		return -1;
+	}
+
+	/* Commit the entire seed atomically. */
+	if (sg_db_commit() != 0) {
+		mgmt_log("ERROR", "first-boot seed: commit failed; rolling back");
+		sg_db_rollback();
+		return -1;
+	}
 
 	mgmt_log("INFO", "default configuration seeded successfully");
 	return 0;
 
 fail:
 	mgmt_log("ERROR", "seed failed — database write error");
+	sg_db_rollback();
 	return -1;
 }
 
@@ -2867,6 +2947,11 @@ static char *mgmtd_show_interfaces(void)
 		char line[256];
 		int n = snprintf(line, sizeof(line), "%-16s %-8s %-21s %s\n",
 				 nics[i], state, ip, desc ? desc : "");
+		/* snprintf returns the untruncated length; the config
+		 * 'description' is uncapped, so clamp to what line actually
+		 * holds before it is used as a copy length below. */
+		if (n > 0 && (size_t)n >= sizeof(line))
+			n = (int)sizeof(line) - 1;
 
 		/* Grow buffer if needed */
 		while (used + (size_t)n + 1 > bufsz) {
@@ -3159,6 +3244,24 @@ static int handle_dhcp_lease_event(int client_fd, const char *user,
 				   const sg_request_hdr_t *hdr)
 {
 	(void)user; (void)hdr;
+
+	/*
+	 * This command mutates the live routing table (flush / replay) and
+	 * is exempt from session-tag validation because its real caller is
+	 * udhcpc, which runs as root with no login session. Authorize on the
+	 * kernel-verified peer UID instead: only root may trigger it. Without
+	 * this, any process whose UID is in the stargazer group (the socket
+	 * is 0660 root:stargazer) — e.g. a monitor-only admin — could flush
+	 * every static route. Fail closed.
+	 */
+	if (g_peer_uid != 0) {
+		mgmt_log("WARN", "DHCP_LEASE_EVENT from non-root uid %u denied",
+			 (unsigned)g_peer_uid);
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "Requires root (udhcpc)");
+		return 0;
+	}
+
 	char iface[IFNAMSIZ], action[16];
 	extract_val(payload, "iface",  iface,  sizeof(iface));
 	extract_val(payload, "action", action, sizeof(action));
@@ -3187,9 +3290,13 @@ static int handle_dhcp_lease_event(int client_fd, const char *user,
 	return 0;
 }
 
-static void mgmtd_replay_config(void)
+/* Re-apply the whole DB to the kernel. Returns the number of per-type
+ * apply failures (0 = full success). Boot ignores the count (best-effort);
+ * rollback surfaces it so a partial re-apply is not reported as success. */
+static int mgmtd_replay_config(void)
 {
 	char result[512];
+	int fails = 0;
 
 	/* Single config types (id="0").
 	 * Order: settings first, then services that depend on them. */
@@ -3219,9 +3326,11 @@ static void mgmtd_replay_config(void)
 			if (rc == SG_OK)
 				fprintf(stderr, "[mgmtd] replay %s: %s\n",
 					single_types[i], result);
-			else
+			else {
 				fprintf(stderr, "[mgmtd] replay FAIL %s: %s\n",
 					single_types[i], result);
+				fails++;
+			}
 			free(data);
 		}
 	}
@@ -3251,8 +3360,9 @@ static void mgmtd_replay_config(void)
 			fprintf(stderr, "[mgmtd] replay firewall_policy: %s%s\n",
 				rc == SG_OK ? "" : "FAIL ",
 				rb_result);
-			/* IPS Phase B: build active.rules từ profiles đang dùng
-			 * (sau khi policy đã nạp) — ipsd sẽ nạp khi start. */
+			if (rc != SG_OK) fails++;
+			/* IPS Phase B: build active.rules from active profiles
+			 * after policy is loaded — ipsd loads this on start. */
 			rebuild_ips_active(rb_result, sizeof(rb_result));
 			fprintf(stderr, "[mgmtd] replay ips: %s\n", rb_result);
 			continue;
@@ -3264,6 +3374,7 @@ static void mgmtd_replay_config(void)
 			fprintf(stderr, "[mgmtd] replay network_nat: %s%s\n",
 				rc == SG_OK ? "" : "FAIL ",
 				rb_result);
+			if (rc != SG_OK) fails++;
 			continue;
 		}
 
@@ -3322,9 +3433,11 @@ static void mgmtd_replay_config(void)
 				if (rc == SG_OK)
 					fprintf(stderr, "[mgmtd] replay %s:%s: %s\n",
 						table_types[i], id, result);
-				else
+				else {
 					fprintf(stderr, "[mgmtd] replay FAIL %s:%s: %s\n",
 						table_types[i], id, result);
+					fails++;
+				}
 				free(data);
 			}
 
@@ -3336,6 +3449,112 @@ static void mgmtd_replay_config(void)
 
 	/* Enable ref existence checks now that all config is loaded */
 	g_replaying = 0;
+	return fails;
+}
+
+/*
+ * Rollback reconcile helpers. Run after a revision restore and before
+ * mgmtd_replay_config() (which only re-applies entries still in the DB) to
+ * tear down the runtime state of entries that existed before the rollback
+ * but not after. old_list is the newline-separated id list captured before
+ * the restore (strtok_r mutates it; the caller passes a throwaway copy).
+ */
+static void rollback_reconcile_dhcp(char *old_list)
+{
+	if (!old_list)
+		return;
+	char *save = NULL;
+	for (char *id = strtok_r(old_list, "\n", &save); id;
+	     id = strtok_r(NULL, "\n", &save)) {
+		char *d = sg_db_get("network_dhcp-server", id);
+		if (d) { free(d); continue; }	/* still present after rollback */
+		unapply_dhcp(id);		/* pool removed → stop its dhcpd */
+	}
+}
+
+static void rollback_reconcile_admins(char *old_list)
+{
+	if (!old_list)
+		return;
+	char *save = NULL;
+	for (char *id = strtok_r(old_list, "\n", &save); id;
+	     id = strtok_r(NULL, "\n", &save)) {
+		char *d = sg_db_get("system_admin", id);
+		if (d)
+			free(d);	/* survives — replay refreshes it */
+		else
+			delete_system_user(id);	/* removed → drop OS account */
+		/* Every pre-rollback admin's permissions/password may have
+		 * changed; purge their sessions so they re-authenticate (the
+		 * acting user was an admin before, so this can log them out). */
+		session_tag_purge_user(id);
+	}
+}
+
+/*
+ * collect_fqdn_address_ids — newline-separated ids of fqdn-type
+ * firewall_address objects currently in the DB. Captured BEFORE a restore
+ * so the rollback can destroy the ipsets of fqdn objects it removes (their
+ * type is gone from the DB after the restore). Heap string, caller frees.
+ */
+static char *collect_fqdn_address_ids(void)
+{
+	char *list = sg_db_list("firewall_address");
+	if (!list)
+		return NULL;
+	size_t cap = 256, len = 0;
+	char *out = malloc(cap);
+	if (!out) { free(list); return NULL; }
+	out[0] = '\0';
+	char *save = NULL;
+	for (char *id = strtok_r(list, "\n", &save); id;
+	     id = strtok_r(NULL, "\n", &save)) {
+		char *t = sg_db_get_val("firewall_address", id, "type");
+		int is_fqdn = (t && strcmp(t, "fqdn") == 0);
+		free(t);
+		if (!is_fqdn)
+			continue;
+		size_t n = strlen(id);
+		if (len + n + 2 > cap) {
+			while (len + n + 2 > cap) cap *= 2;
+			char *nb = realloc(out, cap);
+			if (!nb) { free(out); free(list); return NULL; }
+			out = nb;
+		}
+		memcpy(out + len, id, n);
+		len += n;
+		out[len++] = '\n';
+		out[len] = '\0';
+	}
+	free(list);
+	return out;
+}
+
+/*
+ * rollback_reconcile_fqdn — destroy the runtime hash:ip ipset of every fqdn
+ * address object that the restore removed or changed away from fqdn type.
+ * old_list is the pre-restore fqdn id list from collect_fqdn_address_ids
+ * (strtok_r mutates it). The ipset is owned by the fqdn object and is not
+ * touched by replay or the FORWARD rebuild, so it must be destroyed here.
+ */
+static void rollback_reconcile_fqdn(char *old_list)
+{
+	if (!old_list)
+		return;
+	char *save = NULL;
+	for (char *id = strtok_r(old_list, "\n", &save); id;
+	     id = strtok_r(NULL, "\n", &save)) {
+		/* Keep the ipset only if the object still exists AND is still
+		 * fqdn-type. If the rollback removed it OR reverted its type
+		 * (e.g. fqdn -> ipmask), the set is orphaned and must go —
+		 * a surviving row with a changed type would otherwise leak. */
+		char *t = sg_db_get_val("firewall_address", id, "type");
+		int still_fqdn = (t && strcmp(t, "fqdn") == 0);
+		free(t);
+		if (still_fqdn)
+			continue;
+		fqdn_object_removed(id);
+	}
 }
 
 /* ── Session tag table ──────────────────────────────────────────────────── */
@@ -4206,6 +4425,13 @@ static int handle_supervisor_test(int client_fd, const char *user,
 	     tok = strtok_r(NULL, "\n", &sp))
 		lines[nlines++] = tok;
 
+	if (nlines == 0) {
+		/* A newline-only payload passes the !payload[0] guard but
+		 * yields zero tokens — lines[0] would be uninitialized. */
+		send_error(client_fd, SG_ERR_MISSING_ARG, "No operation");
+		return 0;
+	}
+
 	const char *op = lines[0];
 
 	if (strcmp(op, "start") == 0 && nlines >= 2) {
@@ -4947,7 +5173,21 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 					return 0;
 				}
 
+				/* Rename in one transaction: write the new key,
+				 * cascade the new name into every referencing
+				 * field, delete the old key — all commit together
+				 * or all roll back, so the entry never exists under
+				 * both names. sg_db_set/_set_val join this
+				 * transaction (they own BEGIN/COMMIT only at top
+				 * level). */
+				if (sg_db_begin() != 0) {
+					free(existing);
+					send_error(client_fd, SG_ERR_IO_FAIL,
+						   "Rename failed");
+					return 0;
+				}
 				if (sg_db_set(db_type, new_name, clean) != 0) {
+					sg_db_rollback();
 					free(existing);
 					send_error(client_fd, SG_ERR_IO_FAIL,
 						   "Rename failed");
@@ -4960,7 +5200,15 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 								    refs, 16);
 				int need_fw_rebuild  = 0;
 				int need_nat_rebuild = 0;
-				for (int i = 0; i < nrefs; i++) {
+				int cascade_ok = 1;
+				/* Buffer cascade audit lines and emit them only
+				 * AFTER commit succeeds — audit_log writes to a
+				 * flat file outside the transaction, so logging
+				 * inside the loop would record "updated" for refs
+				 * that a later rollback discards. */
+				char **caud = NULL;
+				int n_caud = 0, cap_caud = 0;
+				for (int i = 0; i < nrefs && cascade_ok; i++) {
 					char *found = sg_db_find_referencing(
 						refs[i].type, refs[i].key,
 						db_id);
@@ -4975,9 +5223,16 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 						sg_db_parse_section(
 							e, et, sizeof(et),
 							eid, sizeof(eid));
-						sg_db_set_val(et, eid,
+						/* A failed cascade write must
+						 * abort the whole rename — else
+						 * COMMIT would persist a partial
+						 * (dangling/duplicate) rename. */
+						if (sg_db_set_val(et, eid,
 							      refs[i].key,
-							      new_name);
+							      new_name) != 0) {
+							cascade_ok = 0;
+							break;
+						}
 						if (strcmp(et, "firewall_policy")
 						    == 0)
 							need_fw_rebuild = 1;
@@ -4993,13 +5248,44 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 							 et, eid, db_type,
 							 db_id, new_name,
 							 refs[i].key);
-						audit_log("__cascade",
-							  "200", amsg);
+						/* Defer: buffer now, log post-commit. */
+						if (n_caud == cap_caud) {
+							int ncap = cap_caud ? cap_caud * 2 : 8;
+							char **nb = realloc(caud,
+								(size_t)ncap * sizeof(*caud));
+							if (nb) { caud = nb; cap_caud = ncap; }
+						}
+						if (n_caud < cap_caud) {
+							char *dup = strdup(amsg);
+							if (dup) caud[n_caud++] = dup;
+						}
 					}
 					free(found);
 				}
 
-				sg_db_del(db_type, db_id);
+				/* Delete the old key and commit — but only if
+				 * the cascade fully succeeded; otherwise roll the
+				 * entire rename back (atomicity contract). */
+				if (!cascade_ok ||
+				    sg_db_del(db_type, db_id) != 0 ||
+				    sg_db_commit() != 0) {
+					sg_db_rollback();
+					for (int a = 0; a < n_caud; a++)
+						free(caud[a]);
+					free(caud);
+					free(existing);
+					send_error(client_fd, SG_ERR_IO_FAIL,
+						   "Rename failed");
+					return 0;
+				}
+
+				/* Commit succeeded — now the cascade audit lines
+				 * reflect persisted state, so emit them. */
+				for (int a = 0; a < n_caud; a++) {
+					audit_log("__cascade", "200", caud[a]);
+					free(caud[a]);
+				}
+				free(caud);
 
 				if (need_fw_rebuild) {
 					char rb[512];
@@ -6013,6 +6299,163 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		return 0;
 	}
 
+	case SG_CMD_COMMIT: {
+		/* Snapshot the current config as a named revision. */
+		const char *perms = get_user_permissions(user);
+		if (!has_permission(perms, "configure") &&
+		    !has_permission(perms, "admin")) {
+			send_error(client_fd, SG_ERR_PERM_DENIED,
+				   "Requires 'configure' permission");
+			return 0;
+		}
+		char msg[256] = "";
+		if (payload && payload[0])
+			snprintf(msg, sizeof(msg), "%s", payload);
+		int rev = sg_db_revision_create(user, msg);
+		if (rev < 0) {
+			send_error(client_fd, SG_ERR_IO_FAIL,
+				   "Failed to record revision");
+			return 0;
+		}
+		sg_db_revision_prune(50);	/* bound history after the commit */
+		char out[64];
+		snprintf(out, sizeof(out), "Saved revision %d\n", rev);
+		mgmt_log("INFO", "config commit: rev %d by %s", rev, user);
+		send_ok(client_fd, NULL, out);
+		return 0;
+	}
+
+	case SG_CMD_REVISIONS: {
+		const char *perms = get_user_permissions(user);
+		if (!has_permission(perms, "monitor")) {
+			send_error(client_fd, SG_ERR_PERM_DENIED,
+				   "Requires 'monitor' permission");
+			return 0;
+		}
+		char *list = sg_db_revision_list();
+		if (!list) {
+			send_ok(client_fd, "empty", "  No revisions.\n");
+			return 0;
+		}
+		if (!list[0]) {
+			free(list);
+			send_ok(client_fd, "empty", "  No revisions.\n");
+			return 0;
+		}
+		send_ok(client_fd, NULL, list);
+		free(list);
+		return 0;
+	}
+
+	case SG_CMD_ROLLBACK: {
+		/* Restore the config to a revision and re-apply it to the
+		 * kernel. The current config is snapshotted first so the
+		 * rollback is itself reversible. */
+		const char *perms = get_user_permissions(user);
+		/* Requires 'admin': a rollback restores the WHOLE config table,
+		 * including admin-gated types (system_admin, admin-profile,
+		 * password-policy) that CFG_SET/CFG_DEL require 'admin' to
+		 * change. Gating at 'configure' would let a configure-only user
+		 * reinstate old admins / weaken policy via rollback. */
+		if (!has_permission(perms, "admin")) {
+			send_error(client_fd, SG_ERR_PERM_DENIED,
+				   "Requires 'admin' permission "
+				   "(rollback can restore admin accounts/policy)");
+			return 0;
+		}
+		if (!payload || !payload[0]) {
+			send_error(client_fd, SG_ERR_MISSING_ARG,
+				   "Usage: configure rollback <revision>");
+			return 0;
+		}
+		char *endp = NULL;
+		long rev = strtol(payload, &endp, 10);
+		while (endp && (*endp == ' ' || *endp == '\t' ||
+				*endp == '\n' || *endp == '\r'))
+			endp++;
+		if (endp == payload || *endp != '\0' ||
+		    rev <= 0 || rev > 0x7fffffff) {
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "Invalid revision number");
+			return 0;
+		}
+		if (!sg_db_revision_exists((int)rev)) {
+			send_error(client_fd, SG_ERR_NOT_FOUND,
+				   "Revision not found");
+			return 0;
+		}
+		/* Reversible: snapshot current state before overwriting it. */
+		char snapmsg[96];
+		snprintf(snapmsg, sizeof(snapmsg),
+			 "pre-rollback snapshot (before rollback to rev %ld)",
+			 rev);
+		int snap = sg_db_revision_create(user, snapmsg);
+		if (snap < 0) {
+			send_error(client_fd, SG_ERR_IO_FAIL,
+				   "Failed to snapshot current config; rollback aborted");
+			return 0;
+		}
+		/* Capture the entries that exist BEFORE the restore for the
+		 * types whose runtime state replay cannot tear down (it only
+		 * re-applies surviving entries). After the restore we reconcile
+		 * the ones the rollback removed. */
+		char *old_dhcp   = sg_db_list("network_dhcp-server");
+		char *old_admins = sg_db_list("system_admin");
+		char *old_fqdn   = collect_fqdn_address_ids();
+
+		/* Restore the config table (atomic). */
+		if (sg_db_revision_restore((int)rev) != 0) {
+			free(old_dhcp);
+			free(old_admins);
+			free(old_fqdn);
+			send_error(client_fd, SG_ERR_IO_FAIL,
+				   "Failed to restore revision; config unchanged");
+			return 0;
+		}
+
+		/* Tear down runtime state of entries the rollback removed
+		 * (stop orphaned dhcpd pools; delete OS accounts for admins no
+		 * longer in config + purge every pre-rollback admin's sessions
+		 * so changed/removed privileges force re-auth; destroy ipsets of
+		 * removed fqdn address objects). Replay only re-applies survivors;
+		 * firewall/NAT/routes are fully flush-rebuilt from the DB by it. */
+		rollback_reconcile_dhcp(old_dhcp);
+		rollback_reconcile_admins(old_admins);
+		rollback_reconcile_fqdn(old_fqdn);
+		free(old_dhcp);
+		free(old_admins);
+		free(old_fqdn);
+
+		/* Reconcile the kernel to the restored DB: this flushes and
+		 * rebuilds firewall/NAT/routes and re-applies every surviving
+		 * type, exactly as boot replay does. */
+		int replay_fails = mgmtd_replay_config();
+		/* Re-evaluate live flows against the rolled-back policy. */
+		conntrack_reeval_after_policy_change(0);
+		/* Prune the revision history after the restore has consumed the
+		 * target revision (so pruning cannot remove a revision still in
+		 * use by this rollback). */
+		sg_db_revision_prune(50);
+		mgmt_log("INFO", "config rollback to rev %ld by %s "
+			 "(current saved as rev %d, %d apply failure(s))",
+			 rev, user, snap, replay_fails);
+		char out[160];
+		if (replay_fails > 0)
+			/* DB is restored correctly, but some components did not
+			 * re-apply to the kernel — do not report clean success. */
+			snprintf(out, sizeof(out),
+				 "Rolled back to revision %ld (current saved as rev %d) "
+				 "with %d component(s) failing to apply — see log; "
+				 "a reboot fully reconciles\n",
+				 rev, snap, replay_fails);
+		else
+			snprintf(out, sizeof(out),
+				 "Rolled back to revision %ld (current saved as rev %d)\n",
+				 rev, snap);
+		send_ok(client_fd, NULL, out);
+		return 0;
+	}
+
 	case SG_CMD_WHOAMI: {
 		/* Return caller's profile and permissions from database */
 		char *udata = sg_db_get("system_admin", user);
@@ -6747,6 +7190,7 @@ int main(void)
 			socklen_t cred_len = sizeof(cred);
 			if (getsockopt(cfd, SOL_SOCKET, SO_PEERCRED,
 				       &cred, &cred_len) == 0) {
+				g_peer_uid = cred.uid;
 				/*
 				 * Verify the client-claimed username matches
 				 * the kernel-verified UID. If the claimed user
@@ -6793,6 +7237,10 @@ int main(void)
 				continue;
 			}
 		}
+#else
+		/* Test harness has no SO_PEERCRED; treat the peer as root
+		 * so root-gated handlers remain exercisable under test. */
+		g_peer_uid = 0;
 #endif
 
 		/* Handle request (with verified username)

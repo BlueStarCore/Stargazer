@@ -10,10 +10,10 @@
  * Disabled entries are skipped.
  *
  * SNAT (overload):
- *   -A POSTROUTING [-s srcaddr] [-d dstaddr] -o <srcintf> -j MASQUERADE
+ *   -A POSTROUTING [-s srcaddr] [-d dstaddr] -o <dstintf> -j MASQUERADE
  *
  * DNAT:
- *   -A PREROUTING [-s srcaddr] [-d dstaddr] [-i dstintf]
+ *   -A PREROUTING [-s srcaddr] [-d dstaddr] [-i srcintf]
  *       [-p proto [--dport port]] -j DNAT --to-destination ip[:port]
  *
  * protocol=tcp+udp generates two separate rules (one per protocol),
@@ -35,6 +35,28 @@ static int is_any_or_all(const char *val)
 	return !val[0] ||
 	       strcmp(val, "any") == 0 ||
 	       strcmp(val, "all") == 0;
+}
+
+/*
+ * nat_addr_is_fqdn_obj — true if `val` names a fqdn-type firewall_address.
+ *
+ * NAT needs a fixed IP/subnet; an fqdn object is an ipset of rotating DNS
+ * answers, which has no meaning as a NAT source/destination. The apply
+ * path already skips such a rule fail-closed, but that is silent — reject
+ * it here (config time) so the user is told instead of finding a dead
+ * port-forward later. Keywords and raw CIDRs are never fqdn objects.
+ */
+static int nat_addr_is_fqdn_obj(const char *val)
+{
+	if (is_any_or_all(val) || sg_is_cidr(val))
+		return 0;
+	char *data = sg_db_get("firewall_address", val);
+	if (!data)
+		return 0;	/* missing/dangling ref reported elsewhere */
+	char atype[VALBUFSZ];
+	extract_val(data, "type", atype, sizeof(atype));
+	free(data);
+	return strcmp(atype, "fqdn") == 0;
 }
 
 /*
@@ -89,7 +111,11 @@ static int emit_dnat_rule(struct dynbuf *buf,
 		if (dstport[0])
 			dbuf_printf(buf, " --dport %s", dstport);
 	}
-	if (mapped_port[0])
+	/* Port translation only with a protocol: for proto=all (1:1 NAT) a
+	 * ":port" target is invalid and would abort the whole nat rebuild, so
+	 * emit a plain destination even if mapped_port is set on a stray
+	 * entry. validate_nat rejects this combination at config time. */
+	if (proto && mapped_port[0])
 		dbuf_printf(buf, " -j DNAT --to-destination %s:%s\n",
 			    mapped_ip, mapped_port);
 	else
@@ -282,6 +308,20 @@ sg_status_t validate_nat(const char *id, const char *data,
 		snprintf(result, rsize, "Invalid dstaddr '%s'", dstaddr);
 		return SG_ERR_INVALID_VAL;
 	}
+	if (nat_addr_is_fqdn_obj(srcaddr)) {
+		snprintf(result, rsize,
+			 "NAT cannot use fqdn address object '%s' — use an "
+			 "IP/subnet (fqdn objects are for firewall policy)",
+			 srcaddr);
+		return SG_ERR_INVALID_VAL;
+	}
+	if (nat_addr_is_fqdn_obj(dstaddr)) {
+		snprintf(result, rsize,
+			 "NAT cannot use fqdn address object '%s' — use an "
+			 "IP/subnet (fqdn objects are for firewall policy)",
+			 dstaddr);
+		return SG_ERR_INVALID_VAL;
+	}
 	if (mapped_ip[0] && !sg_is_ipv4(mapped_ip)) {
 		snprintf(result, rsize, "Invalid mapped-ip '%s'", mapped_ip);
 		return SG_ERR_INVALID_VAL;
@@ -299,6 +339,15 @@ sg_status_t validate_nat(const char *id, const char *data,
 	if (dstport[0] && protocol[0] && strcmp(protocol, "all") == 0) {
 		snprintf(result, rsize,
 			 "dstport requires protocol tcp, udp, or tcp+udp");
+		return SG_ERR_INVALID_VAL;
+	}
+	/* Cross-field: port translation needs a protocol. protocol=all with a
+	 * mapped-port would emit "--to-destination IP:PORT" without -p, which
+	 * iptables rejects — failing the whole atomic nat rebuild. Reject it
+	 * here (and emit_dnat_rule drops the port for proto=all defensively). */
+	if (mapped_port[0] && protocol[0] && strcmp(protocol, "all") == 0) {
+		snprintf(result, rsize,
+			 "mapped-port requires protocol tcp, udp, or tcp+udp");
 		return SG_ERR_INVALID_VAL;
 	}
 

@@ -313,7 +313,7 @@
                         <div class="form-section">PER-CORE STATUS</div>
                         <table class="data-table table-borderless">
                             <thead><tr><th>CORE</th><th>FREQ</th><th>USAGE</th><th>TEMP</th><th></th></tr></thead>
-                            <tbody>
+                            <tbody id="percore-tbody">
                             </tbody>
                         </table>
                     </div>
@@ -376,20 +376,41 @@
                     <div class="form-card">
                         <div class="form-section">eMMC &mdash; PRIMARY BOOT</div>
                         <div class="form-row"><label class="form-label">eMMC Size</label><span class="form-value loading" id="disk-emmc-size">loading</span></div>
-                        <div class="form-section">DATA PARTITION</div>
+                        <div class="form-row"><label class="form-label">Allocated</label><span class="form-value" id="disk-emmc-alloc">--</span></div>
+                        <div class="form-section">DATA PARTITION <span style="color:var(--text-dim);font-weight:400;text-transform:none">/etc/stargazer</span></div>
                         <div class="form-row"><label class="form-label">Total</label><span class="form-value loading" id="disk-total">loading</span></div>
                         <div class="form-row"><label class="form-label">Used</label><span class="form-value loading" id="disk-used">loading</span></div>
                         <div class="form-row"><label class="form-label">Free</label><span class="form-value loading" id="disk-free">loading</span></div>
                     </div>
+                    <div class="form-card" id="disk-logs-card" style="display:none">
+                        <div class="form-section">LOGS PARTITION <span style="color:var(--text-dim);font-weight:400;text-transform:none">/etc/stargazer/logs</span></div>
+                        <div class="form-row"><label class="form-label">Total</label><span class="form-value" id="disk-logs-total">--</span></div>
+                        <div class="form-row"><label class="form-label">Used</label><span class="form-value" id="disk-logs-used">--</span></div>
+                        <div class="form-row"><label class="form-label">Free</label><span class="form-value" id="disk-logs-free">--</span></div>
+                        <div class="usage-bar usage-bar-lg mt-8"><div class="usage-fill usage-fill-used" id="disk-logs-bar" style="width:0%"></div></div>
+                    </div>
                 </div>
 
                 <!-- Top Processes -->
-                <div class="page-header mt-24"><h2 class="page-title">TOP PROCESSES</h2><div class="widget-search"><input type="text" placeholder="Filter processes..." class="table-filter" data-target="res-procs"></div></div>
+                <div class="page-header mt-24"><h2 class="page-title">TOP PROCESSES</h2><div class="widget-search"><input type="text" id="proctop-search" placeholder="Filter processes..."></div></div>
                 <table class="data-table" id="proctop-table">
                     <thead><tr><th>PID</th><th>NAME</th><th>CPU TICKS</th><th>MEM (RSS)</th><th>STATE</th></tr></thead>
                     <tbody id="proctop-tbody">
                     </tbody>
                 </table>
+                <div class="rf-pager">
+                    <span class="rf-pager-info" id="proctop-pager-info"></span>
+                    <div class="rf-pager-controls">
+                        <select class="rf-page-size" id="proctop-page-size">
+                            <option value="10" selected>10 / page</option>
+                            <option value="25">25 / page</option>
+                            <option value="50">50 / page</option>
+                        </select>
+                        <button class="btn rf-btn" id="proctop-prev" aria-label="Previous page">&#9664;</button>
+                        <span class="rf-page-num" id="proctop-page-num"></span>
+                        <button class="btn rf-btn" id="proctop-next" aria-label="Next page">&#9654;</button>
+                    </div>
+                </div>
             </div>
 
             <!-- ======== HOME > NETWORK PAGE ======== -->

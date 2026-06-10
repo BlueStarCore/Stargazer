@@ -41,6 +41,7 @@
 #include "sg_db.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -202,7 +203,17 @@ void fqdn_refresh_kick(void)
 		 * next tick retries.  Held until _exit releases it. */
 		int lk = open("/run/stargazer-fqdn.lock",
 			      O_CREAT | O_RDWR | O_CLOEXEC, 0600);
-		if (lk >= 0 && flock(lk, LOCK_EX | LOCK_NB) != 0) {
+		if (lk < 0) {
+			/* Cannot establish the single-flight lock — skip rather
+			 * than run unserialized, which under stress (slow
+			 * resolver outlasting the tick) would let workers pile
+			 * up. Skipping is safe: membership only ages at fqdn-ttl
+			 * and the next tick retries. */
+			mgmt_log("WARN", "fqdn: cannot open refresh lock (%s) — "
+				 "this round skipped", strerror(errno));
+			_exit(0);
+		}
+		if (flock(lk, LOCK_EX | LOCK_NB) != 0) {
 			mgmt_log("WARN", "fqdn: previous refresh still "
 				 "running — this round skipped");
 			_exit(0);

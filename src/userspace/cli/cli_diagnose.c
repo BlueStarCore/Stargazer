@@ -574,15 +574,15 @@ static void diag_security_tests(void)
 	diag_test_status("CFG_LIST_TYPES implemented",
 			 SG_CMD_CFG_LIST_TYPES, "",
 			 SG_OK);
-	diag_test_status("COMMIT unimplemented",
+	diag_test_status("COMMIT records a revision",
 			 SG_CMD_COMMIT, "",
-			 SG_ERR_INVALID_CMD);
-	diag_test_status("REVISIONS unimplemented",
+			 SG_OK);
+	diag_test_status("REVISIONS lists revisions",
 			 SG_CMD_REVISIONS, "",
-			 SG_ERR_INVALID_CMD);
-	diag_test_status("ROLLBACK unimplemented",
+			 SG_OK);
+	diag_test_status("ROLLBACK rejects empty revision",
 			 SG_CMD_ROLLBACK, "",
-			 SG_ERR_INVALID_CMD);
+			 SG_ERR_MISSING_ARG);
 	diag_test_status("SHOW_CONFIG unimplemented",
 			 SG_CMD_SHOW_CONFIG, "",
 			 SG_ERR_INVALID_CMD);

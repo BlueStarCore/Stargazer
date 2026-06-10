@@ -28,6 +28,7 @@
 /* aarch64 syscall numbers (asm-generic/unistd.h) */
 #define SC_openat           56
 #define SC_close            57
+#define SC_unlinkat         35
 #define SC_lseek            62
 #define SC_read             63
 #define SC_write            64
@@ -169,8 +170,9 @@ int webd_sandbox_install(void)
 		SC_ALLOW(SC_getsockopt),
 
 		/* ── openat: O_RDONLY (file serving) and O_WRONLY (firmware
-		 *    upload staging to /tmp/sg-fw-upload.tar.gz); O_RDWR
-		 *    is never required and remains blocked. */
+		 *    upload staging to /tmp/sg-fw-upload.<rand>, opened
+		 *    O_WRONLY|O_CREAT|O_EXCL — NOT mkstemp, which is O_RDWR);
+		 *    O_RDWR is never required and remains blocked. */
 		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SC_openat, 0, 6),
 		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_ARG2),
 		BPF_STMT(BPF_ALU | BPF_AND | BPF_K, O_ACCMODE_MASK),
@@ -235,6 +237,12 @@ int webd_sandbox_install(void)
 		/* ── Misc ────────────────────────────────────────── */
 		SC_ALLOW(SC_fcntl),
 		SC_ALLOW(SC_newfstatat),
+		/* unlinkat: clean up this process's own firmware staging temp
+		 * (/tmp/sg-fw-upload.*) on the upload error paths. unlink() is
+		 * unlinkat on aarch64; without this, an upload error path would
+		 * be killed by the filter. Bounded: webd can already create and
+		 * O_TRUNC files it owns, so deleting its own temps adds little. */
+		SC_ALLOW(SC_unlinkat),
 		SC_ALLOW(SC_exit_group),
 
 		/* ── ioctl: SIOCGIFADDR only ─────────────────────

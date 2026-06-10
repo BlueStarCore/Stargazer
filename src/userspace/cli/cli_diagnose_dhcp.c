@@ -146,6 +146,21 @@ dhcp_ipc(uint32_t opcode, const char *payload)
 	ipc_resp_free(&resp);
 }
 
+/* Same as dhcp_ipc but returns the status — used for restore steps whose
+ * failure would leave 'lo' in the test (dhcp) config; -1 on transport error. */
+static int
+dhcp_ipc_checked(uint32_t opcode, const char *payload)
+{
+	struct ipc_response resp;
+	if (ipc_send_str(opcode, payload, &resp) != 0) {
+		ipc_resp_free(&resp);
+		return -1;
+	}
+	int st = (int)resp.status;
+	ipc_resp_free(&resp);
+	return st;
+}
+
 /* ── Test: DHCP cross-validation (IPC required) ──────────────────────── */
 
 static void test_dhcp_cross_validation(void)
@@ -229,8 +244,11 @@ static void test_dhcp_cross_validation(void)
 			      SG_CMD_CFG_APPLY, APPLY_IFACE_DHCP,
 			      SG_ERR_IN_USE);
 
-	/* Restore lo to static with 127.0.0.1/8 immediately */
-	dhcp_ipc(SG_CMD_CFG_APPLY, APPLY_IFACE_STATIC);
+	/* Restore lo to static with 127.0.0.1/8 immediately. Check the
+	 * result: a failed restore leaves the loopback in dhcp mode, which
+	 * persists in the DB and is replayed on boot — the operator must know. */
+	int restore_ok = (dhcp_ipc_checked(SG_CMD_CFG_APPLY,
+					   APPLY_IFACE_STATIC) == SG_OK);
 
 	/* ── Cleanup ──────────────────────────────────────────────── */
 	dhcp_ipc(SG_CMD_CFG_DEL, SECTION_POOL);
@@ -240,11 +258,18 @@ static void test_dhcp_cross_validation(void)
 		char restore[4096 + 256];
 		snprintf(restore, sizeof(restore),
 			 SECTION_IFACE "\n%s", orig_data);
-		dhcp_ipc(SG_CMD_CFG_SET, restore);
+		if (dhcp_ipc_checked(SG_CMD_CFG_SET, restore) != SG_OK)
+			restore_ok = 0;
 	} else {
 		/* Interface wasn't in DB before — remove our entry */
-		dhcp_ipc(SG_CMD_CFG_DEL, SECTION_IFACE);
+		if (dhcp_ipc_checked(SG_CMD_CFG_DEL, SECTION_IFACE) != SG_OK)
+			restore_ok = 0;
 	}
+
+	if (!restore_ok)
+		printf("  [WARN] failed to restore 'lo' interface config — "
+		       "it may be left in the test (dhcp) state; verify with "
+		       "'show system interface lo'\n");
 }
 
 /* ── Public entry point ───────────────────────────────────────────────── */

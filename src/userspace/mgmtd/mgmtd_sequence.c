@@ -126,7 +126,11 @@ int cmkid_auto_assign(const char *type, char *data, size_t data_sz)
 /* ── Internal helpers ───────────────────────────────────────────────── */
 
 struct seq_entry {
-	char  id[64];
+	/* SG_SAFE_ID_MAX (64) + NUL: sg_is_safe_id accepts ids of length
+	 * exactly 64, so a 64-byte buffer would truncate one to 63 and the
+	 * later sg_db_set_val would target a non-existent row, silently
+	 * leaving that entry at its old sequence (wrong chain order). */
+	char  id[SG_SAFE_ID_MAX + 1];
 	int   seq;
 };
 
@@ -204,8 +208,16 @@ static int collect_seq_range(const char *type, int lo, int hi,
 				}
 				entries = nb;
 			}
-			snprintf(entries[n].id,
-				 sizeof(entries[n].id), "%s", tok);
+			int idn = snprintf(entries[n].id,
+					   sizeof(entries[n].id), "%s", tok);
+			if (idn < 0 || (size_t)idn >= sizeof(entries[n].id)) {
+				/* id too long to store without truncation —
+				 * abort rather than reorder against a wrong id. */
+				free(entries);
+				free(list);
+				*out = NULL;
+				return -1;
+			}
 			entries[n].seq = seq;
 			n++;
 		}
