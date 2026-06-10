@@ -334,40 +334,47 @@ int ips_catalog_to_json(const char *repo_dir, char *buf, size_t cap,
 			extract_token(line, "classtype:", ';', classtype, sizeof(classtype));
 			extract_token(line, "reference:url,", ';', ref_url, sizeof(ref_url));
 
-			/* dừng nếu sắp đầy buf (chừa chỗ đóng]) */
-			if (pos + strlen(name) + 200 > cap)
+			/*
+			 * Reserve enough for all fixed overhead per entry:
+			 *   sid/cat/action prefix  ~200
+			 *   name content           strlen(name)
+			 *   classtype field        ~80
+			 *   cve field              ~45
+			 *   info field             ~150
+			 *   closing "}" + "]"      ~4
+			 * Total non-name overhead: ~480 → use 512 as safe margin.
+			 */
+			if (pos + strlen(name) + 512 > cap)
 				break;
+
+#define JAPPEND(...) do { \
+	int _n = snprintf(buf + pos, cap - pos, __VA_ARGS__); \
+	if (_n > 0) pos += (_n < (int)(cap - pos)) ? (size_t)_n : (cap - pos - 1); \
+} while (0)
 
 			if (!first) buf[pos++] = ',';
 			first = 0;
-			pos += (size_t)snprintf(buf + pos, cap - pos,
-				"{\"sid\":%s,\"category\":\"%s\",\"action\":\"%s\",",
+			JAPPEND("{\"sid\":%s,\"category\":\"%s\",\"action\":\"%s\",",
 				sid, cat, action);
-			pos += (size_t)snprintf(buf + pos, cap - pos, "\"name\":\"");
+			JAPPEND("\"name\":\"");
 			json_str(buf, &pos, cap, name);
-			pos += (size_t)snprintf(buf + pos, cap - pos, "\"");
-			if (classtype[0]) {
-				pos += (size_t)snprintf(buf + pos, cap - pos,
-					",\"classtype\":\"%s\"", classtype);
-			}
-			if (cve[0]) {
-				pos += (size_t)snprintf(buf + pos, cap - pos,
-					",\"cve\":\"CVE-%s\"", cve);
-			}
-			/* info: combine CVE + ref URL into one field */
+			JAPPEND("\"");
+			if (classtype[0])
+				JAPPEND(",\"classtype\":\"%s\"", classtype);
+			if (cve[0])
+				JAPPEND(",\"cve\":\"CVE-%s\"", cve);
 			if (cve[0] || ref_url[0]) {
-				pos += (size_t)snprintf(buf + pos, cap - pos, ",\"info\":\"");
+				JAPPEND(",\"info\":\"");
 				if (cve[0]) {
-					pos += (size_t)snprintf(buf + pos, cap - pos,
-						"CVE-%s", cve);
-					if (ref_url[0])
-						pos += (size_t)snprintf(buf + pos, cap - pos, " ");
+					JAPPEND("CVE-%s", cve);
+					if (ref_url[0]) JAPPEND(" ");
 				}
 				if (ref_url[0])
 					json_str(buf, &pos, cap, ref_url);
-				pos += (size_t)snprintf(buf + pos, cap - pos, "\"");
+				JAPPEND("\"");
 			}
 			if (pos + 4 < cap) buf[pos++] = '}';
+#undef JAPPEND
 		}
 		fclose(in);
 	}
