@@ -283,6 +283,15 @@
         if (page === 'dashboard') { promises.push(renderGauges(), renderIfaces()); }
         else if (page === 'resources') { promises.push(renderResourceGauges(), renderResourceDetails()); }
         else if (page === 'home-network') { promises.push(renderNetworkOverview()); }
+        else if (page === 'sec-ips') { promises.push(initIpsPage(pageEl)); }
+        else if (page === 'sec-ips-profiles') {
+            var profTable = pageEl ? pageEl.querySelector('table[data-entity]') : null;
+            if (profTable) promises.push(loadEntityPage(profTable.dataset.entity, profTable));
+            if (pageEl) resetPageFilters(pageEl);
+            /* Refresh profile dropdown on policy form so new profiles appear */
+            invalidateApiCache('/config/security_ips-profile');
+            populateIpsProfileSelects();
+        }
         else if (page === 'sys-settings') { promises.push(loadSettingsPage(pageEl, 'system')); }
         else if (page === 'sys-password') { promises.push(loadSettingsPage(pageEl, 'password-policy')); }
         else if (page === 'sys-firmware') { promises.push(loadFirmwareInfo()); }
@@ -1538,6 +1547,9 @@
         form.querySelectorAll('.form-row-full input[type="checkbox"]').forEach(function (cb) {
             cb.checked = false;
         });
+        /* Re-sync conditional rows after reset (selects back to index 0) */
+        syncAddressFormRows();
+        syncPolicyFormRows();
     }
 
     function closeModal(instant) {
@@ -1583,6 +1595,25 @@
         if (sel) sel.addEventListener('change', syncAddressFormRows);
     })();
 
+    function syncPolicyFormRows() {
+        var form = document.getElementById('form-policy');
+        if (!form) return;
+        var actionSel  = form.querySelector('.form-row[data-key="action"] select');
+        var ipsRow     = form.querySelector('.form-row[data-key="ips-profile"]');
+        if (!actionSel || !ipsRow) return;
+        var isDeny = actionSel.value === 'deny' || actionSel.value === 'drop';
+        ipsRow.style.display = isDeny ? 'none' : '';
+        if (isDeny) {
+            var ipsSel = ipsRow.querySelector('select');
+            if (ipsSel) ipsSel.value = 'none';
+        }
+    }
+    (function () {
+        var form = document.getElementById('form-policy');
+        var sel = form ? form.querySelector('.form-row[data-key="action"] select') : null;
+        if (sel) sel.addEventListener('change', syncPolicyFormRows);
+    })();
+
     /* Bind all toggle buttons */
     document.querySelectorAll('[data-toggle-form]').forEach(function (btn) {
         btn.addEventListener('click', function () {
@@ -1606,6 +1637,7 @@
                 populateProfileSelect();
                 populateAddrSelects();
                 populateSvcSelects();
+                populateIpsProfileSelects();
                 openModal(id);
                 /* closeModal reset the type select — re-sync the
                  * type-dependent rows (address form: subnet vs fqdn) */
@@ -1732,6 +1764,7 @@
                 { label: 'Action',              key: 'action',   col: 8, bulkEditable: true },
                 { label: 'Status',              key: 'status',   col: 9, bulkEditable: true },
                 { label: 'Schedule',            key: 'schedule', col: -1, bulkEditable: false },
+                { label: 'IPS Profile',         key: 'ips-profile', col: -1, bulkEditable: false },
                 { label: 'Comment',             key: 'comment',  col: -1, bulkEditable: false }
             ]
         },
@@ -1762,6 +1795,33 @@
                 { label: 'Protocol',     key: 'protocol', col: 1, bulkEditable: false },
                 { label: 'Port / Range', key: 'port-range', col: 2, bulkEditable: false },
                 { label: 'Comment',      key: 'comment',  col: 3, bulkEditable: false }
+            ]
+        },
+        ipsProfiles: {
+            formId: 'form-ips-profile',
+            configType: 'security_ips-profile',
+            createTitle: 'NEW IPS PROFILE',
+            editTitle: 'EDIT IPS PROFILE',
+            hasStatus: true,
+            statusLabels: { on: 'Enabled', off: 'Disabled', dotOn: 'enable', dotOff: 'disable' },
+            fields: [
+                { label: 'Name',       key: 'name',       col: 0, bulkEditable: false },
+                { label: 'Categories', key: 'categories', col: 1, bulkEditable: false },
+                { label: 'Status',     key: 'status',     col: 2, bulkEditable: true },
+                { label: 'Comment',    key: 'comment',    col: 3, bulkEditable: false }
+            ]
+        },
+        ipsRulesets: {
+            formId: 'form-ips-ruleset',
+            configType: 'security_ips-ruleset',
+            createTitle: 'ADD RULESET URL',
+            editTitle: 'EDIT RULESET',
+            hasStatus: true,
+            statusLabels: { on: 'Enabled', off: 'Disabled', dotOn: 'enable', dotOff: 'disable' },
+            fields: [
+                { label: 'Name',    key: 'name',    col: 0, bulkEditable: false },
+                { label: 'URL',     key: 'url',     col: 1, bulkEditable: false },
+                { label: 'Status',  key: 'enabled', col: 2, bulkEditable: true }
             ]
         },
         admins: {
@@ -2217,7 +2277,8 @@
             populateIfaceSelects(),
             populateProfileSelect(),
             populateAddrSelects(),
-            populateSvcSelects()
+            populateSvcSelects(),
+            populateIpsProfileSelects()
         ]);
     }
 
@@ -2317,8 +2378,9 @@
         }
 
         /* Editing sets the type select programmatically (no change
-         * event) — re-sync type-dependent rows (address: subnet/fqdn) */
+         * event) — re-sync type-dependent rows */
         syncAddressFormRows();
+        syncPolicyFormRows();
     }
 
     /* Extract clean text from a table cell (strip status dots, tags, etc.) */
@@ -3460,7 +3522,8 @@
         'firewall_address': 1,
         'firewall_service': 1,
         'system_admin': 1,
-        'system_admin-profile': 1
+        'system_admin-profile': 1,
+        'security_ips-profile': 1
     };
     function nextNumericId() {
         var pageEl = document.getElementById('page-' + activePage);
@@ -3637,6 +3700,15 @@
         'password-policy': [
             { configType: 'system_password-policy',
               fields: ['min-length', 'min-uppercase', 'min-lowercase', 'min-digit', 'min-special'] }
+        ],
+        'security': [
+            { configType: 'security_ips',
+              fields: ['status', 'mode', 'snapshot-n'] }
+        ],
+        'security-schedule': [
+            { configType: 'security_ips',
+              fields: ['cron-enabled', 'cron-minutes', 'cron-hours', 'cron-dom',
+                       'cron-months', 'cron-dow', 'cron-desc'] }
         ]
     };
 
@@ -3685,7 +3757,8 @@
 
     /* Single-type configs use id "0" (not a table with entries) */
     var SINGLE_CONFIGS = ['system_settings', 'system_ntp', 'network_dns',
-                          'system_password-policy', 'system_session-ttl'];
+                          'system_password-policy', 'system_session-ttl',
+                          'security_ips'];
 
     function settingsLoad(card, settingsName) {
         var maps = SETTINGS_MAP[settingsName];
@@ -3718,8 +3791,1112 @@
         return Promise.resolve();
     }
 
-    /* Wire settings Apply/Reset buttons */
+    /* ── IPS Monitor: status card + recent alert log ──────────────── */
+    function loadIpsMonitor() {
+        function setTxt(id, v) {
+            var e = document.getElementById(id);
+            if (e) e.textContent = v;
+        }
+        var p1 = api('/monitor/ips').then(function (d) {
+            if (!d) return;
+            setTxt('ips-stat-running',
+                   d.ipsd_running === 'yes' ? 'Running' : 'Stopped');
+            setTxt('ips-stat-status', d.status || '—');
+            setTxt('ips-stat-mode', d.mode || '—');
+            setTxt('ips-stat-snap', d.snapshot_n || '—');
+            setTxt('ips-stat-alerts', d.alert_log_lines || '0');
+        }).catch(function () {});
+        var p2 = api('/monitor/ips-alerts').then(function (d) {
+            var log = document.getElementById('ips-alert-log');
+            if (log) log.textContent =
+                (d && d.output && d.output.trim()) ? d.output
+                                                   : '(chưa có alert nào)';
+        }).catch(function () {
+            var log = document.getElementById('ips-alert-log');
+            if (log) log.textContent = '(không tải được alert log)';
+        });
+        return Promise.all([p1, p2]);
+    }
+
+    /* Refresh button on the IPS Monitor page (legacy, kept for compat) */
+    (function () {
+        var btn = document.getElementById('ips-refresh');
+        if (btn) btn.addEventListener('click', function () { loadIpsMonitor(); });
+    })();
+
+    /* ================================================================
+     *  IPS — 5-tab OPNsense-style page
+     * ================================================================ */
+    (function () {
+
+        /* ── state ── */
+        var _catalog  = null;   /* cached signature catalog array */
+        var _overrides = {};    /* sid(string) → {action, id} */
+        var _rulesPage = 0;
+        var _rulesFilter = { q: '', action: '' };
+        var _alerts    = [];    /* last loaded alert array */
+        var _alertDetailSid = null; /* sid shown in alert-detail modal */
+
+        /* ── helpers ── */
+        function pageEl() { return document.getElementById('page-sec-ips'); }
+
+        /* ── tab switching ── */
+        function ipsTabSwitch(tab) {
+            var pg = pageEl(); if (!pg) return;
+            pg.querySelectorAll('.page-tab[data-ips-tab]').forEach(function (b) {
+                b.classList.toggle('active', b.dataset.ipsTab === tab);
+            });
+            pg.querySelectorAll('.ips-tab-pane').forEach(function (p) {
+                p.style.display = (p.dataset.ipsPane === tab) ? '' : 'none';
+            });
+            if (tab === 'settings') {
+                var card = pg.querySelector('[data-ips-pane="settings"] .form-card[data-settings]');
+                if (card) settingsLoad(card, 'security');
+            } else if (tab === 'download') {
+                loadIpsRulesets();
+            } else if (tab === 'rules') {
+                loadIpsRules();
+            } else if (tab === 'alerts') {
+                loadIpsAlerts();
+            } else if (tab === 'schedule') {
+                var scard = pg.querySelector('[data-ips-pane="schedule"] .form-card[data-settings]');
+                if (scard) settingsLoad(scard, 'security-schedule');
+            }
+        }
+
+        /* ── initIpsPage: called once per navigation ── */
+        window.initIpsPage = function (pg) {
+            if (!pg) return Promise.resolve();
+            if (!pg._ipsInited) {
+                pg._ipsInited = true;
+
+                /* Tab click handlers */
+                pg.querySelectorAll('.page-tab[data-ips-tab]').forEach(function (b) {
+                    b.addEventListener('click', function () { ipsTabSwitch(b.dataset.ipsTab); });
+                });
+
+
+                /* Reload Service button */
+                var rbtn = pg.querySelector('#ips-reload-btn');
+                if (rbtn) rbtn.addEventListener('click', function () {
+                    rbtn.disabled = true;
+                    api('/ips/reload', { method: 'POST' })
+                        .then(function () { showToast('IPS service reloaded', 'success'); })
+                        .catch(function () { showToast('Reload failed — check backend', 'error'); })
+                        .finally(function () { rbtn.disabled = false; });
+                });
+
+                /* Settings tab Apply / Reset buttons — delegate to settingsApply */
+                var settingsCard = pg.querySelector('[data-ips-pane="settings"] .form-card[data-settings]');
+                if (settingsCard) {
+                    var applyBtn = settingsCard.querySelector('.form-actions .btn-primary');
+                    var resetBtn = settingsCard.querySelector('.form-actions .btn:not(.btn-primary)');
+                    if (applyBtn) applyBtn.addEventListener('click', function () {
+                        settingsApply(settingsCard, 'security');
+                    });
+                    if (resetBtn) resetBtn.addEventListener('click', function () {
+                        settingsLoad(settingsCard, 'security');
+                    });
+                }
+
+                /* Schedule tab Reset only — Apply is wired below with cron validation */
+                var schedCard = pg.querySelector('[data-ips-pane="schedule"] .form-card[data-settings]');
+                if (schedCard) {
+                    var sreset = schedCard.querySelector('.form-actions .btn:not(.btn-primary)');
+                    if (sreset) sreset.addEventListener('click', function () {
+                        settingsLoad(schedCard, 'security-schedule');
+                    });
+                }
+
+                /* Download tab: Reload button — rescan custom XML dir */
+                var reloadRsBtn = pg.querySelector('#ips-rulesets-reload-btn');
+                if (reloadRsBtn) reloadRsBtn.addEventListener('click', function () {
+                    reloadRsBtn.disabled = true;
+                    api('/ips/rulesets-reload', { method: 'POST' })
+                        .then(function (d) {
+                            showToast('Ruleset list refreshed', 'success');
+                            loadIpsRulesets();
+                            showIpsUpdateLog(pg, (d && d.output) ? d.output : 'Done');
+                        })
+                        .catch(function () { showToast('Reload failed', 'error'); })
+                        .finally(function () { reloadRsBtn.disabled = false; });
+                });
+
+                /* Select-all checkbox */
+                var rsAllCb = pg.querySelector('#ips-rulesets-all');
+                if (rsAllCb) rsAllCb.addEventListener('change', function () {
+                    pg.querySelectorAll('#ips-rulesets-tbody .rs-cb').forEach(function (cb) {
+                        if (!cb.disabled) cb.checked = rsAllCb.checked;
+                    });
+                });
+
+                /* Ruleset search */
+                var rsSearch = pg.querySelector('#ips-rulesets-search');
+                if (rsSearch) rsSearch.addEventListener('input', function () {
+                    filterRulesetRows(rsSearch.value.trim().toLowerCase());
+                });
+
+                /* Download & Update — requires at least one checkbox selected */
+                var updateBtn = pg.querySelector('#ips-update-now-btn');
+                var _pollTimer = null;
+                var _pollIds   = [];
+
+                function stopLogPolling() {
+                    if (_pollTimer) { clearInterval(_pollTimer); _pollTimer = null; }
+                }
+
+                function startLogPolling(ids) {
+                    stopLogPolling();
+                    _pollIds = ids.slice();
+                    var remaining = _pollIds.slice();
+
+                    function poll() {
+                        api('/ips/update-log').then(function (d) {
+                            var out = (d && d.output) ? d.output : '';
+                            showIpsUpdateLog(pg, out);
+
+                            /* Check which IDs are accounted for (Success: or ERROR:) */
+                            remaining = remaining.filter(function (id) {
+                                /* ips-update.sh logs lines like: "2026-01-01 [catname] Success:..." */
+                                var re = new RegExp('\\[' + id.replace(/[-]/g, '.') + '\\].*?(Success:|ERROR:)', 'i');
+                                return !re.test(out);
+                            });
+
+                            if (!remaining.length) {
+                                stopLogPolling();
+                                var hasErr = out.indexOf('ERROR:') !== -1;
+                                if (hasErr) {
+                                    showToast('Download finished with errors — see log below', 'error');
+                                } else {
+                                    showToast('All rulesets downloaded successfully', 'success');
+                                }
+                                /* Bust the signatures cache so Rules tab re-fetches */
+                                invalidateApiCache('/ips/signatures');
+                                _catalog = null;
+                                loadIpsRulesets();
+                            }
+                        }).catch(function () { /* poll silently */ });
+                    }
+
+                    poll();                             /* immediate first fetch */
+                    _pollTimer = setInterval(poll, 3000); /* then every 3 s */
+                    /* safety: stop polling after 5 minutes regardless */
+                    setTimeout(function () {
+                        if (_pollTimer) {
+                            stopLogPolling();
+                            invalidateApiCache('/ips/signatures');
+                            _catalog = null;
+                            loadIpsRulesets();
+                        }
+                    }, 300000);
+                }
+
+                if (updateBtn) updateBtn.addEventListener('click', function () {
+                    var checked = pg.querySelectorAll('#ips-rulesets-tbody .rs-cb:checked');
+                    if (!checked.length) {
+                        showToast('Select at least one ruleset to download', 'error');
+                        return;
+                    }
+                    var ids = [];
+                    checked.forEach(function (cb) { ids.push(cb.dataset.id); });
+                    updateBtn.disabled = true;
+                    updateBtn.textContent = 'Starting…';
+                    api('/ips/update-now', { method: 'POST', body: { ids: ids.join(',') } })
+                        .then(function () {
+                            showToast('Downloading ' + ids.length + ' ruleset(s)…', 'success');
+                            startLogPolling(ids);
+                        })
+                        .catch(function (err) {
+                            showToast('Failed to start download: ' + (err.message || 'network error'), 'error');
+                        })
+                        .finally(function () {
+                            updateBtn.disabled = false;
+                            updateBtn.textContent = 'Download & Update Rules';
+                        });
+                });
+
+                /* ── Custom ruleset import modal ── */
+                var customModal  = document.getElementById('modal-ips-custom');
+                var customDesc   = document.getElementById('ips-custom-desc');
+                var customUrl    = document.getElementById('ips-custom-url');
+                var customSubmit = document.getElementById('ips-custom-submit');
+
+                function openCustomModal() {
+                    if (!customModal) return;
+                    if (customDesc) customDesc.value = '';
+                    if (customUrl)  customUrl.value  = '';
+                    customModal.style.display = 'flex';
+                    if (customDesc) customDesc.focus();
+                }
+                function closeCustomModal() {
+                    if (customModal) customModal.style.display = 'none';
+                }
+
+                var addCustomBtn = pg.querySelector('#ips-custom-add-btn');
+                if (addCustomBtn) addCustomBtn.addEventListener('click', openCustomModal);
+
+                var customClose  = document.getElementById('ips-custom-modal-close');
+                var customCancel = document.getElementById('ips-custom-cancel');
+                if (customClose)  customClose.addEventListener('click', closeCustomModal);
+                if (customCancel) customCancel.addEventListener('click', closeCustomModal);
+                if (customModal)  customModal.addEventListener('click', function (e) {
+                    if (e.target === customModal) closeCustomModal();
+                });
+
+                if (customSubmit) customSubmit.addEventListener('click', function () {
+                    var desc = customDesc ? customDesc.value.trim() : '';
+                    var url  = customUrl  ? customUrl.value.trim()  : '';
+                    if (!desc) { showToast('Description is required', 'error'); return; }
+                    if (!url)  { showToast('URL is required', 'error'); return; }
+                    if (!/^https?:\/\/.+/.test(url)) {
+                        showToast('URL must start with http:// or https://', 'error');
+                        return;
+                    }
+                    /* Generate a safe ID from the description */
+                    var genId = 'custom-' + desc.toLowerCase()
+                        .replace(/[^a-z0-9]+/g, '-')
+                        .replace(/^-+|-+$/g, '')
+                        .slice(0, 32) + '-' + Date.now().toString(36);
+                    customSubmit.disabled = true;
+                    api('/config/security_ips-ruleset', {
+                        method: 'POST',
+                        body: { id: genId, description: desc, url: url,
+                                enabled: 'enable', builtin: 'no' }
+                    }).then(function () {
+                        showToast('Custom ruleset added — select it and click Download & Update Rules', 'success');
+                        closeCustomModal();
+                        loadIpsRulesets();
+                    }).catch(function (err) {
+                        showToast((err && err.message) || 'Failed to add ruleset', 'error');
+                    }).finally(function () { customSubmit.disabled = false; });
+                });
+
+                /* Delete custom ruleset via event delegation on the tbody */
+                var rsTbody = pg.querySelector('#ips-rulesets-tbody');
+                if (rsTbody) rsTbody.addEventListener('click', function (ev) {
+                    var btn = ev.target.closest('[data-del-id]');
+                    if (!btn) return;
+                    var id = btn.dataset.delId;
+                    if (!id) return;
+                    if (!confirm('Delete custom ruleset "' + id + '"?')) return;
+                    api('/config/security_ips-ruleset/' + encodeURIComponent(id),
+                        { method: 'DELETE' })
+                        .then(function () {
+                            showToast('Ruleset deleted', 'success');
+                            loadIpsRulesets();
+                        })
+                        .catch(function () { showToast('Delete failed', 'error'); });
+                });
+
+                /* Schedule: cron validation + live preview */
+                var schedCard = pg.querySelector('[data-ips-pane="schedule"] .form-card');
+                if (schedCard) {
+                    var CRON_FIELDS = [
+                        { key: 'cron-minutes', min: 0, max: 59,  label: 'Minutes' },
+                        { key: 'cron-hours',   min: 0, max: 23,  label: 'Hours' },
+                        { key: 'cron-dom',     min: 1, max: 31,  label: 'Day of month' },
+                        { key: 'cron-months',  min: 1, max: 12,  label: 'Months' },
+                        { key: 'cron-dow',     min: 0, max: 6,   label: 'Days of week' }
+                    ];
+                    function getCronVal(k) {
+                        var row = schedCard.querySelector('[data-key="' + k + '"]');
+                        var inp = row ? row.querySelector('.form-input') : null;
+                        return inp ? inp.value.trim() : '';
+                    }
+                    function updateCronPreview() {
+                        var vals = CRON_FIELDS.map(function (f) {
+                            var v = getCronVal(f.key);
+                            return v || (f.min === 0 && f.max >= 23 ? '0' : '*');
+                        });
+                        var lbl = schedCard.querySelector('#cron-preview-label');
+                        if (lbl) lbl.textContent = vals.join(' ');
+                    }
+                    /* Attach preview listeners */
+                    CRON_FIELDS.forEach(function (f) {
+                        var row = schedCard.querySelector('[data-key="' + f.key + '"]');
+                        var inp = row ? row.querySelector('.form-input') : null;
+                        if (inp) inp.addEventListener('input', updateCronPreview);
+                    });
+                    /* Override Apply button with validation */
+                    var sapply = schedCard.querySelector('.form-actions .btn-primary');
+                    if (sapply) {
+                        sapply.addEventListener('click', function () {
+                            for (var fi = 0; fi < CRON_FIELDS.length; fi++) {
+                                var err = validateCronField(
+                                    getCronVal(CRON_FIELDS[fi].key),
+                                    CRON_FIELDS[fi].min, CRON_FIELDS[fi].max,
+                                    CRON_FIELDS[fi].label);
+                                if (err) { showToast(err, 'error'); return; }
+                            }
+                            settingsApply(schedCard, 'security-schedule');
+                        });
+                    }
+                }
+
+                /* Rules tab: search + filter */
+                var qEl = pg.querySelector('#ips-rules-search');
+                if (qEl) qEl.addEventListener('input', function () {
+                    _rulesFilter.q = qEl.value.trim().toLowerCase();
+                    _rulesPage = 0;
+                    renderIpsRulesTable();
+                });
+                var afEl = pg.querySelector('#ips-rules-action-filter');
+                if (afEl) afEl.addEventListener('change', function () {
+                    _rulesFilter.action = afEl.value;
+                    _rulesPage = 0;
+                    renderIpsRulesTable();
+                });
+                var allCb = pg.querySelector('#ips-rules-all');
+                if (allCb) allCb.addEventListener('change', function () {
+                    pg.querySelectorAll('#ips-rules-tbody .rule-cb').forEach(function (cb) {
+                        cb.checked = allCb.checked;
+                    });
+                    updateRulesBulkBar();
+                });
+                pg.querySelector('#ips-rules-tbody') && pg.querySelector('#ips-rules-tbody')
+                    .addEventListener('change', function (e) {
+                        if (e.target.classList.contains('rule-cb')) updateRulesBulkBar();
+                    });
+                var bulkApply = pg.querySelector('#ips-rules-bulk-apply');
+                if (bulkApply) bulkApply.addEventListener('click', applyRulesBulk);
+                var bulkCancel = pg.querySelector('#ips-rules-bulk-cancel');
+                if (bulkCancel) bulkCancel.addEventListener('click', function () {
+                    pg.querySelectorAll('#ips-rules-tbody .rule-cb').forEach(function (cb) { cb.checked = false; });
+                    if (allCb) allCb.checked = false;
+                    updateRulesBulkBar();
+                });
+
+                /* Rules refresh button */
+                var rrBtn = pg.querySelector('#ips-rules-refresh');
+                if (rrBtn) rrBtn.addEventListener('click', function () {
+                    invalidateApiCache('/ips/signatures');
+                    _catalog = null;
+                    loadIpsRules();
+                });
+
+                /* Alerts tab buttons */
+                var arBtn = pg.querySelector('#ips-alerts-refresh');
+                if (arBtn) arBtn.addEventListener('click', loadIpsAlerts);
+                var acBtn = pg.querySelector('#ips-alerts-clear');
+                if (acBtn) acBtn.addEventListener('click', function () {
+                    api('/ips/alerts-clear', { method: 'POST' })
+                        .then(function () { _alerts = []; renderIpsAlertsTable(); showToast('Alerts cleared', 'success'); })
+                        .catch(function () { showToast('Clear failed', 'error'); });
+                });
+                /* Alert info modal close buttons */
+                var adClose  = pg.querySelector('#ips-alert-detail-close');
+                var adClose2 = pg.querySelector('#ips-alert-detail-close2');
+                function closeAlertModal() {
+                    var m = pg.querySelector('#ips-alert-detail-modal');
+                    if (m) m.style.display = 'none';
+                }
+                if (adClose)  adClose.addEventListener('click', closeAlertModal);
+                if (adClose2) adClose2.addEventListener('click', closeAlertModal);
+                var ovBtn = pg.querySelector('#ips-alert-override-btn');
+                if (ovBtn) ovBtn.addEventListener('click', function () {
+                    if (_alertDetailSid) {
+                        closeAlertModal();
+                        ipsTabSwitch('rules');
+                        /* pre-fill search with the SID */
+                        var qInput = pg.querySelector('#ips-rules-search');
+                        if (qInput) {
+                            qInput.value = String(_alertDetailSid);
+                            _rulesFilter.q = String(_alertDetailSid);
+                            _rulesPage = 0;
+                            renderIpsRulesTable();
+                        }
+                    }
+                });
+
+                /* Alert info modal — delegate Info button clicks */
+                var alertTbody = pg.querySelector('#ips-alerts-tbody');
+                if (alertTbody) alertTbody.addEventListener('click', function (e) {
+                    var btn = e.target.closest('.ips-alert-info');
+                    if (!btn) return;
+                    var idx = parseInt(btn.dataset.idx, 10);
+                    var a = _alerts[idx];
+                    if (!a) return;
+                    showAlertDetail(a);
+                });
+            }
+
+            /* Load first (or current active) tab */
+            var activeTab = pg.querySelector('.page-tab.active');
+            var tab = activeTab ? activeTab.dataset.ipsTab : 'settings';
+            ipsTabSwitch(tab);
+            return Promise.resolve();
+        };
+
+        /* ── Download tab: rulesets ── */
+
+        function showIpsUpdateLog(pg, text) {
+            var logDiv = pg.querySelector('#ips-update-log');
+            var logPre = pg.querySelector('#ips-update-log-content');
+            if (logPre) logPre.textContent = text || '';
+            if (logDiv) logDiv.style.display = '';
+        }
+
+        /* Returns an error string if the cron field value is out of range, else null.
+         * Accepts: *, single integer, comma list, or range (e.g. 1-5). */
+        function validateCronField(val, min, max, label) {
+            if (!val || val === '*') return null;
+            var parts = val.split(',');
+            for (var i = 0; i < parts.length; i++) {
+                var p = parts[i].trim();
+                if (!p) return label + ': empty segment in "' + val + '"';
+                if (p.indexOf('-') > 0) {   /* range: e.g. 1-5, not a negative number */
+                    var bounds = p.split('-');
+                    if (bounds.length !== 2) return label + ': invalid range "' + p + '"';
+                    var lo = parseInt(bounds[0], 10), hi = parseInt(bounds[1], 10);
+                    if (isNaN(lo) || isNaN(hi)) return label + ': non-numeric range "' + p + '"';
+                    if (lo < min || hi > max || lo > hi)
+                        return label + ': range "' + p + '" must be ' + min + '–' + max;
+                } else if (p.indexOf('/') !== -1) {
+                    // allow step syntax like */5 or 1-5/2 — validate step number only
+                    var step = parseInt(p.split('/')[1], 10);
+                    if (isNaN(step) || step < 1)
+                        return label + ': invalid step in "' + p + '"';
+                } else {
+                    var n = parseInt(p, 10);
+                    if (isNaN(n)) return label + ': "' + p + '" is not a number';
+                    if (n < min || n > max)
+                        return label + ': ' + n + ' out of range (' + min + '–' + max + ')';
+                }
+            }
+            return null;
+        }
+
+        function loadIpsRulesets() {
+            var pg = pageEl(); if (!pg) return;
+            var tbody = pg.querySelector('#ips-rulesets-tbody');
+            if (!tbody) return;
+            tbody.innerHTML = '<tr><td colspan="4" class="table-empty">Loading…</td></tr>';
+            api('/config/security_ips-ruleset').then(function (data) {
+                var entries = (data && data.entries) ? data.entries : [];
+                if (!entries.length) {
+                    tbody.innerHTML = '<tr><td colspan="4" class="table-empty">No rulesets configured. Click "+ Import Custom Rules" to add one.</td></tr>';
+                    return;
+                }
+                var frag = document.createDocumentFragment();
+                entries.forEach(function (e) {
+                    var tr = document.createElement('tr');
+                    tr.dataset.id = e.id;
+                    tr.dataset.desc = (e.description || e.name || '').toLowerCase();
+
+                    /* checkbox */
+                    var td0 = document.createElement('td'); td0.className = 'td-checkbox';
+                    var cb = document.createElement('input'); cb.type = 'checkbox'; cb.className = 'rs-cb';
+                    cb.dataset.id = e.id;
+                    td0.appendChild(cb); tr.appendChild(td0);
+
+                    /* description */
+                    var td1 = document.createElement('td');
+                    td1.textContent = e.description || e.name || e.id;
+                    if (e.builtin !== 'yes') {
+                        var cBadge = document.createElement('span');
+                        cBadge.textContent = ' (custom)';
+                        cBadge.style.cssText = 'font-size:10px;color:#888';
+                        td1.appendChild(cBadge);
+                    }
+                    tr.appendChild(td1);
+
+                    /* last updated */
+                    var td2 = document.createElement('td');
+                    td2.style.fontSize = '12px';
+                    td2.textContent = e['last-downloaded'] || 'not installed';
+                    tr.appendChild(td2);
+
+                    /* actions — delete for custom entries only */
+                    var td3 = document.createElement('td');
+                    td3.style.cssText = 'text-align:right;white-space:nowrap';
+                    if (e.builtin !== 'yes') {
+                        var delBtn = document.createElement('button');
+                        delBtn.className = 'btn';
+                        delBtn.textContent = 'Delete';
+                        delBtn.style.cssText = 'font-size:11px;padding:2px 8px';
+                        delBtn.dataset.delId = e.id;
+                        td3.appendChild(delBtn);
+                    }
+                    tr.appendChild(td3);
+
+                    frag.appendChild(tr);
+                });
+                tbody.innerHTML = '';
+                tbody.appendChild(frag);
+            }).catch(function () {
+                tbody.innerHTML = '<tr><td colspan="4" class="table-empty">Failed to load rulesets</td></tr>';
+            });
+        }
+
+        function filterRulesetRows(q) {
+            var pg = pageEl(); if (!pg) return;
+            pg.querySelectorAll('#ips-rulesets-tbody tr[data-id]').forEach(function (tr) {
+                var desc = tr.dataset.desc || '';
+                tr.style.display = (!q || desc.indexOf(q) !== -1) ? '' : 'none';
+            });
+        }
+
+        /* ── Rules tab ── */
+        var PAGE_SIZE = 50;
+
+        function loadIpsRules() {
+            var pg = pageEl(); if (!pg) return;
+            var tbody = pg.querySelector('#ips-rules-tbody');
+            if (tbody) tbody.innerHTML = '<tr><td colspan="7" class="table-empty">Loading catalog…</td></tr>';
+            Promise.all([
+                _catalog !== null ? Promise.resolve(_catalog) : cachedApi('/ips/signatures'),
+                api('/config/security_ips-filter')
+            ]).then(function (res) {
+                _catalog = res[0] || [];
+                /* Build override map: value(sid string) → {action, id} for profile=default */
+                _overrides = {};
+                var fd = res[1];
+                if (fd && fd.entries) {
+                    fd.entries.forEach(function (f) {
+                        if (f.profile === 'default' && f.type === 'signature' &&
+                            f.value && f.status === 'enable') {
+                            _overrides[f.value] = { action: f.action, id: f.id };
+                        }
+                    });
+                }
+                _rulesPage = 0;
+                renderIpsRulesTable();
+            }).catch(function () {
+                if (tbody) tbody.innerHTML = '<tr><td colspan="7" class="table-empty">Failed to load</td></tr>';
+            });
+        }
+
+        function filteredRules() {
+            var q = _rulesFilter.q;
+            var af = _rulesFilter.action;
+            return (_catalog || []).filter(function (r) {
+                if (af && (r.action || 'alert') !== af &&
+                    (!_overrides[String(r.sid)] || _overrides[String(r.sid)].action !== af)) return false;
+                if (q) {
+                    var sidStr = String(r.sid || '');
+                    var msg    = (r.name || r.msg || '').toLowerCase();
+                    var src    = (r.category || '').toLowerCase();
+                    var cls    = (r.classtype || '').toLowerCase();
+                    if (sidStr.indexOf(q) === -1 && msg.indexOf(q) === -1 &&
+                        src.indexOf(q) === -1 && cls.indexOf(q) === -1) return false;
+                }
+                return true;
+            });
+        }
+
+        function renderIpsRulesTable() {
+            var pg = pageEl(); if (!pg) return;
+            var tbody = pg.querySelector('#ips-rules-tbody');
+            var pager = pg.querySelector('#ips-rules-pager');
+            if (!tbody) return;
+
+            var rows = filteredRules();
+            var total = rows.length;
+            var pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+            if (_rulesPage >= pages) _rulesPage = pages - 1;
+            var start = _rulesPage * PAGE_SIZE;
+            var slice = rows.slice(start, start + PAGE_SIZE);
+
+            var countLabel = pg.querySelector('#ips-rules-count-label');
+            if (countLabel) {
+                var allTotal = (_catalog || []).length;
+                countLabel.textContent = total === allTotal
+                    ? total + ' rule' + (total !== 1 ? 's' : '')
+                    : total + ' / ' + allTotal + ' rules';
+            }
+
+            if (!slice.length) {
+                var emptyMsg = (_catalog && _catalog.length === 0)
+                    ? 'No rules yet — go to the Download tab and download a ruleset first'
+                    : 'No rules match the filter';
+                tbody.innerHTML = '<tr><td colspan="7" class="table-empty">' + emptyMsg + '</td></tr>';
+                if (pager) pager.innerHTML = '';
+                return;
+            }
+
+            var frag = document.createDocumentFragment();
+            slice.forEach(function (r) {
+                var sidStr = String(r.sid || '');
+                var ov = _overrides[sidStr];
+                var defAction = (r.action === 'drop') ? 'Drop' : 'Alert';
+                var effectiveAction = ov ? (ov.action === 'block' ? 'Drop' : (ov.action.charAt(0).toUpperCase() + ov.action.slice(1))) : defAction;
+                var actionCls = (effectiveAction === 'Drop') ? 'verdict-drop' : (effectiveAction === 'Alert' ? 'verdict-alert' : '');
+                var ovBadge = ov ? ' <span style="font-size:10px;color:#888">(override)</span>' : '';
+                var src = r.category || '—';
+                var cls = r.classtype || '—';
+                var info = r.info || r.cve || '';
+
+                var tr = document.createElement('tr');
+                tr.innerHTML = [
+                    '<td class="td-checkbox"><input type="checkbox" class="rule-cb" data-sid="' + esc(sidStr) + '"></td>',
+                    '<td style="white-space:nowrap">' + esc(sidStr) + '</td>',
+                    '<td class="' + actionCls + '">' + esc(effectiveAction) + ovBadge + '</td>',
+                    '<td style="white-space:nowrap;font-size:12px">' + esc(src) + '</td>',
+                    '<td style="font-size:12px">' + esc(cls) + '</td>',
+                    '<td style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(r.name||r.msg||'') + '">' + esc(r.name||r.msg||'—') + '</td>',
+                    '<td style="font-size:12px;color:#666">' + esc(info) + '</td>'
+                ].join('');
+                frag.appendChild(tr);
+            });
+            tbody.innerHTML = '';
+            tbody.appendChild(frag);
+
+            /* Pager */
+            if (pager) {
+                pager.innerHTML = '';
+                var prev = document.createElement('button');
+                prev.textContent = '‹ Prev';
+                prev.disabled = (_rulesPage === 0);
+                prev.addEventListener('click', function () { _rulesPage--; renderIpsRulesTable(); });
+                pager.appendChild(prev);
+
+                /* Show page numbers around current */
+                var lo = Math.max(0, _rulesPage - 2);
+                var hi = Math.min(pages - 1, _rulesPage + 2);
+                for (var pi = lo; pi <= hi; pi++) {
+                    (function(pi2) {
+                        var pb = document.createElement('button');
+                        pb.textContent = pi2 + 1;
+                        if (pi2 === _rulesPage) pb.classList.add('active');
+                        pb.addEventListener('click', function () { _rulesPage = pi2; renderIpsRulesTable(); });
+                        pager.appendChild(pb);
+                    })(pi);
+                }
+
+                var next = document.createElement('button');
+                next.textContent = 'Next ›';
+                next.disabled = (_rulesPage >= pages - 1);
+                next.addEventListener('click', function () { _rulesPage++; renderIpsRulesTable(); });
+                pager.appendChild(next);
+            }
+        }
+
+        function setRuleOverride(sidStr, action) {
+            if (action === 'default') {
+                /* Remove override */
+                var existing = _overrides[sidStr];
+                if (existing) {
+                    api('/config/security_ips-filter/' + encodeURIComponent(existing.id),
+                        { method: 'DELETE' })
+                        .then(function () { delete _overrides[sidStr]; })
+                        .catch(function () { showToast('Failed to remove override', 'error'); });
+                }
+            } else {
+                /* Create or update override for profile=default */
+                var ovId = 'default-sig-' + sidStr;
+                var payload = { id: ovId, profile: 'default', type: 'signature', value: sidStr,
+                                action: (action === 'drop' ? 'block' : action), status: 'enable' };
+                var existing2 = _overrides[sidStr];
+                var req = existing2
+                    ? api('/config/security_ips-filter/' + encodeURIComponent(existing2.id),
+                          { method: 'PUT', body: payload })
+                    : api('/config/security_ips-filter', { method: 'POST', body: payload });
+                req.then(function () {
+                    _overrides[sidStr] = { action: action, id: ovId };
+                }).catch(function () { showToast('Failed to save override', 'error'); });
+            }
+        }
+
+        function updateRulesBulkBar() {
+            var pg = pageEl(); if (!pg) return;
+            var checked = pg.querySelectorAll('#ips-rules-tbody .rule-cb:checked');
+            var bar = pg.querySelector('#ips-rules-bulk');
+            var cntEl = pg.querySelector('#ips-rules-bulk-count');
+            if (!bar) return;
+            if (checked.length > 0) {
+                bar.style.display = 'flex';
+                if (cntEl) cntEl.textContent = checked.length + ' rule(s) selected';
+            } else {
+                bar.style.display = 'none';
+            }
+        }
+
+        function applyRulesBulk() {
+            var pg = pageEl(); if (!pg) return;
+            var action = (pg.querySelector('#ips-rules-bulk-action') || {}).value || 'default';
+            var checked = pg.querySelectorAll('#ips-rules-tbody .rule-cb:checked');
+            checked.forEach(function (cb) { setRuleOverride(cb.dataset.sid, action); });
+            /* Uncheck + hide bar */
+            checked.forEach(function (cb) { cb.checked = false; });
+            var allCb = pg.querySelector('#ips-rules-all');
+            if (allCb) allCb.checked = false;
+            updateRulesBulkBar();
+        }
+
+        /* ── Alerts tab ── */
+        function loadIpsAlerts() {
+            var pg = pageEl(); if (!pg) return;
+            var tbody = pg.querySelector('#ips-alerts-tbody');
+            if (tbody) tbody.innerHTML = '<tr><td colspan="8" class="table-empty">Loading…</td></tr>';
+            api('/ips/alerts-json').then(function (data) {
+                _alerts = Array.isArray(data) ? data : [];
+                renderIpsAlertsTable();
+            }).catch(function () {
+                _alerts = [];
+                var t = (pageEl() || {}).querySelector ? pageEl().querySelector('#ips-alerts-tbody') : null;
+                if (t) t.innerHTML = '<tr><td colspan="8" class="table-empty">Failed to load alerts</td></tr>';
+            });
+        }
+
+        function renderIpsAlertsTable() {
+            var pg = pageEl(); if (!pg) return;
+            var tbody = pg.querySelector('#ips-alerts-tbody');
+            var cntEl = pg.querySelector('#ips-alerts-count');
+            if (!tbody) return;
+            if (!_alerts.length) {
+                tbody.innerHTML = '<tr><td colspan="8" class="table-empty">No alerts</td></tr>';
+                if (cntEl) cntEl.textContent = '';
+                return;
+            }
+            if (cntEl) cntEl.textContent = _alerts.length + ' alert(s)';
+            var protoMap = { 6:'TCP', 17:'UDP', 1:'ICMP' };
+            var frag = document.createDocumentFragment();
+            _alerts.forEach(function (a, idx) {
+                var tr = document.createElement('tr');
+                tr.dataset.idx = idx;
+                var vCls = a.verdict === 'DROP' ? 'verdict-drop' : (a.verdict === 'ALERT' ? 'verdict-alert' : '');
+                var proto = protoMap[a.proto] || ('IP/' + a.proto);
+                tr.innerHTML = [
+                    '<td style="white-space:nowrap;font-size:11px">' + esc(a.ts || '') + '</td>',
+                    '<td>' + esc(String(a.sid || '')) + '</td>',
+                    '<td class="' + vCls + '">' + esc(a.verdict || '') + '</td>',
+                    '<td>' + esc(proto) + '</td>',
+                    '<td style="white-space:nowrap">' + esc((a.src||'') + ':' + (a.sport||'')) + '</td>',
+                    '<td style="white-space:nowrap">' + esc((a.dst||'') + ':' + (a.dport||'')) + '</td>',
+                    '<td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(a.msg||'') + '">' + esc(a.msg||'—') + '</td>',
+                    '<td><button class="btn btn-info ips-alert-info" data-idx="' + idx + '">Info</button></td>'
+                ].join('');
+                frag.appendChild(tr);
+            });
+            tbody.innerHTML = '';
+            tbody.appendChild(frag);
+        }
+
+        function showAlertDetail(a) {
+            var pg = pageEl(); if (!pg) return;
+            var modal = pg.querySelector('#ips-alert-detail-modal');
+            var body  = pg.querySelector('#ips-alert-detail-body');
+            if (!modal || !body) return;
+            _alertDetailSid = a.sid || null;
+            var protoMap = { 6:'TCP', 17:'UDP', 1:'ICMP' };
+            var proto = protoMap[a.proto] || ('IP/' + a.proto);
+            var mlScore = (a.score >= 0) ? (parseFloat(a.score).toFixed(3)) : 'N/A';
+            body.innerHTML = [
+                '<table class="data-table table-borderless" style="margin:0">',
+                '<tr><td style="width:140px;color:#666;font-weight:600">Timestamp</td><td>' + esc(a.ts||'') + '</td></tr>',
+                '<tr><td>SID</td><td>' + esc(String(a.sid||'')) + '</td></tr>',
+                '<tr><td>Action</td><td class="' + (a.verdict==='DROP'?'verdict-drop':'verdict-alert') + '">' + esc(a.verdict||'') + '</td></tr>',
+                '<tr><td>Protocol</td><td>' + esc(proto) + '</td></tr>',
+                '<tr><td>Source</td><td>' + esc((a.src||'') + ':' + (a.sport||'')) + '</td></tr>',
+                '<tr><td>Destination</td><td>' + esc((a.dst||'') + ':' + (a.dport||'')) + '</td></tr>',
+                '<tr><td>Reason</td><td>' + esc(a.reason||'') + '</td></tr>',
+                '<tr><td>ML Score</td><td>' + esc(mlScore) + '</td></tr>',
+                '<tr><td>Message</td><td>' + esc(a.msg||'—') + '</td></tr>',
+                '</table>'
+            ].join('');
+            var ovBtn = pg.querySelector('#ips-alert-override-btn');
+            if (ovBtn) ovBtn.style.display = (a.sid && a.sid !== 'ML-ANOMALY') ? '' : 'none';
+            modal.style.display = 'flex';
+        }
+
+    })();  /* end IPS 5-tab module */
+
+    /* ================================================================
+     *  IPS Profile — embedded Signatures & Filters (FortiGate-style)
+     * ================================================================ */
+    (function () {
+        var modal    = document.getElementById('ips-sig-modal');
+        if (!modal) return;
+        var profForm = document.getElementById('form-ips-profile');
+        var sigTbody = function () { return document.querySelector('#ips-sig-table tbody'); };
+        var catalog  = [];
+        var pendingFilters = [];   /* filters buffered before profile is saved */
+        var _searchTimer   = null; /* debounce handle */
+
+        function curProfileName() {
+            var row = profForm ? profForm.querySelector('.form-row[data-key="name"] .form-input') : null;
+            return row ? row.value.trim() : '';
+        }
+
+        function renderProfileFilters() {
+            var tb = document.querySelector('#ips-prof-filters tbody');
+            if (!tb) return;
+            var name = curProfileName();
+
+            function paint(dbRows) {
+                if (!dbRows.length && !pendingFilters.length) {
+                    tb.innerHTML = '<tr><td colspan="5" style="opacity:.6">No filters yet. Click "Create New" to add.</td></tr>';
+                    return;
+                }
+                tb.innerHTML = '';
+                dbRows.forEach(function (e) {
+                    var tr = document.createElement('tr');
+                    tr.innerHTML =
+                        '<td>' + (e.type || '') + '</td>' +
+                        '<td>' + (e.value || '') + '</td>' +
+                        '<td>' + (e.action || 'default') + '</td>' +
+                        '<td>' + (e.status || 'enable') + '</td>' +
+                        '<td><button type="button" class="btn ips-del-filter" data-id="' + (e.id || '') + '">Delete</button></td>';
+                    tb.appendChild(tr);
+                });
+                pendingFilters.forEach(function (pf, idx) {
+                    var tr = document.createElement('tr');
+                    tr.style.opacity = '0.65';
+                    tr.innerHTML =
+                        '<td>' + pf.type + '</td>' +
+                        '<td>' + pf.value + '</td>' +
+                        '<td>' + (pf.action || 'default') + '</td>' +
+                        '<td style="color:#f0a800">pending</td>' +
+                        '<td><button type="button" class="btn ips-del-pending" data-idx="' + idx + '">Delete</button></td>';
+                    tb.appendChild(tr);
+                });
+            }
+
+            if (!name) {
+                paint([]);
+                return;
+            }
+            api('/config/security_ips-filter').then(function (data) {
+                var rows = (data && data.entries ? data.entries : [])
+                    .filter(function (e) { return e.profile === name; });
+                paint(rows);
+            }).catch(function () { paint([]); });
+        }
+
+        function loadCatalog() {
+            var tb = sigTbody();
+            if (tb) tb.innerHTML = '<tr><td colspan="6">Loading…</td></tr>';
+            return cachedApi('/ips/signatures').then(function (data) {
+                catalog = Array.isArray(data) ? data : [];
+                renderCatalog('');
+                populateCategorySelect();
+            }).catch(function () {
+                if (tb) tb.innerHTML = '<tr><td colspan="6">Could not load catalog (no ruleset downloaded?).</td></tr>';
+            });
+        }
+
+        function renderCatalog(q) {
+            var tb = sigTbody();
+            if (!tb) return;
+            q = (q || '').toLowerCase();
+            var filtered = catalog.filter(function (s) {
+                if (!q) return true;
+                return (String(s.sid).indexOf(q) >= 0) ||
+                       (s.name     && s.name.toLowerCase().indexOf(q) >= 0) ||
+                       (s.cve      && s.cve.toLowerCase().indexOf(q) >= 0) ||
+                       (s.category && s.category.toLowerCase().indexOf(q) >= 0);
+            });
+            var rows = filtered.slice(0, 100);
+            var total = filtered.length;
+            var countEl = document.getElementById('ips-sig-count');
+            if (countEl) countEl.textContent = 'Showing ' + rows.length + ' of ' + total;
+            if (!rows.length) { tb.innerHTML = '<tr><td colspan="6">No signatures.</td></tr>'; return; }
+            var frag = document.createDocumentFragment();
+            rows.forEach(function (s) {
+                var tr = document.createElement('tr');
+                tr.innerHTML =
+                    '<td><input type="checkbox" class="ips-sig-cb" data-sid="' + s.sid + '"></td>' +
+                    '<td>' + s.sid + '</td>' +
+                    '<td>' + (s.name || '') + '</td>' +
+                    '<td>' + (s.category || '') + '</td>' +
+                    '<td>' + (s.action || '') + '</td>' +
+                    '<td>' + (s.cve || '') + '</td>';
+                frag.appendChild(tr);
+            });
+            tb.innerHTML = '';
+            tb.appendChild(frag);
+        }
+
+        function populateCategorySelect() {
+            var sel = document.getElementById('ips-filter-cat');
+            if (!sel) return;
+            var cats = {};
+            catalog.forEach(function (s) { if (s.category) cats[s.category] = 1; });
+            sel.innerHTML = '<option value="all">all (every category)</option>';
+            Object.keys(cats).sort().forEach(function (c) {
+                var o = document.createElement('option');
+                o.value = c; o.textContent = c;
+                sel.appendChild(o);
+            });
+        }
+
+        function setTab(tab) {
+            document.querySelectorAll('.ips-tab').forEach(function (b) {
+                b.classList.toggle('active', b.dataset.tab === tab);
+            });
+            var ps = document.getElementById('ips-pane-signature');
+            var pf = document.getElementById('ips-pane-filter');
+            if (ps) ps.style.display = (tab === 'signature') ? '' : 'none';
+            if (pf) pf.style.display = (tab === 'filter') ? '' : 'none';
+        }
+
+        function openModal2() {
+            modal.style.display = 'flex';
+            setTab('signature');
+            if (!catalog.length) loadCatalog();
+            else renderCatalog('');
+        }
+        function closeModal2() { modal.style.display = 'none'; }
+
+        /* Buffer a filter entry locally; saved to DB when the profile is saved. */
+        function addFilter(type, value, action) {
+            pendingFilters.push({ type: type, value: value, action: action || 'default' });
+            return Promise.resolve();
+        }
+
+        /* ── profile Save button — intercept when pending filters exist ──
+         * Runs in capture phase (before the global bubble handler at line 3651).
+         * If pendingFilters is empty we do nothing and the global handler fires. */
+        var profSaveBtn = profForm ? profForm.querySelector('.modal-footer .btn-primary') : null;
+        if (profSaveBtn) {
+            profSaveBtn.addEventListener('click', function (e) {
+                if (!pendingFilters.length) return; /* let global handler run */
+                var profName = curProfileName();
+                if (!profName) {
+                    showToast('Enter a profile name before saving', 'error');
+                    e.stopImmediatePropagation();
+                    e.preventDefault();
+                    return;
+                }
+                e.stopImmediatePropagation();
+                e.preventDefault();
+
+                var isEdit  = profForm.dataset.editMode === 'true';
+                var rowId   = profForm.dataset.editRowId || '';
+                var mbody   = profForm.querySelector('.modal-body');
+                function fval(key) {
+                    var el = mbody ? mbody.querySelector('[data-key="' + key + '"] .form-input') : null;
+                    return el ? el.value.trim() : '';
+                }
+                var payload = { name: fval('name') || profName,
+                                categories: fval('categories'),
+                                comment:    fval('comment'),
+                                status:     fval('status') || 'enable' };
+
+                if (!payload.name) { showToast('Name is required', 'error'); return; }
+                if (!/^[a-zA-Z0-9._-]+$/.test(payload.name)) {
+                    showToast('Name must contain only letters, numbers, hyphens, underscores, or dots', 'error');
+                    return;
+                }
+
+                var method, url;
+                if (isEdit) {
+                    method = 'PUT'; url = '/config/security_ips-profile/' + rowId;
+                } else {
+                    method = 'POST'; url = '/config/security_ips-profile';
+                    payload.id = payload.name; /* NAME_AS_ID_TYPES */
+                }
+
+                var toFlush = pendingFilters.slice();
+                api(url, { method: method, body: payload })
+                    .then(function () {
+                        pendingFilters = [];
+                        var savedName = payload.name;
+                        return Promise.all(toFlush.map(function (pf) {
+                            var id = (savedName + '-' + pf.value).replace(/[^A-Za-z0-9_-]/g, '_');
+                            return api('/config/security_ips-filter', {
+                                method: 'POST',
+                                body: { id: id, profile: savedName, type: pf.type,
+                                        value: pf.value, action: pf.action, status: 'enable' }
+                            });
+                        }));
+                    })
+                    .then(function () {
+                        closeModal(false);
+                        showToast('Profile saved with ' + toFlush.length + ' filter(s)', 'success');
+                        refreshPage(activePage);
+                    })
+                    .catch(function (err) {
+                        showToast((err && err.message) || 'Save failed', 'error');
+                    });
+            }, true /* capture phase */);
+        }
+
+        /* ── wiring ── */
+        var addBtn = document.getElementById('ips-add-sig');
+        if (addBtn) addBtn.addEventListener('click', openModal2);
+        var closeBtn  = document.getElementById('ips-sig-close');
+        var cancelBtn = document.getElementById('ips-sig-cancel');
+        if (closeBtn)  closeBtn.addEventListener('click', closeModal2);
+        if (cancelBtn) cancelBtn.addEventListener('click', closeModal2);
+
+        document.querySelectorAll('.ips-tab').forEach(function (b) {
+            b.addEventListener('click', function () { setTab(b.dataset.tab); });
+        });
+
+        var search = document.getElementById('ips-sig-search');
+        if (search) search.addEventListener('input', function () {
+            clearTimeout(_searchTimer);
+            _searchTimer = setTimeout(function () { renderCatalog(search.value); }, 200);
+        });
+        var allCb = document.getElementById('ips-sig-all');
+        if (allCb) allCb.addEventListener('change', function () {
+            document.querySelectorAll('.ips-sig-cb').forEach(function (cb) {
+                cb.checked = allCb.checked;
+            });
+        });
+
+        var okBtn = document.getElementById('ips-sig-ok');
+        if (okBtn) okBtn.addEventListener('click', function () {
+            var action   = (document.getElementById('ips-sig-action') || {}).value || 'default';
+            var activeTab = document.querySelector('.ips-tab.active');
+            var tab      = activeTab ? activeTab.dataset.tab : 'signature';
+            var jobs     = [];
+            if (tab === 'signature') {
+                document.querySelectorAll('.ips-sig-cb:checked').forEach(function (cb) {
+                    jobs.push(addFilter('signature', cb.dataset.sid, action));
+                });
+                if (!jobs.length) { showToast('Select at least 1 signature', 'error'); return; }
+            } else {
+                var sel = document.getElementById('ips-filter-cat');
+                var cat = sel ? sel.value : '';
+                if (!cat) { showToast('Select a category', 'error'); return; }
+                jobs.push(addFilter('category', cat, action));
+            }
+            Promise.all(jobs).then(function () {
+                showToast('Added ' + jobs.length + ' item(s)', 'success');
+                closeModal2();
+                renderProfileFilters();
+            }).catch(function (err) {
+                showToast((err && err.message) || 'Add failed', 'error');
+            });
+        });
+
+        /* Delete: saved filter from DB, or pending filter from local buffer */
+        var ftbl = document.getElementById('ips-prof-filters');
+        if (ftbl) ftbl.addEventListener('click', function (ev) {
+            var pb = ev.target.closest('.ips-del-pending');
+            if (pb) {
+                var idx = parseInt(pb.dataset.idx, 10);
+                if (!isNaN(idx)) { pendingFilters.splice(idx, 1); renderProfileFilters(); }
+                return;
+            }
+            var db = ev.target.closest('.ips-del-filter');
+            if (!db) return;
+            var id = db.dataset.id;
+            if (!id) return;
+            api('/config/security_ips-filter/' + encodeURIComponent(id), { method: 'DELETE' })
+                .then(function () { renderProfileFilters(); })
+                .catch(function () { showToast('Delete failed', 'error'); });
+        });
+
+        /* Render filter list when profile form opens (create + edit). */
+        document.querySelectorAll('[data-toggle-form="form-ips-profile"]').forEach(function (b) {
+            b.addEventListener('click', function () {
+                pendingFilters = [];
+                setTimeout(renderProfileFilters, 60);
+            });
+        });
+        var profTbl = document.querySelector('table[data-entity="ipsProfiles"]');
+        if (profTbl) profTbl.addEventListener('click', function () {
+            pendingFilters = [];
+            setTimeout(renderProfileFilters, 120);
+        });
+    })();
+
+    /* Wire settings Apply/Reset buttons — skip cards with data-custom-apply (wired elsewhere) */
     document.querySelectorAll('[data-settings]').forEach(function (card) {
+        if (card.dataset.customApply !== undefined) return;
         var settingsName = card.dataset.settings;
         var actions = card.querySelector('.form-actions');
         if (!actions) return;
@@ -4461,11 +5638,22 @@
         });
     }
 
+    /* IPS profile select on the policy form — list profiles + keep "none". */
+    function populateIpsProfileSelects() {
+        return cachedApi('/config/security_ips-profile').then(function (data) {
+            if (!data || !data.entries) return;
+            document.querySelectorAll('.ips-profile-select').forEach(function (sel) {
+                populateSelectFrom(sel, data.entries, 'none');
+            });
+        }).catch(function () {});
+    }
+
     /* Run on page load — populate all dynamic selects */
     populateIfaceSelects();
     populateProfileSelect();
     populateAddrSelects();
     populateSvcSelects();
+    populateIpsProfileSelects();
 
     function loadFirmwareInfo() {
         return api('/system/firmware').then(function (data) {

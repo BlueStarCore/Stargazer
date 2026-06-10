@@ -173,6 +173,12 @@ typedef enum {
 	/* IPS daemon status + alert log */
 	SG_CMD_IPS_STATUS        = 684,   /* trạng thái ipsd + counters   */
 	SG_CMD_IPS_ALERTS        = 685,   /* N dòng cuối ips-alert.log    */
+	SG_CMD_IPS_SIGNATURES    = 686,   /* catalog signature repo (JSON) */
+	SG_CMD_IPS_REBUILD       = 687,   /* recompile active.rules + reload (ips-update.sh) */
+	SG_CMD_IPS_UPDATE_NOW    = 688,   /* tải ruleset (security_ips-ruleset) + rebuild + reload */
+	SG_CMD_IPS_ALERTS_JSON       = 689,   /* parse ips-alert.log → JSON array */
+	SG_CMD_IPS_RULESETS_RELOAD   = 690,   /* scan custom dir for .xml → upsert DB entries */
+	SG_CMD_IPS_UPDATE_LOG        = 691,   /* tail ips-update.log → payload */
 
 	/* Keepalive / ping (9xx) */
 	SG_CMD_PING          = 900,

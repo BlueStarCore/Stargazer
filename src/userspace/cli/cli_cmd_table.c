@@ -1198,6 +1198,184 @@ static int cmd_diag_ips_alerts(const char *args, const char *permissions)
 	return 0;
 }
 
+static int cmd_ips_reload(const char *args, const char *permissions)
+{
+	(void)args; (void)permissions;
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_IPS_REBUILD, "", &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+	if (resp.status != SG_OK)
+		print_ipc_error("IPS reload failed", &resp);
+	else if (resp.payload && resp.payload_len > 0)
+		printf("%s\n", resp.payload);
+	else
+		printf("IPS service reloaded.\n");
+	ipc_resp_free(&resp);
+	return 0;
+}
+
+static int cmd_ips_update_now(const char *args, const char *permissions)
+{
+	(void)args; (void)permissions;
+	printf("Downloading enabled rulesets — this may take a moment...\n");
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_IPS_UPDATE_NOW, "", &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+	if (resp.status != SG_OK)
+		print_ipc_error("IPS update failed", &resp);
+	else if (resp.payload && resp.payload_len > 0)
+		printf("%s", resp.payload);
+	else
+		printf("Update complete.\n");
+	ipc_resp_free(&resp);
+	return 0;
+}
+
+static int cmd_show_ips_profiles(const char *args, const char *permissions)
+{
+	(void)args; (void)permissions;
+
+	/* List all IPS profiles */
+	struct ipc_response lresp;
+	if (ipc_send_str(SG_CMD_CFG_LIST, "security_ips-profile", &lresp) != 0 ||
+	    lresp.status != SG_OK || !lresp.payload || !lresp.payload[0]) {
+		ipc_resp_free(&lresp);
+		printf("  No IPS profiles configured.\n");
+		return 0;
+	}
+
+	/* Walk each profile ID */
+	char *ids = lresp.payload;
+	char *id = ids;
+	while (id && *id) {
+		char *nl = strchr(id, '\n');
+		if (nl) *nl = '\0';
+		if (!*id) { if (nl) id = nl + 1; else break; continue; }
+
+		/* Fetch profile fields */
+		char sec[256];
+		snprintf(sec, sizeof(sec), "security_ips-profile:%s", id);
+		struct ipc_response gresp;
+		if (ipc_send_str(SG_CMD_CFG_GET, sec, &gresp) == 0 &&
+		    gresp.status == SG_OK && gresp.payload) {
+			char status[32]  = "enable";
+			char comment[128] = "";
+			sg_kv_get(gresp.payload, "status",  status,  sizeof(status));
+			sg_kv_get(gresp.payload, "comment", comment, sizeof(comment));
+			printf("  %-20s  %-8s  %s\n", id, status,
+			       comment[0] ? comment : "(no comment)");
+		}
+		ipc_resp_free(&gresp);
+
+		/* Fetch filters for this profile */
+		struct ipc_response fresp;
+		if (ipc_send_str(SG_CMD_CFG_LIST, "security_ips-filter", &fresp) == 0 &&
+		    fresp.status == SG_OK && fresp.payload && fresp.payload[0]) {
+			char *fid = fresp.payload;
+			int first = 1;
+			while (fid && *fid) {
+				char *fnl = strchr(fid, '\n');
+				if (fnl) *fnl = '\0';
+				if (!*fid) { if (fnl) fid = fnl + 1; else break; continue; }
+
+				char fsec[256];
+				snprintf(fsec, sizeof(fsec), "security_ips-filter:%s", fid);
+				struct ipc_response fgresp;
+				if (ipc_send_str(SG_CMD_CFG_GET, fsec, &fgresp) == 0 &&
+				    fgresp.status == SG_OK && fgresp.payload) {
+					char fp[64] = "", ftype[32] = "", fval[128] = "", faction[32] = "default";
+					sg_kv_get(fgresp.payload, "profile", fp,      sizeof(fp));
+					sg_kv_get(fgresp.payload, "type",    ftype,   sizeof(ftype));
+					sg_kv_get(fgresp.payload, "value",   fval,    sizeof(fval));
+					sg_kv_get(fgresp.payload, "action",  faction, sizeof(faction));
+					if (strcmp(fp, id) == 0) {
+						if (first) { printf("    Filters:\n"); first = 0; }
+						printf("      %-10s  %-40s  %s\n", ftype, fval, faction);
+					}
+				}
+				ipc_resp_free(&fgresp);
+				if (fnl) fid = fnl + 1; else break;
+			}
+		}
+		ipc_resp_free(&fresp);
+
+		if (nl) id = nl + 1; else break;
+	}
+	ipc_resp_free(&lresp);
+	return 0;
+}
+
+static int cmd_show_ips_filters(const char *args, const char *permissions)
+{
+	(void)permissions;
+
+	if (!args || !args[0]) {
+		printf("  Usage: show ips filter <profile-name>\n");
+		return 0;
+	}
+
+	/* Validate profile exists */
+	char sec[256];
+	snprintf(sec, sizeof(sec), "security_ips-profile:%s", args);
+	struct ipc_response gresp;
+	if (ipc_send_str(SG_CMD_CFG_GET, sec, &gresp) != 0 ||
+	    gresp.status != SG_OK) {
+		ipc_resp_free(&gresp);
+		printf("  Profile '%s' not found.\n", args);
+		return 0;
+	}
+	ipc_resp_free(&gresp);
+
+	/* List all filters, show ones for this profile */
+	struct ipc_response lresp;
+	if (ipc_send_str(SG_CMD_CFG_LIST, "security_ips-filter", &lresp) != 0 ||
+	    lresp.status != SG_OK || !lresp.payload || !lresp.payload[0]) {
+		ipc_resp_free(&lresp);
+		printf("  No filters for profile '%s'.\n", args);
+		return 0;
+	}
+
+	int found = 0;
+	char *fid = lresp.payload;
+	while (fid && *fid) {
+		char *nl = strchr(fid, '\n');
+		if (nl) *nl = '\0';
+		if (!*fid) { if (nl) fid = nl + 1; else break; continue; }
+
+		char fsec[256];
+		snprintf(fsec, sizeof(fsec), "security_ips-filter:%s", fid);
+		struct ipc_response fgresp;
+		if (ipc_send_str(SG_CMD_CFG_GET, fsec, &fgresp) == 0 &&
+		    fgresp.status == SG_OK && fgresp.payload) {
+			char fp[64] = "", ftype[32] = "", fval[128] = "", faction[32] = "default", fstatus[16] = "enable";
+			sg_kv_get(fgresp.payload, "profile", fp,      sizeof(fp));
+			sg_kv_get(fgresp.payload, "type",    ftype,   sizeof(ftype));
+			sg_kv_get(fgresp.payload, "value",   fval,    sizeof(fval));
+			sg_kv_get(fgresp.payload, "action",  faction, sizeof(faction));
+			sg_kv_get(fgresp.payload, "status",  fstatus, sizeof(fstatus));
+			if (strcmp(fp, args) == 0) {
+				if (!found) printf("  Filters for profile '%s':\n", args);
+				printf("    %-10s  %-40s  action=%-8s  %s\n",
+				       ftype, fval, faction, fstatus);
+				found++;
+			}
+		}
+		ipc_resp_free(&fgresp);
+		if (nl) fid = nl + 1; else break;
+	}
+	ipc_resp_free(&lresp);
+
+	if (!found)
+		printf("  No filters for profile '%s'.\n", args);
+	return 0;
+}
+
 static int cmd_ssl_cacert(const char *args, const char *permissions)
 {
 	(void)args;

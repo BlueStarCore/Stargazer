@@ -324,6 +324,28 @@ sg_status_t validate_ips(const char *id, const char *data,
 }
 
 /*
+ * ips_profile_active — policy có IPS không?
+ * Trả 1 nếu `name` trỏ tới một security_ips-profile tồn tại + status=enable
+ * (không phải "none"/rỗng). Profile không tồn tại / disable → 0 (fail-safe:
+ * không soi, không emit NFQUEUE). Thay cho check literal "default" cũ.
+ */
+static int ips_profile_active(const char *name)
+{
+	if (!name || !name[0] || strcmp(name, "none") == 0)
+		return 0;
+	char *st = sg_db_get_val("security_ips-profile", name, "status");
+	int ok = st && strcmp(st, "enable") == 0;
+	if (st && !ok)
+		mgmt_log("INFO", "ips_profile_active: profile '%s' disabled — "
+			 "policy không soi IPS", name);
+	free(st);
+	if (!st)
+		mgmt_log("WARN", "ips_profile_active: profile '%s' không tồn tại "
+			 "— policy không soi IPS", name);
+	return ok;
+}
+
+/*
  * Đọc trạng thái IPS: trả 1 nếu security_ips status=enable, điền *queue.
  * Steering chỉ phát khi bật (off-by-default, fail-safe).
  */
@@ -413,7 +435,7 @@ static void ipsd_sync(int active, int queue_num)
 	} else if (!active && running) {
 		supervisor_stop(IPSD_CHILD_NAME);
 		mgmt_log("INFO", "ipsd_sync: dừng ipsd "
-			 "(không còn policy nào dùng ips-profile=default)");
+			 "(không còn policy nào dùng IPS profile)");
 	}
 	/* active == running: không làm gì */
 }
@@ -461,7 +483,7 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 				" --ctstate ESTABLISHED,RELATED -j ACCEPT\n");
 
 		/* IPS NFQUEUE: đặt per-policy (FortiGate-style), KHÔNG global ở đây.
-		 * Chỉ policy accept có ips-profile=default mới emit rule NFQUEUE,
+		 * Chỉ policy accept có ips-profile != none (profile enable) mới emit NFQUEUE,
 		 * ngay trước rule ACCEPT của policy đó trong vòng lặp bên dưới. */
 	}
 
@@ -650,35 +672,37 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 						       pfx_len);
 
 					if (pfx_ok && ips_on &&
-					    strcmp(ips_profile, "default") == 0) {
-						if (connbytes_supported()) {
-							/* N-packet gate: inspect first
-							 * snapshot_n packets/direction */
-							dbuf_printf(&buf,
-								" -m connbytes"
-								" --connbytes-dir original"
-								" --connbytes-mode packets"
-								" --connbytes 0:%d"
-								" -j NFQUEUE"
-								" --queue-num %d\n",
-								ips_snap - 1, ips_q);
-						} else {
-							/* Fallback: only SYN (NEW) — ML
-							 * + L1 rules still work; L2 payload
-							 * signature sees empty payload on TCP.
-							 * Add CONFIG_NETFILTER_XT_MATCH_CONNBYTES
-							 * to kernel for full inspection. */
-							dbuf_printf(&buf,
-								" -m conntrack"
-								" --ctstate NEW"
-								" -j NFQUEUE"
-								" --queue-num %d\n",
-								ips_q);
-						}
-						rule_count++;
-						/* re-append prefix for next rule */
-						dbuf_append(&buf, saved_pfx, pfx_len);
-					}
+					    ips_profile_active(ips_profile)) {
+                             
+                             /* Kiểm tra Kernel có hỗ trợ connbytes không */
+                             if (connbytes_supported()) {
+                                 dbuf_printf(&buf,
+                                     " -m connbytes"
+                                     " --connbytes-dir original"
+                                     " --connbytes-mode packets"
+                                   " --connbytes 0:%d"
+                                    " -j NFQUEUE"
+                                    " --queue-num %d\n",
+                                    ips_snap - 1, ips_q);
+                            } else {
+                                /* Fallback: Chỉ ném gói NEW vào IPS */
+                                dbuf_printf(&buf,
+                                    " -m conntrack"
+                                    " --ctstate NEW"
+                                    " -m connmark"
+                                    " ! --mark 0x%x/0x%x"
+                                    " -j NFQUEUE"
+                                    " --queue-num %d\n",
+                                    SG_CMK_IPS_INSPECTED,
+                                    SG_CMK_IPS_INSPECTED,
+                                    ips_q);
+                            }
+                            
+                            rule_count++;
+                            /* re-append prefix for next rule */
+                            dbuf_append(&buf, saved_pfx, pfx_len);
+                        }
+
 
 					if (pfx_ok && cmk && cmkid > 0) {
 						dbuf_printf(&buf,
@@ -762,7 +786,7 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 					if (strcmp(st, "disable") == 0) continue;
 					if ((strcmp(act, "accept") == 0 ||
 					     strcmp(act, "allow")  == 0) &&
-					    strcmp(ipp, "default") == 0) {
+					    ips_profile_active(ipp)) {
 						nfqueue_active = 1;
 						break;
 					}

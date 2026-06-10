@@ -13,6 +13,8 @@
 #ifndef SG_FUSION_H
 #define SG_FUSION_H
 
+#include <stdint.h>
+
 /* Giá trị tăng dần theo độ nặng để so sánh trực tiếp. */
 enum ips_verdict { IPS_PASS = 0, IPS_ALERT = 1, IPS_DROP = 2 };
 enum ips_mode    { IPS_MODE_DETECT = 0, IPS_MODE_PREVENT = 1 };
@@ -25,11 +27,13 @@ struct ips_config {
 };
 
 struct ips_decision {
-	int    verdict;     /* enum ips_verdict — đã áp mode                   */
-	int    reason;      /* enum ips_reason — lý do phát hiện (trước downgrade) */
-	int    sig_rule;    /* index rule signature khớp, -1 nếu không          */
-	double score;       /* ML score = P(tấn công); -1 nếu ML không chạy     */
-	int    ml_evaluated;/* 1 nếu đã chấm ML; 0 nếu bỏ qua (signature short-circuit) */
+	int      verdict;           /* enum ips_verdict — đã áp mode                   */
+	int      reason;            /* enum ips_reason — lý do phát hiện (trước downgrade) */
+	int      sig_rule;          /* index rule signature khớp, -1 nếu không          */
+	double   score;             /* ML score = P(tấn công); -1 nếu ML không chạy     */
+	int      ml_evaluated;      /* 1 nếu đã chấm ML; 0 nếu bỏ qua (signature short-circuit) */
+	uint32_t matched_sid;       /* SID của rule khớp; 0 = không có / ML-only        */
+	char     matched_msg[128];  /* msg của rule khớp; rỗng nếu ML-only              */
 };
 
 /* Đặt cấu hình mặc định: prevent, block 0.95, alert 0.50. */

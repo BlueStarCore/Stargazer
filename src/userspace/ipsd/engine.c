@@ -4,6 +4,7 @@
  */
 #include "engine.h"
 #include "ips_model.h"   /* ips_score */
+#include <string.h>
 
 struct ips_decision ips_evaluate(const struct ips_config *cfg,
 				 const struct sig_ruleset *rs,
@@ -26,7 +27,7 @@ struct ips_decision ips_evaluate(const struct ips_config *cfg,
 		}
 	}
 
-	/* [L1-user] user-defined flow rules (từ rule_gen, không có content). */
+	/* [L1-user] user-defined flow rules (no content, từ file rule). */
 	if (fs) {
 		int l1_idx = sig_flow_match(rs, fc, fs);
 		if (l1_idx >= 0) {
@@ -34,6 +35,10 @@ struct ips_decision ips_evaluate(const struct ips_config *cfg,
 			struct ips_decision d = ips_fuse(cfg, l1_idx, action, -1.0);
 			d.score        = -1.0;
 			d.ml_evaluated = 0;
+			d.matched_sid  = rs->l1_rules[l1_idx].sid;
+			strncpy(d.matched_msg, rs->l1_rules[l1_idx].msg,
+				sizeof(d.matched_msg) - 1);
+			d.matched_msg[sizeof(d.matched_msg) - 1] = '\0';
 			return d;
 		}
 	}
@@ -45,6 +50,10 @@ struct ips_decision ips_evaluate(const struct ips_config *cfg,
 		struct ips_decision d = ips_fuse(cfg, sig_idx, action, -1.0);
 		d.score        = -1.0;
 		d.ml_evaluated = 0;
+		d.matched_sid  = rs->rules[sig_idx].sid;
+		strncpy(d.matched_msg, rs->rules[sig_idx].msg,
+			sizeof(d.matched_msg) - 1);
+		d.matched_msg[sizeof(d.matched_msg) - 1] = '\0';
 		return d;
 	}
 

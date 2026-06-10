@@ -35,6 +35,9 @@ static const sg_type_info_t type_table[] = {
 	{ "firewall_address",       CFG_TABLE,  "configure", "Configure address objects"           },
 	{ "firewall_service",       CFG_TABLE,  "configure", "Configure service objects"           },
 	{ "security_ips",           CFG_SINGLE, "configure", "Configure IPS (signature + ML inspection)" },
+	{ "security_ips-profile",   CFG_TABLE,  "configure", "Configure IPS profiles (signature sets)" },
+	{ "security_ips-filter",    CFG_TABLE,  "configure", "Configure IPS profile filters (category/signature + action)" },
+	{ "security_ips-ruleset",   CFG_TABLE,  "configure", "Configure IPS ruleset sources (URL entries for download)" },
 	{ "security_ssl-inspection",CFG_SINGLE, "configure", "Configure SSL/TLS inspection (MITM)" },
 	{ "system_password-policy", CFG_SINGLE, "admin",     "Configure global password policy"    },
 	{ "system_admin-profile",   CFG_TABLE,  "admin",     "Configure admin permission profiles" },
@@ -87,6 +90,42 @@ static const struct field_entry field_table[] = {
 	{ "security_ips", "mode",       "enum:detect,prevent", 0, "prevent", "detect = chỉ alert; prevent = chặn", 0 },
 	{ "security_ips", "queue-num",  "uint:0:65535",        0, "0",       "NFQUEUE number nối với ipsd", 0 },
 	{ "security_ips", "snapshot-n", "uint:1:64",           0, "8",       "Số gói đầu mỗi flow đưa vào NFQUEUE để inspect (connbytes)", 0 },
+	{ "security_ips", "auto-update","enum:disable,daily,weekly", 0, "disable", "Tự cập nhật signature theo lịch (cron)", 0 },
+	{ "security_ips", "update-url", "string",              1, NULL,      "URL nguồn ruleset (ET Open) cho auto-update", 0 },
+	{ "security_ips", "cron-enabled","enum:enable,disable", 0, "disable", "Enable scheduled auto-update", 0 },
+	{ "security_ips", "cron-minutes","string",              1, "0",       "Cron minutes field (0-59, *)", 0 },
+	{ "security_ips", "cron-hours",  "string",              1, "0",       "Cron hours field (0-23, *)", 0 },
+	{ "security_ips", "cron-dom",    "string",              1, "*",       "Cron day-of-month (1-31, *)", 0 },
+	{ "security_ips", "cron-months", "string",              1, "*",       "Cron months (1-12, *)", 0 },
+	{ "security_ips", "cron-dow",    "string",              1, "*",       "Cron days-of-week (0=Sun..6=Sat, *)", 0 },
+	{ "security_ips", "cron-desc",   "string",              1, NULL,      "Schedule description", 0 },
+
+	/* security_ips-profile (CFG_TABLE) — nhiều profile, mỗi profile chọn
+	 * tập signature (categories). Policy trỏ tới profile qua field
+	 * ips-profile (ref-or:security_ips-profile:none). */
+	{ "security_ips-profile", "name",         "safe-id",             0, NULL,     "Profile name", 0 },
+	{ "security_ips-profile", "status",       "enum:enable,disable", 0, "enable", "Enable this profile", 0 },
+	{ "security_ips-profile", "categories",   "string",              1, "all",    "Legacy fallback khi không có filter (comma list, 'all')", 0 },
+	{ "security_ips-profile", "comment",      "string",              1, NULL,     "Optional description", 0 },
+
+	/* security_ips-filter (CFG_TABLE, FortiGate-style) — mỗi entry là một
+	 * mục lọc của một profile: chọn theo category hoặc signature (SID) +
+	 * override action. Nhiều entry/profile (lọc theo field `profile`). */
+	{ "security_ips-filter", "profile", "ref:security_ips-profile",        0, NULL,      "Profile chứa filter này", 0 },
+	{ "security_ips-filter", "type",    "enum:category,signature",         0, "category", "category = nhóm luật; signature = SID cụ thể", 0 },
+	{ "security_ips-filter", "value",   "string",                          0, NULL,      "Tên category hoặc SID", 0 },
+	{ "security_ips-filter", "action",  "enum:default,block,alert,pass",   0, "default", "default=giữ action gốc; block=drop; alert; pass", 0 },
+	{ "security_ips-filter", "status",  "enum:enable,disable",             0, "enable",  "Enable filter này", 0 },
+
+	/* security_ips-ruleset (CFG_TABLE) — nguồn ruleset để tải về.
+	 * Mỗi entry là một URL (ET Open, SSL BL, custom). Cron và "Update Now"
+	 * iterate qua các entry enabled để chạy ips-update.sh. */
+	{ "security_ips-ruleset", "name",           "safe-id",             0, NULL,      "Ruleset name (e.g. et-botcc)", 0 },
+	{ "security_ips-ruleset", "description",   "string",              1, NULL,      "Human-readable ruleset description", 0 },
+	{ "security_ips-ruleset", "url",           "string",              0, NULL,      "HTTP/HTTPS URL của file .rules", 0 },
+	{ "security_ips-ruleset", "enabled",       "enum:enable,disable", 0, "disable", "Tải ruleset này khi update", 0 },
+	{ "security_ips-ruleset", "builtin",       "enum:yes,no",         0, "no",      "Entry mặc định (không xoá được)", SG_FLD_HIDDEN },
+	{ "security_ips-ruleset", "last-downloaded","string",             1, NULL,      "Timestamp of last successful download", SG_FLD_HIDDEN },
 
 	/* security_ssl-inspection (CFG_SINGLE) — MITM TLS inspection steering.
 	 * Off by default; steers forwarded HTTPS into stargazer-ssld. */
@@ -156,7 +195,7 @@ static const struct field_entry field_table[] = {
 	{ "firewall_policy", "cmkid",    "uint:1:16777215",                 1, NULL,     "Connmark id stamped on permitted flows (internal)", SG_FLD_HIDDEN },
 	/* ips-profile: chỉ có nghĩa khi action=accept; validation bắt lỗi nếu
 	 * đặt trên policy deny/drop (giống FortiGate — DENY không cần inspect L7). */
-	{ "firewall_policy", "ips-profile", "enum:none,default",           0, "none",   "IPS security profile (accept-only policies)", 0 },
+	{ "firewall_policy", "ips-profile", "ref-or:security_ips-profile:none", 0, "none", "IPS security profile (accept-only policies)", 0 },
 
 	/* firewall_address
 	 * subnet/fqdn are registry-optional: which one is required depends on

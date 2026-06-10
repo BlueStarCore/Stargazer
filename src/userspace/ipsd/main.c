@@ -6,7 +6,6 @@
  *   nfq_recv → ctdump_query (CTA_ML + ACCT) → ctdump_to_flow_stats/features
  *   → ips_evaluate (L1-builtin → L1-user → L2-payload → ML)
  *   → nfq_verdict (ACCEPT/DROP + set connmark)
- *   → rule_gen_feed (nếu ML block, không sig)
  *   → log_alert (nếu ALERT/DROP)
  *
  * Config đọc từ mgmtd (SG_CMD_CFG_GET "security_ips") lúc khởi động; nếu
@@ -24,7 +23,6 @@
 #include "engine.h"
 #include "flow_rule.h"
 #include "sig_reload.h"
-#include "rule_gen.h"
 #include "fusion.h"
 #include "feature.h"
 
@@ -45,7 +43,6 @@
 #define MGMTD_SOCK      "/run/stargazer-mgmtd.sock"
 #define DEFAULT_RULES   "/etc/stargazer/ips/rules/active.rules"
 #define ALERT_LOG       "/etc/stargazer/logs/ips-alert.log"
-#define AUTORULE_SAVE   "/etc/stargazer/ips/auto.rules"
 
 /* ---- config -------------------------------------------------------------- */
 
@@ -57,7 +54,6 @@ struct ipsd_config {
 	uint32_t snapshot_n;      /* N gói đầu mỗi flow đưa vào NFQUEUE  */
 	uint16_t queue_num;
 	char     rules_path[256];
-	uint32_t rule_gen_min;    /* min_support cho rule_gen              */
 };
 
 static struct ipsd_config g_cfg = {
@@ -68,7 +64,6 @@ static struct ipsd_config g_cfg = {
 	.snapshot_n  = 8,
 	.queue_num   = 0,
 	.rules_path  = DEFAULT_RULES,
-	.rule_gen_min = 3,
 };
 
 /* ---- global state -------------------------------------------------------- */
@@ -101,13 +96,16 @@ static void log_alert(const struct ips_decision *d, const struct nfq_pkt *pkt,
 	struct tm tm; localtime_r(&now, &tm);
 	char ts[24]; strftime(ts, sizeof(ts), "%F %T", &tm);
 
+	const char *msg = d->matched_msg[0] ? d->matched_msg :
+		((d->reason == IPS_R_ML_BLOCK || d->reason == IPS_R_ML_ALERT)
+			? "ML-ANOMALY" : "");
 	fprintf(f, "%s %s proto=%u src=%s:%u dst=%s:%u "
 		"reason=%s score=%.3f sid=%u msg=%s\n",
 		ts, ips_verdict_str(d->verdict),
 		fc->proto, src, pkt->sport, dst, pkt->dport,
 		ips_reason_str(d->reason), score,
-		(d->sig_rule >= 0) ? 0u : 0u,   /* sid future */
-		"");
+		d->matched_sid,
+		msg);
 	fflush(f);
 }
 
@@ -185,7 +183,7 @@ done:
 /* ---- xử lý một gói từ NFQUEUE ------------------------------------------- */
 
 static void process_packet(struct nfq_ctx *nfq, struct nfq_pkt *pkt,
-			    struct sig_reload *sr, struct rule_gen_ctx *rgen,
+			    struct sig_reload *sr,
 			    const struct ips_config *ips_cfg)
 {
 	/* [1] Lấy flow stats từ conntrack */
@@ -213,10 +211,19 @@ static void process_packet(struct nfq_ctx *nfq, struct nfq_pkt *pkt,
 	struct flow_ctx fc;
 	nfq_pkt_to_flow_ctx(pkt, &fc);
 
+	/*
+	 * Đọc ruleset dưới read-lock: reload chạy ở thread nền (sig_reload.c)
+	 * swap con trỏ active rồi FREE bản cũ. Không giữ rdlock ở đây sẽ
+	 * use-after-free khi sig_match đang duyệt AC của bản cũ lúc nó bị free.
+	 * `d` là struct trả về theo GIÁ TRỊ (copy hết) — sig_rule chỉ là index,
+	 * không deref ruleset sau khi unlock → an toàn giải phóng lock sớm.
+	 */
+	pthread_rwlock_rdlock(&sr->rwlock);
 	struct ips_decision d = ips_evaluate(ips_cfg, sr->active,
 					     pkt->payload, pkt->plen,
 					     &fc, feat,
 					     ct_ok ? &fs : NULL);
+	pthread_rwlock_unlock(&sr->rwlock);
 
 	/* [3] Verdict + connmark.
 	 *
@@ -240,27 +247,7 @@ static void process_packet(struct nfq_ctx *nfq, struct nfq_pkt *pkt,
 	if (nfq_verdict(nfq, pkt->id, accept, connmark, cmask) < 0)
 		fprintf(stderr, "ipsd: nfq_verdict failed: %m\n");
 
-	/* [4] Rule generation: ML bắt được mà signature bỏ sót */
-	if (d.ml_evaluated && d.score >= ips_cfg->thr_block && rgen) {
-		struct rule_gen_input rgi = {
-			.proto      = pkt->proto,
-			.dport      = pkt->dport,
-			.tcp_flags  = pkt->tcp_flags,
-			.dsize      = pkt->plen,
-			.syn_count  = fs.syn_count,
-			.ack_count  = fs.ack_count,
-			.psh_count  = fs.psh_count,
-			.bytes_fwd  = ctr.ml.bytes_fwd,
-			.bytes_bwd  = ctr.ml.bytes_bwd,
-			.pkts_fwd   = pkts_fwd,
-			.pkts_bwd   = pkts_bwd,
-			.ml_score   = d.score,
-		};
-		if (rule_gen_feed(rgen, &rgi, sr->active) == 1)
-			rule_gen_save(rgen, AUTORULE_SAVE);
-	}
-
-	/* [5] Log alert */
+	/* [4] Log alert */
 	if (d.verdict != IPS_PASS)
 		log_alert(&d, pkt, &fc, d.score);
 }
@@ -274,25 +261,66 @@ static void usage(const char *prog)
 		"  -q <n>    NFQUEUE number (mặc định %u)\n"
 		"  -r <path> rules file (mặc định %s)\n"
 		"  -d        detect mode (chỉ log, không block)\n"
-		"  -n        không đọc config từ mgmtd\n",
+		"  -n        không đọc config từ mgmtd\n"
+		"  -C        check-syntax: nạp + build -r file rồi thoát "
+		"(0=hợp lệ, 1=lỗi)\n",
 		prog, g_cfg.queue_num, DEFAULT_RULES);
+}
+
+/*
+ * check_syntax — nạp + build ruleset từ path, KHÔNG mở NFQUEUE/mgmtd.
+ * Dùng cho update an toàn: verify ruleset mới TRƯỚC khi swap vào production
+ * (ipsd -C -r /tmp/new.rules). Trả 0 nếu hợp lệ, 1 nếu lỗi/0 rule.
+ */
+static int check_syntax(const char *path)
+{
+	struct sig_ruleset rs;
+	struct sig_load_stats st;
+	sig_ruleset_init(&rs);
+	int added = sig_load_file(&rs, path, &st);
+	if (added < 0) {
+		fprintf(stderr, "ipsd -C: không mở được %s\n", path);
+		sig_ruleset_free(&rs);
+		return 1;
+	}
+	if (st.loaded == 0) {
+		fprintf(stderr, "ipsd -C: %s không có rule hợp lệ "
+			"(skip=%d err=%d)\n", path, st.skipped, st.errors);
+		sig_ruleset_free(&rs);
+		return 1;
+	}
+	if (sig_build(&rs) != 0) {
+		fprintf(stderr, "ipsd -C: build AC thất bại cho %s\n", path);
+		sig_ruleset_free(&rs);
+		return 1;
+	}
+	fprintf(stderr, "ipsd -C: OK %s (%d rule, %d skip, %d err)\n",
+		path, st.loaded, st.skipped, st.errors);
+	sig_ruleset_free(&rs);
+	return 0;
 }
 
 int main(int argc, char **argv)
 {
 	int no_mgmtd = 0;
+	int do_check = 0;
 	int opt;
 
-	while ((opt = getopt(argc, argv, "q:r:dn")) != -1) {
+	while ((opt = getopt(argc, argv, "q:r:dnC")) != -1) {
 		switch (opt) {
 		case 'q': g_cfg.queue_num = (uint16_t)atoi(optarg); break;
 		case 'r': snprintf(g_cfg.rules_path, sizeof(g_cfg.rules_path),
 				   "%s", optarg); break;
 		case 'd': g_cfg.mode = IPS_MODE_DETECT; break;
 		case 'n': no_mgmtd = 1; break;
+		case 'C': do_check = 1; break;
 		default: usage(argv[0]); return 1;
 		}
 	}
+
+	/* [0] check-syntax mode: verify ruleset rồi thoát, không đụng kernel */
+	if (do_check)
+		return check_syntax(g_cfg.rules_path);
 
 	/* [1] Load config từ mgmtd (best-effort) */
 	if (!no_mgmtd)
@@ -319,17 +347,11 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	/* Nạp auto-rules đã lưu từ lần trước */
-	struct rule_gen_ctx rgen;
-	rule_gen_init(&rgen, g_cfg.rule_gen_min, g_cfg.thr_block, 0);
-	rule_gen_load(&rgen, sr.active, AUTORULE_SAVE);
-
 	struct nfq_ctx nfq;
 	if (nfq_open(&nfq, g_cfg.queue_num) < 0) {
 		fprintf(stderr, "ipsd: cannot open NFQUEUE %u: %m\n",
 			g_cfg.queue_num);
 		sig_reload_free(&sr);
-		rule_gen_free(&rgen);
 		return 1;
 	}
 
@@ -378,7 +400,7 @@ int main(int argc, char **argv)
 		/* gói từ NFQUEUE */
 		if (FD_ISSET(nfq.fd, &rfds)) {
 			if (nfq_recv(&nfq, &pkt) == 0)
-				process_packet(&nfq, &pkt, &sr, &rgen, &ips_cfg);
+				process_packet(&nfq, &pkt, &sr, &ips_cfg);
 		}
 	}
 
@@ -387,8 +409,6 @@ int main(int argc, char **argv)
 	nfq_close(&nfq);
 	sig_reload_wait(&sr);
 	sig_reload_free(&sr);
-	rule_gen_save(&rgen, AUTORULE_SAVE);
-	rule_gen_free(&rgen);
 	if (g_logfp) fclose(g_logfp);
 
 	return 0;

@@ -145,6 +145,14 @@ void fqdn_object_removed(const char *obj_name);  /* destroy object's set   */
 sg_status_t rebuild_forward_chain(char *result, size_t rsize);
 sg_status_t rebuild_nat_chains(char *result, size_t rsize);
 
+/* ── IPS ruleset compile + hot-reload (mgmtd_apply_ips.c, Phase B) ───────── */
+/* Compile per-profile rulesets + union active.rules từ repo theo categories,
+ * verify bằng ipsd -C, atomic swap, SIGUSR1 ipsd. Gọi sau khi đổi
+ * security_ips / security_ips-profile / firewall_policy. */
+sg_status_t rebuild_ips_active(char *result, size_t rsize);
+sg_status_t run_ips_update_now(const char *ids_csv, char *result, size_t rsize);
+sg_status_t ips_rulesets_reload_custom(char *result, size_t rsize);
+
 /* Validation-only for CFG_APPLY (no kernel changes) */
 sg_status_t validate_firewall_policy(const char *id, const char *data,
 				     char *result, size_t rsize);

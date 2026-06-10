@@ -122,12 +122,12 @@ int main(void)
 		sig_ruleset_free(&rs3);
 	}
 
-	/* ---- T8: L1 user-defined (rule_gen output không content) ---- */
-	printf("T8 L1 user-defined: rule không content từ rule_gen:\n");
+	/* ---- T8: L1 user-defined (rule không content) ---- */
+	printf("T8 L1 user-defined: rule không content:\n");
 	{
 		struct sig_ruleset rs4;
 		sig_ruleset_init(&rs4);
-		/* rule không content (flags:S, dport 8888) — kiểu output của rule_gen */
+		/* rule không content (flags:S, dport 8888) */
 		sig_parse_line(&rs4,
 			"alert tcp any any -> any 8888 "
 			"(msg:\"AUTO rule\"; flags:S; sid:9000001; rev:1;)");

@@ -20,9 +20,9 @@ BUILD  := build
 CORE   := ac.c sig_rule.c
 HDR    := ac.h sig_rule.h
 
-.PHONY: test ac-test sig-test feat-test model-test fusion-test engine-test rule-gen-test reload-test ctdump-test nfq-test tls-test tls-policy-test ipsd sig-dump et rules-fetch clean
+.PHONY: test ac-test sig-test feat-test model-test fusion-test engine-test reload-test ctdump-test nfq-test tls-test tls-policy-test ipsd sig-dump et rules-fetch clean
 
-test: ac-test sig-test feat-test model-test fusion-test engine-test rule-gen-test reload-test ctdump-test nfq-test tls-test tls-policy-test
+test: ac-test sig-test feat-test model-test fusion-test engine-test reload-test ctdump-test nfq-test tls-test tls-policy-test
 	@echo "== TẤT CẢ TEST PASS =="
 
 ac-test: $(BUILD)/ac_test
@@ -49,11 +49,6 @@ engine-test: $(BUILD)/engine_test
 	@echo "--- chạy engine_test (pipeline hybrid) ---"
 	./$(BUILD)/engine_test
 
-rule-gen-test: $(BUILD)/rule_gen_test
-	@echo "--- chạy rule_gen_test (ThreadSanitizer) ---"
-	@# setarch -R tắt ASLR: tránh 'ThreadSanitizer: unexpected memory mapping'
-	@# trên kernel có entropy mmap cao (lỗi môi trường, không phải lỗi code).
-	setarch "$$(uname -m)" -R ./$(BUILD)/rule_gen_test
 
 nfq-test: $(BUILD)/nfq_test
 	@echo "--- chạy nfq_test (parse, host) ---"
@@ -129,11 +124,6 @@ $(BUILD)/engine_test: engine.c engine.h flow_rule.c flow_rule.h fusion.c \
 	$(CC) $(CFLAGS) $(SANIT) -o $@ engine.c flow_rule.c fusion.c sig_rule.c \
 	    ac.c ips_model.c engine_test.c $(BUILD)/predict.o -lm
 
-# Rule-gen có đa luồng → dùng ThreadSanitizer (không trộn được với ASan).
-$(BUILD)/rule_gen_test: rule_gen.c rule_gen.h sig_rule.c sig_rule.h ac.c ac.h rule_gen_test.c | $(BUILD)
-	$(CC) -O2 -Wall -Wextra -std=c11 -fsanitize=thread \
-	    -o $@ rule_gen.c sig_rule.c ac.c rule_gen_test.c -lpthread
-
 $(BUILD)/nfq_test: nfq.c nfq.h sig_rule.h nfq_test.c | $(BUILD)
 	$(CC) $(CFLAGS) $(SANIT) -o $@ nfq.c nfq_test.c
 
@@ -145,7 +135,7 @@ $(BUILD)/tls_policy_test: tls_policy.c tls_policy.h tls_policy_test.c | $(BUILD)
 
 # stargazer-ipsd binary (host build, không sanitizer để liên kết tốt)
 IPSD_SRCS := main.c nfq.c ctdump.c feature.c flow_rule.c \
-             sig_rule.c sig_reload.c ac.c rule_gen.c \
+             sig_rule.c sig_reload.c ac.c \
              engine.c fusion.c ips_model.c
 
 $(BUILD)/stargazer-ipsd: $(IPSD_SRCS) model/predict.c $(BUILD)/predict.o | $(BUILD)

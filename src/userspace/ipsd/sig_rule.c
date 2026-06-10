@@ -71,14 +71,98 @@ static int parse_action(const char *s)
 	return SIG_ALERT;                         /* alert/log/pass… → alert */
 }
 
-/* Port chỉ nhận số đơn; "any"/biến `$..`/danh sách `[..]`/dải `a:b` → 0 (any). */
-static uint16_t parse_port(const char *s)
+/*
+ * Snort port-variable expansion table.
+ * Variables that represent IP groups ($HTTP_SERVERS, $SQL_SERVERS …) may
+ * appear in the port position in some rule files; they expand to "any" (n=0).
+ * Source-address variables ($HOME_NET, $EXTERNAL_NET …) are silently ignored
+ * at the IP level — IP-group matching is a known MVP limitation.
+ */
+static const struct {
+	const char    *name;
+	uint16_t       ports[SIG_DPORT_MAX];
+	uint8_t        n;
+} PORT_VARS[] = {
+	{ "$HTTP_PORTS",      {80, 8080, 8000, 8008},    4 },
+	{ "$HTTPS_PORTS",     {443, 8443},                2 },
+	{ "$HTTP_SERVERS",    {0},                        0 }, /* IP var → any */
+	{ "$SQL_SERVERS",     {0},                        0 }, /* IP var → any */
+	{ "$DNS_SERVERS",     {53},                       1 },
+	{ "$SMTP_SERVERS",    {25, 587, 465},             3 },
+	{ "$SSH_PORTS",       {22},                       1 },
+	{ "$FTP_PORTS",       {21, 2121},                 2 },
+	{ "$ORACLE_PORTS",    {1521},                     1 },
+	{ "$SHELLCODE_PORTS", {0},                        0 }, /* → any */
+	{ "$FILE_DATA_PORTS", {80, 110, 143},             3 },
+	{ NULL,               {0},                        0 },
+};
+
+/*
+ * Parse a port field from a Snort rule header into a port list.
+ * "any" / "!" prefix / ranges "a:b" / unknown vars → n_out=0 (any port).
+ * Port lists "[a,b,c]" → parsed up to SIG_DPORT_MAX entries.
+ * Known $VARIABLE names → expanded from PORT_VARS table above.
+ */
+static void parse_port_to_list(const char *s, uint16_t *list, uint8_t *n_out)
 {
-	if (!s || !*s) return 0;
+	*n_out = 0;
+	if (!s || !*s) return;
+
+	/* Negation, "any", ranges → treat as any */
+	if (*s == '!' || !strcasecmp(s, "any")) return;
+
+	/* Known Snort variable */
+	if (*s == '$') {
+		for (int i = 0; PORT_VARS[i].name; i++) {
+			if (!strcmp(s, PORT_VARS[i].name)) {
+				*n_out = PORT_VARS[i].n;
+				for (uint8_t j = 0; j < PORT_VARS[i].n; j++)
+					list[j] = PORT_VARS[i].ports[j];
+				return;
+			}
+		}
+		return; /* unknown var → any */
+	}
+
+	/* Port list "[a,b,c]" */
+	if (*s == '[') {
+		s++;
+		uint8_t n = 0;
+		while (*s && *s != ']' && n < SIG_DPORT_MAX) {
+			while (*s == ' ' || *s == ',') s++;
+			if (!*s || *s == ']') break;
+			/* skip negated entries "!port" */
+			if (*s == '!') { while (*s && *s != ',' && *s != ']') s++; continue; }
+			char tok[8]; int ti = 0;
+			while (*s && *s != ',' && *s != ']' && ti < 7)
+				tok[ti++] = *s++;
+			tok[ti] = '\0';
+			/* skip ranges */
+			if (strchr(tok, ':')) continue;
+			long v = atol(tok);
+			if (v > 0 && v < 65536) list[n++] = (uint16_t)v;
+		}
+		*n_out = n;
+		return;
+	}
+
+	/* Range "a:b" → any (we don't store ranges) */
+	if (strchr(s, ':')) return;
+
+	/* Plain integer */
 	for (const char *q = s; *q; q++)
-		if (!isdigit((unsigned char)*q)) return 0;
+		if (!isdigit((unsigned char)*q)) return;
 	long v = atol(s);
-	return (v > 0 && v < 65536) ? (uint16_t)v : 0;
+	if (v > 0 && v < 65536) { list[0] = (uint16_t)v; *n_out = 1; }
+}
+
+/* Inline port-list membership test used by verify_rule and sig_flow_match. */
+static int port_match(const uint16_t *list, uint8_t n, uint16_t port)
+{
+	if (!n) return 1;                          /* n==0 → any */
+	for (uint8_t i = 0; i < n; i++)
+		if (list[i] == port) return 1;
+	return 0;
 }
 
 static uint8_t parse_flags(const char *s)
@@ -239,7 +323,7 @@ int sig_parse_line(struct sig_ruleset *rs, const char *line)
 	if (!r) return -1;
 	r->action = parse_action(action);
 	r->proto  = parse_proto(proto);
-	r->dport  = parse_port(dport);
+	parse_port_to_list(dport, r->dport_list, &r->n_dport);
 
 	if (parse_options(r, options) < 0) {
 		/* dọn content đã cấp của rule lỗi, không commit */
@@ -250,7 +334,7 @@ int sig_parse_line(struct sig_ruleset *rs, const char *line)
 
 	if (r->n_content == 0) {
 		/* Rule không content → L1 flow-rule (proto/dport/flags).
-		 * Lưu vào l1_rules thay vì bỏ qua — đây là output của rule_gen
+		 * Lưu vào l1_rules thay vì bỏ qua — rule không content
 		 * và rule scan/flood không cần payload. */
 		if (rs->n_l1 == rs->cap_l1) {
 			int nc = rs->cap_l1 ? rs->cap_l1 * 2 : 32;
@@ -265,7 +349,9 @@ int sig_parse_line(struct sig_ruleset *rs, const char *line)
 		fr->rev       = r->rev;
 		fr->action    = r->action;
 		fr->proto     = (uint8_t)r->proto;
-		fr->dport     = r->dport;
+		fr->n_dport   = r->n_dport;
+		for (uint8_t pi = 0; pi < r->n_dport; pi++)
+			fr->dport_list[pi] = r->dport_list[pi];
 		fr->flags_set = r->flags_set;
 		size_t mn = strlen(r->msg);
 		if (mn >= sizeof(fr->msg)) mn = sizeof(fr->msg) - 1;
@@ -363,7 +449,7 @@ static int verify_rule(const struct sig_rule *r, const uint8_t *p, int len,
 		       const struct flow_ctx *fc)
 {
 	if (r->proto != SIG_PROTO_ANY && fc->proto != r->proto) return 0;
-	if (r->dport != 0 && fc->dport != r->dport)             return 0;
+	if (!port_match(r->dport_list, r->n_dport, fc->dport))  return 0;
 	if (r->flags_set && (fc->tcp_flags & r->flags_set) != r->flags_set) return 0;
 
 	int pos = 0;                                    /* ép thứ tự content */
@@ -432,7 +518,7 @@ int sig_flow_match(const struct sig_ruleset *rs, const struct flow_ctx *fc,
 
 		if (r->proto != SIG_PROTO_ANY && (uint8_t)fc->proto != r->proto)
 			continue;
-		if (r->dport != 0 && fc->dport != r->dport)
+		if (!port_match(r->dport_list, r->n_dport, fc->dport))
 			continue;
 		/* flags_set: kiểm trên tcp_flags_fwd tích lũy (có gói nào set không?) */
 		if (r->flags_set &&

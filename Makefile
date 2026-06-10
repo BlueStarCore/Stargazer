@@ -124,7 +124,7 @@ all: image
 
 kernel: $(KERNEL_IMAGE)
 
-$(KERNEL_IMAGE): | kernel-source kernel-config
+$(KERNEL_IMAGE): $(KERNEL_DIR)/.config | kernel-source
 	@echo "[1/5] Building kernel..."
 	$(MAKE) -C $(KERNEL_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) olddefconfig
 	$(MAKE) -C $(KERNEL_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) -j$$(nproc) Image dtbs modules
@@ -149,7 +149,11 @@ kernel-source:
 		exit 1; \
 	fi
 
-kernel-config:
+# File target: produces $(KERNEL_DIR)/.config. kernel.img depends on it, so a
+# manual .config edit (newer mtime) triggers a kernel rebuild. The guard keeps
+# an existing .config intact — only a missing one is regenerated from defconfig
+# (so hand edits are never wiped by defconfig).
+$(KERNEL_DIR)/.config: | kernel-source
 	@if [ ! -f "$(KERNEL_DIR)/.config" ]; then \
 		echo "Configuring kernel for BPI-R4 (MT7988A)..."; \
 		$(MAKE) -C $(KERNEL_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) mt7988a_bpi-r4_defconfig; \
@@ -235,7 +239,7 @@ $(BUILD_DIR)/modules/$(MODULE_NAME).ko &: $(KERNEL_IMAGE) $(SRC_WATCH)
 
 busybox: $(BUSYBOX_BIN) $(BUSYBOX_LINKS)
 
-$(BUSYBOX_BIN):
+$(BUSYBOX_BIN): $(BUSYBOX_CONFIG_FRAGMENT)
 	@echo "[3/5] Building BusyBox..."
 	@if [ ! -d "$(BUSYBOX_DIR)" ]; then \
 		mkdir -p "$(BUSYBOX_CACHE_DIR)"; \
@@ -272,7 +276,7 @@ $(BUSYBOX_BIN):
 	cp $(BUSYBOX_DIR)/busybox $(BUSYBOX_BIN)
 	@echo "[3/5] BusyBox ready: $(BUSYBOX_BIN)"
 
-$(BUSYBOX_LINKS):
+$(BUSYBOX_LINKS): $(BUSYBOX_CONFIG_FRAGMENT)
 	@if [ ! -d "$(BUSYBOX_DIR)" ]; then \
 		mkdir -p "$(BUSYBOX_CACHE_DIR)"; \
 		echo "Cloning BusyBox source..."; \
@@ -962,18 +966,21 @@ firmware: rootfs
 # =============================================================================
 
 IPSD_DIR       := $(PROJECT_ROOT)/src/userspace/ipsd
-IPSD_SRCS      := $(IPSD_DIR)/main.c $(IPSD_DIR)/nfq.c $(IPSD_DIR)/ctdump.c \
+# Nguồn "core" (file nhỏ, compile nhanh). predict.c (model tl2cgen 6 MB / 108k
+# dòng) tách riêng → cache thành predict.o, chỉ build lại khi model đổi.
+IPSD_CORE_SRCS := $(IPSD_DIR)/main.c $(IPSD_DIR)/nfq.c $(IPSD_DIR)/ctdump.c \
                   $(IPSD_DIR)/feature.c $(IPSD_DIR)/flow_rule.c \
                   $(IPSD_DIR)/sig_rule.c $(IPSD_DIR)/sig_reload.c \
-                  $(IPSD_DIR)/ac.c $(IPSD_DIR)/rule_gen.c \
+                  $(IPSD_DIR)/ac.c \
                   $(IPSD_DIR)/engine.c $(IPSD_DIR)/fusion.c \
-                  $(IPSD_DIR)/ips_model.c \
-                  $(IPSD_DIR)/model/predict.c
+                  $(IPSD_DIR)/ips_model.c
+IPSD_PREDICT_C := $(IPSD_DIR)/model/predict.c
+IPSD_PREDICT_O := $(BUILD_DIR)/ipsd/predict.o
 IPSD_BIN       := $(BUILD_DIR)/ipsd/stargazer-ipsd
 
 ipsd: $(IPSD_BIN)
 
-$(IPSD_BIN): $(IPSD_SRCS)
+$(IPSD_BIN): $(IPSD_CORE_SRCS) $(IPSD_PREDICT_C)
 	@mkdir -p $(BUILD_DIR)/ipsd
 	@echo "[ipsd] Cross-compiling stargazer-ipsd (ARM64)..."
 	@# Dùng musl nếu có, ngược lại dùng aarch64-linux-gnu-gcc (đủ cho QEMU test)
@@ -986,9 +993,18 @@ $(IPSD_BIN): $(IPSD_SRCS)
 	    echo "ERROR: no ARM64 cross-compiler found"; \
 	    echo "Run: make musl-toolchain   OR   sudo apt install gcc-aarch64-linux-gnu"; \
 	    exit 1; fi
+	@# predict.o: cache; chỉ recompile khi predict.c mới hơn (-w tắt warning
+	@# code generate). Lần đầu mất vài phút, các lần sau bỏ qua bước này.
+	@if [ ! -f $(IPSD_PREDICT_O) ] || \
+	    [ $(IPSD_PREDICT_C) -nt $(IPSD_PREDICT_O) ]; then \
+	    echo "[ipsd] compiling predict.o (model ML 6MB — lần đầu/đổi model, vài phút)..."; \
+	    $(IPSD_CC) -O2 -w -c $(IPSD_PREDICT_C) -o $(IPSD_PREDICT_O); \
+	else \
+	    echo "[ipsd] predict.o cached — bỏ qua compile model"; \
+	fi
 	$(IPSD_CC) -O2 -Wall -std=c11 \
 	    -I$(IPSD_DIR) \
-	    $(IPSD_SRCS) \
+	    $(IPSD_CORE_SRCS) $(IPSD_PREDICT_O) \
 	    -lpthread -lm \
 	    -o $(IPSD_BIN)
 	@echo "[ipsd] Built: $(IPSD_BIN)"
@@ -1104,6 +1120,11 @@ test-build: modules busybox dash iptables logind mgmtd cli webd tools uboot ipsd
 	@cp $(USERSPACE_DIR)/usr/libexec/stargazer/* $(BUILD_DIR)/test/initramfs/usr/libexec/stargazer/
 	@chmod +x $(BUILD_DIR)/test/initramfs/usr/libexec/stargazer/*
 
+	# Crontab cho IPS signature auto-update (crond đọc /var/spool/cron/crontabs)
+	@mkdir -p $(BUILD_DIR)/test/initramfs/var/spool/cron/crontabs
+	@cp $(USERSPACE_DIR)/var/spool/cron/crontabs/root \
+	    $(BUILD_DIR)/test/initramfs/var/spool/cron/crontabs/root 2>/dev/null || true
+
 	# Install udhcpc default script (for DHCP network configuration)
 	@mkdir -p $(BUILD_DIR)/test/initramfs/usr/share/udhcpc
 	@cp $(USERSPACE_DIR)/usr/share/udhcpc/default.script $(BUILD_DIR)/test/initramfs/usr/share/udhcpc/
@@ -1112,19 +1133,31 @@ test-build: modules busybox dash iptables logind mgmtd cli webd tools uboot ipsd
 	# Create stargazer config directory (mgmtd seeds defaults on first boot)
 	@mkdir -p $(BUILD_DIR)/test/initramfs/etc/stargazer
 
-	# Install IPS daemon + default rules
+	# Install IPS daemon + signature repository (Phase B)
 	cp $(IPSD_BIN) $(BUILD_DIR)/test/initramfs/sbin/stargazer-ipsd
 	@chmod +x $(BUILD_DIR)/test/initramfs/sbin/stargazer-ipsd
+	@# Repo theo category: repo/<cat>.rules. profiles/ giữ ruleset compile
+	@# per-profile. rules/active.rules là bản ipsd nạp (mgmtd compile lúc boot).
+	@mkdir -p $(BUILD_DIR)/test/initramfs/etc/stargazer/ips/repo
+	@mkdir -p $(BUILD_DIR)/test/initramfs/etc/stargazer/ips/profiles
 	@mkdir -p $(BUILD_DIR)/test/initramfs/etc/stargazer/ips/rules
+	@# emerging-scan.rules → repo/scan.rules (thêm category khác = thả file
+	@# emerging-<cat>.rules vào ipsd/rules/ rồi map tại đây).
 	@if [ -f $(IPSD_DIR)/rules/emerging-scan.rules ]; then \
 		cp $(IPSD_DIR)/rules/emerging-scan.rules \
-		   $(BUILD_DIR)/test/initramfs/etc/stargazer/ips/rules/; \
+		   $(BUILD_DIR)/test/initramfs/etc/stargazer/ips/repo/scan.rules; \
 	fi
-	@# "active.rules" = symlink tới bộ rule mặc định
-	@ln -sf emerging-scan.rules \
+	@for c in malware web dos; do \
+		[ -f $(IPSD_DIR)/rules/emerging-$$c.rules ] && \
+		cp $(IPSD_DIR)/rules/emerging-$$c.rules \
+		   $(BUILD_DIR)/test/initramfs/etc/stargazer/ips/repo/$$c.rules || true; \
+	done
+	@# active.rules seed = repo/scan.rules (mgmtd sẽ compile lại theo profile
+	@# lúc boot; seed để ipsd có gì nạp nếu mgmtd chưa kịp).
+	@cp $(BUILD_DIR)/test/initramfs/etc/stargazer/ips/repo/scan.rules \
 	    $(BUILD_DIR)/test/initramfs/etc/stargazer/ips/rules/active.rules 2>/dev/null || true
 	@mkdir -p $(BUILD_DIR)/test/initramfs/etc/stargazer/logs
-	@echo "[ipsd] IPS daemon + rules installed in initramfs"
+	@echo "[ipsd] IPS daemon + signature repo installed in initramfs"
 
 	# Pack initramfs
 	cd $(BUILD_DIR)/test/initramfs && find . | sort | cpio -o -H newc 2>/dev/null | gzip -n -9 > $(BUILD_DIR)/test/initramfs.gz

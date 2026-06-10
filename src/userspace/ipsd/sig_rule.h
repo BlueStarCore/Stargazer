@@ -46,11 +46,21 @@ struct sig_content {
 	int      depth;  /* chỉ tìm trong `depth` byte kể từ offset; -1 = không đặt */
 };
 
+/*
+ * Port list: n_dport == 0 means any port; n_dport > 0 means match any port in
+ * the list.  Populated from literal ports or from Snort variable expansion
+ * (e.g. $HTTP_PORTS → {80,8080,8000,8008}).  Source IP/dest IP variables
+ * ($HOME_NET, $EXTERNAL_NET, …) are NOT resolved — they are silently treated
+ * as "any"; this is a known MVP limitation noted in the thesis.
+ */
+#define SIG_DPORT_MAX 8
+
 struct sig_rule {
 	uint32_t sid, rev;
 	int      action;             /* SIG_ALERT / SIG_DROP   */
 	int      proto;              /* SIG_PROTO_*            */
-	uint16_t dport;              /* 0 = any               */
+	uint16_t dport_list[SIG_DPORT_MAX]; /* destination port list */
+	uint8_t  n_dport;            /* 0 = any port           */
 	uint8_t  flags_set;          /* cờ TCP bắt buộc set (0 = bỏ qua) */
 	struct sig_content content[SIG_MAX_CONTENT];
 	int      n_content;
@@ -61,14 +71,15 @@ struct sig_rule {
 /*
  * L1 flow-rule: rule không có content (chỉ proto/dport/flags).
  * Khớp dựa trên thống kê flow (struct flow_stats trong flow_rule.h),
- * KHÔNG cần payload. Được nạp từ rule_gen hoặc file rule không có content.
+ * KHÔNG cần payload. Nạp từ file rule không có content.
  * Snort gọi đây là "non-payload detection rules".
  */
 struct sig_flow_rule {
 	uint32_t sid, rev;
 	int      action;        /* SIG_ALERT / SIG_DROP */
 	uint8_t  proto;         /* SIG_PROTO_* */
-	uint16_t dport;         /* 0 = any */
+	uint16_t dport_list[SIG_DPORT_MAX];
+	uint8_t  n_dport;       /* 0 = any */
 	uint8_t  flags_set;     /* cờ TCP phải set trong tcp_flags_fwd (0 = bỏ qua) */
 	char     msg[SIG_MSG_MAX];
 };
@@ -79,7 +90,7 @@ struct sig_ruleset {
 	int                 n_rules, cap_rules;
 	struct ac_automaton ac;
 	int                 built;
-	/* L1: flow-stat rules (no payload, từ rule_gen hoặc file) */
+	/* L1: flow-stat rules (no payload, từ file) */
 	struct sig_flow_rule *l1_rules;
 	int                   n_l1, cap_l1;
 };

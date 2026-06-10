@@ -18,6 +18,7 @@
 #include "mgmtd_internal.h"
 #include "mgmtd_apply.h"
 #include "mgmtd_dynbuf.h"
+#include "mgmtd_ips_compile.h"   /* ips_catalog_to_json */
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -483,6 +484,257 @@ int handle_ips_alerts(int client_fd, const char *user,
 	}
 	send_ok(client_fd, NULL, out);
 	free(out);
+	return 0;
+}
+
+/* ── SG_CMD_IPS_UPDATE_LOG (691) — tail ips-update.log ──────────────── */
+
+int handle_ips_update_log(int client_fd, const char *user,
+			  const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)hdr; (void)payload;
+
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED, "monitor required");
+		return 0;
+	}
+
+	const char *tail[] = {"tail", "-n", "100",
+			      "/etc/stargazer/logs/ips-update.log", NULL};
+	char *out = safe_exec(tail);
+	if (!out || !out[0]) {
+		send_ok(client_fd, NULL, "(ips-update.log is empty — no downloads yet)\n");
+		free(out);
+		return 0;
+	}
+	send_ok(client_fd, NULL, out);
+	free(out);
+	return 0;
+}
+
+/* ── SG_CMD_IPS_ALERTS_JSON (689) — parse alert log → JSON array ─────── */
+
+int handle_ips_alerts_json(int client_fd, const char *user,
+			   const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)hdr;
+
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED, "monitor required");
+		return 0;
+	}
+
+	char nlines_s[16] = "100";
+	if (payload && payload[0])
+		extract_val(payload, "lines", nlines_s, sizeof(nlines_s));
+	int nlines = atoi(nlines_s);
+	if (nlines < 1 || nlines > 5000) nlines = 100;
+	char nlarg[16];
+	snprintf(nlarg, sizeof(nlarg), "%d", nlines);
+
+	const char *tail_argv[] = {"tail", "-n", nlarg,
+				   "/etc/stargazer/logs/ips-alert.log", NULL};
+	char *raw = safe_exec(tail_argv);
+	if (!raw || !raw[0]) {
+		free(raw);
+		send_ok(client_fd, NULL, "[]");
+		return 0;
+	}
+
+	/* Allocate output buffer: each line → ~300 bytes JSON, add 64 overhead */
+	size_t cap = (size_t)nlines * 320 + 64;
+	char *json = malloc(cap);
+	if (!json) { free(raw); send_ok(client_fd, NULL, "[]"); return 0; }
+
+	size_t pos = 0;
+	json[pos++] = '[';
+	int first = 1;
+
+	char *p = raw;
+	while (*p) {
+		char *nl = strchr(p, '\n');
+		size_t llen = nl ? (size_t)(nl - p) : strlen(p);
+		if (llen == 0) { p = nl ? nl + 1 : p + llen; continue; }
+
+		/* Format: ts_date ts_time verdict proto=N src=IP:PORT dst=IP:PORT
+		 *         reason=STR score=FLOAT sid=N msg=STR */
+		char ts[24]="", verdict[8]="", src[48]="", dst[48]="";
+		char reason[24]="", msg_rest[256]="";
+		unsigned proto = 0;
+		unsigned sport = 0, dport = 0;
+		double   score = -1.0;
+		unsigned sid   = 0;
+
+		/* Parse: first two tokens are date + time, third is verdict,
+		 * rest are key=value except msg= which may contain spaces */
+		char line[512];
+		size_t cp = llen < sizeof(line)-1 ? llen : sizeof(line)-1;
+		memcpy(line, p, cp); line[cp] = '\0';
+
+		char date[12]="", timebuf[10]="";
+		sscanf(line, "%11s %9s %7s", date, timebuf, verdict);
+		snprintf(ts, sizeof(ts), "%s %s", date, timebuf);
+
+		/* Parse key=value tokens after first 3 tokens */
+		char *kv = line;
+		int tok = 0;
+		while (*kv) {
+			while (*kv == ' ') kv++;
+			char *end = kv; while (*end && *end != ' ') end++;
+			if (tok >= 3) {
+				/* key=value */
+				char *eq = memchr(kv, '=', (size_t)(end - kv));
+				if (eq) {
+					*eq = '\0'; *end = '\0';
+					const char *key = kv, *val = eq + 1;
+					if (strcmp(key, "proto") == 0)       proto = (unsigned)atoi(val);
+					else if (strcmp(key, "src") == 0) {
+						const char *c = strrchr(val, ':');
+						if (c) {
+							size_t ilen = (size_t)(c - val);
+							if (ilen >= sizeof(src)) ilen = sizeof(src)-1;
+							memcpy(src, val, ilen); src[ilen] = '\0';
+							sport = (unsigned)atoi(c+1);
+						} else {
+							snprintf(src, sizeof(src), "%s", val);
+						}
+					} else if (strcmp(key, "dst") == 0) {
+						const char *c = strrchr(val, ':');
+						if (c) {
+							size_t ilen = (size_t)(c - val);
+							if (ilen >= sizeof(dst)) ilen = sizeof(dst)-1;
+							memcpy(dst, val, ilen); dst[ilen] = '\0';
+							dport = (unsigned)atoi(c+1);
+						} else {
+							snprintf(dst, sizeof(dst), "%s", val);
+						}
+					} else if (strcmp(key, "reason") == 0) snprintf(reason, sizeof(reason), "%s", val);
+					else if (strcmp(key, "score") == 0)  score = atof(val);
+					else if (strcmp(key, "sid") == 0)    sid   = (unsigned)atoi(val);
+					else if (strcmp(key, "msg") == 0)    snprintf(msg_rest, sizeof(msg_rest), "%s", val);
+					*end = ' '; *eq = '=';
+				}
+			}
+			tok++;
+			kv = *end ? end + 1 : end;
+		}
+
+		/* ML-ANOMALY placeholder */
+		const char *sid_str = "0";
+		char sid_buf[16];
+		if (sid == 0 && (strncmp(reason, "ml-", 3) == 0 ||
+				 strcmp(reason, "ml-block") == 0 ||
+				 strcmp(reason, "ml-alert") == 0)) {
+			sid_str = "ML-ANOMALY";
+		} else {
+			snprintf(sid_buf, sizeof(sid_buf), "%u", sid);
+			sid_str = sid_buf;
+		}
+
+		const char *msg_disp = msg_rest[0] ? msg_rest :
+				(sid == 0 ? "ML anomaly detection" : "");
+
+		if (!first) {
+			if (pos + 2 < cap) { json[pos++] = ','; json[pos++] = '\n'; }
+		}
+		first = 0;
+
+		int n = snprintf(json + pos, cap - pos,
+			"{\"ts\":\"%s\",\"verdict\":\"%s\",\"proto\":%u,"
+			"\"src\":\"%s\",\"sport\":%u,\"dst\":\"%s\",\"dport\":%u,"
+			"\"reason\":\"%s\",\"score\":%.3f,\"sid\":\"%s\",\"msg\":\"%s\"}",
+			ts, verdict, proto,
+			src, sport, dst, dport,
+			reason, score, sid_str, msg_disp);
+		if (n > 0 && (size_t)n < cap - pos) pos += (size_t)n;
+
+		p = nl ? nl + 1 : p + llen;
+	}
+	free(raw);
+
+	if (pos + 2 < cap) { json[pos++] = ']'; json[pos] = '\0'; }
+	send_ok(client_fd, NULL, json);
+	free(json);
+	return 0;
+}
+
+/* ── SG_CMD_IPS_SIGNATURES (686) ───────────────────────────────────────── */
+
+int handle_ips_signatures(int client_fd, const char *user,
+			  const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)payload; (void)hdr;
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "configure")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED, "configure required");
+		return 0;
+	}
+
+	/*
+	 * Build allowed-category list from DB entries that have been
+	 * downloaded (last-downloaded is non-empty).  Derive the category
+	 * name from the URL the same way run_ips_update_now does:
+	 *   basename(url) → strip ".rules" → strip leading "emerging-"
+	 * Only files whose stem is in this list appear in the catalog.
+	 */
+#define MAX_ALLOWED 64
+	char  cat_bufs[MAX_ALLOWED][128];
+	const char *allowed[MAX_ALLOWED];
+	int n_allowed = 0;
+
+	char *ids = sg_db_list("security_ips-ruleset");
+	if (ids) {
+		char *sp = NULL;
+		for (char *id = strtok_r(ids, "\n", &sp);
+		     id && n_allowed < MAX_ALLOWED;
+		     id = strtok_r(NULL, "\n", &sp)) {
+			char *lastdl = sg_db_get_val("security_ips-ruleset", id,
+						     "last-downloaded");
+			if (!lastdl || !lastdl[0]) { free(lastdl); continue; }
+			free(lastdl);
+			char *url = sg_db_get_val("security_ips-ruleset", id, "url");
+			if (!url || !url[0]) { free(url); continue; }
+			/* basename */
+			const char *base = strrchr(url, '/');
+			base = base ? base + 1 : url;
+			snprintf(cat_bufs[n_allowed], 128, "%s", base);
+			/* strip .rules */
+			char *dot = strrchr(cat_bufs[n_allowed], '.');
+			if (dot && strcmp(dot, ".rules") == 0) *dot = '\0';
+			/* strip leading "emerging-" */
+			const char *cat = cat_bufs[n_allowed];
+			if (strncmp(cat, "emerging-", 9) == 0) cat += 9;
+			if (cat != cat_bufs[n_allowed])
+				memmove(cat_bufs[n_allowed], cat, strlen(cat) + 1);
+			allowed[n_allowed] = cat_bufs[n_allowed];
+			n_allowed++;
+			free(url);
+		}
+		free(ids);
+	}
+#undef MAX_ALLOWED
+
+	if (n_allowed == 0) {
+		send_ok(client_fd, NULL, "[]");   /* nothing downloaded yet */
+		return 0;
+	}
+
+	char *json = malloc(SG_RESPONSE_MAX);
+	if (!json) {
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL, "Out of memory");
+		return 0;
+	}
+	int n = ips_catalog_to_json("/etc/stargazer/ips/repo", json,
+				    SG_RESPONSE_MAX, allowed, n_allowed);
+	if (n < 0) {
+		free(json);
+		send_ok(client_fd, NULL, "[]");
+		return 0;
+	}
+	send_ok(client_fd, NULL, json);
+	free(json);
 	return 0;
 }
 

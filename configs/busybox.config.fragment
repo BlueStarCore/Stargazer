@@ -40,6 +40,12 @@ CONFIG_FEATURE_IP_SHORT_FORMS=y
 CONFIG_PING=y
 CONFIG_FEATURE_FANCY_PING=y
 
+# `nc` — netcat: LAN VM dùng làm target sink (nc -l -p N) để TCP handshake
+# hoàn tất, data packet đi qua firewall cho IPS soi payload signature.
+CONFIG_NC=y
+CONFIG_NC_SERVER=y
+CONFIG_NC_EXTRA=y
+
 # `traceroute` — route diagnose (mgmtd_network.c)
 CONFIG_TRACEROUTE=y
 CONFIG_FEATURE_TRACEROUTE_VERBOSE=y
@@ -242,3 +248,11 @@ CONFIG_STTY=y
 
 # `echo` — defensive (dash builtin handles most cases)
 CONFIG_ECHO=y
+
+# `sha256sum` — hash dedup cho IPS signature auto-update (ips-update.sh)
+CONFIG_SHA256SUM=y
+# `crond` — chạy lịch auto-update IPS signature
+CONFIG_CROND=y
+CONFIG_FEATURE_CROND_D=y
+CONFIG_FEATURE_CROND_CALL_SENDMAIL=n
+CONFIG_FEATURE_CROND_DIR="/var/spool/cron"

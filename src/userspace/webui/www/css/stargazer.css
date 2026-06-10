@@ -2343,3 +2343,106 @@ tr.drop-below {
         padding: 32px 24px 28px;
     }
 }
+
+/* ── Info icon + hover tooltip (IPS page hints, reusable) ──────────────── */
+.sg-info {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px; height: 18px;
+    border-radius: 50%;
+    border: 1px solid currentColor;
+    font-size: 11px; font-weight: bold;
+    cursor: help;
+    opacity: 0.7;
+    vertical-align: middle;
+}
+.sg-info:hover { opacity: 1; }
+.sg-info .sg-tip {
+    visibility: hidden;
+    opacity: 0;
+    position: absolute;
+    left: 24px; top: 50%;
+    transform: translateY(-50%);
+    width: max-content; max-width: 320px;
+    background: #1c2333;
+    color: #d8e0f0;
+    border: 1px solid #3a4a66;
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 12px; font-weight: normal;
+    line-height: 1.45;
+    white-space: normal;
+    z-index: 50;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.4);
+    transition: opacity 0.12s ease;
+    pointer-events: none;
+}
+.sg-info:hover .sg-tip,
+.sg-info:focus .sg-tip { visibility: visible; opacity: 1; }
+
+/* ── Overlay modal (IPS Add Signatures, kiểu FortiGate) ───────────────── */
+.modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.6);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+}
+.modal-overlay .ips-tab {
+    opacity: 0.6;
+}
+.modal-overlay .ips-tab.active {
+    opacity: 1;
+    border-bottom: 2px solid #4a9eff;
+}
+#ips-sig-table td, #ips-prof-filters td { font-size: 12px; }
+
+/* ── IPS page-level tabs ──────────────────────────────────────────── */
+.page-tab-bar {
+    display: flex;
+    gap: 0;
+    border-bottom: 2px solid var(--border-light);
+    margin-bottom: 16px;
+}
+.page-tab {
+    background: none;
+    border: none;
+    border-bottom: 3px solid transparent;
+    margin-bottom: -2px;
+    padding: 8px 20px;
+    cursor: pointer;
+    color: var(--gray-text);
+    opacity: 0.6;
+    font-size: 13px;
+    font-weight: 500;
+    letter-spacing: 0.3px;
+    transition: opacity 0.15s, border-color 0.15s;
+}
+.page-tab:hover { opacity: 0.85; }
+.page-tab.active {
+    opacity: 1;
+    border-bottom-color: var(--dawn-orange);
+    color: var(--dawn-orange);
+}
+.ips-tab-pane { min-height: 200px; }
+
+/* ── IPS Alerts table ─────────────────────────────────────────────── */
+#ips-alerts-table td { font-size: 12px; }
+#ips-alerts-table .verdict-drop  { color: var(--color-danger); font-weight:600; }
+#ips-alerts-table .verdict-alert { color: #e89a2e; font-weight:600; }
+.btn-info { padding:2px 8px; font-size:11px; }
+
+/* ── IPS Rules table ──────────────────────────────────────────────── */
+#ips-rules-table td { font-size: 12px; }
+.ips-override-select { font-size:11px; padding:2px 4px; border:1px solid var(--border-light); }
+#ips-rules-bulk { display:none; padding:8px 12px; background:var(--border-light);
+                  border-radius:4px; margin-top:8px; display:flex; gap:8px; align-items:center; }
+.rf-pager { display:flex; gap:4px; margin-top:8px; justify-content:flex-end; flex-wrap:wrap; }
+.rf-pager button { padding:3px 8px; font-size:12px; border:1px solid var(--border-light);
+                   background:#fff; cursor:pointer; border-radius:3px; }
+.rf-pager button.active { background:var(--dawn-orange); color:#fff; border-color:var(--dawn-orange); }
+.rf-pager button:disabled { opacity:0.4; cursor:default; }

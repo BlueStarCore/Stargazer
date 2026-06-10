@@ -35,7 +35,7 @@ void flow_rule_flags_str(uint8_t flags, char *buf, size_t n)
  * Thứ tự DROP trước ALERT quan trọng để loop dừng đúng.
  */
 
-/* SID base cho built-in (tránh đụng ET OPEN <3000000 và rule_gen 9000000+) */
+/* SID base cho built-in (tránh đụng ET OPEN (<3000000)) */
 #define BIN_SID_BASE 1000000u
 
 /* Ngưỡng SYN flood: syn_count >= N VÀ syn_count > RATIO * ack_count.

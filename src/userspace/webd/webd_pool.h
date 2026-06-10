@@ -40,6 +40,12 @@
 #define FLOW_FIRMWARE_UPLOAD 19
 #define FLOW_MONITOR_DHCP    20
 #define FLOW_MONITOR_SESSIONS 21
+#define FLOW_IPS_STATUS      22
+#define FLOW_IPS_ALERTS      23
+#define FLOW_IPS_SIGS        24
+#define FLOW_IPS_UPDATE      25
+#define FLOW_IPS_ALERTS_JSON 26
+#define FLOW_IPS_UPDATE_LOG  27
 
 typedef struct {
 	unsigned long   conn_id;        /* Mongoose connection ID */
