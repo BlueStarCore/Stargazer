@@ -16,13 +16,20 @@ CFLAGS ?= -O2 -Wall -Wextra -std=c11
 SANIT  := -fsanitize=address,undefined
 BUILD  := build
 
+# P4 — nếu host có libpcre2-8 → test luôn đường pcre (HAVE_PCRE). Không có →
+# build không pcre (luật pcre KẸP ALERT), test vẫn chạy.
+HAVE_PCRE := $(shell pkg-config --exists libpcre2-8 2>/dev/null && echo 1)
+ifeq ($(HAVE_PCRE),1)
+  PCRE_FLAGS := -DHAVE_PCRE $(shell pkg-config --cflags --libs libpcre2-8)
+endif
+
 # Nguồn engine dùng chung (KHÔNG gồm file chứa main()).
 CORE   := ac.c sig_rule.c
 HDR    := ac.h sig_rule.h
 
-.PHONY: test ac-test sig-test feat-test model-test fusion-test engine-test reload-test ctdump-test nfq-test tls-test tls-policy-test ipsd sig-dump et rules-fetch clean
+.PHONY: test ac-test sig-test feat-test model-test fusion-test engine-test reload-test ctdump-test nfq-test tls-test tls-policy-test reass-test http-tx-test ipsd sig-dump et rules-fetch clean
 
-test: ac-test sig-test feat-test model-test fusion-test engine-test reload-test ctdump-test nfq-test tls-test tls-policy-test
+test: ac-test sig-test feat-test model-test fusion-test engine-test reload-test ctdump-test nfq-test tls-test tls-policy-test reass-test http-tx-test
 	@echo "== TẤT CẢ TEST PASS =="
 
 ac-test: $(BUILD)/ac_test
@@ -61,6 +68,14 @@ tls-test: $(BUILD)/tls_clienthello_test
 tls-policy-test: $(BUILD)/tls_policy_test
 	@echo "--- chạy tls_policy_test (splice/bump decision, host) ---"
 	./$(BUILD)/tls_policy_test
+
+reass-test: $(BUILD)/reass_test
+	@echo "--- chạy reass_test (ráp dòng TCP + streaming AC, host) ---"
+	./$(BUILD)/reass_test
+
+http-tx-test: $(BUILD)/http_tx_test
+	@echo "--- chạy http_tx_test (re-arm transaction HTTP, host) ---"
+	./$(BUILD)/http_tx_test
 
 ctdump-test: $(BUILD)/ctdump_test
 	@echo "--- chạy ctdump_test (host, không cần kernel) ---"
@@ -102,7 +117,7 @@ $(BUILD)/ac_test: ac.c ac.h ac_test.c | $(BUILD)
 	$(CC) $(CFLAGS) $(SANIT) -o $@ ac.c ac_test.c
 
 $(BUILD)/sig_test: $(CORE) $(HDR) sig_test.c | $(BUILD)
-	$(CC) $(CFLAGS) $(SANIT) -o $@ $(CORE) sig_test.c
+	$(CC) $(CFLAGS) $(SANIT) -o $@ $(CORE) proto_buf.c tls_clienthello.c sig_test.c $(PCRE_FLAGS)
 
 $(BUILD)/feature_test: feature.c feature.h feature_test.c | $(BUILD)
 	$(CC) $(CFLAGS) $(SANIT) -o $@ feature.c feature_test.c -lm
@@ -133,9 +148,16 @@ $(BUILD)/tls_clienthello_test: tls_clienthello.c tls_clienthello.h tls_clienthel
 $(BUILD)/tls_policy_test: tls_policy.c tls_policy.h tls_policy_test.c | $(BUILD)
 	$(CC) $(CFLAGS) $(SANIT) -o $@ tls_policy.c tls_policy_test.c
 
+$(BUILD)/reass_test: ac.c ac.h reass.c reass.h reass_test.c | $(BUILD)
+	$(CC) $(CFLAGS) $(SANIT) -o $@ ac.c reass.c reass_test.c
+
+$(BUILD)/http_tx_test: ac.c reass.c http_tx.c http_tx.h http_tx_test.c | $(BUILD)
+	$(CC) $(CFLAGS) $(SANIT) -o $@ ac.c reass.c http_tx.c http_tx_test.c
+
 # stargazer-ipsd binary (host build, không sanitizer để liên kết tốt)
 IPSD_SRCS := main.c nfq.c ctdump.c feature.c flow_rule.c \
-             sig_rule.c sig_reload.c ac.c \
+             sig_rule.c sig_reload.c ac.c reass.c \
+             proto_buf.c tls_clienthello.c http_tx.c \
              engine.c fusion.c ips_model.c
 
 $(BUILD)/stargazer-ipsd: $(IPSD_SRCS) model/predict.c $(BUILD)/predict.o | $(BUILD)

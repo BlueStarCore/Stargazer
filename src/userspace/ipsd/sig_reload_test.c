@@ -53,11 +53,14 @@ static void t1_init_match(void)
 	check(sr.active->n_rules > 0,  "có rule sau init");
 	check(sr.pipe_rd >= 0,         "self-pipe mở");
 
-	/* payload khớp FTP brute-force (sid 2010642): "USER root" dport 21 */
+	/* payload khớp FTP brute-force (sid 2010642): "USER root" dport 21.
+	 * Luật có flow:established,to_server (P6) → phải cấp ngữ cảnh tương ứng. */
 	struct flow_ctx fc21;
 	memset(&fc21, 0, sizeof(fc21));
-	fc21.proto = SIG_PROTO_TCP;
-	fc21.dport = 21;
+	fc21.proto       = SIG_PROTO_TCP;
+	fc21.dport       = 21;
+	fc21.established = 1;
+	fc21.to_server   = 1;
 	int idx = sig_reload_match(&sr, (const uint8_t *)"USER root", 9, &fc21);
 	check(idx >= 0, "match trên ruleset thật (FTP brute-force @dport 21)");
 

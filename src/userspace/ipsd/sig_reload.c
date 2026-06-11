@@ -18,6 +18,26 @@
  * Chỉ set một lần trong sig_reload_init(); không bao giờ đổi sau đó. */
 static struct sig_reload *sr_global = NULL;
 
+/*
+ * P0 — độ phủ thật: ghi breakdown ra file để mgmtd/UI đọc (SG_CMD_IPS_STATUS).
+ * "% thực sự enforce" = loaded_full / (loaded_full+loaded_alert). Không giấu.
+ */
+#define IPSD_STATS_FILE "/run/stargazer-ipsd.stats"
+static void write_load_stats(const struct sig_load_stats *st)
+{
+	FILE *f = fopen(IPSD_STATS_FILE, "w");
+	if (!f)
+		return;
+	fprintf(f,
+		"loaded=%d\nloaded_full=%d\nloaded_alert=%d\n"
+		"skipped=%d\nskipped_unsupported=%d\nskipped_reputation=%d\n"
+		"skipped_no_content=%d\nerrors=%d\n",
+		st->loaded, st->loaded_full, st->loaded_alert,
+		st->skipped, st->skipped_unsupported, st->skipped_reputation,
+		st->skipped_no_content, st->errors);
+	fclose(f);
+}
+
 /* ---- signal handler (async-signal-safe: chỉ write) ----------------------- */
 
 static void sigusr1_handler(int sig)
@@ -71,8 +91,13 @@ static void *reload_thread_fn(void *arg)
 		free(fresh);
 		goto fail;
 	}
-	fprintf(stderr, "sig_reload: loaded %d rules (%d skipped, %d errors) from %s\n",
-		st.loaded, st.skipped, st.errors, path);
+	fprintf(stderr,
+		"sig_reload: loaded %d rules (full=%d alert-cap=%d | skip=%d "
+		"[unsup=%d reputation=%d no-content=%d] err=%d) from %s\n",
+		st.loaded, st.loaded_full, st.loaded_alert, st.skipped,
+		st.skipped_unsupported, st.skipped_reputation,
+		st.skipped_no_content, st.errors, path);
+	write_load_stats(&st);
 
 	/* [c] build AC — bước tốn kém; bản cũ vẫn chạy trong lúc này */
 	if (sig_build(fresh) != 0) {
@@ -176,8 +201,13 @@ int sig_reload_init(struct sig_reload *sr, const char *rules_path)
 	sigemptyset(&sa.sa_mask);
 	sigaction(SIGUSR1, &sa, NULL);
 
-	fprintf(stderr, "sig_reload_init: ready (%d rules) from %s\n",
-		initial->n_rules, rules_path);
+	fprintf(stderr,
+		"sig_reload_init: ready (%d rules: full=%d alert-cap=%d | "
+		"skip unsup=%d reputation=%d no-content=%d err=%d) from %s\n",
+		st.loaded, st.loaded_full, st.loaded_alert,
+		st.skipped_unsupported, st.skipped_reputation,
+		st.skipped_no_content, st.errors, rules_path);
+	write_load_stats(&st);
 	return 0;
 }
 

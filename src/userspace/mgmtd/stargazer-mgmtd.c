@@ -6612,14 +6612,15 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			return 0;
 		}
 		const char *argv[] = {
-			"iptables", "-L", "INPUT", "-n", "-v", NULL
+			"iptables", "-L", "FORWARD", "-n", "-v",
+			"--line-numbers", NULL
 		};
 		char *out = safe_exec(argv);
 		if (out && out[0])
 			send_ok(client_fd, NULL, out);
 		else
 			send_ok(client_fd, "empty",
-				"  No INPUT chain rules found.\n"
+				"  No FORWARD chain rules found.\n"
 				"  (is iptables available?)\n");
 		free(out);
 		return 0;

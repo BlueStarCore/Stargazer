@@ -228,6 +228,12 @@ $(BUILD_DIR)/modules/$(MODULE_NAME).ko &: $(KERNEL_IMAGE) $(SRC_WATCH)
 		[ -n "$$f" ] && cp "$$f" $(BUILD_DIR)/modules/ && \
 			echo "[modules] copied $$m" || true; \
 	done
+	# Copy ip_set modules (required for FQDN address objects and -m set matching)
+	@for m in ip_set.ko ip_set_hash_ip.ko xt_set.ko; do \
+		f=$$(find $(KERNEL_DIR) -name "$$m" 2>/dev/null | head -1); \
+		[ -n "$$f" ] && cp "$$f" $(BUILD_DIR)/modules/ && \
+			echo "[modules] copied $$m" || true; \
+	done
 	# Copy af_packet.ko — only when CONFIG_PACKET=m (skip if built-in =y)
 	@[ -f $(KERNEL_DIR)/net/packet/af_packet.ko ] && \
 		cp $(KERNEL_DIR)/net/packet/af_packet.ko $(BUILD_DIR)/modules/ || true
@@ -1035,14 +1041,40 @@ IPSD_DIR       := $(PROJECT_ROOT)/src/userspace/ipsd
 IPSD_CORE_SRCS := $(IPSD_DIR)/main.c $(IPSD_DIR)/nfq.c $(IPSD_DIR)/ctdump.c \
                   $(IPSD_DIR)/feature.c $(IPSD_DIR)/flow_rule.c \
                   $(IPSD_DIR)/sig_rule.c $(IPSD_DIR)/sig_reload.c \
-                  $(IPSD_DIR)/ac.c \
+                  $(IPSD_DIR)/ac.c $(IPSD_DIR)/reass.c \
+                  $(IPSD_DIR)/proto_buf.c $(IPSD_DIR)/tls_clienthello.c \
+                  $(IPSD_DIR)/http_tx.c \
                   $(IPSD_DIR)/engine.c $(IPSD_DIR)/fusion.c \
                   $(IPSD_DIR)/ips_model.c
 IPSD_PREDICT_C := $(IPSD_DIR)/model/predict.c
 IPSD_PREDICT_O := $(BUILD_DIR)/ipsd/predict.o
 IPSD_BIN       := $(BUILD_DIR)/ipsd/stargazer-ipsd
 
+# P4 — libpcre2 static (cross musl) để bật regex (HAVE_PCRE). JIT off (ReDoS).
+PCRE2_VERSION  := 10.44
+PCRE2_URL      := https://github.com/PCRE2Project/pcre2/releases/download/pcre2-$(PCRE2_VERSION)/pcre2-$(PCRE2_VERSION).tar.gz
+PCRE2_DIR      := $(BUSYBOX_CACHE_DIR)/pcre2-$(PCRE2_VERSION)
+PCRE2_PREFIX   := $(BUILD_DIR)/ipsd/pcre2-prefix
+PCRE2_LIB      := $(PCRE2_PREFIX)/lib/libpcre2-8.a
+
 ipsd: $(IPSD_BIN)
+
+# Build libpcre2-8.a static cho aarch64-musl (JIT off → interpreter tôn trọng
+# match-limit, không treo). Chỉ build khi có MUSL_CC.
+$(PCRE2_LIB): $(MUSL_CC)
+	@mkdir -p $(BUSYBOX_CACHE_DIR) $(BUILD_DIR)/ipsd
+	@if [ ! -d "$(PCRE2_DIR)" ]; then \
+	    echo "[ipsd] Downloading pcre2 $(PCRE2_VERSION)..."; \
+	    curl -fSL "$(PCRE2_URL)" -o "$(BUSYBOX_CACHE_DIR)/pcre2.tar.gz"; \
+	    tar -xzf "$(BUSYBOX_CACHE_DIR)/pcre2.tar.gz" -C "$(BUSYBOX_CACHE_DIR)"; \
+	    rm -f "$(BUSYBOX_CACHE_DIR)/pcre2.tar.gz"; \
+	fi
+	@echo "[ipsd] Cross-compiling libpcre2-8 (musl static, JIT off)..."
+	cd $(PCRE2_DIR) && ./configure --host=aarch64-linux-musl CC=$(MUSL_CC) \
+	    CFLAGS="-Os" LDFLAGS="-static" --enable-static --disable-shared \
+	    --disable-jit --prefix=$(PCRE2_PREFIX) >/dev/null && \
+	$(MAKE) -j$$(nproc) >/dev/null && $(MAKE) install >/dev/null
+	@echo "[ipsd] libpcre2: $(PCRE2_LIB)"
 
 $(IPSD_BIN): $(IPSD_CORE_SRCS) $(IPSD_PREDICT_C)
 	@mkdir -p $(BUILD_DIR)/ipsd
@@ -1057,6 +1089,11 @@ $(IPSD_BIN): $(IPSD_CORE_SRCS) $(IPSD_PREDICT_C)
 	    echo "ERROR: no ARM64 cross-compiler found"; \
 	    echo "Run: make musl-toolchain   OR   sudo apt install gcc-aarch64-linux-gnu"; \
 	    exit 1; fi
+	@# P4: build libpcre2 (chỉ với musl) → bật HAVE_PCRE. Fallback gnu → không pcre.
+	@if [ -x "$(MUSL_CC)" ] && [ ! -f "$(PCRE2_LIB)" ]; then \
+	    $(MAKE) $(PCRE2_LIB); fi
+	$(eval IPSD_PCRE_CFLAGS := $(shell [ -f "$(PCRE2_LIB)" ] && echo "-DHAVE_PCRE -I$(PCRE2_PREFIX)/include"))
+	$(eval IPSD_PCRE_LIB := $(shell [ -f "$(PCRE2_LIB)" ] && echo "$(PCRE2_LIB)"))
 	@# predict.o: cache; chỉ recompile khi predict.c mới hơn (-w tắt warning
 	@# code generate). Lần đầu mất vài phút, các lần sau bỏ qua bước này.
 	@if [ ! -f $(IPSD_PREDICT_O) ] || \
@@ -1067,11 +1104,11 @@ $(IPSD_BIN): $(IPSD_CORE_SRCS) $(IPSD_PREDICT_C)
 	    echo "[ipsd] predict.o cached — bỏ qua compile model"; \
 	fi
 	$(IPSD_CC) -O2 -Wall -std=c11 \
-	    -I$(IPSD_DIR) \
-	    $(IPSD_CORE_SRCS) $(IPSD_PREDICT_O) \
+	    -I$(IPSD_DIR) $(IPSD_PCRE_CFLAGS) \
+	    $(IPSD_CORE_SRCS) $(IPSD_PREDICT_O) $(IPSD_PCRE_LIB) \
 	    -lpthread -lm \
 	    -o $(IPSD_BIN)
-	@echo "[ipsd] Built: $(IPSD_BIN)"
+	@echo "[ipsd] Built: $(IPSD_BIN)$(if $(IPSD_PCRE_LIB), (HAVE_PCRE),)"
 
 test-build: modules busybox dash iptables logind mgmtd cli webd tools uboot ipsd
 	@echo "Building test initramfs..."
@@ -1205,21 +1242,9 @@ test-build: modules busybox dash iptables logind mgmtd cli webd tools uboot ipsd
 	@mkdir -p $(BUILD_DIR)/test/initramfs/etc/stargazer/ips/repo
 	@mkdir -p $(BUILD_DIR)/test/initramfs/etc/stargazer/ips/profiles
 	@mkdir -p $(BUILD_DIR)/test/initramfs/etc/stargazer/ips/rules
-	@# emerging-scan.rules → repo/scan.rules (thêm category khác = thả file
-	@# emerging-<cat>.rules vào ipsd/rules/ rồi map tại đây).
-	@if [ -f $(IPSD_DIR)/rules/emerging-scan.rules ]; then \
-		cp $(IPSD_DIR)/rules/emerging-scan.rules \
-		   $(BUILD_DIR)/test/initramfs/etc/stargazer/ips/repo/scan.rules; \
-	fi
-	@for c in malware web dos; do \
-		[ -f $(IPSD_DIR)/rules/emerging-$$c.rules ] && \
-		cp $(IPSD_DIR)/rules/emerging-$$c.rules \
-		   $(BUILD_DIR)/test/initramfs/etc/stargazer/ips/repo/$$c.rules || true; \
-	done
-	@# active.rules seed = repo/scan.rules (mgmtd sẽ compile lại theo profile
-	@# lúc boot; seed để ipsd có gì nạp nếu mgmtd chưa kịp).
-	@cp $(BUILD_DIR)/test/initramfs/etc/stargazer/ips/repo/scan.rules \
-	    $(BUILD_DIR)/test/initramfs/etc/stargazer/ips/rules/active.rules 2>/dev/null || true
+	@# repo/ và rules/ được tạo rỗng; ipsd sẽ không nạp gì cho tới khi
+	@# user download ruleset qua web UI (Download tab → Update Rules).
+	@touch $(BUILD_DIR)/test/initramfs/etc/stargazer/ips/rules/active.rules
 	@mkdir -p $(BUILD_DIR)/test/initramfs/etc/stargazer/logs
 	@echo "[ipsd] IPS daemon + signature repo installed in initramfs"
 

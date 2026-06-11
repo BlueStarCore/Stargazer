@@ -459,6 +459,22 @@ int handle_ips_status(int client_fd, const char *user,
 	free(pidout);
 	if (n > 0) pos += (size_t)n;
 
+	/* P0 — độ phủ ruleset thật (ipsd ghi lúc nạp): loaded_full/alert/skip…
+	 * File key=value, đính nguyên vào response. Thiếu file (ipsd chưa nạp) →
+	 * bỏ qua, UI hiển thị "—". */
+	FILE *sf = fopen("/run/stargazer-ipsd.stats", "r");
+	if (sf) {
+		char line[128];
+		while (fgets(line, sizeof(line), sf)) {
+			size_t ll = strlen(line);
+			if (ll + 1 < sizeof(resp) - pos) {
+				memcpy(resp + pos, line, ll);
+				pos += ll;
+			}
+		}
+		fclose(sf);
+	}
+
 	/* Số dòng alert log */
 	const char *wc[] = {"wc", "-l",
 			    "/etc/stargazer/logs/ips-alert.log", NULL};

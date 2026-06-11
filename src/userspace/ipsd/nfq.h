@@ -13,10 +13,11 @@
  * Connmark được set qua NFQA_CT → CTA_MARK trong message verdict
  * (Linux ≥ 3.16: kernel cập nhật conntrack mark từ verdict).
  *
- * Iptables rules cần thêm (do mgmtd thêm khi IPS bật):
- *   -I FORWARD 1 -m connmark --mark 0x2/0x2 -j DROP
- *   -I FORWARD 2 -m conntrack --ctstate NEW \
- *               -m connmark ! --mark 0x4/0x4 -j NFQUEUE --queue-num 0
+ * Iptables rules (do mgmtd thêm khi IPS bật, per-policy):
+ *   <match> -m connmark --mark 0x2/0x2 -j DROP   (flow đã kết án)
+ *   <match> -m connbytes --connbytes-dir both --connbytes-mode bytes \
+ *           --connbytes 0:K -m connmark ! --mark 0x4/0x4 \
+ *           -j NFQUEUE --queue-num Q   (P1: soi K byte đầu, 2 chiều)
  */
 #ifndef SG_NFQ_H
 #define SG_NFQ_H
@@ -24,10 +25,11 @@
 #include <stdint.h>
 #include "sig_rule.h"   /* SIG_TCP_*, SIG_PROTO_*, struct flow_ctx */
 
-/* ---- connmark bits IPS --------------------------------------------------- */
-#define SG_CMK_IPS_BLOCK       0x00000002u   /* bit 1 */
-#define SG_CMK_IPS_INSPECTED   0x00000004u   /* bit 2 */
-#define SG_CMK_IPS_MASK        0x00000006u   /* cả 2 bit */
+/* ---- connmark bits IPS (tách rời DIRTY bit0 + policy_id bit8-31 của mgmtd) -- */
+#define SG_CMK_IPS_BLOCK       0x00000002u   /* bit 1 — flow kết án → DROP       */
+#define SG_CMK_IPS_INSPECTED   0x00000004u   /* bit 2 — soi xong → offload       */
+#define SG_CMK_IPS_WATCH       0x00000008u   /* bit 3 — giữ soi quá K (keep-alive)*/
+#define SG_CMK_IPS_MASK        0x0000000Eu   /* bit 1-3                          */
 
 /* ---- context NFQUEUE ------------------------------------------------------ */
 struct nfq_ctx {
@@ -52,6 +54,9 @@ struct nfq_pkt {
 
 	/* TCP cờ của GÓI NÀY (không phải tích lũy) */
 	uint8_t   tcp_flags;    /* SIG_TCP_* */
+
+	/* TCP seq của byte payload đầu (host order) — đặt segment vào reass (P1) */
+	uint32_t  tcp_seq;
 
 	/* TCP window của gói SYN forward (feature #13); -1 nếu không phải SYN */
 	int32_t   init_win;
@@ -108,6 +113,10 @@ static inline void nfq_pkt_to_flow_ctx(const struct nfq_pkt *p,
 				  SIG_PROTO_ANY);
 	fc->dport     = p->dport;
 	fc->tcp_flags = p->tcp_flags;
+	fc->established = 0;   /* P6 — caller (main.c) đặt lại từ conntrack/dir */
+	fc->to_server   = 1;
+	fc->fb          = NULL; /* P5 — chỉ flow TCP có pool mới track cờ */
+	fc->bufs        = NULL; /* P6 — caller trích vùng cho TCP đã ghép */
 }
 
 #endif /* SG_NFQ_H */

@@ -243,9 +243,9 @@ static int connbytes_supported(void)
 	const char *newc[]   = {"iptables", "-N", "SG_CB_PROBE", NULL};
 	const char *addc[]   = {"iptables", "-A", "SG_CB_PROBE",
 				"-m", "connbytes",
-				"--connbytes-dir", "original",
-				"--connbytes-mode", "packets",
-				"--connbytes", "0:7", "-j", "RETURN", NULL};
+				"--connbytes-dir", "both",
+				"--connbytes-mode", "bytes",
+				"--connbytes", "0:16384", "-j", "RETURN", NULL};
 	const char *flushc[] = {"iptables", "-F", "SG_CB_PROBE", NULL};
 	const char *delc[]   = {"iptables", "-X", "SG_CB_PROBE", NULL};
 
@@ -254,9 +254,9 @@ static int connbytes_supported(void)
 	ipt_exec(flushc);
 	ipt_exec(delc);
 
-	mgmt_log("INFO", "xt_connbytes %s; IPS NFQUEUE rule uses %s",
+	mgmt_log("INFO", "xt_connbytes(mode bytes) %s; IPS NFQUEUE rule uses %s",
 		 cached ? "available" : "unavailable",
-		 cached ? "connbytes (N-packet gate)"
+		 cached ? "connbytes byte-window 2 chiều (P1)"
 			: "--ctstate NEW (SYN-only fallback)");
 	return cached;
 }
@@ -288,6 +288,15 @@ static int connbytes_supported(void)
 /* IPS connmark bits — PHẢI khớp src/userspace/ipsd/nfq.h. */
 #define SG_CMK_IPS_BLOCK     0x00000002u   /* flow ipsd kết án → mọi gói DROP   */
 #define SG_CMK_IPS_INSPECTED 0x00000004u   /* đã có verdict → khỏi queue lại    */
+#define SG_CMK_IPS_WATCH     0x00000008u   /* P1 re-arm: giữ soi quá K (keep-alive) */
+
+/* Bản đồ bit (P1): IPS dùng bit 1-3, KHÔNG được chồng DIRTY (bit0) hay
+ * policy_id (bit 8-31). Assert lúc biên dịch. */
+_Static_assert((SG_CMK_IPS_BLOCK | SG_CMK_IPS_INSPECTED | SG_CMK_IPS_WATCH) ==
+	       0x0000000Eu, "IPS bits must be 1-3");
+_Static_assert(((SG_CMK_IPS_BLOCK | SG_CMK_IPS_INSPECTED | SG_CMK_IPS_WATCH) &
+		(SG_CMK_DIRTY | 0xFFFFFF00u)) == 0,
+	       "IPS bits overlap DIRTY/policy_id");
 
 /* Validate config security_ips cho CFG_SET (không đụng kernel). */
 sg_status_t validate_ips(const char *id, const char *data,
@@ -349,10 +358,11 @@ static int ips_profile_active(const char *name)
  * Đọc trạng thái IPS: trả 1 nếu security_ips status=enable, điền *queue.
  * Steering chỉ phát khi bật (off-by-default, fail-safe).
  */
-static int ips_enabled(int *queue, int *snapshot_n)
+static int ips_enabled(int *queue, int *snapshot_n, int *snapshot_bytes)
 {
-	if (queue)    *queue    = 0;
-	if (snapshot_n) *snapshot_n = 8;   /* default */
+	if (queue)         *queue         = 0;
+	if (snapshot_n)    *snapshot_n    = 8;       /* default */
+	if (snapshot_bytes) *snapshot_bytes = 16384;  /* default K (P1) */
 	char *st = sg_db_get_val("security_ips", "0", "status");
 	int on = st && strcmp(st, "enable") == 0;
 	free(st);
@@ -376,6 +386,16 @@ static int ips_enabled(int *queue, int *snapshot_n)
 					*snapshot_n = v;
 			}
 			free(sn);
+		}
+		if (snapshot_bytes) {
+			char *sb = sg_db_get_val("security_ips", "0",
+						 "snapshot-bytes");
+			if (sb && sb[0]) {
+				int v = atoi(sb);
+				if (v >= 1024 && v <= 262144)
+					*snapshot_bytes = v;
+			}
+			free(sb);
 		}
 	}
 	return on;
@@ -456,8 +476,8 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 	/* Foundation rules (conntrack-stateful):
 	 *   - drop packets conntrack cannot associate with a valid flow (INVALID);
 	 *   - fast-path accept of established/related return traffic. */
-	int ips_q = 0, ips_snap = 8;
-	int ips_on = ips_enabled(&ips_q, &ips_snap);
+	int ips_q = 0, ips_sbytes = 16384;
+	int ips_on = ips_enabled(&ips_q, NULL, &ips_sbytes);
 	{
 		const char *inv = "-A FORWARD -m conntrack --ctstate INVALID -j DROP\n";
 		dbuf_append(&buf, inv, strlen(inv));
@@ -652,16 +672,19 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 					 * thế sẽ xóa mất rule vừa emit).
 					 *
 					 * Thứ tự (FortiGate-style, theo ips-profile):
-					 *   [IPS]  <match> connbytes 0:(N-1) → NFQUEUE
-					 *          ipsd nhận N gói đầu mỗi flow, trả
-					 *          NF_ACCEPT; NF_DROP+BLOCK khi phát hiện.
+					 *   [IPS]  <match> connbytes 0:K bytes both → NFQUEUE
+					 *          ipsd ráp dòng + soi K byte đầu (2 chiều)
+					 *          mỗi flow (P1). NF_ACCEPT; NF_DROP+BLOCK khi
+					 *          phát hiện. `! INSPECTED` để ipsd offload sớm.
 					 *   [CMK]  <match> → CONNMARK (stamp policy_id)
 					 *          <match> → ACCEPT
 					 *
-					 * connbytes-dir original: chỉ đếm gói từ initiator.
-					 * Sau N gói, connbytes > N-1 → rule không match →
-					 * flow đi thẳng qua CONNMARK+ACCEPT. Không loop.
-					 * Không --queue-bypass: ipsd chết → fail-closed.
+					 * connbytes-mode bytes --connbytes-dir both: đếm BYTE
+					 * cả 2 chiều. Vượt K → rule không match → flow đi thẳng
+					 * (đã soi đủ cửa sổ). Đóng né cắt-segment/đổi-chiều/MSS
+					 * nhỏ. Không --queue-bypass: ipsd chết → fail-closed.
+					 * Fallback (kernel thiếu connbytes mode bytes): ctstate
+					 * NEW (SYN-only) — pipeline vẫn chạy, ít hiệu quả hơn.
 					 */
 					size_t pfx_len = buf.used - rule_start;
 					char saved_pfx[256];
@@ -673,35 +696,57 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 
 					if (pfx_ok && ips_on &&
 					    ips_profile_active(ips_profile)) {
-                             
-                             /* Kiểm tra Kernel có hỗ trợ connbytes không */
-                             if (connbytes_supported()) {
-                                 dbuf_printf(&buf,
-                                     " -m connbytes"
-                                     " --connbytes-dir original"
-                                     " --connbytes-mode packets"
-                                   " --connbytes 0:%d"
-                                    " -j NFQUEUE"
-                                    " --queue-num %d\n",
-                                    ips_snap - 1, ips_q);
-                            } else {
-                                /* Fallback: Chỉ ném gói NEW vào IPS */
-                                dbuf_printf(&buf,
-                                    " -m conntrack"
-                                    " --ctstate NEW"
-                                    " -m connmark"
-                                    " ! --mark 0x%x/0x%x"
-                                    " -j NFQUEUE"
-                                    " --queue-num %d\n",
-                                    SG_CMK_IPS_INSPECTED,
-                                    SG_CMK_IPS_INSPECTED,
-                                    ips_q);
-                            }
-                            
-                            rule_count++;
-                            /* re-append prefix for next rule */
-                            dbuf_append(&buf, saved_pfx, pfx_len);
-                        }
+
+						if (connbytes_supported()) {
+							dbuf_printf(&buf,
+							    " -m connbytes"
+							    " --connbytes-dir both"
+							    " --connbytes-mode bytes"
+							    " --connbytes 0:%d"
+							    " -m connmark"
+							    " ! --mark 0x%x/0x%x"
+							    " -j NFQUEUE"
+							    " --queue-num %d\n",
+							    ips_sbytes,
+							    SG_CMK_IPS_INSPECTED,
+							    SG_CMK_IPS_INSPECTED,
+							    ips_q);
+						} else {
+							/* Fallback: chỉ ném gói NEW vào IPS */
+							dbuf_printf(&buf,
+							    " -m conntrack"
+							    " --ctstate NEW"
+							    " -m connmark"
+							    " ! --mark 0x%x/0x%x"
+							    " -j NFQUEUE"
+							    " --queue-num %d\n",
+							    SG_CMK_IPS_INSPECTED,
+							    SG_CMK_IPS_INSPECTED,
+							    ips_q);
+						}
+
+						rule_count++;
+						/* re-append prefix for next rule */
+						dbuf_append(&buf, saved_pfx, pfx_len);
+
+						/* P1 re-arm — BĂNG B (WATCH): khi ipsd đặt
+						 * IPS_WATCH (HTTP keep-alive), giữ ĐẨY gói lên
+						 * dù đã vượt K → soi MỌI transaction. Đặt sau
+						 * băng A; connbytes có thể đã hết hiệu lực nhưng
+						 * WATCH vẫn match. */
+						if (connbytes_supported()) {
+							dbuf_printf(&buf,
+							    " -m connmark"
+							    " --mark 0x%x/0x%x"
+							    " -j NFQUEUE"
+							    " --queue-num %d\n",
+							    SG_CMK_IPS_WATCH,
+							    SG_CMK_IPS_WATCH,
+							    ips_q);
+							rule_count++;
+							dbuf_append(&buf, saved_pfx, pfx_len);
+						}
+					}
 
 
 					if (pfx_ok && cmk && cmkid > 0) {

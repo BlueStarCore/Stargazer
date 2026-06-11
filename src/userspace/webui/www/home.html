@@ -835,7 +835,6 @@
                     <div class="table-scroll">
                         <table class="data-table" id="ips-rules-table">
                             <thead><tr>
-                                <th class="th-checkbox"><input type="checkbox" id="ips-rules-all"></th>
                                 <th>SID</th>
                                 <th>ACTION</th>
                                 <th>SOURCE</th>
@@ -847,17 +846,6 @@
                         </table>
                     </div>
                     <div class="rf-pager" id="ips-rules-pager"></div>
-                    <div id="ips-rules-bulk" style="display:none;margin-top:8px;padding:6px 10px;background:#f5f5f5;border-radius:4px;align-items:center;gap:8px">
-                        <span id="ips-rules-bulk-count" style="font-size:13px;color:#555"></span>
-                        <select id="ips-rules-bulk-action" class="form-input" style="width:150px;font-size:12px">
-                            <option value="alert">Alert</option>
-                            <option value="drop">Drop</option>
-                            <option value="pass">Pass</option>
-                            <option value="default">Remove Override</option>
-                        </select>
-                        <button class="btn btn-primary" id="ips-rules-bulk-apply" style="font-size:12px">Apply to selected</button>
-                        <button class="btn" id="ips-rules-bulk-cancel" style="font-size:12px">Cancel</button>
-                    </div>
                 </div>
 
                 <!-- ── Tab: Alerts ── -->
@@ -888,7 +876,6 @@
                             <div class="form-section"><span class="modal-title-text">ALERT DETAILS</span><button class="modal-close" type="button" id="ips-alert-detail-close">&#10005;</button></div>
                             <div class="modal-body" id="ips-alert-detail-body"></div>
                             <div class="modal-footer">
-                                <button class="btn btn-primary" id="ips-alert-override-btn">Override Action</button>
                                 <button class="btn" id="ips-alert-detail-close2">Close</button>
                             </div>
                         </div>
@@ -975,8 +962,8 @@
                             <button type="button" class="btn-create" id="ips-add-sig"><span class="btn-create-plus">+</span> Create New</button>
                         </div>
                         <table class="data-table" id="ips-prof-filters">
-                            <thead><tr><th>TYPE</th><th>VALUE</th><th>ACTION</th><th>STATUS</th><th></th></tr></thead>
-                            <tbody><tr><td colspan="5" style="opacity:.6">Lưu profile rồi thêm signature/filter…</td></tr></tbody>
+                            <thead><tr><th>TYPE</th><th>VALUE</th><th>STATUS</th><th></th></tr></thead>
+                            <tbody><tr><td colspan="4" style="opacity:.6">Lưu profile rồi thêm signature/filter…</td></tr></tbody>
                         </table>
                     </div>
                     <div class="modal-footer"><button class="btn btn-primary">Save</button><button class="btn" data-toggle-form="form-ips-profile">Cancel</button></div>
@@ -994,13 +981,6 @@
                             <button type="button" class="btn ips-tab" data-tab="signature">Signature</button>
                             <button type="button" class="btn ips-tab" data-tab="filter">Filter (Category)</button>
                             <span style="flex:1"></span>
-                            <span class="filter-label">Action</span>
-                            <select class="form-input" id="ips-sig-action" style="width:auto">
-                                <option value="default" selected>Default</option>
-                                <option value="block">Block</option>
-                                <option value="alert">Alert</option>
-                                <option value="pass">Pass</option>
-                            </select>
                         </div>
                         <!-- Signature pane -->
                         <div id="ips-pane-signature">
@@ -1013,7 +993,7 @@
                         <!-- Filter (category) pane -->
                         <div id="ips-pane-filter" style="display:none">
                             <div class="form-row"><label class="form-label">Category</label><select class="form-input" id="ips-filter-cat"><option value="all">all (mọi category)</option></select></div>
-                            <p class="form-hint" style="opacity:.6;margin-top:8px">Thêm cả nhóm luật theo category, áp Action ở trên cho toàn nhóm.</p>
+                            <p class="form-hint" style="opacity:.6;margin-top:8px">Thêm cả nhóm luật theo category (giữ action gốc của từng rule).</p>
                         </div>
                     </div>
                     <div class="modal-footer"><button class="btn btn-primary" id="ips-sig-ok">OK</button><button class="btn" id="ips-sig-cancel">Cancel</button></div>
@@ -1036,6 +1016,8 @@
                     <div class="form-row"><label class="form-label">Status</label><span id="ips-stat-status" class="form-value">—</span></div>
                     <div class="form-row"><label class="form-label">Mode</label><span id="ips-stat-mode" class="form-value">—</span></div>
                     <div class="form-row"><label class="form-label">Snapshot N</label><span id="ips-stat-snap" class="form-value">—</span></div>
+                    <div class="form-row"><label class="form-label">Rules loaded</label><span id="ips-stat-rules" class="form-value">—</span></div>
+                    <div class="form-row"><label class="form-label">Enforce coverage</label><span id="ips-stat-coverage" class="form-value">—</span></div>
                     <div class="form-row"><label class="form-label">Total alerts</label><span id="ips-stat-alerts" class="form-value">—</span></div>
                     <div class="form-actions"><button class="btn" id="ips-refresh">Refresh</button></div>
                 </div>

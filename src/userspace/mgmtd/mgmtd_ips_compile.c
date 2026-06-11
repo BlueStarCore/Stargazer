@@ -115,54 +115,27 @@ int ips_compile_categories(const char *repo_dir, const char *categories,
 	return merged;
 }
 
-/* ── FortiGate-style filter compile + action override ─────────────────── */
-
-/* Tên action override theo enum, NULL nếu = default (giữ nguyên). */
-static const char *action_word(int action)
-{
-	switch (action) {
-	case IPS_FA_BLOCK: return "drop";
-	case IPS_FA_ALERT: return "alert";
-	case IPS_FA_PASS:  return "pass";
-	default:           return NULL;   /* default → giữ action gốc */
-	}
-}
+/* ── FortiGate-style filter compile (chọn luật, KHÔNG override action) ── */
 
 /*
- * Ghi một dòng rule ra fp, GHI ĐÈ action token đầu nếu cần.
- * Dòng comment (#) / rỗng → copy nguyên. Trả 1 nếu ghi một RULE, 0 nếu không.
+ * Ghi một dòng rule ra fp nguyên trạng (giữ action gốc của rule).
+ * Dòng comment (#) / rỗng → bỏ. Trả 1 nếu ghi một RULE, 0 nếu không.
  */
-static int write_rule_line(FILE *fp, const char *line, int action)
+static int write_rule_line(FILE *fp, const char *line)
 {
 	const char *p = line;
 	while (*p == ' ' || *p == '\t') p++;
-	if (*p == '\0' || *p == '\n' || *p == '#') {
-		/* comment/blank — chỉ copy nếu là blank giữ định dạng, bỏ comment */
-		return 0;
-	}
+	if (*p == '\0' || *p == '\n' || *p == '#')
+		return 0;            /* comment/blank — bỏ */
 
-	const char *newact = action_word(action);
-	if (!newact) {
-		/* default: giữ nguyên dòng */
-		fputs(line, fp);
-		if (line[strlen(line) - 1] != '\n')
-			fputc('\n', fp);
-		return 1;
-	}
-
-	/* override: thay token action đầu tiên (tới khoảng trắng) */
-	const char *sp = p;
-	while (*sp && *sp != ' ' && *sp != '\t') sp++;
-	/* sp trỏ sau action word; phần còn lại từ sp */
-	fprintf(fp, "%s%s", newact, sp);
-	if (sp[strlen(sp) - 1] != '\n')
+	fputs(line, fp);
+	if (line[strlen(line) - 1] != '\n')
 		fputc('\n', fp);
 	return 1;
 }
 
-/* Ghép repo/<base>, ghi đè action mỗi rule. Trả số rule ghi. */
-static int append_rules_rewrite(FILE *fp, const char *repo_dir,
-				const char *base, int action)
+/* Ghép repo/<base> nguyên trạng. Trả số rule ghi. */
+static int append_rules(FILE *fp, const char *repo_dir, const char *base)
 {
 	char path[512];
 	if (snprintf(path, sizeof(path), "%s/%s", repo_dir, base) >= (int)sizeof(path))
@@ -173,12 +146,10 @@ static int append_rules_rewrite(FILE *fp, const char *repo_dir,
 	int n = 0, cont = 0;
 	char line[8192];
 	while (fgets(line, sizeof(line), in)) {
-		if (cont) {
-			/* dòng nối tiếp của rule trước → copy nguyên, không rewrite */
-			fputs(line, fp);
-		} else {
-			n += write_rule_line(fp, line, action);
-		}
+		if (cont)
+			fputs(line, fp);     /* dòng nối tiếp của rule trước */
+		else
+			n += write_rule_line(fp, line);
 		/* dòng kết thúc bằng '\' (trước \n) → dòng sau là nối tiếp */
 		size_t l = strlen(line);
 		while (l && (line[l-1] == '\n' || line[l-1] == '\r')) l--;
@@ -188,9 +159,8 @@ static int append_rules_rewrite(FILE *fp, const char *repo_dir,
 	return n;
 }
 
-/* Tìm rule có sid:<value>; trong mọi *.rules của repo, ghi với override. */
-static int append_sid_rewrite(FILE *fp, const char *repo_dir,
-			      const char *sid, int action)
+/* Tìm rule có sid:<value>; trong mọi *.rules của repo, ghi nguyên trạng. */
+static int append_sid(FILE *fp, const char *repo_dir, const char *sid)
 {
 	char needle[160];
 	snprintf(needle, sizeof(needle), "sid:%s;", sid);
@@ -213,7 +183,7 @@ static int append_sid_rewrite(FILE *fp, const char *repo_dir,
 		char line[8192];
 		while (fgets(line, sizeof(line), in)) {
 			if (strstr(line, needle))
-				n += write_rule_line(fp, line, action);
+				n += write_rule_line(fp, line);
 		}
 		fclose(in);
 	}
@@ -402,15 +372,11 @@ int ips_compile_filters(const char *repo_dir, const struct ips_filter *filters,
 		if (f->type == IPS_FT_CATEGORY) {
 			char base[140];
 			snprintf(base, sizeof(base), "%s.rules", f->value);
-			fprintf(fp, "\n# filter: category %s action=%d\n",
-				f->value, f->action);
-			rules += append_rules_rewrite(fp, repo_dir, base,
-						      f->action);
+			fprintf(fp, "\n# filter: category %s\n", f->value);
+			rules += append_rules(fp, repo_dir, base);
 		} else { /* IPS_FT_SIGNATURE */
-			fprintf(fp, "\n# filter: signature %s action=%d\n",
-				f->value, f->action);
-			rules += append_sid_rewrite(fp, repo_dir, f->value,
-						    f->action);
+			fprintf(fp, "\n# filter: signature %s\n", f->value);
+			rules += append_sid(fp, repo_dir, f->value);
 		}
 	}
 

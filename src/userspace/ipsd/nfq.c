@@ -227,6 +227,7 @@ int nfq_parse_packet(const uint8_t *data, uint16_t len, struct nfq_pkt *pkt)
 	pkt->dport  = 0;
 	pkt->tcp_flags = 0;
 	pkt->init_win  = -1;
+	pkt->tcp_seq   = 0;
 
 	uint16_t l4hdr = 0;
 
@@ -235,6 +236,7 @@ int nfq_parse_packet(const uint8_t *data, uint16_t len, struct nfq_pkt *pkt)
 			(const struct tcphdr *)(data + ihl);
 		pkt->sport = ntohs(th->source);
 		pkt->dport = ntohs(th->dest);
+		pkt->tcp_seq = ntohl(th->seq);   /* seq của byte payload đầu (P1 reass) */
 		l4hdr = (uint16_t)(th->doff * 4);
 
 		if (th->fin) pkt->tcp_flags |= SIG_TCP_FIN;

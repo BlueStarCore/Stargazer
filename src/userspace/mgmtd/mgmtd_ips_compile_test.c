@@ -83,51 +83,42 @@ int main(void)
 		CHECK(n == -1, "out path lỗi → -1");
 	}
 
-	printf("== test 6: filter category + action override block→drop ==\n");
+	printf("== test 6: filter category ghép rule, GIỮ action gốc (không override) ==\n");
 	{
 		struct ips_filter f[] = {
-			{ IPS_FT_CATEGORY, "scan", IPS_FA_BLOCK },
+			{ IPS_FT_CATEGORY, "scan" },
 		};
 		int n = ips_compile_filters(repo, f, 1, out);
 		CHECK(n == 1, "ghi 1 rule từ scan");
-		CHECK(file_contains(out, "drop tcp"), "action alert→drop (block)");
-		CHECK(!file_contains(out, "alert tcp"), "không còn alert gốc");
-	}
-
-	printf("== test 7: filter category action=default giữ nguyên ==\n");
-	{
-		struct ips_filter f[] = {
-			{ IPS_FT_CATEGORY, "scan", IPS_FA_DEFAULT },
-		};
-		ips_compile_filters(repo, f, 1, out);
 		CHECK(file_contains(out, "alert tcp"), "giữ action gốc (alert)");
+		CHECK(!file_contains(out, "drop tcp"), "KHÔNG override action");
 	}
 
-	printf("== test 8: filter signature theo SID + action pass ==\n");
+	printf("== test 7: filter signature theo SID, giữ action gốc ==\n");
 	{
 		struct ips_filter f[] = {
-			{ IPS_FT_SIGNATURE, "2", IPS_FA_PASS },
+			{ IPS_FT_SIGNATURE, "2" },
 		};
 		int n = ips_compile_filters(repo, f, 1, out);
 		CHECK(n == 1, "tìm + ghi đúng 1 rule sid:2");
-		CHECK(file_contains(out, "pass tcp") && file_contains(out, "sid:2;"),
-		      "sid:2 → action pass");
+		CHECK(file_contains(out, "alert tcp") && file_contains(out, "sid:2;"),
+		      "sid:2 giữ action gốc (alert)");
 		CHECK(!file_contains(out, "sid:1;"), "không lấy sid khác");
 	}
 
-	printf("== test 9: nhiều filter kết hợp ==\n");
+	printf("== test 8: nhiều filter kết hợp, đều giữ action gốc ==\n");
 	{
 		struct ips_filter f[] = {
-			{ IPS_FT_CATEGORY,  "web",  IPS_FA_ALERT },
-			{ IPS_FT_SIGNATURE, "1",    IPS_FA_BLOCK },
+			{ IPS_FT_CATEGORY,  "web" },
+			{ IPS_FT_SIGNATURE, "1"   },
 		};
 		int n = ips_compile_filters(repo, f, 2, out);
 		CHECK(n == 2, "web(1) + sid:1(1) = 2 rule");
-		CHECK(file_contains(out, "sid:1;") && file_contains(out, "drop tcp"),
-		      "sid:1 → drop");
+		CHECK(file_contains(out, "sid:1;"), "có sid:1");
+		CHECK(!file_contains(out, "drop tcp"), "KHÔNG override (đều alert gốc)");
 	}
 
-	printf("== test 10: catalog JSON liệt kê signature ==\n");
+	printf("== test 9: catalog JSON liệt kê signature ==\n");
 	{
 		/* rule có msg + cve để kiểm parse */
 		snprintf(p, sizeof(p), "%s/web.rules", repo);

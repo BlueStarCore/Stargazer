@@ -4,18 +4,16 @@
  *
  * Luồng mỗi gói từ NFQUEUE:
  *   nfq_recv → ctdump_query (CTA_ML + ACCT) → ctdump_to_flow_stats/features
- *   → ips_evaluate (L1-builtin → L1-user → L2-payload → ML)
+ *   → [TCP] reass_segment (ráp dòng) + streaming AC làm lớp L2;
+ *     [UDP/ICMP] khớp payload gói đơn
+ *   → ips_evaluate_full (L1-builtin → L1-user → L2 → ML)
  *   → nfq_verdict (ACCEPT/DROP + set connmark)
  *   → log_alert (nếu ALERT/DROP)
  *
  * Config đọc từ mgmtd (SG_CMD_CFG_GET "security_ips") lúc khởi động; nếu
- * mgmtd chưa có type đó thì dùng giá trị mặc định. Reload ruleset qua SIGUSR1.
+ * mgmtd chưa có type đó thì dùng giá trị mặc định. Reload ruleset qua SIGUSR1
+ * (reass pool rebind sang automaton mới + re-scan dòng đã có).
  * Graceful shutdown qua SIGTERM/SIGINT.
- *
- * Iptables rules cần mgmtd thêm khi IPS bật (rebuild_forward_chain):
- *   -I FORWARD 1 -m connmark --mark 0x2/0x2 -j DROP
- *   -I FORWARD 2 -m conntrack --ctstate NEW \
- *               -m connmark ! --mark 0x4/0x4 -j NFQUEUE --queue-num 0
  */
 #define _GNU_SOURCE
 #include "nfq.h"
@@ -25,6 +23,9 @@
 #include "sig_reload.h"
 #include "fusion.h"
 #include "feature.h"
+#include "reass.h"
+#include "proto_buf.h"
+#include "http_tx.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -180,6 +181,151 @@ done:
 	close(fd);
 }
 
+/* ---- pool reassembly per-flow (P1) -------------------------------------- *
+ * Direct-mapped (1 entry/bucket): hash 5-tuple → bucket; va chạm → evict (đơn
+ * giản, BỊ CHẶN bộ nhớ cứng: ≤ FLOW_BUCKETS flow). Mỗi flow ~2*(K + K/8) byte;
+ * 512 * ~36KB ≈ 18MB < trần 32MB. Chỉ truy cập từ main thread → không cần lock.
+ * (LRU theo thời gian là cải tiến sau; va-chạm-evict đã chặn bộ nhớ an toàn.)   */
+#define FLOW_BUCKETS 512
+
+struct flow_key {
+	uint32_t ip_a, ip_b;
+	uint16_t port_a, port_b;
+	uint8_t  proto;
+	uint8_t  used;
+};
+
+struct flow_slot {
+	struct flow_key   key;
+	uint32_t          init_ip;    /* initiator: to_server = gói từ (init_ip,init_port) */
+	uint16_t          init_port;
+	struct reass_flow rf;
+	struct flowbit_state fb;      /* P5 — cờ flowbits per-flow */
+	struct http_tx      htx;      /* P1 re-arm — transaction HTTP per-flow */
+};
+
+static struct flow_slot g_flows[FLOW_BUCKETS];
+
+/* Khoá canonical: 2 chiều của cùng flow map về cùng key. */
+static void flow_build_key(struct flow_key *k, uint32_t sip, uint16_t sp,
+			   uint32_t dip, uint16_t dp, uint8_t proto)
+{
+	int a_first = (sip != dip) ? (sip < dip) : (sp <= dp);
+	if (a_first) { k->ip_a = sip; k->port_a = sp; k->ip_b = dip; k->port_b = dp; }
+	else         { k->ip_a = dip; k->port_a = dp; k->ip_b = sip; k->port_b = sp; }
+	k->proto = proto;
+	k->used  = 1;
+}
+static uint32_t flow_hash(const struct flow_key *k)
+{
+	uint32_t h = 2166136261u;
+	h = (h ^ k->ip_a) * 16777619u;
+	h = (h ^ k->ip_b) * 16777619u;
+	h = (h ^ (((uint32_t)k->port_a << 16) | k->port_b)) * 16777619u;
+	h = (h ^ k->proto) * 16777619u;
+	return h;
+}
+static int flow_key_eq(const struct flow_key *a, const struct flow_key *b)
+{
+	return a->used && b->used && a->ip_a == b->ip_a && a->ip_b == b->ip_b &&
+	       a->port_a == b->port_a && a->port_b == b->port_b &&
+	       a->proto == b->proto;
+}
+
+/* Lấy/ tạo slot cho gói TCP. *dir_out = REASS_TO_SERVER/CLIENT. NULL nếu OOM. */
+static struct flow_slot *flow_get(const struct nfq_pkt *pkt,
+				  const struct ac_automaton *ac, int *dir_out)
+{
+	struct flow_key k;
+	flow_build_key(&k, pkt->src_ip, pkt->sport, pkt->dst_ip, pkt->dport,
+		       pkt->proto);
+	struct flow_slot *s = &g_flows[flow_hash(&k) % FLOW_BUCKETS];
+
+	if (!flow_key_eq(&s->key, &k)) {
+		if (s->key.used)
+			reass_flow_free(&s->rf);        /* evict flow cũ ở bucket này */
+		if (reass_flow_init(&s->rf, ac, 0) != 0) {
+			s->key.used = 0;
+			return NULL;
+		}
+		s->key       = k;
+		s->init_ip   = pkt->src_ip;             /* gói đầu thấy = initiator */
+		s->init_port = pkt->sport;
+		memset(&s->fb, 0, sizeof(s->fb));       /* P5 — flow mới: cờ sạch */
+		http_tx_init(&s->htx, 0);               /* P1 re-arm: budget = K mặc định */
+	}
+	int to_server = (pkt->src_ip == s->init_ip && pkt->sport == s->init_port);
+	*dir_out = to_server ? REASS_TO_SERVER : REASS_TO_CLIENT;
+	return s;
+}
+
+/* Ctx gom kết quả L2 khi streaming AC trúng trên dòng đã ghép. */
+struct l2_match {
+	const struct sig_ruleset *rs;
+	struct reass_flow        *rf;
+	struct flow_ctx           fc;
+	struct flowbit_state     *fb;   /* P5 — bitset cờ của flow (để set/unset) */
+	int best_idx;
+	int best_action;
+	struct match_buffers      bufs; /* P6 — vùng giao thức (trích 1 lần/feed) */
+	int bufs_ready;
+	int bufs_dir;
+	uint32_t bufs_contig;
+};
+static int l2_on_match(int rule_id, uint64_t end_off, int dir, void *ctx)
+{
+	(void)end_off;
+	struct l2_match *m = ctx;
+	uint32_t clen;
+	const uint8_t *buf = reass_dir_buf(m->rf, dir, &clen);
+	if (!buf)
+		return 0;
+
+	/* P6 — trích sticky buffer từ dòng chiều này (HTTP request / TLS SNI).
+	 * Cache theo (dir, contig): consume (P1 re-arm) làm cửa sổ TRƯỢT → contig
+	 * đổi → trích lại (tránh buffer stale). */
+	if (!m->bufs_ready || m->bufs_dir != dir || m->bufs_contig != clen) {
+		bufs_init_raw(&m->bufs, buf, (int)clen);
+		bufs_extract(&m->bufs, buf, (int)clen);
+		m->fc.bufs    = &m->bufs;
+		m->bufs_ready = 1;
+		m->bufs_dir   = dir;
+		m->bufs_contig = clen;
+	}
+
+	if (!sig_verify(m->rs, rule_id, buf, (int)clen, &m->fc))
+		return 0;                               /* prefilter trúng, verify trượt */
+
+	const struct sig_rule *r = &m->rs->rules[rule_id];
+	sig_flowbits_apply(r, m->fb);                   /* P5 — set/unset/toggle */
+	if (r->fb_noalert)
+		return 0;                               /* chỉ tag cờ, không verdict */
+
+	int action = r->action;
+	if (r->fidelity == SIG_FID_ALERT)
+		action = SIG_ALERT;                     /* P0 fidelity-cap */
+	if (action > m->best_action) {
+		m->best_action = action;
+		m->best_idx    = rule_id;
+	}
+	return (m->best_action == SIG_DROP);            /* dừng sớm khi đã có DROP */
+}
+
+/* Quyết định fail-closed khi ráp dòng bất thường (lỗ trống/quá tải). */
+static struct ips_decision make_failclosed(const struct ips_config *cfg)
+{
+	struct ips_decision d;
+	memset(&d, 0, sizeof(d));
+	d.sig_rule     = -1;
+	d.score        = -1.0;
+	d.ml_evaluated = 0;
+	d.reason       = IPS_R_SIGNATURE;
+	d.verdict      = (cfg->mode == IPS_MODE_DETECT) ? IPS_ALERT : IPS_DROP;
+	snprintf(d.matched_msg, sizeof(d.matched_msg),
+		 "reass anomaly (gap/overflow) fail-closed");
+	return d;
+}
+
 /* ---- xử lý một gói từ NFQUEUE ------------------------------------------- */
 
 static void process_packet(struct nfq_ctx *nfq, struct nfq_pkt *pkt,
@@ -210,6 +356,10 @@ static void process_packet(struct nfq_ctx *nfq, struct nfq_pkt *pkt,
 	/* [2] Evaluate: L1-builtin → L1-user → L2-payload → ML */
 	struct flow_ctx fc;
 	nfq_pkt_to_flow_ctx(pkt, &fc);
+	/* P6 — flow: established = đã thấy traffic chiều ngược (proxy). to_server
+	 * mặc định 1 (đặt lại theo dir thực cho TCP bên dưới). */
+	fc.established = (pkts_bwd > 0) ? 1 : 0;
+	fc.to_server   = 1;
 
 	/*
 	 * Đọc ruleset dưới read-lock: reload chạy ở thread nền (sig_reload.c)
@@ -219,22 +369,78 @@ static void process_packet(struct nfq_ctx *nfq, struct nfq_pkt *pkt,
 	 * không deref ruleset sau khi unlock → an toàn giải phóng lock sớm.
 	 */
 	pthread_rwlock_rdlock(&sr->rwlock);
-	struct ips_decision d = ips_evaluate(ips_cfg, sr->active,
-					     pkt->payload, pkt->plen,
-					     &fc, feat,
-					     ct_ok ? &fs : NULL);
+	const struct sig_ruleset *rs = sr->active;
+	struct ips_decision d;
+	int sig_watch = 0, sig_inspected = 0;   /* P1 re-arm → connmark */
+
+	if (pkt->proto == 6 /* TCP */) {
+		/* L2 chạy trên DÒNG ĐÃ GHÉP (P1): chống né cắt-segment/đảo-chiều. */
+		int dir;
+		struct flow_slot *slot = flow_get(pkt, &rs->ac, &dir);
+		if (slot) {
+			fc.to_server = (dir == REASS_TO_SERVER) ? 1 : 0;   /* P6 */
+			fc.fb = &slot->fb;                                 /* P5 */
+			struct l2_match mm = { .rs = rs, .rf = &slot->rf,
+					       .fc = fc, .fb = &slot->fb,
+					       .best_idx = -1, .best_action = -1 };
+
+			/* Hot-reload: ruleset đổi → node-state cũ vô nghĩa + con trỏ ac
+			 * cũ đã free. So sánh con trỏ (KHÔNG deref) rồi rebind: reset
+			 * + re-scan dòng đã có bằng automaton mới TRƯỚC khi feed.
+			 * Flag-id flowbits cũng đổi theo ruleset → xoá bitset luôn. */
+			if (slot->rf.ac != &rs->ac) {
+				memset(&slot->fb, 0, sizeof(slot->fb));
+				reass_flow_rebind(&slot->rf, &rs->ac,
+						  l2_on_match, &mm);
+			}
+
+			int rrc = REASS_OK;
+			if (pkt->payload && pkt->plen)
+				rrc = reass_segment(&slot->rf, dir, pkt->tcp_seq,
+						    pkt->payload, pkt->plen,
+						    l2_on_match, &mm);
+
+			/* P1 re-arm — chỉ chiều to_server: parse transaction HTTP,
+			 * re-arm mỗi request, skip thân quá budget, free (RAM phẳng).
+			 * Tín hiệu: anomaly→fail-closed; want_inspected→offload;
+			 * want_watch→giữ IPS_WATCH (soi mọi transaction keep-alive). */
+			if (rrc != REASS_FAILCLOSED && dir == REASS_TO_SERVER) {
+				http_tx_step(&slot->htx, &slot->rf,
+					     l2_on_match, &mm);
+				if (slot->htx.anomaly)
+					rrc = REASS_FAILCLOSED;
+				else if (slot->htx.want_inspected)
+					sig_inspected = 1;
+				else if (slot->htx.want_watch)
+					sig_watch = 1;
+			}
+
+			if (rrc == REASS_FAILCLOSED)
+				d = make_failclosed(ips_cfg);
+			else
+				d = ips_evaluate_full(ips_cfg, rs, NULL, 0, &fc,
+						      feat, ct_ok ? &fs : NULL,
+						      1, mm.best_idx,
+						      mm.best_action);
+		} else {
+			/* pool OOM → fallback khớp per-packet (không reass) */
+			d = ips_evaluate(ips_cfg, rs, pkt->payload, pkt->plen,
+					 &fc, feat, ct_ok ? &fs : NULL);
+		}
+	} else {
+		/* UDP/ICMP: không có stream → khớp payload gói đơn như cũ. */
+		d = ips_evaluate(ips_cfg, rs, pkt->payload, pkt->plen,
+				 &fc, feat, ct_ok ? &fs : NULL);
+	}
 	pthread_rwlock_unlock(&sr->rwlock);
 
 	/* [3] Verdict + connmark.
-	 *
-	 * Với connbytes-based NFQUEUE rule, gating đã do kernel lo (connbytes
-	 * 0:N-1 tự hết hiệu lực sau N gói). ipsd chỉ cần:
-	 *   - DROP  : NF_DROP + set IPS_BLOCK connmark → rule global DROP ở đầu
-	 *             chain chặn mọi gói tiếp theo của flow.
-	 *   - ACCEPT: NF_ACCEPT đơn giản, không cần INSPECTED connmark. Gói
-	 *             tiếp tục forwarding và đến CONNMARK+ACCEPT policy rule.
-	 *             Sau N gói (connbytes vượt N-1), gói không vào NFQUEUE nữa.
-	 */
+	 *   - DROP        : NF_DROP + IPS_BLOCK → rule DROP đầu chain chặn flow.
+	 *   - WATCH (P1)  : HTTP keep-alive còn transaction → set IPS_WATCH (băng B
+	 *                   giữ flow trong queue, soi MỌI transaction quá K).
+	 *   - INSPECTED   : Connection: close / non-HTTP / hết → set IPS_INSPECTED,
+	 *                   xoá WATCH → offload (khỏi queue). Băng A đã có ! INSPECTED.
+	 * WATCH/INSPECTED loại trừ nhau; set bit này thì xoá bit kia (qua mask). */
 	uint32_t connmark = 0, cmask = 0;
 	int accept = 1;
 
@@ -242,6 +448,12 @@ static void process_packet(struct nfq_ctx *nfq, struct nfq_pkt *pkt,
 		accept   = 0;
 		connmark = SG_CMK_IPS_BLOCK;
 		cmask    = SG_CMK_IPS_MASK;
+	} else if (sig_inspected) {
+		connmark = SG_CMK_IPS_INSPECTED;                 /* set INSPECTED, xoá WATCH */
+		cmask    = SG_CMK_IPS_INSPECTED | SG_CMK_IPS_WATCH;
+	} else if (sig_watch) {
+		connmark = SG_CMK_IPS_WATCH;                      /* set WATCH */
+		cmask    = SG_CMK_IPS_WATCH;
 	}
 
 	if (nfq_verdict(nfq, pkt->id, accept, connmark, cmask) < 0)
@@ -371,7 +583,7 @@ int main(int argc, char **argv)
 	/* SIGUSR1 đã được sig_reload_init đăng ký (→ self-pipe) */
 
 	fprintf(stderr, "ipsd: ready (%d rules, queue %u)\n",
-		sr.active->n_rules + sr.active->n_l1, g_cfg.queue_num);
+		sr.active->n_rules, g_cfg.queue_num);
 
 	/* [4] Main event loop */
 	struct nfq_pkt pkt;
@@ -407,6 +619,9 @@ int main(int argc, char **argv)
 	/* [5] Graceful shutdown */
 	fprintf(stderr, "ipsd: shutting down\n");
 	nfq_close(&nfq);
+	for (int i = 0; i < FLOW_BUCKETS; i++)
+		if (g_flows[i].key.used)
+			reass_flow_free(&g_flows[i].rf);
 	sig_reload_wait(&sr);
 	sig_reload_free(&sr);
 	if (g_logfp) fclose(g_logfp);

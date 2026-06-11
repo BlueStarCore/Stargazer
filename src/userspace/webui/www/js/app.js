@@ -3936,6 +3936,20 @@
             setTxt('ips-stat-status', d.status || '—');
             setTxt('ips-stat-mode', d.mode || '—');
             setTxt('ips-stat-snap', d.snapshot_n || '—');
+            /* P0 — độ phủ thật: full=được DROP, alert-cap=chỉ ALERT (thiếu
+             * keyword thu hẹp chưa hỗ trợ). */
+            if (d.loaded !== undefined) {
+                var full = parseInt(d.loaded_full || '0', 10);
+                var alertCap = parseInt(d.loaded_alert || '0', 10);
+                var total = parseInt(d.loaded || '0', 10);
+                setTxt('ips-stat-rules',
+                       total + ' (full ' + full + ', alert-cap ' + alertCap + ')');
+                setTxt('ips-stat-coverage',
+                       total ? (100 * full / total).toFixed(1) + '% enforce' : '—');
+            } else {
+                setTxt('ips-stat-rules', '—');
+                setTxt('ips-stat-coverage', '—');
+            }
             setTxt('ips-stat-alerts', d.alert_log_lines || '0');
         }).catch(function () {});
         var p2 = api('/monitor/ips-alerts').then(function (d) {
@@ -3963,13 +3977,12 @@
 
         /* ── state ── */
         var _catalog  = null;   /* cached signature catalog array */
-        var _overrides = {};    /* sid(string) → {action, id} */
         var _rulesPage = 0;
         var _rulesFilter = { q: '', action: '' };
         var _alerts    = [];    /* last loaded alert array */
-        var _alertDetailSid = null; /* sid shown in alert-detail modal */
 
         /* ── helpers ── */
+        var esc = SgCommon.escHTML;
         function pageEl() { return document.getElementById('page-sec-ips'); }
 
         /* ── tab switching ── */
@@ -4278,25 +4291,6 @@
                     _rulesPage = 0;
                     renderIpsRulesTable();
                 });
-                var allCb = pg.querySelector('#ips-rules-all');
-                if (allCb) allCb.addEventListener('change', function () {
-                    pg.querySelectorAll('#ips-rules-tbody .rule-cb').forEach(function (cb) {
-                        cb.checked = allCb.checked;
-                    });
-                    updateRulesBulkBar();
-                });
-                pg.querySelector('#ips-rules-tbody') && pg.querySelector('#ips-rules-tbody')
-                    .addEventListener('change', function (e) {
-                        if (e.target.classList.contains('rule-cb')) updateRulesBulkBar();
-                    });
-                var bulkApply = pg.querySelector('#ips-rules-bulk-apply');
-                if (bulkApply) bulkApply.addEventListener('click', applyRulesBulk);
-                var bulkCancel = pg.querySelector('#ips-rules-bulk-cancel');
-                if (bulkCancel) bulkCancel.addEventListener('click', function () {
-                    pg.querySelectorAll('#ips-rules-tbody .rule-cb').forEach(function (cb) { cb.checked = false; });
-                    if (allCb) allCb.checked = false;
-                    updateRulesBulkBar();
-                });
 
                 /* Rules refresh button */
                 var rrBtn = pg.querySelector('#ips-rules-refresh');
@@ -4324,21 +4318,6 @@
                 }
                 if (adClose)  adClose.addEventListener('click', closeAlertModal);
                 if (adClose2) adClose2.addEventListener('click', closeAlertModal);
-                var ovBtn = pg.querySelector('#ips-alert-override-btn');
-                if (ovBtn) ovBtn.addEventListener('click', function () {
-                    if (_alertDetailSid) {
-                        closeAlertModal();
-                        ipsTabSwitch('rules');
-                        /* pre-fill search with the SID */
-                        var qInput = pg.querySelector('#ips-rules-search');
-                        if (qInput) {
-                            qInput.value = String(_alertDetailSid);
-                            _rulesFilter.q = String(_alertDetailSid);
-                            _rulesPage = 0;
-                            renderIpsRulesTable();
-                        }
-                    }
-                });
 
                 /* Alert info modal — delegate Info button clicks */
                 var alertTbody = pg.querySelector('#ips-alerts-tbody');
@@ -4474,27 +4453,14 @@
         function loadIpsRules() {
             var pg = pageEl(); if (!pg) return;
             var tbody = pg.querySelector('#ips-rules-tbody');
-            if (tbody) tbody.innerHTML = '<tr><td colspan="7" class="table-empty">Loading catalog…</td></tr>';
-            Promise.all([
-                _catalog !== null ? Promise.resolve(_catalog) : cachedApi('/ips/signatures'),
-                api('/config/security_ips-filter')
-            ]).then(function (res) {
-                _catalog = res[0] || [];
-                /* Build override map: value(sid string) → {action, id} for profile=default */
-                _overrides = {};
-                var fd = res[1];
-                if (fd && fd.entries) {
-                    fd.entries.forEach(function (f) {
-                        if (f.profile === 'default' && f.type === 'signature' &&
-                            f.value && f.status === 'enable') {
-                            _overrides[f.value] = { action: f.action, id: f.id };
-                        }
-                    });
-                }
+            if (tbody) tbody.innerHTML = '<tr><td colspan="6" class="table-empty">Loading catalog…</td></tr>';
+            (_catalog !== null ? Promise.resolve(_catalog) : cachedApi('/ips/signatures'))
+            .then(function (cat) {
+                _catalog = cat || [];
                 _rulesPage = 0;
                 renderIpsRulesTable();
             }).catch(function () {
-                if (tbody) tbody.innerHTML = '<tr><td colspan="7" class="table-empty">Failed to load</td></tr>';
+                if (tbody) tbody.innerHTML = '<tr><td colspan="6" class="table-empty">Failed to load</td></tr>';
             });
         }
 
@@ -4502,8 +4468,7 @@
             var q = _rulesFilter.q;
             var af = _rulesFilter.action;
             return (_catalog || []).filter(function (r) {
-                if (af && (r.action || 'alert') !== af &&
-                    (!_overrides[String(r.sid)] || _overrides[String(r.sid)].action !== af)) return false;
+                if (af && (r.action || 'alert') !== af) return false;
                 if (q) {
                     var sidStr = String(r.sid || '');
                     var msg    = (r.name || r.msg || '').toLowerCase();
@@ -4541,7 +4506,7 @@
                 var emptyMsg = (_catalog && _catalog.length === 0)
                     ? 'No rules yet — go to the Download tab and download a ruleset first'
                     : 'No rules match the filter';
-                tbody.innerHTML = '<tr><td colspan="7" class="table-empty">' + emptyMsg + '</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="6" class="table-empty">' + emptyMsg + '</td></tr>';
                 if (pager) pager.innerHTML = '';
                 return;
             }
@@ -4549,20 +4514,16 @@
             var frag = document.createDocumentFragment();
             slice.forEach(function (r) {
                 var sidStr = String(r.sid || '');
-                var ov = _overrides[sidStr];
-                var defAction = (r.action === 'drop') ? 'Drop' : 'Alert';
-                var effectiveAction = ov ? (ov.action === 'block' ? 'Drop' : (ov.action.charAt(0).toUpperCase() + ov.action.slice(1))) : defAction;
-                var actionCls = (effectiveAction === 'Drop') ? 'verdict-drop' : (effectiveAction === 'Alert' ? 'verdict-alert' : '');
-                var ovBadge = ov ? ' <span style="font-size:10px;color:#888">(override)</span>' : '';
+                var action = (r.action === 'drop') ? 'Drop' : 'Alert';
+                var actionCls = (action === 'Drop') ? 'verdict-drop' : 'verdict-alert';
                 var src = r.category || '—';
                 var cls = r.classtype || '—';
                 var info = r.info || r.cve || '';
 
                 var tr = document.createElement('tr');
                 tr.innerHTML = [
-                    '<td class="td-checkbox"><input type="checkbox" class="rule-cb" data-sid="' + esc(sidStr) + '"></td>',
                     '<td style="white-space:nowrap">' + esc(sidStr) + '</td>',
-                    '<td class="' + actionCls + '">' + esc(effectiveAction) + ovBadge + '</td>',
+                    '<td class="' + actionCls + '">' + esc(action) + '</td>',
                     '<td style="white-space:nowrap;font-size:12px">' + esc(src) + '</td>',
                     '<td style="font-size:12px">' + esc(cls) + '</td>',
                     '<td style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(r.name||r.msg||'') + '">' + esc(r.name||r.msg||'—') + '</td>',
@@ -4601,58 +4562,6 @@
                 next.addEventListener('click', function () { _rulesPage++; renderIpsRulesTable(); });
                 pager.appendChild(next);
             }
-        }
-
-        function setRuleOverride(sidStr, action) {
-            if (action === 'default') {
-                /* Remove override */
-                var existing = _overrides[sidStr];
-                if (existing) {
-                    api('/config/security_ips-filter/' + encodeURIComponent(existing.id),
-                        { method: 'DELETE' })
-                        .then(function () { delete _overrides[sidStr]; })
-                        .catch(function () { showToast('Failed to remove override', 'error'); });
-                }
-            } else {
-                /* Create or update override for profile=default */
-                var ovId = 'default-sig-' + sidStr;
-                var payload = { id: ovId, profile: 'default', type: 'signature', value: sidStr,
-                                action: (action === 'drop' ? 'block' : action), status: 'enable' };
-                var existing2 = _overrides[sidStr];
-                var req = existing2
-                    ? api('/config/security_ips-filter/' + encodeURIComponent(existing2.id),
-                          { method: 'PUT', body: payload })
-                    : api('/config/security_ips-filter', { method: 'POST', body: payload });
-                req.then(function () {
-                    _overrides[sidStr] = { action: action, id: ovId };
-                }).catch(function () { showToast('Failed to save override', 'error'); });
-            }
-        }
-
-        function updateRulesBulkBar() {
-            var pg = pageEl(); if (!pg) return;
-            var checked = pg.querySelectorAll('#ips-rules-tbody .rule-cb:checked');
-            var bar = pg.querySelector('#ips-rules-bulk');
-            var cntEl = pg.querySelector('#ips-rules-bulk-count');
-            if (!bar) return;
-            if (checked.length > 0) {
-                bar.style.display = 'flex';
-                if (cntEl) cntEl.textContent = checked.length + ' rule(s) selected';
-            } else {
-                bar.style.display = 'none';
-            }
-        }
-
-        function applyRulesBulk() {
-            var pg = pageEl(); if (!pg) return;
-            var action = (pg.querySelector('#ips-rules-bulk-action') || {}).value || 'default';
-            var checked = pg.querySelectorAll('#ips-rules-tbody .rule-cb:checked');
-            checked.forEach(function (cb) { setRuleOverride(cb.dataset.sid, action); });
-            /* Uncheck + hide bar */
-            checked.forEach(function (cb) { cb.checked = false; });
-            var allCb = pg.querySelector('#ips-rules-all');
-            if (allCb) allCb.checked = false;
-            updateRulesBulkBar();
         }
 
         /* ── Alerts tab ── */
@@ -4709,7 +4618,6 @@
             var modal = pg.querySelector('#ips-alert-detail-modal');
             var body  = pg.querySelector('#ips-alert-detail-body');
             if (!modal || !body) return;
-            _alertDetailSid = a.sid || null;
             var protoMap = { 6:'TCP', 17:'UDP', 1:'ICMP' };
             var proto = protoMap[a.proto] || ('IP/' + a.proto);
             var mlScore = (a.score >= 0) ? (parseFloat(a.score).toFixed(3)) : 'N/A';
@@ -4726,8 +4634,6 @@
                 '<tr><td>Message</td><td>' + esc(a.msg||'—') + '</td></tr>',
                 '</table>'
             ].join('');
-            var ovBtn = pg.querySelector('#ips-alert-override-btn');
-            if (ovBtn) ovBtn.style.display = (a.sid && a.sid !== 'ML-ANOMALY') ? '' : 'none';
             modal.style.display = 'flex';
         }
 
@@ -4757,7 +4663,7 @@
 
             function paint(dbRows) {
                 if (!dbRows.length && !pendingFilters.length) {
-                    tb.innerHTML = '<tr><td colspan="5" style="opacity:.6">No filters yet. Click "Create New" to add.</td></tr>';
+                    tb.innerHTML = '<tr><td colspan="4" style="opacity:.6">No filters yet. Click "Create New" to add.</td></tr>';
                     return;
                 }
                 tb.innerHTML = '';
@@ -4766,7 +4672,6 @@
                     tr.innerHTML =
                         '<td>' + (e.type || '') + '</td>' +
                         '<td>' + (e.value || '') + '</td>' +
-                        '<td>' + (e.action || 'default') + '</td>' +
                         '<td>' + (e.status || 'enable') + '</td>' +
                         '<td><button type="button" class="btn ips-del-filter" data-id="' + (e.id || '') + '">Delete</button></td>';
                     tb.appendChild(tr);
@@ -4777,7 +4682,6 @@
                     tr.innerHTML =
                         '<td>' + pf.type + '</td>' +
                         '<td>' + pf.value + '</td>' +
-                        '<td>' + (pf.action || 'default') + '</td>' +
                         '<td style="color:#f0a800">pending</td>' +
                         '<td><button type="button" class="btn ips-del-pending" data-idx="' + idx + '">Delete</button></td>';
                     tb.appendChild(tr);
@@ -4871,8 +4775,8 @@
         function closeModal2() { modal.style.display = 'none'; }
 
         /* Buffer a filter entry locally; saved to DB when the profile is saved. */
-        function addFilter(type, value, action) {
-            pendingFilters.push({ type: type, value: value, action: action || 'default' });
+        function addFilter(type, value) {
+            pendingFilters.push({ type: type, value: value });
             return Promise.resolve();
         }
 
@@ -4929,7 +4833,7 @@
                             return api('/config/security_ips-filter', {
                                 method: 'POST',
                                 body: { id: id, profile: savedName, type: pf.type,
-                                        value: pf.value, action: pf.action, status: 'enable' }
+                                        value: pf.value, status: 'enable' }
                             });
                         }));
                     })
@@ -4970,20 +4874,19 @@
 
         var okBtn = document.getElementById('ips-sig-ok');
         if (okBtn) okBtn.addEventListener('click', function () {
-            var action   = (document.getElementById('ips-sig-action') || {}).value || 'default';
             var activeTab = document.querySelector('.ips-tab.active');
             var tab      = activeTab ? activeTab.dataset.tab : 'signature';
             var jobs     = [];
             if (tab === 'signature') {
                 document.querySelectorAll('.ips-sig-cb:checked').forEach(function (cb) {
-                    jobs.push(addFilter('signature', cb.dataset.sid, action));
+                    jobs.push(addFilter('signature', cb.dataset.sid));
                 });
                 if (!jobs.length) { showToast('Select at least 1 signature', 'error'); return; }
             } else {
                 var sel = document.getElementById('ips-filter-cat');
                 var cat = sel ? sel.value : '';
                 if (!cat) { showToast('Select a category', 'error'); return; }
-                jobs.push(addFilter('category', cat, action));
+                jobs.push(addFilter('category', cat));
             }
             Promise.all(jobs).then(function () {
                 showToast('Added ' + jobs.length + ' item(s)', 'success');

@@ -113,7 +113,7 @@ typedef enum {
 
 	/* Firewall/routing diagnostics (63x) */
 	SG_CMD_DIAG_FW_IPTABLES  = 630,  /* Show iptables rules (filter/nat) */
-	SG_CMD_DIAG_FW_POLICY    = 631,  /* Show INPUT chain policy+rules    */
+	SG_CMD_DIAG_FW_POLICY    = 631,  /* Show FORWARD chain rules         */
 	SG_CMD_DIAG_FW_CONNTRACK = 632,  /* Show conntrack entries            */
 	SG_CMD_DIAG_ROUTES       = 633,  /* Show IPv4+IPv6 routing tables     */
 	SG_CMD_DIAG_FW_IPSET     = 634,  /* Dump an FQDN object's ipset       */

@@ -57,6 +57,21 @@ int  ac_build(struct ac_automaton *ac);
 int  ac_search(const struct ac_automaton *ac, const uint8_t *text, size_t len,
 	       int (*on_match)(int id, size_t end_pos, void *ctx), void *ctx);
 
+/*
+ * Quét STREAMING: tiếp tục từ trạng thái *state (0 = root) qua nhiều lần feed
+ * mà KHÔNG quét lại từ đầu — dùng cho reassembly dòng TCP (mỗi lần có byte liên
+ * tục mới thì feed tiếp). *state được lưu giữa các lần gọi (in/out).
+ *   stream_off : offset (trong DÒNG) của text[0] → on_match nhận end_off là vị
+ *                trí byte CUỐI pattern TRONG DÒNG (cần cho verify offset/depth/
+ *                distance/within).
+ * on_match trả khác 0 để dừng sớm. Trả tổng match (hoặc -1 nếu chưa build /
+ * state NULL). Aho-Corasick vốn streaming: node hiện tại là toàn bộ trạng thái.
+ */
+int  ac_search_stream(const struct ac_automaton *ac, int32_t *state,
+		      const uint8_t *text, size_t len, uint64_t stream_off,
+		      int (*on_match)(int id, uint64_t end_off, void *ctx),
+		      void *ctx);
+
 /* Giải phóng bộ nhớ, đưa automaton về trạng thái rỗng (gọi lại ac_init được). */
 void ac_free(struct ac_automaton *ac);
 

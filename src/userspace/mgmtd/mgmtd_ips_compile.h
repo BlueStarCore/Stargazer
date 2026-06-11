@@ -29,24 +29,22 @@
 int ips_compile_categories(const char *repo_dir, const char *categories,
 			   const char *out_path);
 
-/* ── FortiGate-style filter compile (Yêu cầu mới) ─────────────────────── */
+/* ── FortiGate-style filter compile (chọn luật vào profile) ───────────── */
 
 enum ips_filter_type   { IPS_FT_CATEGORY = 0, IPS_FT_SIGNATURE = 1 };
-enum ips_filter_action { IPS_FA_DEFAULT  = 0, IPS_FA_BLOCK, IPS_FA_ALERT,
-			 IPS_FA_PASS };
 
 struct ips_filter {
 	int  type;          /* enum ips_filter_type   */
 	char value[128];    /* tên category hoặc SID  */
-	int  action;        /* enum ips_filter_action */
 };
 
 /*
  * Compile ruleset của một profile TỪ danh sách filter vào out_path.
- *   - filter category: ghép repo/<value>.rules, GHI ĐÈ action mỗi rule theo
- *     filter.action (default=giữ nguyên, block=drop, alert=alert, pass=pass).
+ *   - filter category: ghép repo/<value>.rules nguyên trạng.
  *   - filter signature: tìm rule có `sid:<value>;` trong toàn repo, ghi ra
- *     với action override.
+ *     nguyên trạng.
+ * Action của từng rule GIỮ NGUYÊN (không override) — verdict do action gốc
+ * của rule + policy/mode quyết định.
  * Trả số dòng RULE đã ghi (>=0), -1 nếu lỗi mở out_path/repo.
  */
 int ips_compile_filters(const char *repo_dir, const struct ips_filter *filters,

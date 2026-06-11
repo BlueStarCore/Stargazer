@@ -57,8 +57,7 @@ int main(void)
         "(msg:\"AUTO: Metasploit default port\"; flags:S; sid:9000001; rev:1;)");
 
     sig_build(&rs);
-    printf("Ruleset: %d L2 payload rules, %d L1 flow rules loaded\n",
-           rs.n_rules, rs.n_l1);
+    printf("Ruleset: %d L2 payload (content) rules loaded\n", rs.n_rules);
 
     struct ips_config cfg;
     ips_config_default(&cfg);   /* prevent, block 0.95, alert 0.50 */

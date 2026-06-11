@@ -5,9 +5,9 @@
  *
  * Kho global : /etc/stargazer/ips/repo/<category>.rules
  * Per-profile: /etc/stargazer/ips/profiles/<name>.rules
- *              compile từ bảng security_ips-filter (category/signature + action
- *              override), hoặc fallback field `categories` nếu profile chưa có
- *              filter nào.
+ *              compile từ bảng security_ips-filter (chọn category/signature;
+ *              action giữ nguyên theo rule), hoặc fallback field `categories`
+ *              nếu profile chưa có filter nào.
  * Active     : /etc/stargazer/ips/rules/active.rules = NỐI ruleset của các
  *              profile đang được policy accept dùng.
  *
@@ -53,17 +53,9 @@ static int parse_filter_type(const char *s)
 						  : IPS_FT_CATEGORY;
 }
 
-static int parse_filter_action(const char *s)
-{
-	if (!s) return IPS_FA_DEFAULT;
-	if (strcmp(s, "block") == 0) return IPS_FA_BLOCK;
-	if (strcmp(s, "alert") == 0) return IPS_FA_ALERT;
-	if (strcmp(s, "pass")  == 0) return IPS_FA_PASS;
-	return IPS_FA_DEFAULT;
-}
-
 /*
  * Gom filter (status=enable) thuộc `profile` vào out[]. Trả số filter.
+ * Chỉ CHỌN luật (type/value); action giữ nguyên theo từng rule.
  */
 static int gather_filters(const char *profile, struct ips_filter *out, int max)
 {
@@ -78,16 +70,14 @@ static int gather_filters(const char *profile, struct ips_filter *out, int max)
 		char *st  = sg_db_get_val("security_ips-filter", id, "status");
 		char *ty  = sg_db_get_val("security_ips-filter", id, "type");
 		char *va  = sg_db_get_val("security_ips-filter", id, "value");
-		char *ac  = sg_db_get_val("security_ips-filter", id, "action");
 
 		if (pf && strcmp(pf, profile) == 0 &&
 		    (!st || strcmp(st, "disable") != 0) && va && va[0]) {
 			out[n].type   = parse_filter_type(ty);
-			out[n].action = parse_filter_action(ac);
 			snprintf(out[n].value, sizeof(out[n].value), "%s", va);
 			n++;
 		}
-		free(pf); free(st); free(ty); free(va); free(ac);
+		free(pf); free(st); free(ty); free(va);
 	}
 	free(list);
 	return n;

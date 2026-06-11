@@ -36,7 +36,7 @@ static const sg_type_info_t type_table[] = {
 	{ "firewall_service",       CFG_TABLE,  "configure", "Configure service objects"           },
 	{ "security_ips",           CFG_SINGLE, "configure", "Configure IPS (signature + ML inspection)" },
 	{ "security_ips-profile",   CFG_TABLE,  "configure", "Configure IPS profiles (signature sets)" },
-	{ "security_ips-filter",    CFG_TABLE,  "configure", "Configure IPS profile filters (category/signature + action)" },
+	{ "security_ips-filter",    CFG_TABLE,  "configure", "Configure IPS profile filters (category/signature selection)" },
 	{ "security_ips-ruleset",   CFG_TABLE,  "configure", "Configure IPS ruleset sources (URL entries for download)" },
 	{ "security_ssl-inspection",CFG_SINGLE, "configure", "Configure SSL/TLS inspection (MITM)" },
 	{ "system_password-policy", CFG_SINGLE, "admin",     "Configure global password policy"    },
@@ -89,7 +89,8 @@ static const struct field_entry field_table[] = {
 	{ "security_ips", "status",     "enum:enable,disable", 0, "disable", "Enable IPS inspection", 0 },
 	{ "security_ips", "mode",       "enum:detect,prevent", 0, "prevent", "detect = chỉ alert; prevent = chặn", 0 },
 	{ "security_ips", "queue-num",  "uint:0:65535",        0, "0",       "NFQUEUE number nối với ipsd", 0 },
-	{ "security_ips", "snapshot-n", "uint:1:64",           0, "8",       "Số gói đầu mỗi flow đưa vào NFQUEUE để inspect (connbytes)", 0 },
+	{ "security_ips", "snapshot-n", "uint:1:64",           0, "8",       "Số gói đầu mỗi flow đưa vào NFQUEUE (fallback khi kernel thiếu connbytes mode bytes)", 0 },
+	{ "security_ips", "snapshot-bytes", "uint:1024:262144", 0, "16384",  "Cửa sổ soi mỗi flow (byte, 2 chiều) — connbytes-mode bytes (P1 reassembly)", 0 },
 	{ "security_ips", "auto-update","enum:disable,daily,weekly", 0, "disable", "Tự cập nhật signature theo lịch (cron)", 0 },
 	{ "security_ips", "update-url", "string",              1, NULL,      "URL nguồn ruleset (ET Open) cho auto-update", 0 },
 	{ "security_ips", "cron-enabled","enum:enable,disable", 0, "disable", "Enable scheduled auto-update", 0 },
@@ -109,12 +110,12 @@ static const struct field_entry field_table[] = {
 	{ "security_ips-profile", "comment",      "string",              1, NULL,     "Optional description", 0 },
 
 	/* security_ips-filter (CFG_TABLE, FortiGate-style) — mỗi entry là một
-	 * mục lọc của một profile: chọn theo category hoặc signature (SID) +
-	 * override action. Nhiều entry/profile (lọc theo field `profile`). */
+	 * mục lọc của một profile: chọn theo category hoặc signature (SID).
+	 * Chỉ CHỌN luật vào profile; action giữ nguyên theo từng rule (không
+	 * override). Nhiều entry/profile (lọc theo field `profile`). */
 	{ "security_ips-filter", "profile", "ref:security_ips-profile",        0, NULL,      "Profile chứa filter này", 0 },
 	{ "security_ips-filter", "type",    "enum:category,signature",         0, "category", "category = nhóm luật; signature = SID cụ thể", 0 },
 	{ "security_ips-filter", "value",   "string",                          0, NULL,      "Tên category hoặc SID", 0 },
-	{ "security_ips-filter", "action",  "enum:default,block,alert,pass",   0, "default", "default=giữ action gốc; block=drop; alert; pass", 0 },
 	{ "security_ips-filter", "status",  "enum:enable,disable",             0, "enable",  "Enable filter này", 0 },
 
 	/* security_ips-ruleset (CFG_TABLE) — nguồn ruleset để tải về.

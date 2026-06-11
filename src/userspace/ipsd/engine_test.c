@@ -122,31 +122,25 @@ int main(void)
 		sig_ruleset_free(&rs3);
 	}
 
-	/* ---- T8: L1 user-defined (rule không content) ---- */
-	printf("T8 L1 user-defined: rule không content:\n");
+	/* ---- T8: rule KHÔNG content (đã gỡ L1 signature) → bỏ, eval xuống ML ---- */
+	printf("T8 rule không content bị bỏ (gỡ L1 signature):\n");
 	{
 		struct sig_ruleset rs4;
 		sig_ruleset_init(&rs4);
-		/* rule không content (flags:S, dport 8888) */
+		/* rule không content (flags:S, dport 8888) — không còn nạp */
 		sig_parse_line(&rs4,
 			"alert tcp any any -> any 8888 "
 			"(msg:\"AUTO rule\"; flags:S; sid:9000001; rev:1;)");
 		sig_build(&rs4);
 
-		check(rs4.n_l1 == 1, "rule không content vào l1_rules");
-		check(rs4.n_rules == 0, "L2 rules vẫn rỗng");
+		check(rs4.n_rules == 0, "rule không content KHÔNG nạp (L2 rỗng)");
 
-		struct flow_stats fs = {
-			/* pkts > PORT_SCAN_MAX_PKTS (3) để không bị built-in port-scan chặn trước */
-			.syn_count = 1, .ack_count = 5, .pkts_fwd = 5, .pkts_bwd = 3,
-			.tcp_flags_fwd = SIG_TCP_SYN | SIG_TCP_ACK,
-		};
+		/* fs=NULL → bỏ L1-builtin; không L1-user/L2 → xuống ML */
 		struct flow_ctx fc = { .proto = SIG_PROTO_TCP, .dport = 8888 };
 		struct ips_decision d4 = ips_evaluate(&prevent, &rs4,
-			(const uint8_t *)"", 0, &fc, feat, &fs);
+			(const uint8_t *)"", 0, &fc, feat, NULL);
 
-		check(d4.verdict == IPS_ALERT,      "user L1 rule khớp → ALERT");
-		check(d4.ml_evaluated == 0,         "ML KHÔNG chạy");
+		check(d4.ml_evaluated == 1, "không L1-user/L2 → ML chạy");
 		sig_ruleset_free(&rs4);
 	}
 

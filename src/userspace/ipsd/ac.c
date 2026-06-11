@@ -141,6 +141,37 @@ for (size_t i = 0; i < len; i++) {      /* vòng lặp quét văn bản*/
 	return hits;
 }
 
+int ac_search_stream(const struct ac_automaton *ac, int32_t *state,
+		     const uint8_t *text, size_t len, uint64_t stream_off,
+		     int (*on_match)(int, uint64_t, void *), void *ctx)
+{
+	if (!ac->built || !state)
+		return -1;
+
+	int32_t st = *state;
+	if (st < 0 || st >= ac->n_nodes)        /* phòng thủ: state hỏng → root */
+		st = 0;
+	int hits = 0;
+
+	for (size_t i = 0; i < len; i++) {
+		uint8_t c = ac_norm(ac->nocase, text[i]);
+		st = ac->nodes[st].next[c];     /* sau build luôn != -1 */
+
+		for (int32_t t = st; t != -1; t = ac->nodes[t].out_link) {
+			if (ac->nodes[t].out != -1) {
+				hits++;
+				if (on_match &&
+				    on_match(ac->nodes[t].out, stream_off + i, ctx)) {
+					*state = st;    /* lưu state trước khi dừng */
+					return hits;
+				}
+			}
+		}
+	}
+	*state = st;                            /* lưu state cho lần feed sau */
+	return hits;
+}
+
 void ac_free(struct ac_automaton *ac)
 {
 	free(ac->nodes);

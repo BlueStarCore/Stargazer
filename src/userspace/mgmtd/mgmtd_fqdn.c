@@ -220,6 +220,7 @@ void fqdn_refresh_kick(void)
 		}
 
 		/* Worker: blocking resolves, then exit. */
+		int ct_flush_needed = 0;
 		for (int i = 0; i < njobs; i++) {
 			uint32_t ips[SG_FQDN_KEEPALIVE_MAX];
 			int n = fqdn_resolve(jobs[i].fqdn, ips,
@@ -252,11 +253,30 @@ void fqdn_refresh_kick(void)
 				if (n <= 0)
 					continue;
 			}
+
+			/* If the set was empty before this resolve, flush
+			 * conntrack after all adds so any connections that
+			 * slipped through the empty-set window must
+			 * re-establish and hit the now-populated deny rule. */
+			uint32_t dummy[1];
+			int was_empty = (sg_ipset_members(jobs[i].set,
+							  dummy, 1) == 0);
+
 			int rc = sg_ipset_add(jobs[i].set, ips, n);
 			if (rc != 0)
 				mgmt_log("ERROR", "fqdn: ipset update %s "
 					 "failed (%d)", jobs[i].set, rc);
+			else if (was_empty)
+				ct_flush_needed = 1;
 		}
+
+		/* Flush conntrack only when at least one previously-empty set
+		 * was populated.  This terminates any connections that bypassed
+		 * the deny rule during the brief empty-set window and forces
+		 * them to re-establish against the now-active rule. */
+		if (ct_flush_needed)
+			conntrack_flush_all();
+
 		_exit(0);
 	}
 
