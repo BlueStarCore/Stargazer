@@ -34,7 +34,7 @@ X("configure rollback",                     "Rollback configuration to revision"
 
 X("execute",                                "Execute commands and operations",          NULL,              0,  NULL)
 
-X("execute system",                         "System management commands",              "admin",           0,  NULL)
+X("execute system",                         "Run a system binary (direct exec, no shell); see subcommands below", "admin", -1, cmd_system)
 X("execute system shutdown",                "Shut down the system",                    "admin",           0,  cmd_sys_shutdown)
 X("execute system reboot",                  "Reboot the system",                       "admin",           0,  cmd_sys_reboot)
 X("execute system factory-reboot",         "Factory reset and reboot",                "admin",           0,  cmd_sys_factory_reboot)

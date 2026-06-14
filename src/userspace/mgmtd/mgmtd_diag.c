@@ -2964,6 +2964,133 @@ int handle_diag_busybox_list(int client_fd, const char *user,
 	return 0;
 }
 
+/* ── SG_CMD_SYS_LIST (617) ────────────────────────────────────────────── */
+
+#define SYS_LIST_MAX      512   /* max binaries collected per group */
+#define SYS_LIST_NAMELEN  48    /* max basename length kept            */
+
+static int sys_list_namecmp(const void *a, const void *b)
+{
+	return strcmp((const char *)a, (const char *)b);
+}
+
+/*
+ * Enumerate every executable under /bin, /sbin, /usr/bin, /usr/sbin and
+ * return them grouped (busybox applets vs standalone binaries), sorted and
+ * word-wrapped, ready for the CLI to print verbatim. Backs the
+ * `execute system ?` listing.
+ *
+ * Admin-only, matching the `execute system` command itself. The CLI is
+ * sandboxed (no getdents64/readlinkat), so this enumeration runs in mgmtd.
+ */
+int handle_sys_list(int client_fd, const char *user,
+		    const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)payload; (void)hdr;
+
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "admin")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "admin permission required");
+		return 0;
+	}
+
+	static const char *dirs[] = {
+		"/bin", "/sbin", "/usr/bin", "/usr/sbin", NULL
+	};
+
+	/* static (not stack): two 24 KiB arrays — handler runs serially. */
+	static char applets[SYS_LIST_MAX][SYS_LIST_NAMELEN];
+	static char standalone[SYS_LIST_MAX][SYS_LIST_NAMELEN];
+	int n_applet = 0, n_stand = 0;
+
+	for (int i = 0; dirs[i]; i++) {
+		DIR *d = opendir(dirs[i]);
+		if (!d)
+			continue;
+		struct dirent *de;
+		while ((de = readdir(d)) != NULL) {
+			if (de->d_name[0] == '.')
+				continue;
+
+			char path[512];
+			int n = snprintf(path, sizeof(path), "%s/%s",
+					 dirs[i], de->d_name);
+			if (n <= 0 || (size_t)n >= sizeof(path))
+				continue;
+
+			/* Only runnable files (resolves symlinks). */
+			if (access(path, X_OK) != 0)
+				continue;
+
+			/* Skip implausibly long basenames (keeps the copy
+			 * below bounded and the compiler's truncation check
+			 * satisfied). */
+			size_t nlen = strlen(de->d_name);
+			if (nlen >= SYS_LIST_NAMELEN)
+				continue;
+
+			char target[256];
+			ssize_t tlen = readlink(path, target, sizeof(target) - 1);
+			int is_applet = (tlen > 0 &&
+					 (target[tlen] = '\0',
+					  strcmp(target, "/bin/busybox") == 0));
+
+			char (*arr)[SYS_LIST_NAMELEN] =
+				is_applet ? applets : standalone;
+			int *cnt = is_applet ? &n_applet : &n_stand;
+
+			/* Dedup by basename across directories. */
+			int dup = 0;
+			for (int k = 0; k < *cnt; k++) {
+				if (strcmp(arr[k], de->d_name) == 0) {
+					dup = 1;
+					break;
+				}
+			}
+			if (dup || *cnt >= SYS_LIST_MAX)
+				continue;
+			memcpy(arr[(*cnt)++], de->d_name, nlen + 1);
+		}
+		closedir(d);
+	}
+
+	qsort(applets, n_applet, SYS_LIST_NAMELEN, sys_list_namecmp);
+	qsort(standalone, n_stand, SYS_LIST_NAMELEN, sys_list_namecmp);
+
+	char resp[SG_RESPONSE_MAX];
+	size_t pos = 0;
+	resp[0] = '\0';
+
+	/* Two groups, each word-wrapped at ~72 cols with a 4-space indent. */
+	for (int g = 0; g < 2; g++) {
+		char (*arr)[SYS_LIST_NAMELEN] = g ? standalone : applets;
+		int cnt = g ? n_stand : n_applet;
+		buf_appendf(resp, sizeof(resp), &pos, "  %s (%d):\n",
+			    g ? "Standalone binaries" : "BusyBox applets", cnt);
+		int col = 0;
+		for (int k = 0; k < cnt; k++) {
+			int wlen = (int)strlen(arr[k]);
+			if (col == 0) {
+				buf_appendf(resp, sizeof(resp), &pos, "    ");
+				col = 4;
+			} else if (col + 2 + wlen > 72) {
+				buf_appendf(resp, sizeof(resp), &pos, "\n    ");
+				col = 4;
+			} else {
+				buf_appendf(resp, sizeof(resp), &pos, "  ");
+				col += 2;
+			}
+			buf_appendf(resp, sizeof(resp), &pos, "%s", arr[k]);
+			col += wlen;
+		}
+		buf_appendf(resp, sizeof(resp), &pos, "\n");
+	}
+
+	send_ok(client_fd, NULL, resp);
+	return 0;
+}
+
 /* ── SG_CMD_DIAG_NTP (652) ────────────────────────────────────────────── */
 
 int handle_diag_ntp(int client_fd, const char *user,

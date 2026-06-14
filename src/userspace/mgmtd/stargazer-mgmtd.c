@@ -6552,6 +6552,12 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 	case SG_CMD_NET_ARPING:
 		return handle_net_arping(client_fd, user, payload, hdr);
 
+	/* ── Arbitrary system binary (fnsysctl-style, admin-only) ────── */
+	case SG_CMD_SYS_EXEC:
+		return handle_sys_exec(client_fd, user, payload, hdr);
+	case SG_CMD_SYS_LIST:
+		return handle_sys_list(client_fd, user, payload, hdr);
+
 	/* ── System diagnostics (handlers in mgmtd_diag.c) ───────────── */
 	case SG_CMD_DIAG_CPU:
 		return handle_diag_cpu(client_fd, user, payload, hdr);

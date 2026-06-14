@@ -1254,6 +1254,46 @@ static void print_chunk(const char *data, size_t len)
 	fflush(stdout);
 }
 
+static int cmd_system(const char *args, const char *permissions)
+{
+	(void)permissions;
+
+	/*
+	 * `execute system` is also the parent node of the management
+	 * subcommands (shutdown / reboot / factory-*). Those longer paths are
+	 * routed to their own handlers by cmd_dispatch's longest-prefix match,
+	 * so this handler only ever runs for a free-form binary invocation or
+	 * for the bare `execute system` with no trailing words.
+	 */
+	if (!args || !*args) {
+		printf("  Usage: execute system <binary> [args...]\n");
+		printf("         Runs a system binary directly as root.\n");
+		printf("  Example: execute system df -h\n");
+		printf("  Management subcommands: shutdown | reboot |"
+		       " factory-reboot | factory-shutdown\n");
+		return 0;
+	}
+
+	/*
+	 * Forward the command line verbatim as a single value. A CLI line never
+	 * contains a newline, so one key=value line carries it intact; mgmtd
+	 * tokenizes on whitespace and execvp()s the result.
+	 */
+	char payload[SG_PAYLOAD_MAX];
+	int n = snprintf(payload, sizeof(payload), "cmd=%s\n", args);
+	if (n < 0 || (size_t)n >= sizeof(payload)) {
+		printf("  Error: command line too long.\n");
+		return 0;
+	}
+
+	int st = ipc_send_stream(SG_CMD_SYS_EXEC, payload, print_chunk);
+	if (st < 0)
+		printf("  Error: could not contact management daemon.\n");
+	else if (st != SG_OK)
+		printf("  Command failed: %s\n", sg_status_str((sg_status_t)st));
+	return 0;
+}
+
 static int cmd_ping(const char *args, const char *permissions)
 {
 	(void)permissions;
