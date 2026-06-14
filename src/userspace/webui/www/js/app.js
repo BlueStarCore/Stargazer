@@ -60,6 +60,10 @@
         var now = Date.now();
         var entry = apiCache[path];
         if (entry && (now - entry.t) < API_TTL_MS) {
+            /* Cache hit vẫn là "có data hợp lệ" → đếm như một api() thành công
+             * để cơ chế reveal trang (setActivePage) gỡ loading cover ngay,
+             * không phải chờ watchdog 8s khi tab dùng cachedApi (vd tab Rules). */
+            if (entry.v != null) apiSuccessCount++;
             return Promise.resolve(entry.v);
         }
         return api(path).then(function (data) {
@@ -71,6 +75,21 @@
         if (!pathPrefix) { apiCache = {}; return; }
         Object.keys(apiCache).forEach(function (k) {
             if (k.indexOf(pathPrefix) === 0) delete apiCache[k];
+        });
+    }
+
+    /* Catalog signature fetch — SERVER-SIDE search (response IPC giới hạn 64KB;
+     * ruleset lớn không tải hết được, phải lọc theo từ khoá ở backend).
+     * Trả {items:[], truncated:0|1}. Tương thích server cũ trả array.
+     * Top-level: dùng chung cho cả module IPS 5-tab và modal "Add Signatures". */
+    function fetchCatalog(q) {
+        var path = '/ips/signatures';
+        if (q) path += '?q=' + encodeURIComponent(q);
+        return cachedApi(path).then(function (data) {
+            if (Array.isArray(data)) return { items: data, categories: [], truncated: 0 };
+            return { items: (data && data.items) || [],
+                     categories: (data && data.categories) || [],
+                     truncated: (data && data.truncated) ? 1 : 0 };
         });
     }
 
@@ -295,6 +314,16 @@
         else if (page === 'sys-settings') { promises.push(loadSettingsPage(pageEl, 'system')); }
         else if (page === 'sys-password') { promises.push(loadSettingsPage(pageEl, 'password-policy')); }
         else if (page === 'sys-firmware') { promises.push(loadFirmwareInfo()); }
+        else if (page === 'sec-ssl') {
+            var sslTable = pageEl ? pageEl.querySelector('table[data-entity]') : null;
+            if (sslTable) promises.push(loadEntityPage(sslTable.dataset.entity, sslTable));
+            if (pageEl) resetPageFilters(pageEl);
+            /* Refresh SSL-profile dropdown on policy form so new profiles appear */
+            invalidateApiCache('/config/security_ssl-inspection-profile');
+            populateSslProfileSelects();
+            initSslPageExtras(pageEl);
+        }
+        else if (page === 'sys-certificates') { promises.push(initCertPage(pageEl)); }
         else if (page === 'interfaces') {
             var ifTable = pageEl ? pageEl.querySelector('table[data-entity]') : null;
             var ifLoad = ifTable ? loadEntityPage(ifTable.dataset.entity, ifTable) : Promise.resolve();
@@ -1731,19 +1760,38 @@
         var form = document.getElementById('form-policy');
         if (!form) return;
         var actionSel  = form.querySelector('.form-row[data-key="action"] select');
-        var ipsRow     = form.querySelector('.form-row[data-key="ips-profile"]');
-        if (!actionSel || !ipsRow) return;
+        if (!actionSel) return;
         var isDeny = actionSel.value === 'deny' || actionSel.value === 'drop';
-        ipsRow.style.display = isDeny ? 'none' : '';
-        if (isDeny) {
-            var ipsSel = ipsRow.querySelector('select');
-            if (ipsSel) ipsSel.value = 'none';
+
+        /* IPS: toggle ips-status quyết định hiện dropdown profile. DENY/DROP ẩn
+         * cả toggle lẫn profile (chỉ hợp lệ cho accept — khớp backend). */
+        var ipsStatRow = form.querySelector('.form-row[data-key="ips-status"]');
+        var ipsRow     = form.querySelector('.form-row[data-key="ips-profile"]');
+        var ipsOn = false;
+        if (ipsStatRow) {
+            var cb = ipsStatRow.querySelector('input[type="checkbox"]');
+            ipsOn = !!(cb && cb.checked);
+            ipsStatRow.style.display = isDeny ? 'none' : '';
+        }
+        if (ipsRow) ipsRow.style.display = (isDeny || !ipsOn) ? 'none' : '';
+
+        /* SSL inspection cũng chỉ hợp lệ trên accept — DENY/DROP ẩn + reset. */
+        var sslRow = form.querySelector('.form-row[data-key="ssl-profile"]');
+        if (sslRow) {
+            sslRow.style.display = isDeny ? 'none' : '';
+            if (isDeny) {
+                var sslSel = sslRow.querySelector('select');
+                if (sslSel) sslSel.value = 'no-inspection';
+            }
         }
     }
     (function () {
         var form = document.getElementById('form-policy');
-        var sel = form ? form.querySelector('.form-row[data-key="action"] select') : null;
+        if (!form) return;
+        var sel = form.querySelector('.form-row[data-key="action"] select');
         if (sel) sel.addEventListener('change', syncPolicyFormRows);
+        var ipsCb = form.querySelector('.form-row[data-key="ips-status"] input[type="checkbox"]');
+        if (ipsCb) ipsCb.addEventListener('change', syncPolicyFormRows);
     })();
 
     /* Bind all toggle buttons */
@@ -1896,7 +1944,9 @@
                 { label: 'Action',              key: 'action',   col: 8, bulkEditable: true },
                 { label: 'Status',              key: 'status',   col: 9, bulkEditable: true },
                 { label: 'Schedule',            key: 'schedule', col: -1, bulkEditable: false },
+                { label: 'IPS',                 key: 'ips-status',  col: -1, bulkEditable: false },
                 { label: 'IPS Profile',         key: 'ips-profile', col: -1, bulkEditable: false },
+                { label: 'SSL Inspection',      key: 'ssl-profile', col: -1, bulkEditable: false },
                 { label: 'Comment',             key: 'comment',  col: -1, bulkEditable: false }
             ]
         },
@@ -1941,6 +1991,24 @@
                 { label: 'Categories', key: 'categories', col: 1, bulkEditable: false },
                 { label: 'Status',     key: 'status',     col: 2, bulkEditable: true },
                 { label: 'Comment',    key: 'comment',    col: 3, bulkEditable: false }
+            ]
+        },
+        sslProfiles: {
+            formId: 'form-ssl-profile',
+            configType: 'security_ssl-inspection-profile',
+            createTitle: 'NEW SSL INSPECTION PROFILE',
+            editTitle: 'EDIT SSL INSPECTION PROFILE',
+            hasStatus: true,
+            statusLabels: { on: 'Enabled', off: 'Disabled', dotOn: 'enable', dotOff: 'disable' },
+            fields: [
+                { label: 'Name',            key: 'name',                  col: 0, bulkEditable: false },
+                { label: 'Inspection Mode', key: 'inspection-mode',       col: 1, bulkEditable: false },
+                { label: 'Status',          key: 'status',                col: 2, bulkEditable: true },
+                { label: 'No-SNI',          key: 'no-sni',                col: -1, bulkEditable: false },
+                { label: 'Untrusted Cert',  key: 'untrusted-server-cert', col: -1, bulkEditable: false },
+                { label: 'Unsupported',     key: 'unsupported',           col: -1, bulkEditable: false },
+                { label: 'Exempt',          key: 'exempt',                col: -1, bulkEditable: false },
+                { label: 'Comment',         key: 'comment',               col: 3, bulkEditable: false }
             ]
         },
         ipsRulesets: {
@@ -2488,6 +2556,10 @@
             if (val === undefined || val === null) return;
             if (inp.tagName === 'SELECT') {
                 selectOption(inp, String(val));
+            } else if (inp.type === 'checkbox') {
+                inp.checked = inp.dataset.on
+                    ? (String(val) === inp.dataset.on)
+                    : (val === true || val === 'true' || val === 'enable' || val === '1');
             } else {
                 inp.value = val;
             }
@@ -2507,6 +2579,17 @@
                     cb.checked = tokens.indexOf(cb.value) !== -1;
                 });
             });
+        }
+
+        /* Policy cũ (legacy) chưa có ips-status nhưng có ips-profile thật →
+         * suy ra toggle BẬT để edit+save không vô tình tắt IPS. */
+        if (formBody && data['ips-status'] === undefined) {
+            var ipsCb = formBody.querySelector(
+                '.form-row[data-key="ips-status"] input[type="checkbox"]');
+            if (ipsCb) {
+                var ipp = data['ips-profile'];
+                ipsCb.checked = !!(ipp && ipp !== 'none' && ipp !== '');
+            }
         }
 
         /* Editing sets the type select programmatically (no change
@@ -3621,7 +3704,15 @@
                 var val = opt ? (opt.value || opt.text) : '';
                 if (val) payload[f.key] = val;
             } else if (inp.type === 'checkbox') {
-                payload[f.key] = inp.checked;
+                /* Switch enum (data-on/data-off) → chuỗi enable/disable; checkbox
+                 * thường → boolean. */
+                if (inp.dataset.on || inp.dataset.off) {
+                    payload[f.key] = inp.checked
+                        ? (inp.dataset.on  || 'enable')
+                        : (inp.dataset.off || 'disable');
+                } else {
+                    payload[f.key] = inp.checked;
+                }
             } else if (inp.value !== '') {
                 payload[f.key] = inp.value;
             }
@@ -3835,7 +3926,7 @@
         ],
         'security': [
             { configType: 'security_ips',
-              fields: ['status', 'mode', 'snapshot-n'] }
+              fields: ['status', 'mode', 'snapshot-bytes'] }
         ],
         'security-schedule': [
             { configType: 'security_ips',
@@ -3923,6 +4014,89 @@
         return Promise.resolve();
     }
 
+    /* SSL Inspection page: cảnh báo deep (kiểu FortiGate) + diagnostics. */
+    function initSslPageExtras(pg) {
+        if (!pg) return;
+        var modeSel   = pg.querySelector('.form-row[data-key="inspection-mode"] .form-input');
+        var statusSel = pg.querySelector('.form-row[data-key="status"] .form-input');
+        var exemptInp = pg.querySelector('.form-row[data-key="exempt"] .form-input');
+        var warn      = pg.querySelector('#ssl-deep-warning');
+        var exSummary = pg.querySelector('#ssl-exempt-summary');
+
+        function updateWarn() {
+            var deep = modeSel && modeSel.value === 'deep';
+            var on   = statusSel && statusSel.value === 'enable';
+            if (warn) warn.style.display = (deep && on) ? '' : 'none';
+            if (exSummary) {
+                var ex = exemptInp && exemptInp.value.trim();
+                exSummary.textContent = ex ? ex : '(none configured)';
+            }
+        }
+        [modeSel, statusSel].forEach(function (s) {
+            if (s && !s._sslWired) { s.addEventListener('change', updateWarn); s._sslWired = 1; }
+        });
+        if (exemptInp && !exemptInp._sslWired) {
+            exemptInp.addEventListener('input', updateWarn); exemptInp._sslWired = 1;
+        }
+        updateWarn();
+
+        var diagBtn = pg.querySelector('#ssl-diag-btn');
+        var diagOut = pg.querySelector('#ssl-diag-output');
+        if (diagBtn && !diagBtn._wired) {
+            diagBtn._wired = 1;
+            diagBtn.addEventListener('click', function () {
+                if (diagOut) diagOut.textContent = 'Running…';
+                api('/monitor/ssl').then(function (d) {
+                    if (diagOut) diagOut.textContent = (d && d.output) ? d.output : '(no output)';
+                }).catch(function () {
+                    if (diagOut) diagOut.textContent = '(failed to run diagnostics)';
+                });
+            });
+        }
+    }
+
+    /* Certificates page: xem/export/download CA của SSL inspection. */
+    function initCertPage(pg) {
+        if (!pg) return Promise.resolve();
+        var statusEl = pg.querySelector('#cert-ca-status');
+        var pemCard  = pg.querySelector('#cert-pem-card');
+        var pemEl    = pg.querySelector('#cert-pem');
+        var exportBtn= pg.querySelector('#cert-export-btn');
+        var dlBtn    = pg.querySelector('#cert-download-btn');
+        var caPem = '';
+
+        if (exportBtn && !exportBtn._wired) {
+            exportBtn._wired = 1;
+            exportBtn.addEventListener('click', function () {
+                if (!caPem) { showToast('CA chưa có — bật deep SSL inspection để sinh CA', 'error'); return; }
+                if (pemEl) pemEl.textContent = caPem;
+                if (pemCard) pemCard.style.display = '';
+            });
+        }
+        if (dlBtn && !dlBtn._wired) {
+            dlBtn._wired = 1;
+            dlBtn.addEventListener('click', function () {
+                if (!caPem) { showToast('CA chưa có', 'error'); return; }
+                var blob = new Blob([caPem], { type: 'application/x-pem-file' });
+                var a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                a.download = 'stargazer-ca.crt';
+                document.body.appendChild(a); a.click(); document.body.removeChild(a);
+                URL.revokeObjectURL(a.href);
+            });
+        }
+
+        return api('/monitor/ssl-cacert').then(function (d) {
+            caPem = (d && d.output) ? d.output : '';
+            if (statusEl) statusEl.textContent = caPem
+                ? 'CA present (' + caPem.length + ' bytes PEM)'
+                : 'CA chưa tạo — bật deep SSL inspection để sinh tự động';
+        }).catch(function () {
+            caPem = '';
+            if (statusEl) statusEl.textContent = 'CA chưa tạo — bật deep SSL inspection để sinh tự động';
+        });
+    }
+
     /* ── IPS Monitor: status card + recent alert log ──────────────── */
     function loadIpsMonitor() {
         function setTxt(id, v) {
@@ -3935,7 +4109,8 @@
                    d.ipsd_running === 'yes' ? 'Running' : 'Stopped');
             setTxt('ips-stat-status', d.status || '—');
             setTxt('ips-stat-mode', d.mode || '—');
-            setTxt('ips-stat-snap', d.snapshot_n || '—');
+            setTxt('ips-stat-snap',
+                   d.snapshot_bytes ? (d.snapshot_bytes + ' B') : '—');
             /* P0 — độ phủ thật: full=được DROP, alert-cap=chỉ ALERT (thiếu
              * keyword thu hẹp chưa hỗ trợ). */
             if (d.loaded !== undefined) {
@@ -3976,9 +4151,11 @@
     (function () {
 
         /* ── state ── */
-        var _catalog  = null;   /* cached signature catalog array */
+        var _catalog  = null;   /* cached signature catalog array (current query) */
+        var _catalogTrunc = 0;  /* 1 → server cắt kết quả, cần thu hẹp từ khoá */
         var _rulesPage = 0;
         var _rulesFilter = { q: '', action: '' };
+        var _rulesSearchTimer = null;
         var _alerts    = [];    /* last loaded alert array */
 
         /* ── helpers ── */
@@ -3994,19 +4171,23 @@
             pg.querySelectorAll('.ips-tab-pane').forEach(function (p) {
                 p.style.display = (p.dataset.ipsPane === tab) ? '' : 'none';
             });
+            /* Trả promise của loader để initIpsPage await được — nếu không,
+             * cơ chế reveal trang sẽ không thấy api() thành công và phải chờ
+             * watchdog 8s (MAX_COVER_MS) mới gỡ loading cover. */
             if (tab === 'settings') {
                 var card = pg.querySelector('[data-ips-pane="settings"] .form-card[data-settings]');
-                if (card) settingsLoad(card, 'security');
+                return card ? settingsLoad(card, 'security') : Promise.resolve();
             } else if (tab === 'download') {
-                loadIpsRulesets();
+                return loadIpsRulesets();
             } else if (tab === 'rules') {
-                loadIpsRules();
+                return loadIpsRules();
             } else if (tab === 'alerts') {
-                loadIpsAlerts();
+                return loadIpsAlerts();
             } else if (tab === 'schedule') {
                 var scard = pg.querySelector('[data-ips-pane="schedule"] .form-card[data-settings]');
-                if (scard) settingsLoad(scard, 'security-schedule');
+                return scard ? settingsLoad(scard, 'security-schedule') : Promise.resolve();
             }
+            return Promise.resolve();
         }
 
         /* ── initIpsPage: called once per navigation ── */
@@ -4083,58 +4264,6 @@
 
                 /* Download & Update — requires at least one checkbox selected */
                 var updateBtn = pg.querySelector('#ips-update-now-btn');
-                var _pollTimer = null;
-                var _pollIds   = [];
-
-                function stopLogPolling() {
-                    if (_pollTimer) { clearInterval(_pollTimer); _pollTimer = null; }
-                }
-
-                function startLogPolling(ids) {
-                    stopLogPolling();
-                    _pollIds = ids.slice();
-                    var remaining = _pollIds.slice();
-
-                    function poll() {
-                        api('/ips/update-log').then(function (d) {
-                            var out = (d && d.output) ? d.output : '';
-                            showIpsUpdateLog(pg, out);
-
-                            /* Check which IDs are accounted for (Success: or ERROR:) */
-                            remaining = remaining.filter(function (id) {
-                                /* ips-update.sh logs lines like: "2026-01-01 [catname] Success:..." */
-                                var re = new RegExp('\\[' + id.replace(/[-]/g, '.') + '\\].*?(Success:|ERROR:)', 'i');
-                                return !re.test(out);
-                            });
-
-                            if (!remaining.length) {
-                                stopLogPolling();
-                                var hasErr = out.indexOf('ERROR:') !== -1;
-                                if (hasErr) {
-                                    showToast('Download finished with errors — see log below', 'error');
-                                } else {
-                                    showToast('All rulesets downloaded successfully', 'success');
-                                }
-                                /* Bust the signatures cache so Rules tab re-fetches */
-                                invalidateApiCache('/ips/signatures');
-                                _catalog = null;
-                                loadIpsRulesets();
-                            }
-                        }).catch(function () { /* poll silently */ });
-                    }
-
-                    poll();                             /* immediate first fetch */
-                    _pollTimer = setInterval(poll, 3000); /* then every 3 s */
-                    /* safety: stop polling after 5 minutes regardless */
-                    setTimeout(function () {
-                        if (_pollTimer) {
-                            stopLogPolling();
-                            invalidateApiCache('/ips/signatures');
-                            _catalog = null;
-                            loadIpsRulesets();
-                        }
-                    }, 300000);
-                }
 
                 if (updateBtn) updateBtn.addEventListener('click', function () {
                     var checked = pg.querySelectorAll('#ips-rulesets-tbody .rs-cb:checked');
@@ -4145,18 +4274,31 @@
                     var ids = [];
                     checked.forEach(function (cb) { ids.push(cb.dataset.id); });
                     updateBtn.disabled = true;
-                    updateBtn.textContent = 'Starting…';
+                    updateBtn.textContent = 'Downloading…';
+                    /* Request CHỜ tới khi tải xong: mgmtd fork một inner child sở
+                     * hữu kết nối và trả ĐÚNG kết quả (thành công/lỗi + lý do).
+                     * Tải lớn có thể lâu — nút giữ trạng thái "Downloading…". */
                     api('/ips/update-now', { method: 'POST', body: { ids: ids.join(',') } })
-                        .then(function () {
-                            showToast('Downloading ' + ids.length + ' ruleset(s)…', 'success');
-                            startLogPolling(ids);
+                        .then(function (resp) {
+                            showToast((resp && resp.output) ? resp.output
+                                      : ('Đã tải ' + ids.length + ' ruleset'), 'success');
                         })
                         .catch(function (err) {
-                            showToast('Failed to start download: ' + (err.message || 'network error'), 'error');
+                            /* err.message mang lý do chi tiết từ backend:
+                             * no internet / DNS sai / syntax hỏng / file rỗng… */
+                            showToast('Tải lỗi: ' + (err.message || 'lỗi mạng'), 'error');
                         })
                         .finally(function () {
                             updateBtn.disabled = false;
                             updateBtn.textContent = 'Download & Update Rules';
+                            /* Log chi tiết per-ruleset + cập nhật timestamp +
+                             * làm mới catalog (rule mới hiện ở tab Rules). */
+                            api('/ips/update-log').then(function (d) {
+                                showIpsUpdateLog(pg, (d && d.output) ? d.output : '');
+                            }).catch(function () {});
+                            invalidateApiCache('/ips/signatures');
+                            _catalog = null;
+                            loadIpsRulesets();
                         });
                 });
 
@@ -4230,7 +4372,7 @@
                             showToast('Ruleset deleted', 'success');
                             loadIpsRulesets();
                         })
-                        .catch(function () { showToast('Delete failed', 'error'); });
+                        .catch(function (err) { showToast(err.message || 'Delete failed', 'error'); });
                 });
 
                 /* Schedule: cron validation + live preview */
@@ -4278,12 +4420,14 @@
                     }
                 }
 
-                /* Rules tab: search + filter */
+                /* Rules tab: search + filter. Search re-fetches SERVER-SIDE
+                 * (catalog có thể quá lớn để tải hết — backend lọc theo q). */
                 var qEl = pg.querySelector('#ips-rules-search');
                 if (qEl) qEl.addEventListener('input', function () {
                     _rulesFilter.q = qEl.value.trim().toLowerCase();
                     _rulesPage = 0;
-                    renderIpsRulesTable();
+                    clearTimeout(_rulesSearchTimer);
+                    _rulesSearchTimer = setTimeout(loadIpsRules, 250);
                 });
                 var afEl = pg.querySelector('#ips-rules-action-filter');
                 if (afEl) afEl.addEventListener('change', function () {
@@ -4331,11 +4475,11 @@
                 });
             }
 
-            /* Load first (or current active) tab */
+            /* Load first (or current active) tab — RETURN promise của nó để
+             * setActivePage reveal ngay khi data về, không phải chờ watchdog 8s. */
             var activeTab = pg.querySelector('.page-tab.active');
             var tab = activeTab ? activeTab.dataset.ipsTab : 'settings';
-            ipsTabSwitch(tab);
-            return Promise.resolve();
+            return ipsTabSwitch(tab);
         };
 
         /* ── Download tab: rulesets ── */
@@ -4378,11 +4522,11 @@
         }
 
         function loadIpsRulesets() {
-            var pg = pageEl(); if (!pg) return;
+            var pg = pageEl(); if (!pg) return Promise.resolve();
             var tbody = pg.querySelector('#ips-rulesets-tbody');
-            if (!tbody) return;
+            if (!tbody) return Promise.resolve();
             tbody.innerHTML = '<tr><td colspan="4" class="table-empty">Loading…</td></tr>';
-            api('/config/security_ips-ruleset').then(function (data) {
+            return api('/config/security_ips-ruleset').then(function (data) {
                 var entries = (data && data.entries) ? data.entries : [];
                 if (!entries.length) {
                     tbody.innerHTML = '<tr><td colspan="4" class="table-empty">No rulesets configured. Click "+ Import Custom Rules" to add one.</td></tr>';
@@ -4451,12 +4595,13 @@
         var PAGE_SIZE = 50;
 
         function loadIpsRules() {
-            var pg = pageEl(); if (!pg) return;
+            var pg = pageEl(); if (!pg) return Promise.resolve();
             var tbody = pg.querySelector('#ips-rules-tbody');
             if (tbody) tbody.innerHTML = '<tr><td colspan="6" class="table-empty">Loading catalog…</td></tr>';
-            (_catalog !== null ? Promise.resolve(_catalog) : cachedApi('/ips/signatures'))
-            .then(function (cat) {
-                _catalog = cat || [];
+            return fetchCatalog(_rulesFilter.q)
+            .then(function (res) {
+                _catalog = res.items || [];
+                _catalogTrunc = res.truncated;
                 _rulesPage = 0;
                 renderIpsRulesTable();
             }).catch(function () {
@@ -4465,18 +4610,11 @@
         }
 
         function filteredRules() {
-            var q = _rulesFilter.q;
+            /* Từ khoá đã lọc SERVER-SIDE (fetchCatalog) — ở đây chỉ lọc theo
+             * action (server không lọc theo action). */
             var af = _rulesFilter.action;
             return (_catalog || []).filter(function (r) {
                 if (af && (r.action || 'alert') !== af) return false;
-                if (q) {
-                    var sidStr = String(r.sid || '');
-                    var msg    = (r.name || r.msg || '').toLowerCase();
-                    var src    = (r.category || '').toLowerCase();
-                    var cls    = (r.classtype || '').toLowerCase();
-                    if (sidStr.indexOf(q) === -1 && msg.indexOf(q) === -1 &&
-                        src.indexOf(q) === -1 && cls.indexOf(q) === -1) return false;
-                }
                 return true;
             });
         }
@@ -4500,6 +4638,8 @@
                 countLabel.textContent = total === allTotal
                     ? total + ' rule' + (total !== 1 ? 's' : '')
                     : total + ' / ' + allTotal + ' rules';
+                if (_catalogTrunc)
+                    countLabel.textContent += ' — too many to list, type to search';
             }
 
             if (!slice.length) {
@@ -4566,10 +4706,10 @@
 
         /* ── Alerts tab ── */
         function loadIpsAlerts() {
-            var pg = pageEl(); if (!pg) return;
+            var pg = pageEl(); if (!pg) return Promise.resolve();
             var tbody = pg.querySelector('#ips-alerts-tbody');
             if (tbody) tbody.innerHTML = '<tr><td colspan="8" class="table-empty">Loading…</td></tr>';
-            api('/ips/alerts-json').then(function (data) {
+            return api('/ips/alerts-json').then(function (data) {
                 _alerts = Array.isArray(data) ? data : [];
                 renderIpsAlertsTable();
             }).catch(function () {
@@ -4648,6 +4788,7 @@
         var profForm = document.getElementById('form-ips-profile');
         var sigTbody = function () { return document.querySelector('#ips-sig-table tbody'); };
         var catalog  = [];
+        var catalogTrunc = 0;      /* 1 → server cắt kết quả */
         var pendingFilters = [];   /* filters buffered before profile is saved */
         var _searchTimer   = null; /* debounce handle */
 
@@ -4663,7 +4804,7 @@
 
             function paint(dbRows) {
                 if (!dbRows.length && !pendingFilters.length) {
-                    tb.innerHTML = '<tr><td colspan="4" style="opacity:.6">No filters yet. Click "Create New" to add.</td></tr>';
+                    tb.innerHTML = '<tr><td colspan="5" style="opacity:.6">No filters yet. Click "Create New" to add.</td></tr>';
                     return;
                 }
                 tb.innerHTML = '';
@@ -4672,6 +4813,7 @@
                     tr.innerHTML =
                         '<td>' + (e.type || '') + '</td>' +
                         '<td>' + (e.value || '') + '</td>' +
+                        '<td>' + (e.action || 'default') + '</td>' +
                         '<td>' + (e.status || 'enable') + '</td>' +
                         '<td><button type="button" class="btn ips-del-filter" data-id="' + (e.id || '') + '">Delete</button></td>';
                     tb.appendChild(tr);
@@ -4682,6 +4824,7 @@
                     tr.innerHTML =
                         '<td>' + pf.type + '</td>' +
                         '<td>' + pf.value + '</td>' +
+                        '<td>' + (pf.action || 'default') + '</td>' +
                         '<td style="color:#f0a800">pending</td>' +
                         '<td><button type="button" class="btn ips-del-pending" data-idx="' + idx + '">Delete</button></td>';
                     tb.appendChild(tr);
@@ -4699,33 +4842,35 @@
             }).catch(function () { paint([]); });
         }
 
-        function loadCatalog() {
+        /* loadCatalog(q) — fetch SERVER-SIDE filtered (catalog có thể > 64KB).
+         * q rỗng = chunk đầu (có thể bị cắt → gợi ý gõ từ khoá). */
+        function loadCatalog(q) {
             var tb = sigTbody();
             if (tb) tb.innerHTML = '<tr><td colspan="6">Loading…</td></tr>';
-            return cachedApi('/ips/signatures').then(function (data) {
-                catalog = Array.isArray(data) ? data : [];
-                renderCatalog('');
-                populateCategorySelect();
+            return fetchCatalog(q || '').then(function (res) {
+                catalog = res.items || [];
+                catalogTrunc = res.truncated;
+                renderCatalog();
+                /* Dropdown category lấy từ res.categories (danh sách ĐẦY ĐỦ mọi
+                 * ruleset đã tải, không bị giới hạn 64KB) — chỉ build lần đầu. */
+                if (!q) populateCategorySelect(res.categories);
             }).catch(function () {
                 if (tb) tb.innerHTML = '<tr><td colspan="6">Could not load catalog (no ruleset downloaded?).</td></tr>';
             });
         }
 
-        function renderCatalog(q) {
+        function renderCatalog() {
             var tb = sigTbody();
             if (!tb) return;
-            q = (q || '').toLowerCase();
-            var filtered = catalog.filter(function (s) {
-                if (!q) return true;
-                return (String(s.sid).indexOf(q) >= 0) ||
-                       (s.name     && s.name.toLowerCase().indexOf(q) >= 0) ||
-                       (s.cve      && s.cve.toLowerCase().indexOf(q) >= 0) ||
-                       (s.category && s.category.toLowerCase().indexOf(q) >= 0);
-            });
-            var rows = filtered.slice(0, 100);
-            var total = filtered.length;
+            /* catalog đã được backend lọc theo từ khoá → hiển thị trực tiếp */
+            var rows = catalog.slice(0, 100);
+            var total = catalog.length;
             var countEl = document.getElementById('ips-sig-count');
-            if (countEl) countEl.textContent = 'Showing ' + rows.length + ' of ' + total;
+            if (countEl) {
+                countEl.textContent = 'Showing ' + rows.length + ' of ' + total;
+                if (catalogTrunc)
+                    countEl.textContent += ' — too many to list, refine your search';
+            }
             if (!rows.length) { tb.innerHTML = '<tr><td colspan="6">No signatures.</td></tr>'; return; }
             var frag = document.createDocumentFragment();
             rows.forEach(function (s) {
@@ -4743,11 +4888,15 @@
             tb.appendChild(frag);
         }
 
-        function populateCategorySelect() {
+        function populateCategorySelect(categories) {
             var sel = document.getElementById('ips-filter-cat');
             if (!sel) return;
             var cats = {};
-            catalog.forEach(function (s) { if (s.category) cats[s.category] = 1; });
+            /* Ưu tiên danh sách đầy đủ từ backend; fallback: suy từ catalog đã tải. */
+            if (categories && categories.length)
+                categories.forEach(function (c) { if (c) cats[c] = 1; });
+            else
+                catalog.forEach(function (s) { if (s.category) cats[s.category] = 1; });
             sel.innerHTML = '<option value="all">all (every category)</option>';
             Object.keys(cats).sort().forEach(function (c) {
                 var o = document.createElement('option');
@@ -4769,14 +4918,14 @@
         function openModal2() {
             modal.style.display = 'flex';
             setTab('signature');
-            if (!catalog.length) loadCatalog();
-            else renderCatalog('');
+            loadCatalog('');
         }
         function closeModal2() { modal.style.display = 'none'; }
 
         /* Buffer a filter entry locally; saved to DB when the profile is saved. */
-        function addFilter(type, value) {
-            pendingFilters.push({ type: type, value: value });
+        function addFilter(type, value, action) {
+            pendingFilters.push({ type: type, value: value,
+                                  action: action || 'default' });
             return Promise.resolve();
         }
 
@@ -4833,7 +4982,9 @@
                             return api('/config/security_ips-filter', {
                                 method: 'POST',
                                 body: { id: id, profile: savedName, type: pf.type,
-                                        value: pf.value, status: 'enable' }
+                                        value: pf.value,
+                                        action: pf.action || 'default',
+                                        status: 'enable' }
                             });
                         }));
                     })
@@ -4863,7 +5014,7 @@
         var search = document.getElementById('ips-sig-search');
         if (search) search.addEventListener('input', function () {
             clearTimeout(_searchTimer);
-            _searchTimer = setTimeout(function () { renderCatalog(search.value); }, 200);
+            _searchTimer = setTimeout(function () { loadCatalog(search.value.trim()); }, 250);
         });
         var allCb = document.getElementById('ips-sig-all');
         if (allCb) allCb.addEventListener('change', function () {
@@ -4874,19 +5025,20 @@
 
         var okBtn = document.getElementById('ips-sig-ok');
         if (okBtn) okBtn.addEventListener('click', function () {
+            var action   = (document.getElementById('ips-sig-action') || {}).value || 'default';
             var activeTab = document.querySelector('.ips-tab.active');
             var tab      = activeTab ? activeTab.dataset.tab : 'signature';
             var jobs     = [];
             if (tab === 'signature') {
                 document.querySelectorAll('.ips-sig-cb:checked').forEach(function (cb) {
-                    jobs.push(addFilter('signature', cb.dataset.sid));
+                    jobs.push(addFilter('signature', cb.dataset.sid, action));
                 });
                 if (!jobs.length) { showToast('Select at least 1 signature', 'error'); return; }
             } else {
                 var sel = document.getElementById('ips-filter-cat');
                 var cat = sel ? sel.value : '';
                 if (!cat) { showToast('Select a category', 'error'); return; }
-                jobs.push(addFilter('category', cat));
+                jobs.push(addFilter('category', cat, action));
             }
             Promise.all(jobs).then(function () {
                 showToast('Added ' + jobs.length + ' item(s)', 'success');
@@ -4912,7 +5064,7 @@
             if (!id) return;
             api('/config/security_ips-filter/' + encodeURIComponent(id), { method: 'DELETE' })
                 .then(function () { renderProfileFilters(); })
-                .catch(function () { showToast('Delete failed', 'error'); });
+                .catch(function (err) { showToast(err.message || 'Delete failed', 'error'); });
         });
 
         /* Render filter list when profile form opens (create + edit). */
@@ -5679,12 +5831,55 @@
         });
     }
 
-    /* IPS profile select on the policy form — list profiles + keep "none". */
+    /* IPS profile select on the policy form. Bỏ "none" (đã thay bằng toggle
+     * ips-status); mặc định built-in "default" (toàn bộ signature) luôn đầu. */
     function populateIpsProfileSelects() {
         return cachedApi('/config/security_ips-profile').then(function (data) {
-            if (!data || !data.entries) return;
+            var entries = (data && data.entries) ? data.entries : [];
             document.querySelectorAll('.ips-profile-select').forEach(function (sel) {
-                populateSelectFrom(sel, data.entries, 'none');
+                var cur = sel.value || 'default';
+                sel.innerHTML = '';
+                var def = document.createElement('option');
+                def.value = 'default';
+                def.textContent = 'default';
+                sel.appendChild(def);
+                entries.forEach(function (e) {
+                    var eid = e.id || e.name || '';
+                    if (!eid || eid === 'default') return;
+                    var opt = document.createElement('option');
+                    opt.value = eid;
+                    opt.textContent = eid;
+                    sel.appendChild(opt);
+                });
+                selectOption(sel, cur);
+            });
+        }).catch(function () {});
+    }
+
+    /* SSL inspection profile select on the policy form. Default is the
+     * built-in "no-inspection" (always first, always selected by default);
+     * configured profiles follow. Built fresh so no-inspection is never
+     * duplicated even though it's a real DB entry. */
+    function populateSslProfileSelects() {
+        return cachedApi('/config/security_ssl-inspection-profile').then(function (data) {
+            var entries = (data && data.entries) ? data.entries : [];
+            document.querySelectorAll('.ssl-profile-select').forEach(function (sel) {
+                var cur = sel.value || 'no-inspection';
+                sel.innerHTML = '';
+                var def = document.createElement('option');
+                def.value = 'no-inspection';
+                def.textContent = 'no-inspection';
+                sel.appendChild(def);
+                entries.forEach(function (e) {
+                    var eid = e.id || e.name || '';
+                    if (!eid || eid === 'no-inspection') return;
+                    var opt = document.createElement('option');
+                    opt.value = eid;
+                    opt.textContent = eid;
+                    sel.appendChild(opt);
+                });
+                sel.value = cur;
+                if (!sel.value) sel.value = 'no-inspection';
             });
         }).catch(function () {});
     }
@@ -5695,6 +5890,7 @@
     populateAddrSelects();
     populateSvcSelects();
     populateIpsProfileSelects();
+    populateSslProfileSelects();
 
     function loadFirmwareInfo() {
         return api('/system/firmware').then(function (data) {

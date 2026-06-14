@@ -28,8 +28,7 @@
 /* ---- connmark bits IPS (tách rời DIRTY bit0 + policy_id bit8-31 của mgmtd) -- */
 #define SG_CMK_IPS_BLOCK       0x00000002u   /* bit 1 — flow kết án → DROP       */
 #define SG_CMK_IPS_INSPECTED   0x00000004u   /* bit 2 — soi xong → offload       */
-#define SG_CMK_IPS_WATCH       0x00000008u   /* bit 3 — giữ soi quá K (keep-alive)*/
-#define SG_CMK_IPS_MASK        0x0000000Eu   /* bit 1-3                          */
+#define SG_CMK_IPS_MASK        0x00000006u   /* bit 1-2                          */
 
 /* ---- context NFQUEUE ------------------------------------------------------ */
 struct nfq_ctx {
@@ -60,6 +59,17 @@ struct nfq_pkt {
 
 	/* TCP window của gói SYN forward (feature #13); -1 nếu không phải SYN */
 	int32_t   init_win;
+
+	/* IPS profile id của flow = low byte skb mark (NFQA_MARK), do mgmtd MARK
+	 * rule per-policy đặt. 1..31 = profile; 0 = không rõ → soi mọi rule. */
+	uint8_t   ips_prof_id;
+
+	/* Thời điểm kernel đưa gói vào NFQUEUE (NFQA_TIMESTAMP, epoch giây) = lúc
+	 * gói tấn công được GHI NHẬN. 0 = không có timestamp wall-clock đáng tin
+	 * (kernel không gửi, HOẶC gửi monotonic/uptime — bị nfq_recv loại) → người
+	 * ghi log fallback time(NULL). Khi >0 thì chính xác hơn giờ-lúc-ghi-log
+	 * dưới burst (userspace trễ sau queue của kernel). */
+	int64_t   cap_sec;
 
 	/* L4 payload (trỏ vào raw_buf) */
 	const uint8_t *payload;
@@ -115,6 +125,7 @@ static inline void nfq_pkt_to_flow_ctx(const struct nfq_pkt *p,
 	fc->tcp_flags = p->tcp_flags;
 	fc->established = 0;   /* P6 — caller (main.c) đặt lại từ conntrack/dir */
 	fc->to_server   = 1;
+	fc->prof_id     = p->ips_prof_id; /* per-policy scoping (skb mark) */
 	fc->fb          = NULL; /* P5 — chỉ flow TCP có pool mới track cờ */
 	fc->bufs        = NULL; /* P6 — caller trích vùng cho TCP đã ghép */
 }

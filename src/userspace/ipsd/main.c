@@ -19,13 +19,15 @@
 #include "nfq.h"
 #include "ctdump.h"
 #include "engine.h"
+#include "ips_model.h"   /* ips_score — gọi tại checkpoint */
 #include "flow_rule.h"
 #include "sig_reload.h"
 #include "fusion.h"
 #include "feature.h"
 #include "reass.h"
 #include "proto_buf.h"
-#include "http_tx.h"
+#include "ml_scan.h"
+#include "insp_ipc.h"   /* Phase 4: IPC inspection server (HTTPS-deep) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,6 +37,8 @@
 #include <time.h>
 #include <errno.h>
 #include <sys/select.h>
+#include <sys/stat.h>     /* mkdir — đảm bảo /etc/stargazer/logs tồn tại */
+#include <fcntl.h>        /* open O_APPEND — alert log fd giữ mở */
 #include <arpa/inet.h>
 
 /* IPC mgmtd — chỉ dùng để đọc config, không bắt buộc */
@@ -44,6 +48,7 @@
 #define MGMTD_SOCK      "/run/stargazer-mgmtd.sock"
 #define DEFAULT_RULES   "/etc/stargazer/ips/rules/active.rules"
 #define ALERT_LOG       "/etc/stargazer/logs/ips-alert.log"
+#define PID_FILE        "/run/stargazer-ipsd.pid"   /* logrotate gửi SIGHUP tới pid này */
 
 /* ---- config -------------------------------------------------------------- */
 
@@ -75,39 +80,123 @@ static void handle_stop(int sig) { (void)sig; g_stop = 1; }
 
 /* ---- alert log ----------------------------------------------------------- */
 
-static FILE *g_logfp;
+/* Đếm số alert đã ghi — telemetry để chẩn đoán "alert log trống". */
+unsigned long g_alert_logged;
+
+/* fd alert log giữ mở suốt vòng đời daemon → 1 write()/alert thay vì
+ * open+write+close (3 syscall). Lúc burst (đang bị quét/tấn công) alert
+ * dồn dập, chi phí mỗi alert nằm thẳng trên đường đi của gói nên phải rẻ.
+ * O_APPEND: kernel luôn ghi cuối file ⇒ `alerts-clear` (mgmtd open O_TRUNC)
+ * cắt file về 0 không tạo sparse hole, và không cần fflush thủ công vì
+ * write() đi thẳng kernel (không qua buffer libc → alert hiện ngay cho
+ * mgmtd read_last_lines). -1 = chưa mở / mở lỗi. */
+static int g_alert_fd = -1;
+
+/* SIGHUP = logrotate báo "đã xoay file". Handler chỉ bật cờ (open() KHÔNG
+ * async-signal-safe → không gọi trong handler); main loop đóng+mở lại fd. */
+static volatile sig_atomic_t g_log_reopen;
+
+static void handle_hup(int sig) { (void)sig; g_log_reopen = 1; }
+
+static void log_open(void)
+{
+	/* O_CLOEXEC: ip/dmesg fork ra không kế thừa fd. 0640: /etc/stargazer/logs
+	 * là 0700 root, chỉ root đọc trực tiếp — mgmtd phục vụ cho webd/cli. */
+	g_alert_fd = open(ALERT_LOG,
+			  O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0640);
+}
 
 static void log_init(void)
 {
-	g_logfp = fopen(ALERT_LOG, "a");
-	if (!g_logfp)
-		fprintf(stderr, "ipsd: cannot open alert log %s: %m\n", ALERT_LOG);
+	/* /etc/stargazer/logs là partition lưu trữ — đảm bảo dir tồn tại. */
+	mkdir("/etc/stargazer", 0755);
+	mkdir("/etc/stargazer/logs", 0755);
+	log_open();
+	if (g_alert_fd < 0)
+		fprintf(stderr, "ipsd: open %s failed: %m\n", ALERT_LOG);
+}
+
+/* SIGHUP → đóng fd cũ, mở lại theo path (giống Suricata). Nếu logrotate đã
+ * rename file cũ + tạo file mới cùng tên, lần mở này bám file mới rỗng; nếu
+ * file CHƯA bị xoay, chỉ là append tiếp đúng file đó → vô hại (idempotent),
+ * nên SIGHUP an toàn gửi bất cứ lúc nào. */
+static void log_reopen(void)
+{
+	if (g_alert_fd >= 0) close(g_alert_fd);
+	log_open();
+	if (g_alert_fd < 0)
+		fprintf(stderr, "ipsd: log reopen %s failed: %m\n", ALERT_LOG);
 }
 
 static void log_alert(const struct ips_decision *d, const struct nfq_pkt *pkt,
 		      const struct flow_ctx *fc, double score)
 {
-	FILE *f = g_logfp ? g_logfp : stderr;
 	char src[INET_ADDRSTRLEN], dst[INET_ADDRSTRLEN];
 	struct in_addr sa, da;
 	sa.s_addr = htonl(pkt->src_ip); inet_ntop(AF_INET, &sa, src, sizeof(src));
 	da.s_addr = htonl(pkt->dst_ip); inet_ntop(AF_INET, &da, dst, sizeof(dst));
 
-	time_t now = time(NULL);
+	/* Date/Time = thời điểm gói tấn công được GHI NHẬN, lấy từ kernel
+	 * (NFQA_TIMESTAMP lúc gói vào queue). Vắng (cap_sec=0, kernel không set
+	 * skb->tstamp) → fallback giờ hiện tại lúc ghi log. Dưới burst userspace
+	 * trễ sau queue nên cap_sec phản ánh đúng thời điểm tấn công hơn. */
+	time_t now = (pkt->cap_sec > 0) ? (time_t)pkt->cap_sec : time(NULL);
 	struct tm tm; localtime_r(&now, &tm);
 	char ts[24]; strftime(ts, sizeof(ts), "%F %T", &tm);
 
 	const char *msg = d->matched_msg[0] ? d->matched_msg :
 		((d->reason == IPS_R_ML_BLOCK || d->reason == IPS_R_ML_ALERT)
 			? "ML-ANOMALY" : "");
-	fprintf(f, "%s %s proto=%u src=%s:%u dst=%s:%u "
-		"reason=%s score=%.3f sid=%u msg=%s\n",
+	(void)fc;   /* fc->proto là enum SIG_PROTO_*, KHÔNG phải IP proto — dùng pkt */
+	/* score < 0 = ML chưa chấm (khớp signature thuần) → in "n/a" cho rõ. */
+	char scorebuf[16];
+	if (score >= 0) snprintf(scorebuf, sizeof(scorebuf), "%.3f", score);
+	else            snprintf(scorebuf, sizeof(scorebuf), "n/a");
+	char line[512];
+	int ln = snprintf(line, sizeof(line),
+		"%s %s proto=%u src=%s:%u dst=%s:%u "
+		"reason=%s score=%s sid=%u msg=%s\n",
 		ts, ips_verdict_str(d->verdict),
-		fc->proto, src, pkt->sport, dst, pkt->dport,
-		ips_reason_str(d->reason), score,
-		d->matched_sid,
-		msg);
-	fflush(f);
+		pkt->proto, src, pkt->sport, dst, pkt->dport,
+		ips_reason_str(d->reason), scorebuf,
+		d->matched_sid, msg);
+	if (ln < 0) ln = 0;
+
+	/* fd chưa mở (init lỗi / log-partition mới mount) → thử mở lại 1 lần.
+	 * Vẫn lỗi thì rơi xuống stderr — đừng nuốt alert lặng lẽ (honesty first).
+	 * write() O_APPEND lên file thường là atomic ⇒ không xé dòng giữa các
+	 * alert dù sau này có nhiều writer. */
+	if (g_alert_fd < 0)
+		log_open();
+	int fd = (g_alert_fd >= 0) ? g_alert_fd : STDERR_FILENO;
+	if (write(fd, line, (size_t)ln) < 0 && fd != STDERR_FILENO) {
+		/* fd hỏng giữa chừng (ENOSPC/EIO/EBADF do file bị thay) → mở lại
+		 * rồi thử lần nữa; cùng đường thì stderr. */
+		log_reopen();
+		int rfd = (g_alert_fd >= 0) ? g_alert_fd : STDERR_FILENO;
+		if (write(rfd, line, (size_t)ln) < 0)
+			fprintf(stderr, "ipsd: alert log write failed: %m\n");
+	}
+	g_alert_logged++;
+}
+
+/* ---- pid file ------------------------------------------------------------ */
+
+/* logrotate (postrotate) đọc PID_FILE để biết gửi SIGHUP cho ai. mgmtd
+ * supervise ipsd qua fork+exec nên tự biết pid; file này dành cho công cụ
+ * xoay log bên ngoài. */
+static void write_pidfile(void)
+{
+	int fd = open(PID_FILE, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+	if (fd < 0) {
+		fprintf(stderr, "ipsd: write %s failed: %m\n", PID_FILE);
+		return;
+	}
+	char buf[16];
+	int n = snprintf(buf, sizeof(buf), "%d\n", (int)getpid());
+	if (n > 0 && write(fd, buf, (size_t)n) < 0)
+		fprintf(stderr, "ipsd: write %s failed: %m\n", PID_FILE);
+	close(fd);
 }
 
 /* ---- đọc config từ mgmtd (best-effort) ----------------------------------- */
@@ -188,6 +277,26 @@ done:
  * (LRU theo thời gian là cải tiến sau; va-chạm-evict đã chặn bộ nhớ an toàn.)   */
 #define FLOW_BUCKETS 512
 
+/* CHECKPOINT inference — ngưỡng rút từ phân tích thống kê CIC-IDS-2017
+ * (2.83 triệu flow): chấm ML đúng 1 lần khi flow chạm trigger ĐẦU TIÊN trong
+ * {FIN/RST, N gói, K byte, T tuổi}, miễn signature CHƯA khớp gói nào. Cơ sở:
+ *   FIN/RST → flow KẾT THÚC: chấm trên flow hoàn chỉnh, BẮT flow NGẮN (PortScan
+ *             ~2 gói/~0s) vốn không bao giờ chạm cap gói/byte/thời gian.
+ *   N=24  → phủ ~hoàn-chỉnh DoS/DDoS (≤16 gói: 95-100%) + Patator (≤32: 100%).
+ *   K=14KB→ ngay dưới byte-window kernel 16KB (bắt flow nặng trước khi offload).
+ *   T=12s → khe giữa flow thường (<2s) và slow-DoS (60-97s) → bắt slow sớm. */
+#define ML_CKP_PKTS    24u
+#define ML_CKP_BYTES   14000u
+#define ML_CKP_AGE_NS  12000000000ULL   /* 12 giây (ns) */
+
+/* now theo CLOCK_MONOTONIC ns — cùng đồng hồ với kernel first_ns (ktime_get_ns). */
+static uint64_t mono_ns(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
 struct flow_key {
 	uint32_t ip_a, ip_b;
 	uint16_t port_a, port_b;
@@ -201,7 +310,7 @@ struct flow_slot {
 	uint16_t          init_port;
 	struct reass_flow rf;
 	struct flowbit_state fb;      /* P5 — cờ flowbits per-flow */
-	struct http_tx      htx;      /* P1 re-arm — transaction HTTP per-flow */
+	uint8_t             ml_done;  /* đã chấm ML tại checkpoint (1 lần/flow) */
 };
 
 static struct flow_slot g_flows[FLOW_BUCKETS];
@@ -252,7 +361,7 @@ static struct flow_slot *flow_get(const struct nfq_pkt *pkt,
 		s->init_ip   = pkt->src_ip;             /* gói đầu thấy = initiator */
 		s->init_port = pkt->sport;
 		memset(&s->fb, 0, sizeof(s->fb));       /* P5 — flow mới: cờ sạch */
-		http_tx_init(&s->htx, 0);               /* P1 re-arm: budget = K mặc định */
+		s->ml_done = 0;                         /* flow mới: chưa chấm ML */
 	}
 	int to_server = (pkt->src_ip == s->init_ip && pkt->sport == s->init_port);
 	*dir_out = to_server ? REASS_TO_SERVER : REASS_TO_CLIENT;
@@ -272,9 +381,15 @@ struct l2_match {
 	int bufs_dir;
 	uint32_t bufs_contig;
 };
+/* Khoanh vùng vì sao L2 không match: ac_raw = số lần AC prefilter trúng (trước
+ * sig_verify); flow_oom = số gói rơi vào đường per-packet (flow_get NULL). */
+static unsigned long g_ac_raw, g_flow_oom, g_tcp_payload;
+extern unsigned long g_reass_fed;   /* byte thực sự feed vào AC (reass.c) */
+
 static int l2_on_match(int rule_id, uint64_t end_off, int dir, void *ctx)
 {
 	(void)end_off;
+	g_ac_raw++;                 /* AC prefilter trúng (trước sig_verify) */
 	struct l2_match *m = ctx;
 	uint32_t clen;
 	const uint8_t *buf = reass_dir_buf(m->rf, dir, &clen);
@@ -326,12 +441,47 @@ static struct ips_decision make_failclosed(const struct ips_config *cfg)
 	return d;
 }
 
+/* ---- telemetry runtime — soi đường NFQUEUE trên thiết bị (không có shell).
+ * Ghi /run/stargazer-ipsd.rt; handle_ips_status đính vào `execute diagnose ips
+ * status`. pkt_seen=0 → kernel KHÔNG giao gói (queue bind fail). pkt_seen>0 +
+ * pkt_accept>0 mà traffic vẫn treo → verdict không release. recv_err cao →
+ * nfq_recv parse fail. ------------------------------------------------------ */
+static unsigned long g_pkt_seen, g_pkt_accept, g_pkt_drop, g_recv_err;
+/* Phân loại nguồn phát hiện:
+ *   flow_anomaly = L1-builtin (SYN-flood/port-scan, KHÔNG phải signature)
+ *   l2_sig       = signature dựa-content (rule người dùng — 9000001/9000002…)
+ *   ml           = ML scoring
+ * l2_sig=0 mà gửi traffic có pattern → content-signature KHÔNG match (bug L2). */
+static unsigned long g_anomaly_hits, g_l2_hits, g_ml_hits;
+
+static void write_rt_stats(void)
+{
+	FILE *f = fopen("/run/stargazer-ipsd.rt.tmp", "w");
+	if (!f) return;
+	fprintf(f, "pkt_seen=%lu\npkt_accept=%lu\npkt_drop=%lu\npkt_recv_err=%lu\n"
+		   "hits_flow_anomaly=%lu\nhits_l2_sig=%lu\nhits_ml=%lu\n"
+		   "ac_raw=%lu\nflow_oom=%lu\ntcp_payload=%lu\nreass_fed=%lu\n"
+		   "alerts_logged=%lu\n",
+		g_pkt_seen, g_pkt_accept, g_pkt_drop, g_recv_err,
+		g_anomaly_hits, g_l2_hits, g_ml_hits, g_ac_raw, g_flow_oom,
+		g_tcp_payload, g_reass_fed, g_alert_logged);
+	fclose(f);
+	rename("/run/stargazer-ipsd.rt.tmp", "/run/stargazer-ipsd.rt");
+}
+
 /* ---- xử lý một gói từ NFQUEUE ------------------------------------------- */
 
 static void process_packet(struct nfq_ctx *nfq, struct nfq_pkt *pkt,
 			    struct sig_reload *sr,
 			    const struct ips_config *ips_cfg)
 {
+	/* [0] Gói SYN forward (SYN set, ACK clear) mang Init_Win_bytes_forward —
+	 * lưu cache cho vòng ML scoring (conntrack dump KHÔNG có window này). */
+	if (pkt->proto == 6 && pkt->init_win >= 0 &&
+	    (pkt->tcp_flags & SIG_TCP_SYN) && !(pkt->tcp_flags & SIG_TCP_ACK))
+		ml_iwin_put(pkt->proto, pkt->src_ip, pkt->dst_ip,
+			    pkt->sport, pkt->dport, pkt->init_win);
+
 	/* [1] Lấy flow stats từ conntrack */
 	struct ctdump_result ctr;
 	int ct_ok = (ctdump_query(pkt->src_ip, pkt->dst_ip,
@@ -371,7 +521,7 @@ static void process_packet(struct nfq_ctx *nfq, struct nfq_pkt *pkt,
 	pthread_rwlock_rdlock(&sr->rwlock);
 	const struct sig_ruleset *rs = sr->active;
 	struct ips_decision d;
-	int sig_watch = 0, sig_inspected = 0;   /* P1 re-arm → connmark */
+	int sig_inspected = 0;   /* ML-benign → connmark INSPECTED (offload) */
 
 	if (pkt->proto == 6 /* TCP */) {
 		/* L2 chạy trên DÒNG ĐÃ GHÉP (P1): chống né cắt-segment/đảo-chiều. */
@@ -395,24 +545,11 @@ static void process_packet(struct nfq_ctx *nfq, struct nfq_pkt *pkt,
 			}
 
 			int rrc = REASS_OK;
-			if (pkt->payload && pkt->plen)
+			if (pkt->payload && pkt->plen) {
+				g_tcp_payload++;        /* gói TCP có payload tới reass */
 				rrc = reass_segment(&slot->rf, dir, pkt->tcp_seq,
 						    pkt->payload, pkt->plen,
 						    l2_on_match, &mm);
-
-			/* P1 re-arm — chỉ chiều to_server: parse transaction HTTP,
-			 * re-arm mỗi request, skip thân quá budget, free (RAM phẳng).
-			 * Tín hiệu: anomaly→fail-closed; want_inspected→offload;
-			 * want_watch→giữ IPS_WATCH (soi mọi transaction keep-alive). */
-			if (rrc != REASS_FAILCLOSED && dir == REASS_TO_SERVER) {
-				http_tx_step(&slot->htx, &slot->rf,
-					     l2_on_match, &mm);
-				if (slot->htx.anomaly)
-					rrc = REASS_FAILCLOSED;
-				else if (slot->htx.want_inspected)
-					sig_inspected = 1;
-				else if (slot->htx.want_watch)
-					sig_watch = 1;
 			}
 
 			if (rrc == REASS_FAILCLOSED)
@@ -422,8 +559,49 @@ static void process_packet(struct nfq_ctx *nfq, struct nfq_pkt *pkt,
 						      feat, ct_ok ? &fs : NULL,
 						      1, mm.best_idx,
 						      mm.best_action);
+
+			/* CHECKPOINT: signature CHƯA khớp gói nào + flow chạm trigger
+			 * ĐẦU TIÊN {FIN/RST, N gói, K byte, T tuổi} → ML phán quyết
+			 * ĐÚNG 1 LẦN trên feature TÍCH LŨY. init_win lấy từ cache (gói
+			 * hiện tại không phải SYN → pkt->init_win=-1). Chấm xong: lành/
+			 * alert → offload (INSPECTED); độc (prevent) → block. */
+			if (d.verdict == IPS_PASS && d.sig_rule == -1 &&
+			    !slot->ml_done && ct_ok && ctr.ml_valid) {
+				uint32_t N = fs.pkts_fwd + fs.pkts_bwd;
+				uint64_t B = ctr.ml.bytes_fwd + ctr.ml.bytes_bwd;
+				uint64_t now = mono_ns();
+				uint64_t age = (ctr.ml.first_ns && now > ctr.ml.first_ns)
+					       ? now - ctr.ml.first_ns : 0;
+				/* T1 — flow kết thúc: chấm trên flow hoàn chỉnh, bắt flow
+				 * NGẮN (PortScan ~2 gói) không bao giờ chạm cap dưới đây. */
+				int fin_rst = (pkt->tcp_flags &
+					       (SIG_TCP_FIN | SIG_TCP_RST)) != 0;
+				if (fin_rst || N >= ML_CKP_PKTS || B >= ML_CKP_BYTES ||
+				    age >= ML_CKP_AGE_NS) {
+					int32_t iwin = ml_iwin_get(pkt->proto,
+						pkt->src_ip, pkt->dst_ip,
+						pkt->sport, pkt->dport);
+					if (iwin < 0) iwin = pkt->init_win;
+					ctdump_to_features(&ctr, fs.pkts_fwd,
+						fs.pkts_bwd, iwin, feat);
+					double sc = ips_score(feat);
+					d = ips_fuse(ips_cfg, -1, 0, sc);
+					d.ml_evaluated = 1;
+					d.score        = sc;
+					slot->ml_done  = 1;
+					/* Đã chấm xong flow này → offload trừ khi DROP (DROP đã
+					 * offload qua IPS_BLOCK). Gồm cả ALERT (detect mode). */
+					if (d.verdict != IPS_DROP)
+						sig_inspected = 1;
+					ml_record_score(pkt->proto, pkt->src_ip,
+						pkt->dst_ip, pkt->sport,
+						pkt->dport, N, ctr.ml.syn_count,
+						ctr.ml.ack_count, iwin, sc);
+				}
+			}
 		} else {
 			/* pool OOM → fallback khớp per-packet (không reass) */
+			g_flow_oom++;
 			d = ips_evaluate(ips_cfg, rs, pkt->payload, pkt->plen,
 					 &fc, feat, ct_ok ? &fs : NULL);
 		}
@@ -435,12 +613,11 @@ static void process_packet(struct nfq_ctx *nfq, struct nfq_pkt *pkt,
 	pthread_rwlock_unlock(&sr->rwlock);
 
 	/* [3] Verdict + connmark.
-	 *   - DROP        : NF_DROP + IPS_BLOCK → rule DROP đầu chain chặn flow.
-	 *   - WATCH (P1)  : HTTP keep-alive còn transaction → set IPS_WATCH (băng B
-	 *                   giữ flow trong queue, soi MỌI transaction quá K).
-	 *   - INSPECTED   : Connection: close / non-HTTP / hết → set IPS_INSPECTED,
-	 *                   xoá WATCH → offload (khỏi queue). Băng A đã có ! INSPECTED.
-	 * WATCH/INSPECTED loại trừ nhau; set bit này thì xoá bit kia (qua mask). */
+	 *   - DROP      : NF_DROP + IPS_BLOCK → rule DROP đầu chain chặn flow.
+	 *   - INSPECTED : ML checkpoint phán lành → set IPS_INSPECTED → offload
+	 *                 (khỏi queue). Băng A đã có ! INSPECTED. Trước checkpoint:
+	 *                 không đặt gì → cổng connbytes 0:K giữ soi liên tục, hết K
+	 *                 thì tự offload. */
 	uint32_t connmark = 0, cmask = 0;
 	int accept = 1;
 
@@ -449,15 +626,19 @@ static void process_packet(struct nfq_ctx *nfq, struct nfq_pkt *pkt,
 		connmark = SG_CMK_IPS_BLOCK;
 		cmask    = SG_CMK_IPS_MASK;
 	} else if (sig_inspected) {
-		connmark = SG_CMK_IPS_INSPECTED;                 /* set INSPECTED, xoá WATCH */
-		cmask    = SG_CMK_IPS_INSPECTED | SG_CMK_IPS_WATCH;
-	} else if (sig_watch) {
-		connmark = SG_CMK_IPS_WATCH;                      /* set WATCH */
-		cmask    = SG_CMK_IPS_WATCH;
+		connmark = SG_CMK_IPS_INSPECTED;
+		cmask    = SG_CMK_IPS_INSPECTED;
 	}
 
 	if (nfq_verdict(nfq, pkt->id, accept, connmark, cmask) < 0)
 		fprintf(stderr, "ipsd: nfq_verdict failed: %m\n");
+	if (accept) g_pkt_accept++; else g_pkt_drop++;
+	/* Phân loại nguồn phát hiện (mọi verdict != PASS, kể cả ALERT ở detect). */
+	if (d.verdict != IPS_PASS) {
+		if (d.sig_rule == -2)      g_anomaly_hits++; /* L1-builtin flow anomaly */
+		else if (d.sig_rule >= 0)  g_l2_hits++;      /* L2 content-signature */
+		else                       g_ml_hits++;      /* ML */
+	}
 
 	/* [4] Log alert */
 	if (d.verdict != IPS_PASS)
@@ -559,6 +740,12 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	/* Phase 4 (additive): IPC inspection server cho HTTPS-deep từ ssld. Dùng
+	 * chung ruleset (rdlock) với NFQUEUE. Lỗi → log + chạy tiếp không IPC. */
+	if (insp_ipc_start(&sr, &g_cfg) != 0)
+		fprintf(stderr, "ipsd: insp_ipc server không khởi động được "
+			"(HTTPS-deep sẽ dùng fallback per-chunk của ssld)\n");
+
 	struct nfq_ctx nfq;
 	if (nfq_open(&nfq, g_cfg.queue_num) < 0) {
 		fprintf(stderr, "ipsd: cannot open NFQUEUE %u: %m\n",
@@ -580,15 +767,34 @@ int main(int argc, char **argv)
 	sigemptyset(&sa_stop.sa_mask);
 	sigaction(SIGTERM, &sa_stop, NULL);
 	sigaction(SIGINT,  &sa_stop, NULL);
+	/* SIGHUP → logrotate: đóng+mở lại alert log. KHÔNG SA_RESTART để select()
+	 * bị ngắt ngay (select không tự restart kể cả có SA_RESTART), main loop
+	 * thấy cờ và reopen ở vòng kế. */
+	struct sigaction sa_hup = { .sa_handler = handle_hup };
+	sigemptyset(&sa_hup.sa_mask);
+	sigaction(SIGHUP, &sa_hup, NULL);
 	/* SIGUSR1 đã được sig_reload_init đăng ký (→ self-pipe) */
+
+	/* PID file cho công cụ xoay log ngoài (logrotate postrotate kill -HUP). */
+	write_pidfile();
 
 	fprintf(stderr, "ipsd: ready (%d rules, queue %u)\n",
 		sr.active->n_rules, g_cfg.queue_num);
+
+	/* ML chấm inline tại CHECKPOINT min(N,K,T) trong process_packet — không
+	 * còn thread polling. Điểm ghi qua ml_record_score → ml_scores_flush. */
 
 	/* [4] Main event loop */
 	struct nfq_pkt pkt;
 
 	while (!g_stop) {
+		/* SIGHUP (logrotate) → đóng+mở lại alert log. Đặt ở đầu vòng để bắt
+		 * cả trường hợp select() trả EINTR và `continue` bên dưới. */
+		if (g_log_reopen) {
+			g_log_reopen = 0;
+			log_reopen();
+		}
+
 		fd_set rfds;
 		int maxfd = nfq.fd > sr.pipe_rd ? nfq.fd : sr.pipe_rd;
 
@@ -611,20 +817,27 @@ int main(int argc, char **argv)
 
 		/* gói từ NFQUEUE */
 		if (FD_ISSET(nfq.fd, &rfds)) {
-			if (nfq_recv(&nfq, &pkt) == 0)
+			if (nfq_recv(&nfq, &pkt) == 0) {
+				g_pkt_seen++;
 				process_packet(&nfq, &pkt, &sr, &ips_cfg);
+			} else {
+				g_recv_err++;
+			}
 		}
+		write_rt_stats();   /* throttle tự nhiên: ≥1 lần/giây qua select timeout */
+		ml_scores_flush();  /* đẩy điểm checkpoint ra /run/...scores */
 	}
 
 	/* [5] Graceful shutdown */
 	fprintf(stderr, "ipsd: shutting down\n");
+	unlink(PID_FILE);
+	if (g_alert_fd >= 0) close(g_alert_fd);
 	nfq_close(&nfq);
 	for (int i = 0; i < FLOW_BUCKETS; i++)
 		if (g_flows[i].key.used)
 			reass_flow_free(&g_flows[i].rf);
 	sig_reload_wait(&sr);
 	sig_reload_free(&sr);
-	if (g_logfp) fclose(g_logfp);
 
 	return 0;
 }

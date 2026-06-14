@@ -1210,6 +1210,60 @@ static int cmd_diag_ips_alerts(const char *args, const char *permissions)
 	return 0;
 }
 
+static int cmd_diag_ips_scores(const char *args, const char *permissions)
+{
+	(void)permissions;
+	char payload[64] = "";
+	if (args && args[0])
+		snprintf(payload, sizeof(payload), "lines=%s\n", args);
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_IPS_SCORES, payload, &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+	if (resp.status != SG_OK)
+		print_ipc_error("Failed", &resp);
+	else if (resp.payload && resp.payload_len > 0)
+		printf("%s", resp.payload);
+	ipc_resp_free(&resp);
+	return 0;
+}
+
+static int cmd_diag_ssl(const char *args, const char *permissions)
+{
+	(void)args; (void)permissions;
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_SSL_DIAG, "", &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+	if (resp.status != SG_OK)
+		print_ipc_error("Failed", &resp);
+	else if (resp.payload && resp.payload_len > 0)
+		printf("%s", resp.payload);
+	ipc_resp_free(&resp);
+	return 0;
+}
+
+static int cmd_diag_ips_alerts_clear(const char *args, const char *permissions)
+{
+	(void)args; (void)permissions;
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_IPS_ALERTS_CLEAR, "", &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+	if (resp.status != SG_OK)
+		print_ipc_error("Clear failed", &resp);
+	else
+		printf("  IPS alert log cleared.\n");
+	ipc_resp_free(&resp);
+	return 0;
+}
+
 static int cmd_ips_reload(const char *args, const char *permissions)
 {
 	(void)args; (void)permissions;
@@ -1404,9 +1458,14 @@ static int cmd_ssl_cacert(const char *args, const char *permissions)
 		ipc_resp_free(&resp);
 		return 0;
 	}
-	/* In nguyên PEM ra stdout — admin copy/scp về cài vào client trust store */
+	/* In nguyên PEM ra stdout — admin copy/scp về cài vào client trust store.
+	 * Output rỗng = CA chưa sinh (chưa bật profile deep nào) — gợi ý rõ. */
 	if (resp.payload && resp.payload_len > 0)
 		printf("%s", resp.payload);
+	else
+		printf("  CA chưa tồn tại — tạo SSL inspection profile chế độ "
+		       "deep rồi gán vào firewall policy để stargazer-ssld sinh "
+		       "CA tự động.\n");
 	ipc_resp_free(&resp);
 	return 0;
 }

@@ -62,17 +62,17 @@ int main(void)
 	check(d.verdict == IPS_ALERT && d.reason == IPS_R_SIGNATURE, "ALERT do signature");
 	check(d.ml_evaluated == 0,          "ML KHÔNG chạy với rule alert");
 
-	printf("T3 không signature → ML chạy:\n");
+	printf("T3 không signature → PASS no-match (ML hoãn tới checkpoint):\n");
 	d = eval(&prevent, &rs, "totally harmless payload", feat);
-	check(d.ml_evaluated == 1,          "ML CHẠY (ml_evaluated=1)");
-	check(d.score >= 0.0 && d.score <= 1.0, "score ∈ [0,1]");
+	check(d.ml_evaluated == 0,          "engine KHÔNG chạy ML (ml_evaluated=0)");
+	check(d.verdict == IPS_PASS,        "verdict PASS (chờ checkpoint)");
 	check(d.sig_rule == -1,             "không rule signature nào");
 
-	printf("T4 không signature + ngưỡng ép → ML DROP:\n");
-	struct ips_config force = prevent; force.thr_block = 0.0;  /* mọi score ≥0 → DROP */
+	printf("T4 không signature → vẫn PASS dù ngưỡng ép (ML không ở engine):\n");
+	struct ips_config force = prevent; force.thr_block = 0.0;
 	d = eval(&force, &rs, "totally harmless payload", feat);
-	check(d.verdict == IPS_DROP && d.reason == IPS_R_ML_BLOCK, "ML quyết DROP");
-	check(d.ml_evaluated == 1,          "ML đã chạy");
+	check(d.verdict == IPS_PASS,        "engine không tự DROP (ML ở checkpoint)");
+	check(d.ml_evaluated == 0,          "ML không chạy ở engine");
 
 	printf("T5 detect mode: signature DROP → ALERT, vẫn bỏ ML:\n");
 	d = eval(&detect, &rs, "noise EVIL noise", feat);
@@ -82,8 +82,8 @@ int main(void)
 
 	sig_ruleset_free(&rs);
 
-	/* ---- T6: L1 built-in short-circuit (SYN flood) ---- */
-	printf("T6 L1 built-in: SYN flood → DROP (bỏ ML và L2):\n");
+	/* ---- T6: L1-builtin ĐÃ GỠ — SYN-flood stats KHÔNG còn short-circuit ---- */
+	printf("T6 L1-builtin đã gỡ: flow SYN-flood không auto-DROP → ML chạy:\n");
 	{
 		struct sig_ruleset rs2;
 		sig_ruleset_init(&rs2);
@@ -98,14 +98,14 @@ int main(void)
 		struct ips_decision d2 = ips_evaluate(&prevent, &rs2,
 			(const uint8_t *)"", 0, &fc, feat, &fs);
 
-		check(d2.verdict == IPS_DROP,       "SYN flood → DROP");
-		check(d2.ml_evaluated == 0,         "ML KHÔNG chạy (L1 short-circuit)");
-		check(d2.score == -1.0,             "score = -1");
+		check(d2.ml_evaluated == 0,  "L1 gỡ + ML ở checkpoint → engine PASS");
+		check(d2.sig_rule != -2,     "không còn verdict flow-anomaly (-2)");
+		check(d2.verdict == IPS_PASS,"không short-circuit, không tự DROP");
 		sig_ruleset_free(&rs2);
 	}
 
-	/* ---- T7: L1 built-in: known-bad port → ALERT ---- */
-	printf("T7 L1 built-in: known-bad port 4444 → ALERT:\n");
+	/* ---- T7: L1-builtin ĐÃ GỠ — known-bad port KHÔNG còn auto-ALERT ---- */
+	printf("T7 L1-builtin đã gỡ: known-bad port 4444 không auto-alert → ML:\n");
 	{
 		struct sig_ruleset rs3;
 		sig_ruleset_init(&rs3);
@@ -117,8 +117,7 @@ int main(void)
 		struct ips_decision d3 = ips_evaluate(&prevent, &rs3,
 			(const uint8_t *)"some data", 9, &fc, feat, &fs);
 
-		check(d3.verdict == IPS_ALERT,      "dport 4444 → ALERT");
-		check(d3.ml_evaluated == 0,         "ML KHÔNG chạy");
+		check(d3.ml_evaluated == 0,  "known-bad port → không L1, engine PASS");
 		sig_ruleset_free(&rs3);
 	}
 
@@ -140,7 +139,7 @@ int main(void)
 		struct ips_decision d4 = ips_evaluate(&prevent, &rs4,
 			(const uint8_t *)"", 0, &fc, feat, NULL);
 
-		check(d4.ml_evaluated == 1, "không L1-user/L2 → ML chạy");
+		check(d4.ml_evaluated == 0, "không L1-user/L2 → engine PASS (ML ở checkpoint)");
 		sig_ruleset_free(&rs4);
 	}
 

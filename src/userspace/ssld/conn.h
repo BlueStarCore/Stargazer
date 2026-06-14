@@ -29,6 +29,8 @@ struct ssld_ctx {
 	struct certcache        *cc;
 	struct sig_ruleset      *rules;    /* NULL → bump không soi payload  */
 	int                      verify_upstream;
+	int                      no_ipc;         /* P4: 1 = soi per-chunk, không IPC */
+	int                      ipc_failclosed; /* P4: 1 = IPC lỗi → chặn flow */
 };
 
 struct ssld_stats {

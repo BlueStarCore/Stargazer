@@ -57,6 +57,25 @@ int ctdump_query(uint32_t src_ip, uint32_t dst_ip,
 		 uint8_t  proto,
 		 struct ctdump_result *out);
 
+/* ---- dump TẤT CẢ flow (cho vòng ML scoring) ------------------------------ */
+
+/* Một flow trong dump: 5-tuple (host order) + kết quả CTA_ML/counters. */
+struct ctdump_flow {
+	uint32_t src_ip, dst_ip;     /* host byte order */
+	uint16_t sport,  dport;      /* host byte order */
+	uint8_t  proto;
+	struct ctdump_result res;
+};
+
+/* Callback gọi cho mỗi flow trong dump. Trả 0 để tiếp tục, !=0 để dừng sớm. */
+typedef int (*ctdump_flow_cb)(const struct ctdump_flow *f, void *ctx);
+
+/*
+ * Gửi CT_GET với NLM_F_DUMP (lấy mọi flow), parse tuple + CTA_ML từng entry,
+ * gọi cb(). Trả số flow đã duyệt, -1 nếu lỗi socket/gửi.
+ */
+int ctdump_dump_all(ctdump_flow_cb cb, void *ctx);
+
 /*
  * Tiện ích: từ ctdump_result → điền flow_stats (cho engine L1) và
  * feature vector (cho engine ML). init_win_fwd lấy từ gói SYN trong NFQUEUE.

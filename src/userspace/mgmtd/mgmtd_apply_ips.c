@@ -5,8 +5,8 @@
  *
  * Kho global : /etc/stargazer/ips/repo/<category>.rules
  * Per-profile: /etc/stargazer/ips/profiles/<name>.rules
- *              compile từ bảng security_ips-filter (chọn category/signature;
- *              action giữ nguyên theo rule), hoặc fallback field `categories`
+ *              compile từ bảng security_ips-filter (category/signature + action
+ *              per-entry kiểu FortiGate, P7), hoặc fallback field `categories`
  *              nếu profile chưa có filter nào.
  * Active     : /etc/stargazer/ips/rules/active.rules = NỐI ruleset của các
  *              profile đang được policy accept dùng.
@@ -30,8 +30,10 @@
 #include <dirent.h>
 #include <sys/stat.h>
 
+#define IPS_BASE_DIR   "/etc/stargazer/ips"
 #define IPS_REPO_DIR   "/etc/stargazer/ips/repo"
 #define IPS_PROF_DIR   "/etc/stargazer/ips/profiles"
+#define IPS_RULES_DIR  "/etc/stargazer/ips/rules"
 #define IPS_ACTIVE     "/etc/stargazer/ips/rules/active.rules"
 #define IPS_ACTIVE_TMP "/etc/stargazer/ips/rules/.active.rules.tmp"
 #define IPSD_BIN       "/sbin/stargazer-ipsd"
@@ -53,9 +55,19 @@ static int parse_filter_type(const char *s)
 						  : IPS_FT_CATEGORY;
 }
 
+/* P7 — action per-entry (FortiGate). */
+static int parse_filter_action(const char *s)
+{
+	if (!s) return IPS_FA_DEFAULT;
+	if (!strcmp(s, "block")) return IPS_FA_BLOCK;
+	if (!strcmp(s, "alert")) return IPS_FA_ALERT;
+	if (!strcmp(s, "pass"))  return IPS_FA_PASS;
+	return IPS_FA_DEFAULT;
+}
+
 /*
  * Gom filter (status=enable) thuộc `profile` vào out[]. Trả số filter.
- * Chỉ CHỌN luật (type/value); action giữ nguyên theo từng rule.
+ * Mỗi entry mang type/value + action per-entry (P7).
  */
 static int gather_filters(const char *profile, struct ips_filter *out, int max)
 {
@@ -70,14 +82,16 @@ static int gather_filters(const char *profile, struct ips_filter *out, int max)
 		char *st  = sg_db_get_val("security_ips-filter", id, "status");
 		char *ty  = sg_db_get_val("security_ips-filter", id, "type");
 		char *va  = sg_db_get_val("security_ips-filter", id, "value");
+		char *ac  = sg_db_get_val("security_ips-filter", id, "action");
 
 		if (pf && strcmp(pf, profile) == 0 &&
 		    (!st || strcmp(st, "disable") != 0) && va && va[0]) {
 			out[n].type   = parse_filter_type(ty);
+			out[n].action = parse_filter_action(ac);
 			snprintf(out[n].value, sizeof(out[n].value), "%s", va);
 			n++;
 		}
-		free(pf); free(st); free(ty); free(va);
+		free(pf); free(st); free(ty); free(va); free(ac);
 	}
 	free(list);
 	return n;
@@ -112,16 +126,91 @@ static int compile_one_profile(const char *name, char *out_path, size_t opcap)
 	return r;
 }
 
-/* Nối nội dung file path vào dst. Trả 1 nếu nối được. */
-static int append_file_to(FILE *dst, const char *path)
+int ips_profile_bit(const char *name)
+{
+	if (!name || !*name)
+		return -1;
+	char *list = sg_db_list("security_ips-profile");
+	if (!list)
+		return -1;
+	int bit = -1, idx = 0;
+	char *sp = NULL;
+	for (char *id = strtok_r(list, "\n", &sp); id;
+	     id = strtok_r(NULL, "\n", &sp)) {
+		char *st = sg_db_get_val("security_ips-profile", id, "status");
+		int en = st && strcmp(st, "enable") == 0;
+		free(st);
+		if (!en)
+			continue;
+		if (idx > 30)
+			break;                  /* hết bit cho uint32 mask */
+		if (strcmp(id, name) == 0) { bit = idx; break; }
+		idx++;
+	}
+	free(list);
+	return bit;
+}
+
+/* ── Dedup theo sid khi gộp active.rules (per-policy scoping) ───────────────
+ * Một sid có thể nằm trong NHIỀU profile in-use. Aho-Corasick của ipsd chỉ giữ
+ * MỘT rule / pattern (last-wins) → emit sid trùng nhiều lần sẽ che bớt bản sao.
+ * Vì vậy gộp: mỗi sid emit ĐÚNG MỘT lần, `sgprof:` = OR bit MỌI profile chứa nó.
+ * Map sid→mask: open-addressing, key uint32, 8B/slot. */
+struct sidslot { uint32_t sid, mask; uint8_t used, emitted; };
+
+static struct sidslot *sidmap_get(struct sidslot *m, size_t cap, uint32_t sid)
+{
+	size_t i = ((size_t)sid * 2654435761u) & (cap - 1);
+	for (size_t n = 0; n < cap; n++) {
+		struct sidslot *e = &m[i];
+		if (!e->used) { e->used = 1; e->sid = sid; return e; }
+		if (e->sid == sid) return e;
+		i = (i + 1) & (cap - 1);
+	}
+	return NULL;            /* đầy (cap chọn dư) — bỏ qua dedup cho sid này */
+}
+
+/* Trích sid từ một dòng rule Suricata; 0 nếu không có. */
+static uint32_t line_sid(const char *line)
+{
+	const char *s = strstr(line, "sid:");
+	return s ? (uint32_t)strtoul(s + 4, NULL, 10) : 0;
+}
+
+/* Pass 1: quét file rule của một profile, OR bit vào mask của từng sid. */
+static void sidmap_scan(struct sidslot *m, size_t cap, const char *path, int bit)
+{
+	if (bit < 0) return;
+	FILE *in = fopen(path, "r");
+	if (!in) return;
+	char line[16384];
+	while (fgets(line, sizeof(line), in)) {
+		uint32_t sid = line_sid(line);
+		if (!sid) continue;
+		struct sidslot *e = sidmap_get(m, cap, sid);
+		if (e) e->mask |= (1u << bit);
+	}
+	fclose(in);
+}
+
+/* Pass 2: emit rule của một profile, mỗi sid CHỈ một lần (lần đầu gặp), gắn
+ * `sgprof:0x<mask>;` trước ')' cuối. Trả 1 nếu mở được file. */
+static int sidmap_emit(FILE *dst, struct sidslot *m, size_t cap,
+		       const char *path)
 {
 	FILE *in = fopen(path, "r");
-	if (!in)
-		return 0;
-	char buf[8192];
-	size_t r;
-	while ((r = fread(buf, 1, sizeof(buf), in)) > 0)
-		fwrite(buf, 1, r, dst);
+	if (!in) return 0;
+	char line[16384];
+	while (fgets(line, sizeof(line), in)) {
+		uint32_t sid = line_sid(line);
+		char *rp = strrchr(line, ')');
+		if (!sid || !rp || line[0] == '#') continue;  /* chỉ emit dòng rule */
+		struct sidslot *e = sidmap_get(m, cap, sid);
+		if (!e || e->emitted) continue;               /* đã emit → bỏ (dedup) */
+		e->emitted = 1;
+		*rp = '\0';
+		fprintf(dst, "%s sgprof:0x%x;)%s", line, e->mask, rp + 1);
+	}
 	fclose(in);
 	return 1;
 }
@@ -160,7 +249,15 @@ static void ips_write_update_conf(void)
 
 sg_status_t rebuild_ips_active(char *result, size_t rsize)
 {
-	mkdir(IPS_PROF_DIR, 0700);   /* đảm bảo tồn tại (no-op nếu có) */
+	/* Đảm bảo CẢ cây thư mục IPS tồn tại (no-op nếu có). Trên device,
+	 * /etc/stargazer là partition lưu trữ riêng (sống qua firmware upgrade) —
+	 * nếu được tạo bởi firmware cũ chưa có cây IPS thì rules/ có thể thiếu →
+	 * fopen(IPS_ACTIVE_TMP) fail "cannot open active tmp" → ipsd không bao giờ
+	 * có active.rules để nạp. mkdir tuần tự vì mkdir() không tạo parent. */
+	mkdir(IPS_BASE_DIR,  0700);
+	mkdir(IPS_REPO_DIR,  0700);
+	mkdir(IPS_PROF_DIR,  0700);
+	mkdir(IPS_RULES_DIR, 0700);
 	ips_write_update_conf();     /* đồng bộ conf cho cron */
 
 	/* [1] compile từng profile enable → profiles/<name>.rules */
@@ -179,53 +276,77 @@ sg_status_t rebuild_ips_active(char *result, size_t rsize)
 		free(plist);
 	}
 
-	/* [2] active.rules tạm = NỐI ruleset của profile được policy accept dùng */
-	FILE *tmp = fopen(IPS_ACTIVE_TMP, "w");
-	if (!tmp) {
-		snprintf(result, rsize, "IPS: cannot open active tmp");
-		return SG_ERR_SYSTEM_FAIL;
-	}
-	fprintf(tmp, "# Stargazer IPS active ruleset (union các profile in-use)\n");
+	/* [2] active.rules tạm = GỘP ruleset các profile in-use, DEDUP theo sid với
+	 * sgprof = OR bit mọi profile chứa sid (per-policy scoping). */
 
-	int used = 0;
+	/* [2a] Thu thập profile in-use (policy accept+enable, profile enable,
+	 * != none), kèm bit của nó. Dedup theo tên profile. */
+	char inuse[32][64];
+	int  inuse_bit[32];
+	int  n_inuse = 0;
 	char *fpl = sg_db_list("firewall_policy");
 	if (fpl) {
-		/* tránh nối trùng cùng một profile nhiều lần */
-		char seen[64][64];
-		int nseen = 0;
 		char *sp = NULL;
 		for (char *id = strtok_r(fpl, "\n", &sp); id;
 		     id = strtok_r(NULL, "\n", &sp)) {
 			char *act = sg_db_get_val("firewall_policy", id, "action");
 			char *ipp = sg_db_get_val("firewall_policy", id, "ips-profile");
 			char *pst = sg_db_get_val("firewall_policy", id, "status");
+			char *ipstat = sg_db_get_val("firewall_policy", id, "ips-status");
 			int accept = act && (strcmp(act, "accept") == 0 ||
 					     strcmp(act, "allow") == 0);
 			int enabled = !pst || strcmp(pst, "disable") != 0;
-			if (accept && enabled && ipp && ipp[0] &&
+			/* toggle ips-status: disable → bỏ qua; rỗng (legacy) → theo
+			 * profile như cũ (tương thích ngược, không cần migrate). */
+			int ips_off = ipstat && strcmp(ipstat, "disable") == 0;
+			if (accept && enabled && !ips_off && ipp && ipp[0] &&
 			    strcmp(ipp, "none") != 0) {
-				/* profile enable? + chưa nối? */
 				char *pstat = sg_db_get_val("security_ips-profile",
 							    ipp, "status");
 				int dup = 0;
-				for (int i = 0; i < nseen; i++)
-					if (strcmp(seen[i], ipp) == 0) dup = 1;
-				if (pstat && strcmp(pstat, "enable") == 0 && !dup) {
-					char pp[512];
-					snprintf(pp, sizeof(pp), "%s/%s.rules",
-						 IPS_PROF_DIR, ipp);
-					if (append_file_to(tmp, pp)) {
-						used++;
-						if (nseen < 64)
-							snprintf(seen[nseen++], 64,
-								 "%s", ipp);
-					}
+				for (int i = 0; i < n_inuse; i++)
+					if (strcmp(inuse[i], ipp) == 0) dup = 1;
+				int bit = ips_profile_bit(ipp);
+				if (pstat && strcmp(pstat, "enable") == 0 &&
+				    !dup && bit >= 0 && n_inuse < 32) {
+					snprintf(inuse[n_inuse], 64, "%s", ipp);
+					inuse_bit[n_inuse] = bit;
+					n_inuse++;
 				}
 				free(pstat);
 			}
-			free(act); free(ipp); free(pst);
+			free(act); free(ipp); free(pst); free(ipstat);
 		}
 		free(fpl);
+	}
+
+	/* [2b] Map sid→mask (Pass 1) rồi emit dedup (Pass 2). */
+	FILE *tmp = fopen(IPS_ACTIVE_TMP, "w");
+	if (!tmp) {
+		snprintf(result, rsize, "IPS: cannot open active tmp");
+		return SG_ERR_SYSTEM_FAIL;
+	}
+	fprintf(tmp, "# Stargazer IPS active ruleset (dedup theo sid, per-policy"
+		     " scoping qua sgprof bitmask)\n");
+
+	const size_t SIDCAP = 131072;   /* dư cho ET-open (~40k sid) */
+	struct sidslot *smap = calloc(SIDCAP, sizeof(*smap));
+	int used = 0;
+	if (smap) {
+		for (int i = 0; i < n_inuse; i++) {
+			char pp[512];
+			snprintf(pp, sizeof(pp), "%s/%.63s.rules",
+				 IPS_PROF_DIR, inuse[i]);
+			sidmap_scan(smap, SIDCAP, pp, inuse_bit[i]);
+		}
+		for (int i = 0; i < n_inuse; i++) {
+			char pp[512];
+			snprintf(pp, sizeof(pp), "%s/%.63s.rules",
+				 IPS_PROF_DIR, inuse[i]);
+			if (sidmap_emit(tmp, smap, SIDCAP, pp))
+				used++;
+		}
+		free(smap);
 	}
 	fclose(tmp);
 
@@ -264,6 +385,24 @@ sg_status_t rebuild_ips_active(char *result, size_t rsize)
 			 "chưa chạy", used);
 	}
 
+	/* ssld soi plaintext HTTPS đã giải mã bằng CÙNG active.rules nhưng nạp rule
+	 * lúc khởi động (không hot-reload). active.rules vừa đổi → đồng bộ ssld:
+	 * mtime mới vào sig của ssld_sync → instance nào đang chạy sẽ restart để nạp
+	 * ruleset mới. Không có ssld nào → no-op. */
+	ssld_sync();
+
+	/* Phase 4 Pha 2: đồng bộ hook kernel ML-HTTPS (LOCAL_IN) theo cờ ml-https.
+	 * enable → ml_account_local=1 (kernel tích lũy CTA_ML cho leg ssld);
+	 * disable → 0 (hook no-op, kernel y hệt cũ). Lỗi ghi → bỏ qua (gated). */
+	{
+		char *ml = sg_db_get_val("security_ips", "0", "ml-https");
+		int on = ml && strcmp(ml, "enable") == 0;
+		free(ml);
+		FILE *pf = fopen("/sys/module/pkt_forward/parameters/"
+				 "ml_account_local", "w");
+		if (pf) { fputc(on ? '1' : '0', pf); fclose(pf); }
+	}
+
 	snprintf(result, rsize, "IPS active rebuilt (%d profile in use)", used);
 	return SG_OK;
 }
@@ -281,7 +420,9 @@ sg_status_t run_ips_update_now(const char *ids_csv, char *result, size_t rsize)
 	static const char *UPD = "/usr/libexec/stargazer/ips-update.sh";
 	char *ids = sg_db_list("security_ips-ruleset");
 	int   updated = 0, errors = 0;
-	size_t pos = 0;
+	char  failed[512] = "";        /* tên các ruleset tải lỗi (cho thông báo) */
+	size_t fpos = 0;
+	char  reason[256] = "";        /* lý do lỗi ĐẦU TIÊN (trích từ script) */
 
 	if (!ids) {
 		snprintf(result, rsize, "No rulesets configured");
@@ -338,11 +479,27 @@ sg_status_t run_ips_update_now(const char *ids_csv, char *result, size_t rsize)
 
 		const char *argv[] = { UPD, url, catname, NULL };
 		char *out = safe_exec(argv);
-		int n = snprintf(result + pos, rsize - pos, "[%s] %s\n",
-				 catname, out ? out : "error");
-		if (n > 0 && (size_t)n < rsize - pos) pos += (size_t)n;
-		if (!out) {
+		/* Lỗi = không chạy được script (out NULL) HOẶC script in "ERROR"
+		 * (tải thất bại / file rỗng / verify hỏng). Chi tiết đã vào
+		 * ips-update.log; ở đây chỉ gom tên để báo người dùng. */
+		int ok = (out && !strstr(out, "ERROR"));
+		if (!ok) {
 			errors++;
+			int fn = snprintf(failed + fpos, sizeof(failed) - fpos,
+					  "%s%s", fpos ? ", " : "", catname);
+			if (fn > 0 && (size_t)fn < sizeof(failed) - fpos)
+				fpos += (size_t)fn;
+			/* Trích dòng ERROR đầu tiên làm lý do hiển thị (no internet /
+			 * DNS sai / syntax hỏng / file rỗng…). */
+			if (!reason[0]) {
+				const char *e = out ? strstr(out, "ERROR") : NULL;
+				if (e)
+					snprintf(reason, sizeof(reason), "%.*s",
+						 (int)strcspn(e, "\n"), e);
+				else
+					snprintf(reason, sizeof(reason),
+						 "không chạy được script tải");
+			}
 		} else {
 			updated++;
 			if (strstr(out, "Success:") || strstr(out, "unchanged")) {
@@ -361,12 +518,16 @@ sg_status_t run_ips_update_now(const char *ids_csv, char *result, size_t rsize)
 	/* Rebuild active ruleset after all downloads */
 	char rb[256];
 	rebuild_ips_active(rb, sizeof(rb));
-	int n = snprintf(result + pos, rsize - pos, "%s\n", rb);
-	if (n > 0 && (size_t)n < rsize - pos) pos += (size_t)n;
 
-	if (errors > 0)
+	/* Thông báo rõ cho người dùng (toast trên UI). */
+	if (errors > 0) {
+		snprintf(result, rsize,
+			 "Tải thất bại %d ruleset (%s): %s. %d ruleset OK.",
+			 errors, failed[0] ? failed : "?",
+			 reason[0] ? reason : "kiểm tra mạng/URL nguồn", updated);
 		return SG_ERR_SYSTEM_FAIL;
-	(void)updated;
+	}
+	snprintf(result, rsize, "Đã cập nhật %d ruleset thành công.", updated);
 	return SG_OK;
 }
 

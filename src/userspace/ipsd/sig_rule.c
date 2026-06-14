@@ -584,6 +584,11 @@ static int parse_options(struct sig_ruleset *rs, struct sig_rule *r,
 			if (cur >= 0) r->content[cur].offset = parse_uint_field(val, 65535);
 		} else if (!strcmp(key, "depth")) {
 			if (cur >= 0) r->content[cur].depth = parse_uint_field(val, 65535);
+		} else if (!strcmp(key, "sgprof")) {
+			/* Per-policy scoping (Stargazer): BITMASK các profile chứa rule
+			 * này (mgmtd dedup theo sid lúc compile → OR bit mọi profile có
+			 * sid). Giá trị hex "0x..". OR để an toàn nếu xuất hiện nhiều lần. */
+			r->prof_mask |= (uint32_t)strtoul(val, NULL, 0);
 		} else if (!strcmp(key, "http_uri") ||     /* P6 — sticky buffers */
 			   !strcmp(key, "http_raw_uri")) {
 			if (cur >= 0) r->content[cur].buffer = SIG_BUF_HTTP_URI;
@@ -696,7 +701,7 @@ static struct sig_rule *ruleset_new(struct sig_ruleset *rs)
 
 int sig_parse_line(struct sig_ruleset *rs, const char *line)
 {
-	char buf[8192];
+	char buf[16384];   /* khớp acc trong sig_load_file — không cắt rule dài */
 	const char *q = line;
 
 	while (*q == ' ' || *q == '\t') q++;
@@ -746,6 +751,15 @@ int sig_parse_line(struct sig_ruleset *rs, const char *line)
 		return rc;
 	}
 
+	/* Rule KHÔNG có keyword `sid` (r->sid==0): không truy vết được, thường là
+	 * dòng malformed/local; ở đây hay khớp content phổ biến trên traffic thường
+	 * → false-positive. ET/Snort/custom hợp lệ luôn có sid → bỏ an toàn. */
+	if (r->sid == 0) {
+		for (int i = 0; i < r->n_content; i++) free(r->content[i].data);
+		memset(r, 0, sizeof(*r));
+		return SIG_LINE_SKIP_NOSID;
+	}
+
 	/* P0 — content quá yếu (1 content ≤ 2 byte) + còn keyword thu hẹp chưa hỗ
 	 * trợ → prefilter vô dụng + thiếu điều kiện thu hẹp → match quá rộng → bỏ.*/
 	if (r->has_unsup && r->n_content == 1 && r->content[0].len <= 2) {
@@ -773,45 +787,63 @@ int sig_parse_line(struct sig_ruleset *rs, const char *line)
 	return (fid == SIG_FID_ALERT) ? SIG_LINE_ALERT : SIG_LINE_FULL;
 }
 
+static void tally_line(int rc, struct sig_load_stats *s, int *added)
+{
+	switch (rc) {
+	case SIG_LINE_FULL:
+		(*added)++; s->loaded++; s->loaded_full++;  break;
+	case SIG_LINE_ALERT:
+		(*added)++; s->loaded++; s->loaded_alert++; break;
+	case SIG_LINE_BLANK:
+		s->skipped++; break;
+	case SIG_LINE_SKIP_UNSUP:
+		s->skipped++; s->skipped_unsupported++; break;
+	case SIG_LINE_SKIP_REP:
+		s->skipped++; s->skipped_reputation++;  break;
+	case SIG_LINE_SKIP_NOCONTENT:
+		s->skipped++; s->skipped_no_content++;  break;
+	case SIG_LINE_SKIP_NOSID:
+		s->skipped++; s->skipped_no_sid++;      break;
+	default: /* SIG_LINE_ERROR */
+		s->errors++; break;
+	}
+}
+
 int sig_load_file(struct sig_ruleset *rs, const char *path,
 		  struct sig_load_stats *st)
 {
 	FILE *f = fopen(path, "r");
 	if (!f) return -1;
 
-	char acc[8192]; size_t al = 0;
-	char ln[4096];
+	/* acc PHẢI đủ lớn cho rule dài nhất; ln khớp buffer bộ compile (8192) để
+	 * không cắt giữa dòng. BUG cũ: ln[4096] < line[8192] của mgmtd_ips_compile
+	 * → rule ET > 4095 byte bị cắt, mất sid + điều kiện thu hẹp (flow/offset/
+	 * depth nằm cuối) → còn mỗi content rộng → false-positive sid=0. */
+	char acc[16384]; size_t al = 0;
+	char ln[8192];
 	int added = 0;
 	struct sig_load_stats s = { 0 };
 
 	while (fgets(ln, sizeof(ln), f)) {
 		size_t l = strlen(ln);
+		int had_nl = (l > 0 && ln[l - 1] == '\n');   /* dòng vật lý đã hết? */
 		while (l && (ln[l - 1] == '\n' || ln[l - 1] == '\r')) ln[--l] = '\0';
 
-		int cont = (l && ln[l - 1] == '\\');       /* nối dòng */
-		if (cont) ln[--l] = '\0';
+		int backslash = (l && ln[l - 1] == '\\');    /* nối dòng kiểu Snort */
+		if (backslash) ln[--l] = '\0';
 
 		if (al + l < sizeof(acc)) { memcpy(acc + al, ln, l + 1); al += l; }
-		if (cont) continue;
 
-		switch (sig_parse_line(rs, acc)) {
-		case SIG_LINE_FULL:
-			added++; s.loaded++; s.loaded_full++;  break;
-		case SIG_LINE_ALERT:
-			added++; s.loaded++; s.loaded_alert++; break;
-		case SIG_LINE_BLANK:
-			s.skipped++; break;
-		case SIG_LINE_SKIP_UNSUP:
-			s.skipped++; s.skipped_unsupported++; break;
-		case SIG_LINE_SKIP_REP:
-			s.skipped++; s.skipped_reputation++;  break;
-		case SIG_LINE_SKIP_NOCONTENT:
-			s.skipped++; s.skipped_no_content++;  break;
-		default: /* SIG_LINE_ERROR */
-			s.errors++; break;
-		}
+		/* CHƯA hết dòng vật lý (fgets đầy buffer, chưa thấy '\n') HOẶC '\'
+		 * nối dòng → gom tiếp, KHÔNG parse. Đây là phần fix dòng dài. */
+		if (!had_nl || backslash)
+			continue;
+
+		tally_line(sig_parse_line(rs, acc), &s, &added);
 		al = 0; acc[0] = '\0';
 	}
+	if (al > 0)   /* dòng cuối file không có newline kết thúc */
+		tally_line(sig_parse_line(rs, acc), &s, &added);
 	fclose(f);
 	if (st) *st = s;
 	return added;
@@ -877,6 +909,14 @@ static int mem_find(const uint8_t *hay, const uint8_t *needle, int nlen,
 static int verify_rule(const struct sig_rule *r, const uint8_t *p, int len,
 		       const struct flow_ctx *fc)
 {
+	/* Per-policy scoping: rule chỉ thuộc các profile trong prof_mask. Flow mang
+	 * prof_id (1..31) = profile của policy đã cho phép flow (skb mark/NFQA_MARK).
+	 * prof_mask==0 (rule chưa tag) hoặc prof_id==0 (flow không rõ profile) → áp
+	 * dụng (fail-safe: thà soi thừa còn hơn bỏ sót). Ngược lại chỉ khớp khi bit
+	 * profile của flow nằm trong mask của rule. */
+	if (r->prof_mask && fc->prof_id &&
+	    !(r->prof_mask & (1u << (fc->prof_id - 1)))) return 0;
+
 	if (r->proto != SIG_PROTO_ANY && fc->proto != r->proto) return 0;
 	if (!port_match(r->dport_list, r->n_dport, fc->dport))  return 0;
 	if (r->flags_set && (fc->tcp_flags & r->flags_set) != r->flags_set) return 0;

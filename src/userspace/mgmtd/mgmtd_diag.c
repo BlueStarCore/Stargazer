@@ -411,13 +411,188 @@ int handle_ssl_cacert(int client_fd, const char *user,
 	ssize_t n = read_small_file("/etc/stargazer/ssl/ca-cert.pem",
 				    pem, sizeof(pem));
 	if (n <= 0) {
-		send_error(client_fd, SG_ERR_ENTRY_NOT_FOUND,
-			   "CA chưa tồn tại — bật SSL inspection để tạo "
-			   "(config security ssl-inspection / set status enable)");
+		/* CA chưa sinh là TRẠNG THÁI BÌNH THƯỜNG (chưa bật profile deep
+		 * nào) — KHÔNG phải lỗi backend. Trả OK với output rỗng để UI hiện
+		 * "CA chưa tạo" nhẹ nhàng, không bật banner đỏ. CLI tự in gợi ý. */
+		send_ok(client_fd, NULL, "");
 		return 0;
 	}
 	send_ok(client_fd, NULL, pem);
 	return 0;
+}
+
+/* ── SG_CMD_SSL_DIAG (694) — chẩn đoán SSL inspection (debug device) ────── */
+
+int handle_ssl_diag(int client_fd, const char *user,
+		    const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)payload; (void)hdr;
+
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED, "monitor required");
+		return 0;
+	}
+
+	char resp[8192]; size_t pos = 0; int n;
+#define ADD(...) do { n = snprintf(resp+pos, sizeof(resp)-pos, __VA_ARGS__); \
+		      if (n > 0) pos += (size_t)n; } while (0)
+#define SSL_PROF "security_ssl-inspection-profile"
+#define SSL_PORT_BASE_DIAG 8443   /* ssld profile #i nghe BASE+i (khớp ssld_sync) */
+
+	/* ── Hạ tầng dùng chung mọi profile ──────────────────────────────── */
+	int bin_ok = access("/sbin/stargazer-ssld", X_OK) == 0;
+	struct stat stt;
+	int ca_ok = stat("/etc/stargazer/ssl/ca-cert.pem", &stt) == 0 && stt.st_size > 0;
+	long long ca_sz = ca_ok ? (long long)stt.st_size : 0;
+
+	/* Đếm root CA trong trust store (số dòng "BEGIN CERTIFICATE"). */
+	int trust = 0;
+	FILE *tf = fopen("/etc/ssl/certs/ca-certificates.crt", "r");
+	if (tf) {
+		char line[256];
+		while (fgets(line, sizeof(line), tf))
+			if (strstr(line, "BEGIN CERTIFICATE")) trust++;
+		fclose(tf);
+	}
+
+	/* Bảng steering hiện hành (nat PREROUTING) để đối chiếu. */
+	const char *ipt[] = {"iptables", "-t", "nat", "-S", "PREROUTING", NULL};
+	char *natr = safe_exec(ipt);
+
+	ADD("=== SSL Inspection ===\n");
+	ADD("ssld_binary=%s\n", bin_ok ? "present" : "MISSING");
+	ADD("ca_cert=%s", ca_ok ? "present" : "MISSING");
+	if (ca_ok) ADD(" (%lld bytes)", ca_sz);
+	ADD("\n");
+	ADD("trust_store=/etc/ssl/certs/ca-certificates.crt (%d root CA)\n", trust);
+
+	/* ── Liệt kê profile + ssld của nó ───────────────────────────────── */
+	int n_active = 0, n_running_bad = 0;
+	char *list = sg_db_list(SSL_PROF);
+	if (list) {
+		int idx = 0;            /* cùng thứ tự cấp cổng với ssld_sync */
+		char *sp = NULL;
+		for (char *id = strtok_r(list, "\n", &sp); id;
+		     id = strtok_r(NULL, "\n", &sp)) {
+			int builtin = strcmp(id, "no-inspection") == 0;
+			char *st   = sg_db_get_val(SSL_PROF, id, "status");
+			char *mode = sg_db_get_val(SSL_PROF, id, "inspection-mode");
+			char *nosni= sg_db_get_val(SSL_PROF, id, "no-sni");
+			char *untr = sg_db_get_val(SSL_PROF, id, "untrusted-server-cert");
+			char *exmpt= sg_db_get_val(SSL_PROF, id, "exempt");
+			int en   = !builtin && st && !strcmp(st, "enable");
+			int deep = mode && !strcmp(mode, "deep");
+
+			ADD("\n[profile %s]%s\n", id, builtin ? " (builtin)" : "");
+			if (builtin) {
+				ADD("  inspection=none (traffic đi thẳng, không giải mã)\n");
+			} else {
+				ADD("  status=%s\n", en ? "enable" : "disable");
+				ADD("  inspection_mode=%s\n", mode ? mode : "certificate");
+				ADD("  no_sni=%s\n", nosni ? nosni : "bump");
+				ADD("  untrusted_server_cert=%s\n", untr ? untr : "block");
+				int ex = 0;
+				if (exmpt && *exmpt) {
+					ex = 1;
+					for (const char *p = exmpt; *p; p++)
+						if (*p == ',' || *p == ' ') ex++;
+				}
+				ADD("  exempt_count=%d\n", ex);
+
+				if (en) {
+					int port = SSL_PORT_BASE_DIAG + idx;
+					char child[128];
+					snprintf(child, sizeof(child),
+						 "stargazer-ssld-%s", id);
+					pid_t pid = supervisor_get_pid(child);
+					ADD("  listen_port=%d\n", port);
+					ADD("  ssld_running=%s", pid > 0 ? "yes" : "no");
+					if (pid > 0) ADD(" (pid %d)", (int)pid);
+					ADD("\n");
+					n_active++;
+					if (pid <= 0 || (deep && !ca_ok)) n_running_bad++;
+				}
+			}
+			if (en) idx++;
+			free(st); free(mode); free(nosni); free(untr); free(exmpt);
+		}
+		free(list);
+	}
+
+	/* ── Policy nào dùng profile nào ─────────────────────────────────── */
+	ADD("\n--- firewall policy dùng SSL profile ---\n");
+	int n_steer_pol = 0;
+	char *plist = sg_db_list("firewall_policy");
+	if (plist) {
+		char *sp = NULL;
+		for (char *pid = strtok_r(plist, "\n", &sp); pid;
+		     pid = strtok_r(NULL, "\n", &sp)) {
+			char *prof = sg_db_get_val("firewall_policy", pid, "ssl-profile");
+			char *act  = sg_db_get_val("firewall_policy", pid, "action");
+			char *pst  = sg_db_get_val("firewall_policy", pid, "status");
+			if (prof && *prof && strcmp(prof, "no-inspection") != 0) {
+				int on = act && !strcmp(act, "accept") &&
+					 pst && !strcmp(pst, "enable");
+				ADD("  policy %s -> %s%s\n", pid, prof,
+				    on ? "" : " (policy disable/deny — không steer)");
+				if (on) n_steer_pol++;
+			}
+			free(prof); free(act); free(pst);
+		}
+		free(plist);
+	}
+	if (n_steer_pol == 0)
+		ADD("  (không policy nào dùng SSL inspection — đều no-inspection)\n");
+
+	/* ── Steering rule thực tế trong nat PREROUTING ──────────────────── */
+	int steer = natr && strstr(natr, "REDIRECT") != NULL;
+	ADD("\nsteering_rule=%s\n", steer ? "present" : "absent");
+	if (steer) {
+		char *sp = NULL;
+		for (char *l = strtok_r(natr, "\n", &sp); l;
+		     l = strtok_r(NULL, "\n", &sp))
+			if (strstr(l, "REDIRECT")) ADD("  rule=%.180s\n", l);
+	}
+	free(natr);
+
+	/* ── Chẩn đoán ───────────────────────────────────────────────────── */
+	ADD("\n--- chẩn đoán ---\n");
+	if (!bin_ok)
+		ADD("[!] ssld binary THIẾU /sbin/stargazer-ssld → mọi profile inspect "
+		    "sẽ ĐỨT (steering trỏ cổng không ai nghe). Build/cài lại rootfs.\n");
+	if (n_active == 0) {
+		ADD("[i] Không profile nào BẬT — chỉ no-inspection, traffic đi thẳng. "
+		    "An toàn, không giải mã.\n");
+	} else {
+		if (n_running_bad > 0)
+			ADD("[!] %d profile BẬT nhưng ssld không chạy hoặc deep thiếu CA "
+			    "→ HTTPS qua profile đó có thể đứt. Xem log mgmtd; bật lại để "
+			    "ssld sinh CA.\n", n_running_bad);
+		if (n_steer_pol == 0)
+			ADD("[!] Có profile BẬT nhưng KHÔNG policy nào gán → ssld chạy "
+			    "nhưng không traffic nào được steer vào. Gán ssl-profile cho "
+			    "firewall policy.\n");
+		else if (!steer)
+			ADD("[!] Có policy gán profile nhưng KHÔNG thấy REDIRECT trong nat "
+			    "PREROUTING → traffic 443 không vào ssld. Apply lại firewall.\n");
+		if (!ca_ok)
+			ADD("[!] CHƯA có CA (/etc/stargazer/ssl/ca-cert.pem) → deep mode "
+			    "chạy SPLICE-only (không giải mã). Bật profile deep lần đầu để "
+			    "ssld sinh CA.\n");
+		if (bin_ok && n_running_bad == 0 && n_steer_pol > 0 && steer)
+			ADD("[OK] Hoạt động: %d profile chạy, %d policy steer, steering có.\n",
+			    n_active, n_steer_pol);
+		if (ca_ok)
+			ADD("[i] Export CA (execute system ssl-ca-cert) + cài vào client "
+			    "để deep mode không báo cert đỏ.\n");
+	}
+
+	send_ok(client_fd, NULL, resp);
+	return 0;
+#undef ADD
+#undef SSL_PROF
+#undef SSL_PORT_BASE_DIAG
 }
 
 /* ── SG_CMD_IPS_STATUS (684) ───────────────────────────────────────────── */
@@ -433,30 +608,55 @@ int handle_ips_status(int client_fd, const char *user,
 		return 0;
 	}
 
-	char resp[1024];
+	char resp[2048];
 	size_t pos = 0;
 	int n;
 
 	/* Đọc config từ DB */
 	char *status = sg_db_get_val("security_ips", "0", "status");
 	char *mode   = sg_db_get_val("security_ips", "0", "mode");
-	char *snap   = sg_db_get_val("security_ips", "0", "snapshot-n");
+	char *snapb  = sg_db_get_val("security_ips", "0", "snapshot-bytes");
 	n = snprintf(resp + pos, sizeof(resp) - pos,
-		     "status=%s\nmode=%s\nsnapshot_n=%s\n",
+		     "status=%s\nmode=%s\nsnapshot_bytes=%s\n",
 		     status ? status : "disable",
 		     mode   ? mode   : "prevent",
-		     snap   ? snap   : "8");
-	free(status); free(mode); free(snap);
+		     snapb  ? snapb  : "16384");
+	free(status); free(mode); free(snapb);
 	if (n > 0) pos += (size_t)n;
 
-	/* Kiểm tra ipsd có đang chạy không qua pidof */
-	const char *chk[] = {"pidof", "stargazer-ipsd", NULL};
-	char *pidout = safe_exec(chk);
-	int running = (pidout && pidout[0] >= '1' && pidout[0] <= '9');
+	/* ipsd có đang chạy không — hỏi SUPERVISOR (mgmtd tự quản ipsd nên biết
+	 * PID chính xác). pidof không tin cậy: phụ thuộc PATH + cắt comm 15 ký tự. */
+	int running = (supervisor_get_pid("stargazer-ipsd") > 0);
 	n = snprintf(resp + pos, sizeof(resp) - pos,
 		     "ipsd_running=%s\n",
 		     running ? "yes" : "no");
-	free(pidout);
+	if (n > 0) pos += (size_t)n;
+
+	/*
+	 * Chẩn đoán "ipsd không chạy" KHÔNG cần shell (firewall chỉ có CLI):
+	 *   ipsd_binary=missing → firmware chưa cài binary → build/flash lại.
+	 *   active_rules=0      → profile compile rỗng → ipsd thoát ngay
+	 *                         (sig_reload_init loaded=0). Sửa profile cho có rule.
+	 *   active_rules=-1     → chưa có active.rules (chưa gắn profile vào policy).
+	 */
+	n = snprintf(resp + pos, sizeof(resp) - pos, "ipsd_binary=%s\n",
+		     access("/sbin/stargazer-ipsd", X_OK) == 0 ? "present"
+							      : "missing");
+	if (n > 0) pos += (size_t)n;
+
+	int nrules = -1;
+	FILE *ar = fopen("/etc/stargazer/ips/rules/active.rules", "r");
+	if (ar) {
+		nrules = 0;
+		char l[8192];
+		while (fgets(l, sizeof(l), ar)) {
+			const char *p = l;
+			while (*p == ' ' || *p == '\t') p++;
+			if (*p && *p != '#' && *p != '\n') nrules++;
+		}
+		fclose(ar);
+	}
+	n = snprintf(resp + pos, sizeof(resp) - pos, "active_rules=%d\n", nrules);
 	if (n > 0) pos += (size_t)n;
 
 	/* P0 — độ phủ ruleset thật (ipsd ghi lúc nạp): loaded_full/alert/skip…
@@ -475,21 +675,95 @@ int handle_ips_status(int client_fd, const char *user,
 		fclose(sf);
 	}
 
-	/* Số dòng alert log */
-	const char *wc[] = {"wc", "-l",
-			    "/etc/stargazer/logs/ips-alert.log", NULL};
-	char *lines = safe_exec(wc);
+	/* Telemetry runtime NFQUEUE (ipsd ghi mỗi vòng lặp) — chẩn đoán "ipsd chạy
+	 * mà traffic treo" KHÔNG cần shell. pkt_seen=0 → kernel không giao gói. */
+	FILE *rf = fopen("/run/stargazer-ipsd.rt", "r");
+	if (rf) {
+		char line[128];
+		while (fgets(line, sizeof(line), rf)) {
+			size_t ll = strlen(line);
+			if (ll + 1 < sizeof(resp) - pos) {
+				memcpy(resp + pos, line, ll);
+				pos += ll;
+			}
+		}
+		fclose(rf);
+	}
+
+	/* Số dòng alert log — đếm trực tiếp (busybox thiết bị thiếu wc applet). */
+	int alert_lines = 0;
+	FILE *af = fopen("/etc/stargazer/logs/ips-alert.log", "r");
+	if (af) {
+		int c;
+		while ((c = fgetc(af)) != EOF)
+			if (c == '\n') alert_lines++;
+		fclose(af);
+	}
 	n = snprintf(resp + pos, sizeof(resp) - pos,
-		     "alert_log_lines=%s",
-		     lines ? lines : "0");
-	free(lines);
+		     "alert_log_lines=%d", alert_lines);
 	if (n > 0) pos += (size_t)n;
+
+	/* Dump các rule NFQUEUE thực tế trong FORWARD — chốt byte-window
+	 * (connbytes-mode bytes) vs fallback (ctstate NEW SYN-only). Nếu thấy
+	 * "ctstate NEW" → connbytes_supported() trả false → soi vì sao iptables
+	 * -m connbytes fail dù kernel có. Nếu thấy "connbytes ... bytes" mà
+	 * tcp_payload vẫn 0 → vấn đề khác. */
+	const char *ipt[] = {"iptables", "-S", "FORWARD", NULL};
+	char *fwd = safe_exec(ipt);
+	if (fwd) {
+		char *sp = NULL;
+		for (char *l = strtok_r(fwd, "\n", &sp); l;
+		     l = strtok_r(NULL, "\n", &sp)) {
+			if (!strstr(l, "NFQUEUE")) continue;
+			n = snprintf(resp + pos, sizeof(resp) - pos,
+				     "\nnfq_rule=%.200s", l);
+			if (n > 0 && (size_t)n < sizeof(resp) - pos)
+				pos += (size_t)n;
+		}
+		free(fwd);
+	}
 
 	send_ok(client_fd, NULL, resp);
 	return 0;
 }
 
 /* ── SG_CMD_IPS_ALERTS (685) ───────────────────────────────────────────── */
+
+/* Đọc N dòng cuối của file bằng fopen trực tiếp (KHÔNG fork tail — `tail`/PATH
+ * trong child của safe_exec không có trên thiết bị → trả rỗng). Trả chuỗi
+ * malloc hoặc NULL nếu file thiếu/rỗng. Cap đọc 256KB cuối. */
+static char *read_last_lines(const char *path, int nlines)
+{
+	FILE *f = fopen(path, "r");
+	if (!f) return NULL;
+	fseek(f, 0, SEEK_END);
+	long sz = ftell(f);
+	if (sz <= 0) { fclose(f); return NULL; }
+	long cap = 256 * 1024;
+	if (sz > cap) { fseek(f, -cap, SEEK_END); sz = cap; }
+	else          { fseek(f, 0, SEEK_SET); }
+	char *buf = malloc((size_t)sz + 1);
+	if (!buf) { fclose(f); return NULL; }
+	size_t got = fread(buf, 1, (size_t)sz, f);
+	fclose(f);
+	buf[got] = '\0';
+	if (got == 0) { free(buf); return NULL; }
+
+	/* Giữ nlines dòng cuối: bỏ qua (tổng '\n' − nlines) dòng đầu. */
+	int total_nl = 0;
+	for (size_t i = 0; i < got; i++) if (buf[i] == '\n') total_nl++;
+	int skip = total_nl - nlines;
+	if (skip > 0) {
+		int seen = 0;
+		for (size_t i = 0; i < got; i++) {
+			if (buf[i] == '\n' && ++seen == skip) {
+				memmove(buf, buf + i + 1, got - i);
+				break;
+			}
+		}
+	}
+	return buf;
+}
 
 int handle_ips_alerts(int client_fd, const char *user,
 		      const char *payload, const sg_request_hdr_t *hdr)
@@ -508,15 +782,69 @@ int handle_ips_alerts(int client_fd, const char *user,
 		extract_val(payload, "lines", nlines_s, sizeof(nlines_s));
 	int nlines = atoi(nlines_s);
 	if (nlines < 1 || nlines > 1000) nlines = 20;
-	char nlarg[16];
-	snprintf(nlarg, sizeof(nlarg), "%d", nlines);
 
-	const char *tail[] = {"tail", "-n", nlarg,
-			      "/etc/stargazer/logs/ips-alert.log", NULL};
-	char *out = safe_exec(tail);
+	char *out = read_last_lines("/etc/stargazer/logs/ips-alert.log", nlines);
+	if (!out || !out[0]) {
+		send_ok(client_fd, NULL, "(chưa có alert nào)\n");
+		free(out);
+		return 0;
+	}
+	send_ok(client_fd, NULL, out);
+	free(out);
+	return 0;
+}
+
+/* ── SG_CMD_IPS_ALERTS_CLEAR (692) — truncate ips-alert.log ───────────
+ * Phải chạy ở mgmtd (root): /etc/stargazer/logs là 0700 root, webd (uid 900)
+ * không ghi được — trước đây webd tự open(O_TRUNC) → fail âm thầm, UI báo
+ * thành công GIẢ. Đưa về mgmtd để xoá thật. */
+int handle_ips_alerts_clear(int client_fd, const char *user,
+			    const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)hdr; (void)payload;
+
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "admin")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED, "admin required");
+		return 0;
+	}
+
+	const char *path = "/etc/stargazer/logs/ips-alert.log";
+	int fd = open(path, O_WRONLY | O_TRUNC | O_CREAT, 0640);
+	if (fd < 0) {
+		send_error(client_fd, SG_ERR_INTERNAL, "không xoá được alert log");
+		return 0;
+	}
+	close(fd);
+	mgmt_log("INFO", "ips-alert.log đã được xoá bởi %s", user ? user : "?");
+	send_ok(client_fd, NULL, "alert log đã xoá\n");
+	return 0;
+}
+
+/* ── SG_CMD_IPS_SCORES (693) — per-flow ML scores từ vòng dump của ipsd ───
+ * ipsd ghi /run/stargazer-ipsd.scores (tmp+rename) mỗi vài giây. Đọc trực
+ * tiếp bằng fopen (không fork). */
+int handle_ips_scores(int client_fd, const char *user,
+		      const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)hdr;
+
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED, "monitor required");
+		return 0;
+	}
+
+	char nlines_s[16] = "100";
+	if (payload && payload[0])
+		extract_val(payload, "lines", nlines_s, sizeof(nlines_s));
+	int nlines = atoi(nlines_s);
+	if (nlines < 1 || nlines > 2000) nlines = 100;
+
+	char *out = read_last_lines("/run/stargazer-ipsd.scores", nlines);
 	if (!out || !out[0]) {
 		send_ok(client_fd, NULL,
-			"(ips-alert.log trống hoặc chưa có alert nào)\n");
+			"(chưa có điểm — ipsd chưa chạy hoặc chưa có flow đủ gói)\n");
 		free(out);
 		return 0;
 	}
@@ -538,9 +866,7 @@ int handle_ips_update_log(int client_fd, const char *user,
 		return 0;
 	}
 
-	const char *tail[] = {"tail", "-n", "100",
-			      "/etc/stargazer/logs/ips-update.log", NULL};
-	char *out = safe_exec(tail);
+	char *out = read_last_lines("/etc/stargazer/logs/ips-update.log", 100);
 	if (!out || !out[0]) {
 		send_ok(client_fd, NULL, "(ips-update.log is empty — no downloads yet)\n");
 		free(out);
@@ -569,12 +895,9 @@ int handle_ips_alerts_json(int client_fd, const char *user,
 		extract_val(payload, "lines", nlines_s, sizeof(nlines_s));
 	int nlines = atoi(nlines_s);
 	if (nlines < 1 || nlines > 5000) nlines = 100;
-	char nlarg[16];
-	snprintf(nlarg, sizeof(nlarg), "%d", nlines);
 
-	const char *tail_argv[] = {"tail", "-n", nlarg,
-				   "/etc/stargazer/logs/ips-alert.log", NULL};
-	char *raw = safe_exec(tail_argv);
+	/* Đọc trực tiếp bằng fopen (không fork tail — busybox thiếu applet). */
+	char *raw = read_last_lines("/etc/stargazer/logs/ips-alert.log", nlines);
 	if (!raw || !raw[0]) {
 		free(raw);
 		send_ok(client_fd, NULL, "[]");
@@ -649,7 +972,7 @@ int handle_ips_alerts_json(int client_fd, const char *user,
 							snprintf(dst, sizeof(dst), "%s", val);
 						}
 					} else if (strcmp(key, "reason") == 0) snprintf(reason, sizeof(reason), "%s", val);
-					else if (strcmp(key, "score") == 0)  score = atof(val);
+					else if (strcmp(key, "score") == 0)  score = (val[0] == 'n') ? -1.0 : atof(val);
 					else if (strcmp(key, "sid") == 0)    sid   = (unsigned)atoi(val);
 					else if (strcmp(key, "msg") == 0)    snprintf(msg_rest, sizeof(msg_rest), "%s", val);
 					*end = ' '; *eq = '=';
@@ -671,8 +994,11 @@ int handle_ips_alerts_json(int client_fd, const char *user,
 			sid_str = sid_buf;
 		}
 
+		/* Nhãn khi rule không có msg: chỉ gọi "ML anomaly" khi reason là ML —
+		 * KHÔNG suy ra từ sid==0 (rule signature thiếu keyword sid cũng =0). */
+		int is_ml = (strncmp(reason, "ml-", 3) == 0);
 		const char *msg_disp = msg_rest[0] ? msg_rest :
-				(sid == 0 ? "ML anomaly detection" : "");
+				(is_ml ? "ML anomaly detection" : "signature match (no msg)");
 
 		if (!first) {
 			if (pos + 2 < cap) { json[pos++] = ','; json[pos++] = '\n'; }
@@ -703,11 +1029,47 @@ int handle_ips_alerts_json(int client_fd, const char *user,
 int handle_ips_signatures(int client_fd, const char *user,
 			  const char *payload, const sg_request_hdr_t *hdr)
 {
-	(void)payload; (void)hdr;
+	(void)hdr;
 	const char *perms = get_user_permissions(user);
 	if (!has_permission(perms, "configure")) {
 		send_error(client_fd, SG_ERR_PERM_DENIED, "configure required");
 		return 0;
+	}
+
+	/* SEARCH server-side: từ khoá lọc (response IPC giới hạn 64KB). */
+	char q[128] = "";
+	if (payload && payload[0])
+		extract_val(payload, "q", q, sizeof(q));
+
+	/*
+	 * CACHE cho trường hợp KHÔNG từ khoá (mở tab Rules / Add-Signatures) —
+	 * đây là request nặng nhất của trang IPS: 1 + 2N query DB (N ruleset) +
+	 * đọc/parse repo. mgmtd là tiến trình thường trú, accept-loop đơn luồng
+	 * nên cache tĩnh an toàn, không cần khóa.
+	 *
+	 * Key = mtime(repo dir) + mtime(DB file). Mọi thay đổi đều bump một trong
+	 * hai: tải ruleset (mv file vào repo + set last-downloaded trong DB),
+	 * xóa/sửa ruleset (ghi DB). → cache không bao giờ phục vụ dữ liệu cũ.
+	 * Request CÓ từ khoá luôn tính tươi (không cache).
+	 */
+	static char  *sigcache;          /* JSON response no-query (NUL-term) */
+	static time_t sc_repo_s, sc_db_s;
+	static long   sc_repo_n, sc_db_n;
+	int    q_empty = (q[0] == '\0');
+	time_t r_s = 0, d_s = 0; long r_n = 0, d_n = 0;
+	if (q_empty) {
+		struct stat st;
+		if (stat("/etc/stargazer/ips/repo", &st) == 0) {
+			r_s = st.st_mtim.tv_sec; r_n = st.st_mtim.tv_nsec;
+		}
+		if (stat(SG_DB_PATH, &st) == 0) {
+			d_s = st.st_mtim.tv_sec; d_n = st.st_mtim.tv_nsec;
+		}
+		if (sigcache && sc_repo_s == r_s && sc_repo_n == r_n &&
+		    sc_db_s == d_s && sc_db_n == d_n) {
+			send_ok(client_fd, NULL, sigcache);  /* cache hit → tức thì */
+			return 0;
+		}
 	}
 
 	/*
@@ -755,21 +1117,67 @@ int handle_ips_signatures(int client_fd, const char *user,
 #undef MAX_ALLOWED
 
 	if (n_allowed == 0) {
-		send_ok(client_fd, NULL, "[]");   /* nothing downloaded yet */
+		static const char EMPTY[] =
+			"{\"items\":[],\"categories\":[],\"truncated\":0}";
+		if (q_empty) {
+			free(sigcache);
+			sigcache = strdup(EMPTY);
+			sc_repo_s = r_s; sc_repo_n = r_n;
+			sc_db_s = d_s; sc_db_n = d_n;
+		}
+		send_ok(client_fd, NULL, EMPTY);
 		return 0;
 	}
+
+	/* Danh sách category ĐẦY ĐỦ (mọi ruleset đã tải) cho dropdown Filter —
+	 * lấy từ allowed[] (DB), KHÔNG phụ thuộc giới hạn 64KB của catalog items.
+	 * 64 cat × ~128 ký tự + dấu nháy/phẩy < 9 KB. */
+	char catj[9216];
+	size_t cj = 0;
+	cj += (size_t)snprintf(catj + cj, sizeof(catj) - cj, ",\"categories\":[");
+	for (int i = 0; i < n_allowed; i++) {
+		const char *c = allowed[i];
+		cj += (size_t)snprintf(catj + cj, sizeof(catj) - cj, "%s\"",
+				       i ? "," : "");
+		/* category = stem filename (an toàn) — chỉ chặn ký tự phá JSON */
+		for (const char *s = c; *s && cj + 2 < sizeof(catj); s++)
+			if (*s != '"' && *s != '\\' && (unsigned char)*s >= 0x20)
+				catj[cj++] = *s;
+		if (cj + 1 < sizeof(catj)) catj[cj++] = '"';
+	}
+	if (cj + 1 < sizeof(catj)) catj[cj++] = ']';
+	catj[cj] = '\0';
 
 	char *json = malloc(SG_RESPONSE_MAX);
 	if (!json) {
 		send_error(client_fd, SG_ERR_SYSTEM_FAIL, "Out of memory");
 		return 0;
 	}
-	int n = ips_catalog_to_json("/etc/stargazer/ips/repo", json,
-				    SG_RESPONSE_MAX, allowed, n_allowed);
+	/* Bọc thành object {items, categories, truncated}. truncated báo frontend
+	 * khi catalog items bị cắt (ruleset lớn → "thu hẹp từ khoá"). categories
+	 * luôn đầy đủ. Reserve = len(catj) + len(",\"truncated\":N}") + lề. */
+	int trunc = 0;
+	const char *PFX = "{\"items\":";
+	size_t off = strlen(PFX);
+	size_t reserve = cj + 32;
+	memcpy(json, PFX, off);
+	int n = ips_catalog_to_json("/etc/stargazer/ips/repo", json + off,
+				    SG_RESPONSE_MAX - off - reserve, allowed, n_allowed,
+				    q[0] ? q : NULL, &trunc);
 	if (n < 0) {
 		free(json);
-		send_ok(client_fd, NULL, "[]");
+		send_ok(client_fd, NULL, "{\"items\":[],\"categories\":[],\"truncated\":0}");
 		return 0;
+	}
+	off += (size_t)n;
+	memcpy(json + off, catj, cj); off += cj;
+	off += (size_t)snprintf(json + off, SG_RESPONSE_MAX - off,
+				",\"truncated\":%d}", trunc);
+	if (q_empty) {            /* lưu cache (json đã NUL-term tại off) */
+		free(sigcache);
+		sigcache = strdup(json);
+		sc_repo_s = r_s; sc_repo_n = r_n;
+		sc_db_s = d_s; sc_db_n = d_n;
 	}
 	send_ok(client_fd, NULL, json);
 	free(json);

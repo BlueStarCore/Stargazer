@@ -31,10 +31,10 @@ static void write_load_stats(const struct sig_load_stats *st)
 	fprintf(f,
 		"loaded=%d\nloaded_full=%d\nloaded_alert=%d\n"
 		"skipped=%d\nskipped_unsupported=%d\nskipped_reputation=%d\n"
-		"skipped_no_content=%d\nerrors=%d\n",
+		"skipped_no_content=%d\nskipped_no_sid=%d\nerrors=%d\n",
 		st->loaded, st->loaded_full, st->loaded_alert,
 		st->skipped, st->skipped_unsupported, st->skipped_reputation,
-		st->skipped_no_content, st->errors);
+		st->skipped_no_content, st->skipped_no_sid, st->errors);
 	fclose(f);
 }
 
@@ -93,10 +93,10 @@ static void *reload_thread_fn(void *arg)
 	}
 	fprintf(stderr,
 		"sig_reload: loaded %d rules (full=%d alert-cap=%d | skip=%d "
-		"[unsup=%d reputation=%d no-content=%d] err=%d) from %s\n",
+		"[unsup=%d reputation=%d no-content=%d no-sid=%d] err=%d) from %s\n",
 		st.loaded, st.loaded_full, st.loaded_alert, st.skipped,
 		st.skipped_unsupported, st.skipped_reputation,
-		st.skipped_no_content, st.errors, path);
+		st.skipped_no_content, st.skipped_no_sid, st.errors, path);
 	write_load_stats(&st);
 
 	/* [c] build AC — bước tốn kém; bản cũ vẫn chạy trong lúc này */
@@ -203,10 +203,10 @@ int sig_reload_init(struct sig_reload *sr, const char *rules_path)
 
 	fprintf(stderr,
 		"sig_reload_init: ready (%d rules: full=%d alert-cap=%d | "
-		"skip unsup=%d reputation=%d no-content=%d err=%d) from %s\n",
+		"skip unsup=%d reputation=%d no-content=%d no-sid=%d err=%d) from %s\n",
 		st.loaded, st.loaded_full, st.loaded_alert,
 		st.skipped_unsupported, st.skipped_reputation,
-		st.skipped_no_content, st.errors, rules_path);
+		st.skipped_no_content, st.skipped_no_sid, st.errors, rules_path);
 	write_load_stats(&st);
 	return 0;
 }

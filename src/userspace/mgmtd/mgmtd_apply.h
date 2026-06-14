@@ -150,6 +150,10 @@ sg_status_t rebuild_nat_chains(char *result, size_t rsize);
  * verify bằng ipsd -C, atomic swap, SIGUSR1 ipsd. Gọi sau khi đổi
  * security_ips / security_ips-profile / firewall_policy. */
 sg_status_t rebuild_ips_active(char *result, size_t rsize);
+/* Bit index ổn định (0..30) cho IPS profile enable, theo thứ tự sg_db_list. Dùng
+ * CHUNG bởi firewall (skb MARK = bit+1) và ips compile (sgprof:bit; → mask) để hai
+ * bên khớp số. -1 nếu profile không tồn tại / disable / vượt 31 profile. */
+int ips_profile_bit(const char *name);
 sg_status_t run_ips_update_now(const char *ids_csv, char *result, size_t rsize);
 sg_status_t ips_rulesets_reload_custom(char *result, size_t rsize);
 
@@ -158,8 +162,10 @@ sg_status_t validate_firewall_policy(const char *id, const char *data,
 				     char *result, size_t rsize);
 sg_status_t validate_nat(const char *id, const char *data,
 			 char *result, size_t rsize);
-sg_status_t validate_ssl_inspection(const char *id, const char *data,
-				    char *result, size_t rsize);
+/* IPS bật trên policy theo toggle ips-status (tương thích ngược với policy cũ
+ * chưa có ips-status). Dùng cho cả forward chain lẫn SSL steering coupling. */
+int ips_policy_on(const char *status, const char *profile);
+
 sg_status_t validate_ips(const char *id, const char *data,
 			 char *result, size_t rsize);
 
@@ -167,11 +173,15 @@ sg_status_t validate_ips(const char *id, const char *data,
 /*
  * Append the TLS REDIRECT rule(s) into a *nat restore buffer (PREROUTING),
  * steering forwarded HTTPS into stargazer-ssld. Called from rebuild_nat_chains
- * so the whole *nat table stays one atomic restore. No-op (returns 0) if the
- * security_ssl-inspection config row is absent or disabled. Returns the number
- * of rules emitted, or -1 on a sanitization failure (caller still proceeds —
- * fail-safe = no steering, normal traffic). */
+ * so the whole *nat table stays one atomic restore. No-op (returns 0) when no
+ * accept policy binds an enabled security_ssl-inspection-profile. Returns the
+ * number of rules emitted, or -1 on a sanitization failure (caller still
+ * proceeds — fail-safe = no steering, normal traffic). */
 int emit_ssl_steering(struct dynbuf *buf);
+
+/* Start/stop/restart stargazer-ssld theo security_ssl-inspection-profile.
+ * Gọi sau khi rebuild_nat_chains apply steering. off-by-default → no-op. */
+void ssld_sync(void);
 
 /* ── Per-feature apply handlers ─────────────────────────────────────────── */
 

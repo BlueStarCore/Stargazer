@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
+#include <endian.h>       /* be64toh — NFQA_TIMESTAMP big-endian */
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <linux/netlink.h>
@@ -132,7 +133,32 @@ static int build_queue_config(char *buf, int cap, uint16_t qnum)
 			&params, sizeof(params)) < 0)
 		return -1;
 
-	/* CONNTRACK flag → NFQA_CT có trong packet notification */
+	/*
+	 * KHÔNG gộp cờ NFQA_CFG_F_CONNTRACK vào đây. Trên kernel thiếu
+	 * CONFIG_NETFILTER_NETLINK_GLUE_CT, đặt cờ này trả -EOPNOTSUPP làm HỎNG
+	 * CẢ message → BIND/COPY không áp → queue không nhận gói (pkt_seen=0).
+	 * Cờ conntrack gửi RIÊNG, best-effort (build_queue_flags).
+	 */
+	struct nlmsghdr *h = (struct nlmsghdr *)buf;
+	struct nfgenmsg *g = (struct nfgenmsg *)(buf + NLMSG_HDRLEN);
+	h->nlmsg_len   = (uint32_t)NLMSG_ALIGN((size_t)off);
+	h->nlmsg_type  = (uint16_t)((NFNL_SUBSYS_QUEUE << 8) | NFQNL_MSG_CONFIG);
+	h->nlmsg_flags = NLM_F_REQUEST;
+	h->nlmsg_seq   = 1;
+	g->nfgen_family = AF_UNSPEC;
+	g->version      = NFNETLINK_V0;
+	g->res_id       = htons(qnum);
+	return off;
+}
+
+/* Chỉ đặt cờ NFQA_CFG_F_CONNTRACK (NFQA_CT trong packet notification + cho phép
+ * verdict áp connmark). Gửi RIÊNG để lỗi cờ này không kéo theo hỏng BIND/COPY. */
+static int build_queue_flags(char *buf, int cap, uint16_t qnum)
+{
+	memset(buf, 0, (size_t)cap);
+	int off = NLMSG_HDRLEN + (int)NLMSG_ALIGN(sizeof(struct nfgenmsg));
+	if (off > cap) return -1;
+
 	uint32_t flags = htonl(NFQA_CFG_F_CONNTRACK);
 	uint32_t mask  = htonl(NFQA_CFG_F_CONNTRACK);
 	if (nla_put_u32(buf, &off, cap, NFQA_CFG_FLAGS, flags) < 0)
@@ -184,11 +210,20 @@ int nfq_open(struct nfq_ctx *ctx, uint16_t queue_num)
 			      (struct sockaddr *)&dst, sizeof(dst)) < 0)
 		goto err;
 
-	/* Queue BIND + COPY_PACKET + CONNTRACK */
+	/* Queue BIND + COPY_PACKET (BẮT BUỘC — không có thì không nhận gói) */
 	len = build_queue_config(buf, sizeof(buf), queue_num);
 	if (len < 0 || sendto(ctx->fd, buf, (size_t)len, 0,
 			      (struct sockaddr *)&dst, sizeof(dst)) < 0)
 		goto err;
+
+	/* CONNTRACK flag — BEST-EFFORT, gửi RIÊNG. Kernel thiếu glue_ct sẽ trả
+	 * -EOPNOTSUPP nhưng KHÔNG ảnh hưởng BIND/COPY ở trên → gói vẫn được giao.
+	 * Mất cờ chỉ làm verdict không áp được connmark (offload/block flow tiếp
+	 * theo); với detect mode không sao, prevent mode vẫn NF_DROP gói hiện tại. */
+	len = build_queue_flags(buf, sizeof(buf), queue_num);
+	if (len > 0)
+		(void)sendto(ctx->fd, buf, (size_t)len, 0,
+			     (struct sockaddr *)&dst, sizeof(dst));
 
 	return 0;
 err:
@@ -328,6 +363,37 @@ again:
 
 		if (nfq_parse_packet(pkt->raw_buf, copy, pkt) < 0)
 			continue;
+
+		/* NFQA_MARK → skb mark; low byte = IPS profile id (per-policy
+		 * scoping). Đặt SAU nfq_parse_packet (hàm đó không đụng field này).
+		 * Dùng skb mark vì tin cậy hơn NFQA_CT trên kernel thiếu glue_ct. */
+		pkt->ips_prof_id = 0;
+		int mkl = 0;
+		const void *mk = nla_find(attrs, alen, NFQA_MARK, &mkl);
+		if (mk && mkl >= 4)
+			pkt->ips_prof_id =
+				(uint8_t)(ntohl(*(const uint32_t *)mk) & 0xFF);
+
+		/* NFQA_TIMESTAMP → thời điểm kernel ghi nhận gói (cho alert log).
+		 * struct {be64 sec; be64 usec}. Kernel chỉ gửi khi skb->tstamp được
+		 * set → vắng thì cap_sec=0 (log_alert fallback). memcpy vì payload
+		 * attribute chỉ căn 4-byte, đọc be64 trực tiếp có thể lệch alignment.
+		 *
+		 * CẢNH BÁO: từ kernel ~5.18, skb->tstamp của gói FORWARD thường là
+		 * CLOCK_MONOTONIC (mô hình EDT), không phải wall-clock. nfnetlink_queue
+		 * dump thẳng ktime đó → sec ≈ uptime → "1970-01-01 + uptime". Guard:
+		 * chỉ nhận nếu trông như epoch thật (≥ 2020-01-01); monotonic muốn
+		 * vượt mốc này phải uptime ~50 năm → bất khả → bị loại, fallback. */
+		pkt->cap_sec = 0;
+		int tsl = 0;
+		const void *tsp = nla_find(attrs, alen, NFQA_TIMESTAMP, &tsl);
+		if (tsp && tsl >= (int)sizeof(struct nfqnl_msg_packet_timestamp)) {
+			uint64_t sec;
+			memcpy(&sec, tsp, sizeof(sec));   /* field đầu = sec */
+			int64_t s = (int64_t)be64toh(sec);
+			if (s >= 1577836800)              /* 2020-01-01 UTC */
+				pkt->cap_sec = s;
+		}
 
 		return 0;
 	}

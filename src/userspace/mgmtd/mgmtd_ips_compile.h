@@ -29,22 +29,27 @@
 int ips_compile_categories(const char *repo_dir, const char *categories,
 			   const char *out_path);
 
-/* ── FortiGate-style filter compile (chọn luật vào profile) ───────────── */
+/* ── FortiGate IPS sensor: filter compile + per-entry ACTION (P7) ──────── */
 
 enum ips_filter_type   { IPS_FT_CATEGORY = 0, IPS_FT_SIGNATURE = 1 };
+enum ips_filter_action { IPS_FA_DEFAULT = 0, IPS_FA_BLOCK, IPS_FA_ALERT,
+			 IPS_FA_PASS };
 
 struct ips_filter {
 	int  type;          /* enum ips_filter_type   */
 	char value[128];    /* tên category hoặc SID  */
+	int  action;        /* enum ips_filter_action (P7) */
 };
 
 /*
- * Compile ruleset của một profile TỪ danh sách filter vào out_path.
- *   - filter category: ghép repo/<value>.rules nguyên trạng.
- *   - filter signature: tìm rule có `sid:<value>;` trong toàn repo, ghi ra
- *     nguyên trạng.
- * Action của từng rule GIỮ NGUYÊN (không override) — verdict do action gốc
- * của rule + policy/mode quyết định.
+ * Compile ruleset của một profile TỪ danh sách filter vào out_path (P7).
+ * Mỗi entry mang action per-entry; khi ghi rule, REWRITE token action đầu:
+ *   default → giữ action gốc của rule.   block → "drop".   alert → "alert".
+ *   pass    → KHÔNG ghi rule (whitelist, loại khỏi profile).
+ * Precedence (như FortiGate): signature override > category > default — sid có
+ * filter type=signature thì dùng action đó, kể cả khi sid nằm trong category.
+ * Rule partial-match (P0 fidelity ALERT) dù block vẫn bị ipsd kẹp ALERT lúc
+ * chạy (không false-DROP).
  * Trả số dòng RULE đã ghi (>=0), -1 nếu lỗi mở out_path/repo.
  */
 int ips_compile_filters(const char *repo_dir, const struct ips_filter *filters,
@@ -58,8 +63,14 @@ int ips_compile_filters(const char *repo_dir, const struct ips_filter *filters,
  */
 /* allowed: array of category name strings (repo filename stem, e.g. "botcc").
  * Only entries whose category appears in allowed[] are included.
- * Pass allowed=NULL / n_allowed=0 to include everything. */
+ * Pass allowed=NULL / n_allowed=0 to include everything.
+ *
+ * query: lọc text (case-insensitive) — chỉ entry có `query` trong sid/name/
+ * category/cve mới được xuất. NULL/"" = không lọc. Vì response IPC giới hạn
+ * 64KB, ruleset lớn phải SEARCH server-side; *truncated được set 1 nếu còn
+ * entry khớp nhưng hết chỗ (frontend báo "thu hẹp từ khoá"). */
 int ips_catalog_to_json(const char *repo_dir, char *buf, size_t cap,
-                        const char *const *allowed, int n_allowed);
+                        const char *const *allowed, int n_allowed,
+                        const char *query, int *truncated);
 
 #endif /* MGMTD_IPS_COMPILE_H */

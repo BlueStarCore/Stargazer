@@ -12,6 +12,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Telemetry: tổng byte đã feed vào AC (main.c đọc qua extern để chẩn đoán
+ * "ac_raw=0" — phân biệt reass không feed vs AC không trúng). */
+unsigned long g_reass_fed;
+
 /* ---- bitmap byte-đã-nhận ------------------------------------------------- */
 static inline int bit_get(const uint8_t *bm, uint32_t i)
 {
@@ -132,6 +136,7 @@ int reass_segment(struct reass_flow *rf, int dir, uint32_t seq,
 							 : d->scan_limit;
 	if (rf->ac && feed_to > d->scanned) {
 		struct feed_ctx fctx = { cb, ctx, dir };
+		g_reass_fed += (feed_to - d->scanned);   /* telemetry: byte feed vào AC */
 		ac_search_stream(rf->ac, &d->ac_state,
 				 d->buf + d->scanned,
 				 feed_to - d->scanned,

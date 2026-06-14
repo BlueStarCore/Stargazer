@@ -288,6 +288,18 @@ static void ml_account(struct sk_buff *skb, u8 proto, int iif, int oif)
  *
  * Accepted packets continue to conntrack, the iptables policy chain, and NAT.
  */
+/*
+ * Phase 4 (ML cho HTTPS) — GATED. Khi =0 (mặc định) hook LOCAL_IN no-op ngay,
+ * kernel hành xử y hệt cũ. mgmtd đặt =1 khi `ips ml-https enable` để tích lũy
+ * CTA_ML cho leg client→ssld (ssld proxy), giúp ipsd chấm ML trên HTTPS đã giải
+ * mã. KHÔNG thêm field CTA_ML (reuse 14 field). Đọc/ghi runtime qua sysfs:
+ *   /sys/module/pkt_forward/parameters/ml_account_local
+ */
+static int ml_account_local;
+module_param(ml_account_local, int, 0644);
+MODULE_PARM_DESC(ml_account_local,
+	"Phase 4: account ML features on LOCAL_IN (ssld leg). 0=off (default).");
+
 static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 				 const struct nf_hook_state *state)
 {
@@ -325,6 +337,31 @@ static unsigned int forward_hook(void *priv, struct sk_buff *skb,
 		   state->out ? state->out->ifindex : 0);
 
 	atomic64_inc(&pkts_forwarded);
+	return NF_ACCEPT;
+}
+
+/*
+ * Phase 4 — LOCAL_IN hook (gated bởi ml_account_local). Chỉ TÍCH LŨY CTA_ML cho
+ * leg client→ssld (traffic đã REDIRECT vào ssld trở thành local-in). KHÔNG drop,
+ * KHÔNG anomaly-screen (đó là việc của FORWARD). off → return ngay → 0 overhead.
+ */
+static unsigned int local_in_hook(void *priv, struct sk_buff *skb,
+				  const struct nf_hook_state *state)
+{
+	u8 proto;
+
+	if (!ml_account_local)              /* GATED: tắt → y hệt kernel cũ */
+		return NF_ACCEPT;
+	if (!is_valid_ipv4(skb))
+		return NF_ACCEPT;              /* không phải việc của hook này */
+	proto = ip_hdr(skb)->protocol;
+	if (proto != IPPROTO_TCP)
+		return NF_ACCEPT;
+	if (!pskb_may_pull(skb, (unsigned int)ip_hdr(skb)->ihl * 4 +
+			   sizeof(struct tcphdr)))
+		return NF_ACCEPT;
+	/* oif=0 (local delivery); dir lấy từ conntrack trong ml_account. */
+	ml_account(skb, proto, state->in ? state->in->ifindex : 0, 0);
 	return NF_ACCEPT;
 }
 
@@ -369,6 +406,15 @@ static const struct nf_hook_ops nf_forward_ops = {
 	.priority = NF_IP_PRI_CONNTRACK_DEFRAG + 1,
 };
 
+/* Phase 4 — LOCAL_IN: ML accounting cho leg ssld (gated). Priority sau conntrack
+ * để ct đã có khi đọc CTA_ML. Luôn ACCEPT (chỉ tích lũy, off → no-op). */
+static const struct nf_hook_ops nf_local_in_ops = {
+	.hook     = local_in_hook,
+	.pf       = NFPROTO_IPV4,
+	.hooknum  = NF_INET_LOCAL_IN,
+	.priority = NF_IP_PRI_CONNTRACK_DEFRAG + 1,
+};
+
 static int __init pkt_forward_init(void)
 {
 	int ret;
@@ -386,6 +432,13 @@ static int __init pkt_forward_init(void)
 		return ret;
 	}
 
+	/* Phase 4 — LOCAL_IN hook (gated bởi ml_account_local). Đăng ký luôn nhưng
+	 * no-op khi param=0 → toggle runtime qua sysfs không cần re-register. Lỗi
+	 * đăng ký không fatal (ML-HTTPS chỉ là tính năng phụ). */
+	if (nf_register_net_hook(&init_net, &nf_local_in_ops) < 0)
+		pr_warn("pkt_forward: LOCAL_IN hook registration failed — "
+			"ML-HTTPS (Phase 4) unavailable\n");
+
 	/* Create /proc/stargazer/ for the stats file. Failure is non-fatal —
 	 * the module still functions without procfs. */
 	pf_proc_root = proc_mkdir("stargazer", NULL);
@@ -402,6 +455,7 @@ static int __init pkt_forward_init(void)
 
 static void __exit pkt_forward_exit(void)
 {
+	nf_unregister_net_hook(&init_net, &nf_local_in_ops);
 	nf_unregister_net_hook(&init_net, &nf_forward_ops);
 	nf_defrag_ipv4_disable(&init_net);
 	if (proc_pf_stats)

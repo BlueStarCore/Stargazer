@@ -1964,12 +1964,14 @@ static void flow_ips_alerts(work_item_t *item)
 	webd_ipc_resp_free(&resp);
 }
 
-/* GET /api/ips/signatures — catalog signature (mgmtd trả sẵn JSON array). */
-static void flow_ips_signatures(work_item_t *item)
+/* GET /api/ips/alerts-json — mgmtd trả SẴN JSON array [{...}]. Gửi nguyên văn,
+ * KHÔNG qua flow_simple/kv_to_json (nó tưởng payload là key=value → băm nát). */
+static void flow_ips_alerts_json(work_item_t *item)
 {
 	webd_ipc_response_t resp;
-	if (webd_ipc_send(SG_CMD_IPS_SIGNATURES, item->username,
-			  item->session_tag, "", &resp) != 0) {
+	if (webd_ipc_send(SG_CMD_IPS_ALERTS_JSON, item->username,
+			  item->session_tag,
+			  item->payload ? item->payload : "", &resp) != 0) {
 		char *json = json_error("Backend unavailable", NULL);
 		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
 		return;
@@ -1979,8 +1981,41 @@ static void flow_ips_signatures(work_item_t *item)
 		webd_ipc_resp_free(&resp);
 		return;
 	}
-	/* payload đã là JSON array → gửi nguyên */
-	const char *body = resp.payload ? resp.payload : "[]";
+	if (resp.payload && resp.payload_len > 0) {
+		char *body = malloc(resp.payload_len + 1);
+		if (body) {
+			memcpy(body, resp.payload, resp.payload_len);
+			body[resp.payload_len] = '\0';
+			send_result(item->conn_id, 200, body, resp.payload_len);
+		} else {
+			char *j = json_error("Out of memory", NULL);
+			send_result(item->conn_id, 500, j, j ? strlen(j) : 0);
+		}
+	} else {
+		send_result(item->conn_id, 200, strdup("[]"), 2);
+	}
+	webd_ipc_resp_free(&resp);
+}
+
+/* GET /api/ips/signatures — catalog signature (mgmtd trả sẵn JSON object
+ * {items,truncated}). payload mang "q=<từ khoá>" để lọc server-side. */
+static void flow_ips_signatures(work_item_t *item)
+{
+	webd_ipc_response_t resp;
+	const char *q = item->payload ? item->payload : "";
+	if (webd_ipc_send(SG_CMD_IPS_SIGNATURES, item->username,
+			  item->session_tag, q, &resp) != 0) {
+		char *json = json_error("Backend unavailable", NULL);
+		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
+		return;
+	}
+	if (resp.status != SG_OK) {
+		send_ipc_error(item->conn_id, resp.status, resp.extra);
+		webd_ipc_resp_free(&resp);
+		return;
+	}
+	/* payload đã là JSON object → gửi nguyên (item->payload do dispatcher free) */
+	const char *body = resp.payload ? resp.payload : "{\"items\":[],\"truncated\":0}";
 	char *out = strdup(body);
 	send_result(item->conn_id, 200, out, out ? strlen(out) : 0);
 	webd_ipc_resp_free(&resp);
@@ -2168,7 +2203,7 @@ static void *worker_fn(void *arg)
 		case FLOW_IPS_ALERTS:       flow_ips_alerts(&item);       break;
 		case FLOW_IPS_SIGS:         flow_ips_signatures(&item);   break;
 		case FLOW_IPS_UPDATE:       flow_diagnose(&item);         break;
-		case FLOW_IPS_ALERTS_JSON:  flow_simple(&item);           break;
+		case FLOW_IPS_ALERTS_JSON:  flow_ips_alerts_json(&item);   break;
 		case FLOW_IPS_UPDATE_LOG:   flow_diagnose(&item);         break;
 		case FLOW_LOGIN:         flow_login(&item);           break;
 		case FLOW_CONFIG_LIST:   flow_config_list(&item);     break;

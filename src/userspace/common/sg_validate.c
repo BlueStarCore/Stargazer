@@ -36,9 +36,9 @@ static const sg_type_info_t type_table[] = {
 	{ "firewall_service",       CFG_TABLE,  "configure", "Configure service objects"           },
 	{ "security_ips",           CFG_SINGLE, "configure", "Configure IPS (signature + ML inspection)" },
 	{ "security_ips-profile",   CFG_TABLE,  "configure", "Configure IPS profiles (signature sets)" },
-	{ "security_ips-filter",    CFG_TABLE,  "configure", "Configure IPS profile filters (category/signature selection)" },
+	{ "security_ips-filter",    CFG_TABLE,  "configure", "Configure IPS profile filters (category/signature + action, FortiGate-style)" },
 	{ "security_ips-ruleset",   CFG_TABLE,  "configure", "Configure IPS ruleset sources (URL entries for download)" },
-	{ "security_ssl-inspection",CFG_SINGLE, "configure", "Configure SSL/TLS inspection (MITM)" },
+	{ "security_ssl-inspection-profile", CFG_TABLE, "configure", "Configure SSL inspection profiles (FortiGate-style)" },
 	{ "system_password-policy", CFG_SINGLE, "admin",     "Configure global password policy"    },
 	{ "system_admin-profile",   CFG_TABLE,  "admin",     "Configure admin permission profiles" },
 	{ "system_admin",           CFG_TABLE,  "admin",     "Configure admin accounts"            },
@@ -91,6 +91,10 @@ static const struct field_entry field_table[] = {
 	{ "security_ips", "queue-num",  "uint:0:65535",        0, "0",       "NFQUEUE number nối với ipsd", 0 },
 	{ "security_ips", "snapshot-n", "uint:1:64",           0, "8",       "Số gói đầu mỗi flow đưa vào NFQUEUE (fallback khi kernel thiếu connbytes mode bytes)", 0 },
 	{ "security_ips", "snapshot-bytes", "uint:1024:262144", 0, "16384",  "Cửa sổ soi mỗi flow (byte, 2 chiều) — connbytes-mode bytes (P1 reassembly)", 0 },
+	/* Phase 4: HTTPS-deep soi qua IPC engine stateful của ipsd. */
+	{ "security_ips", "ipc-inspect",  "enum:enable,disable", 0, "enable", "Phase 4: ssld đẩy HTTPS đã giải mã qua IPC tới engine stateful ipsd (disable = soi per-chunk)", 0 },
+	{ "security_ips", "ipc-failmode", "enum:open,closed",    0, "open",   "Phase 4: IPC lỗi → open=fallback soi per-chunk; closed=chặn flow (fail-closed)", 0 },
+	{ "security_ips", "ml-https",     "enum:enable,disable", 0, "disable", "Phase 4 Pha 2: ML cho HTTPS đã giải mã — bật hook kernel LOCAL_IN (ml_account_local). Mặc định disable (opt-in).", 0 },
 	{ "security_ips", "auto-update","enum:disable,daily,weekly", 0, "disable", "Tự cập nhật signature theo lịch (cron)", 0 },
 	{ "security_ips", "update-url", "string",              1, NULL,      "URL nguồn ruleset (ET Open) cho auto-update", 0 },
 	{ "security_ips", "cron-enabled","enum:enable,disable", 0, "disable", "Enable scheduled auto-update", 0 },
@@ -109,14 +113,15 @@ static const struct field_entry field_table[] = {
 	{ "security_ips-profile", "categories",   "string",              1, "all",    "Legacy fallback khi không có filter (comma list, 'all')", 0 },
 	{ "security_ips-profile", "comment",      "string",              1, NULL,     "Optional description", 0 },
 
-	/* security_ips-filter (CFG_TABLE, FortiGate-style) — mỗi entry là một
-	 * mục lọc của một profile: chọn theo category hoặc signature (SID).
-	 * Chỉ CHỌN luật vào profile; action giữ nguyên theo từng rule (không
-	 * override). Nhiều entry/profile (lọc theo field `profile`). */
+	/* security_ips-filter (CFG_TABLE, FortiGate IPS sensor) — mỗi entry là một
+	 * mục của một profile: chọn theo category hoặc signature (SID), kèm ACTION
+	 * per-entry (P7). status = có soi entry không; action = khi match làm gì.
+	 * Nhiều entry/profile (lọc theo field `profile`). */
 	{ "security_ips-filter", "profile", "ref:security_ips-profile",        0, NULL,      "Profile chứa filter này", 0 },
 	{ "security_ips-filter", "type",    "enum:category,signature",         0, "category", "category = nhóm luật; signature = SID cụ thể", 0 },
 	{ "security_ips-filter", "value",   "string",                          0, NULL,      "Tên category hoặc SID", 0 },
-	{ "security_ips-filter", "status",  "enum:enable,disable",             0, "enable",  "Enable filter này", 0 },
+	{ "security_ips-filter", "action",  "enum:default,block,alert,pass",   0, "default", "default=giữ action gốc rule; block=drop; alert=cảnh báo; pass=bỏ rule khỏi profile", 0 },
+	{ "security_ips-filter", "status",  "enum:enable,disable",             0, "enable",  "Enable filter này (có soi không)", 0 },
 
 	/* security_ips-ruleset (CFG_TABLE) — nguồn ruleset để tải về.
 	 * Mỗi entry là một URL (ET Open, SSL BL, custom). Cron và "Update Now"
@@ -128,13 +133,17 @@ static const struct field_entry field_table[] = {
 	{ "security_ips-ruleset", "builtin",       "enum:yes,no",         0, "no",      "Entry mặc định (không xoá được)", SG_FLD_HIDDEN },
 	{ "security_ips-ruleset", "last-downloaded","string",             1, NULL,      "Timestamp of last successful download", SG_FLD_HIDDEN },
 
-	/* security_ssl-inspection (CFG_SINGLE) — MITM TLS inspection steering.
-	 * Off by default; steers forwarded HTTPS into stargazer-ssld. */
-	{ "security_ssl-inspection", "status",      "enum:enable,disable",               0, "disable", "Enable SSL/TLS inspection", 0 },
-	{ "security_ssl-inspection", "srcintf",     "ref-iface-or:system_interface:any", 1, NULL,      "Internal interface to inspect (LAN)", 0 },
-	{ "security_ssl-inspection", "ports",       "string",                            0, "443",     "TCP dest ports to inspect (e.g. 443 or 443,8443)", 0 },
-	{ "security_ssl-inspection", "listen-port", "uint:1:65535",                      0, "8443",    "stargazer-ssld proxy listen port", 0 },
-	{ "security_ssl-inspection", "no-sni",      "enum:bump,splice",                  0, "bump",    "Action for TLS flows without SNI", 0 },
+	/* security_ssl-inspection-profile (CFG_TABLE) — profile FortiGate-style.
+	 * srcintf/ports/listen-port KHÔNG ở đây: srcintf/ports lấy từ policy gắn
+	 * profile; listen-port mgmtd tự gán theo index để mỗi profile 1 ssld. */
+	{ "security_ssl-inspection-profile", "name",                  "safe-id",               0, NULL,          "Profile name", 0 },
+	{ "security_ssl-inspection-profile", "status",                "enum:enable,disable",   0, "enable",      "Enable this profile", 0 },
+	{ "security_ssl-inspection-profile", "inspection-mode",       "enum:certificate,deep", 0, "certificate", "certificate=SNI/cert only; deep=MITM decrypt", 0 },
+	{ "security_ssl-inspection-profile", "no-sni",                "enum:bump,splice",      0, "bump",        "Action for TLS without SNI", 0 },
+	{ "security_ssl-inspection-profile", "untrusted-server-cert", "enum:allow,block",      0, "block",       "Untrusted server cert → allow/block", 0 },
+	{ "security_ssl-inspection-profile", "unsupported",           "enum:allow,block",      0, "allow",       "Unsupported (cert-pinning/cipher) → allow/block", 0 },
+	{ "security_ssl-inspection-profile", "exempt",                "string",                1, NULL,          "Exempt SNI domains (comma list)", 0 },
+	{ "security_ssl-inspection-profile", "comment",               "string",                1, NULL,          "Optional description", 0 },
 
 	/* system_interface */
 	{ "system_interface", "mode",        "enum:static,dhcp", 0, "static", "Addressing mode", 0 },
@@ -194,9 +203,16 @@ static const struct field_entry field_table[] = {
 	{ "firewall_policy", "comment",  "string",                          1, NULL,     "Optional description", 0 },
 	{ "firewall_policy", "sequence", "uint:1:9999",                     1, NULL,     "Priority (higher = checked first)", 0 },
 	{ "firewall_policy", "cmkid",    "uint:1:16777215",                 1, NULL,     "Connmark id stamped on permitted flows (internal)", SG_FLD_HIDDEN },
-	/* ips-profile: chỉ có nghĩa khi action=accept; validation bắt lỗi nếu
-	 * đặt trên policy deny/drop (giống FortiGate — DENY không cần inspect L7). */
-	{ "firewall_policy", "ips-profile", "ref-or:security_ips-profile:none", 0, "none", "IPS security profile (accept-only policies)", 0 },
+	/* IPS: KHÔNG có "none". Tắt = ips-profile UNSET (không liên kết profile nào);
+	 * bật = ips-profile = một profile thật (web toggle on → mặc định "default",
+	 * user tự chọn khác; CLI `set ips-profile <name>` để bật, `unset ips-profile`
+	 * để tắt). ips-status là field NỘI BỘ (toggle), tự đồng bộ theo ips-profile —
+	 * ẩn khỏi CLI. ips-profile optional, không default → policy mới mặc định off. */
+	{ "firewall_policy", "ips-status",  "enum:enable,disable", 1, NULL, "Enable IPS inspection (internal toggle)", 0 },
+	{ "firewall_policy", "ips-profile", "ref:security_ips-profile", 1, NULL, "IPS security profile (accept-only policies)", 0 },
+	/* ssl-profile: mặc định built-in "no-inspection" (không giải mã). Chỉ có
+	 * nghĩa khi action=accept. */
+	{ "firewall_policy", "ssl-profile", "ref-or:security_ssl-inspection-profile:no-inspection", 0, "no-inspection", "SSL inspection profile (accept-only policies)", 0 },
 
 	/* firewall_address
 	 * subnet/fqdn are registry-optional: which one is required depends on

@@ -58,12 +58,17 @@ if [ -n "$hdr" ] && [ "$hdr" = "$prev_hdr" ]; then
 fi
 
 # ── 2. Download ──────────────────────────────────────────────────────────────
-if ! "$WGET" -q --timeout=60 -O "$tmp" "$URL"; then
-    log "ERROR: download failed ($URL)"
+# Bắt stderr của wget để trích LÝ DO (no internet / DNS sai / URL hỏng…) cho
+# người dùng, thay vì chỉ "download failed".
+err_out=$("$WGET" --timeout=60 -O "$tmp" "$URL" 2>&1)
+if [ $? -ne 0 ]; then
+    reason=$(printf '%s' "$err_out" | grep -iE 'wget|error|connect|address|resolve|refused|timed out|network' | tail -n 1 | sed 's/^[ \t]*//')
+    [ -z "$reason" ] && reason="no internet/network access or wrong URL"
+    log "ERROR: download failed ($URL) — $reason"
     exit 1
 fi
 if [ ! -s "$tmp" ]; then
-    log "ERROR: downloaded file empty"
+    log "ERROR: downloaded file empty ($URL)"
     exit 1
 fi
 

@@ -53,9 +53,9 @@ int main(int argc, char **argv)
 	if (st.loaded)
 		printf("  %% thực sự enforce     : %.1f%%\n",
 		       100.0 * st.loaded_full / st.loaded);
-	printf("  dòng bỏ qua           : %d (unsupported=%d, reputation=%d, no-content=%d)\n",
+	printf("  dòng bỏ qua           : %d (unsupported=%d, reputation=%d, no-content=%d, no-sid=%d)\n",
 	       st.skipped, st.skipped_unsupported, st.skipped_reputation,
-	       st.skipped_no_content);
+	       st.skipped_no_content, st.skipped_no_sid);
 	printf("  dòng lỗi cú pháp      : %d\n", st.errors);
 	printf("  AC: %d node  (~%.1f MB DFA đầy đủ)\n",
 	       rs.ac.n_nodes,

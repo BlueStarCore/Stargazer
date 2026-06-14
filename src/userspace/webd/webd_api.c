@@ -1201,6 +1201,40 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 		return 0;
 	}
 
+	/* ── /api/monitor/ssl ── SSL inspection diagnostics ──────────── */
+	if (strcmp(segs[0], "monitor") == 0 && nseg == 2 &&
+	    strcmp(segs[1], "ssl") == 0 && mg_str_eq(hm->method, "GET")) {
+		work_item_t item;
+		memset(&item, 0, sizeof(item));
+		item.conn_id = c->id;
+		item.ipc_cmd = SG_CMD_SSL_DIAG;
+		item.flow_type = FLOW_IPS_UPDATE;   /* flow_diagnose → {"output":...} */
+		snprintf(item.username, sizeof(item.username), "%s", sess.username);
+		item.session_tag = sess.ipc_session_tag;
+		if (webd_pool_enqueue(&item) != 0) {
+			reply_json(c, 503, "{\"error\":\"Server busy\"}");
+			return -1;
+		}
+		return 0;
+	}
+
+	/* ── /api/monitor/ssl-cacert ── SSL inspection CA cert (PEM) ──── */
+	if (strcmp(segs[0], "monitor") == 0 && nseg == 2 &&
+	    strcmp(segs[1], "ssl-cacert") == 0 && mg_str_eq(hm->method, "GET")) {
+		work_item_t item;
+		memset(&item, 0, sizeof(item));
+		item.conn_id = c->id;
+		item.ipc_cmd = SG_CMD_SSL_CACERT;
+		item.flow_type = FLOW_IPS_UPDATE;
+		snprintf(item.username, sizeof(item.username), "%s", sess.username);
+		item.session_tag = sess.ipc_session_tag;
+		if (webd_pool_enqueue(&item) != 0) {
+			reply_json(c, 503, "{\"error\":\"Server busy\"}");
+			return -1;
+		}
+		return 0;
+	}
+
 	/* ── /api/monitor/ips-alerts ── recent IPS alerts (default 20) ─ */
 	if (strcmp(segs[0], "monitor") == 0 && nseg == 2 &&
 	    strcmp(segs[1], "ips-alerts") == 0 &&
@@ -1225,6 +1259,10 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 	    strcmp(segs[1], "signatures") == 0 &&
 	    mg_str_eq(hm->method, "GET")) {
 
+		/* ?q= search → forward to mgmtd (response IPC limited to 64KB,
+		 * so large rulesets must be filtered server-side). */
+		char *search = query_param(hm->query, "q");
+
 		work_item_t item;
 		memset(&item, 0, sizeof(item));
 		item.conn_id = c->id;
@@ -1232,7 +1270,17 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 		item.flow_type = FLOW_IPS_SIGS;
 		snprintf(item.username, sizeof(item.username), "%s", sess.username);
 		item.session_tag = sess.ipc_session_tag;
+		if (search && search[0]) {
+			size_t n = strlen(search) + 3; /* "q=" + NUL */
+			item.payload = malloc(n);
+			if (item.payload) {
+				snprintf(item.payload, n, "q=%s", search);
+				item.payload_len = strlen(item.payload);
+			}
+		}
+		free(search);
 		if (webd_pool_enqueue(&item) != 0) {
+			free(item.payload);
 			reply_json(c, 503, "{\"error\":\"Server busy\"}");
 			return -1;
 		}
@@ -1355,10 +1403,20 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 	    strcmp(segs[1], "alerts-clear") == 0 &&
 	    mg_str_eq(hm->method, "POST")) {
 
-		const char *log_path = "/etc/stargazer/logs/ips-alert.log";
-		int fd = open(log_path, O_WRONLY | O_TRUNC | O_CREAT, 0640);
-		if (fd >= 0) close(fd);
-		reply_json(c, 200, "{\"ok\":true}");
+		/* Qua mgmtd (root): /etc/stargazer/logs là 0700 root, webd (uid 900)
+		 * KHÔNG truncate trực tiếp được — trước đây open() fail âm thầm mà
+		 * vẫn báo {ok:true}. Giờ uỷ thác cho mgmtd xoá thật. */
+		work_item_t item;
+		memset(&item, 0, sizeof(item));
+		item.conn_id  = c->id;
+		item.ipc_cmd  = SG_CMD_IPS_ALERTS_CLEAR;
+		item.flow_type = FLOW_SIMPLE;
+		snprintf(item.username, sizeof(item.username), "%s", sess.username);
+		item.session_tag = sess.ipc_session_tag;
+		if (webd_pool_enqueue(&item) != 0) {
+			reply_json(c, 503, "{\"error\":\"Server busy\"}");
+			return -1;
+		}
 		return 0;
 	}
 

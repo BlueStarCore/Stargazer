@@ -179,6 +179,9 @@ typedef enum {
 	SG_CMD_IPS_ALERTS_JSON       = 689,   /* parse ips-alert.log → JSON array */
 	SG_CMD_IPS_RULESETS_RELOAD   = 690,   /* scan custom dir for .xml → upsert DB entries */
 	SG_CMD_IPS_UPDATE_LOG        = 691,   /* tail ips-update.log → payload */
+	SG_CMD_IPS_ALERTS_CLEAR      = 692,   /* truncate ips-alert.log (root) */
+	SG_CMD_IPS_SCORES            = 693,   /* per-flow ML scores (ipsd dump loop) */
+	SG_CMD_SSL_DIAG              = 694,   /* SSL inspection diagnostics (debug) */
 
 	/* Keepalive / ping (9xx) */
 	SG_CMD_PING          = 900,

@@ -101,6 +101,9 @@
                     <div class="nav-sub-item" data-page="sec-ips-profiles">
                         <span class="sub-label">IPS PROFILES</span>
                     </div>
+                    <div class="nav-sub-item" data-page="sec-ssl">
+                        <span class="sub-label">SSL INSPECTION</span>
+                    </div>
                 </div>
             </div>
 
@@ -126,6 +129,9 @@
                     </div>
                     <div class="nav-sub-item" data-page="sys-firmware">
                         <span class="sub-label">FIRMWARE</span>
+                    </div>
+                    <div class="nav-sub-item" data-page="sys-certificates">
+                        <span class="sub-label">CERTIFICATES</span>
                     </div>
                 </div>
             </div>
@@ -648,7 +654,9 @@
                             <div class="form-row" data-key="dstaddr"><label class="form-label">Destination</label><select class="form-input addr-select"><option value="all" selected>all</option></select></div>
                             <div class="form-row" data-key="service"><label class="form-label">Service</label><select class="form-input svc-select"><option value="all" selected>ALL</option></select></div>
                             <div class="form-row" data-key="action"><label class="form-label">Action</label><select class="form-input"><option value="accept" selected>ACCEPT</option><option value="deny">DENY</option><option value="drop">DROP</option></select></div>
-                            <div class="form-row" data-key="ips-profile"><label class="form-label">IPS Profile</label><select class="form-input ips-profile-select"><option value="none" selected>None</option></select></div>
+                            <div class="form-row" data-key="ips-status"><label class="form-label">IPS</label><label class="switch"><input type="checkbox" class="form-input" data-on="enable" data-off="disable"><span class="slider"></span></label></div>
+                            <div class="form-row" data-key="ips-profile"><label class="form-label">IPS Profile</label><select class="form-input ips-profile-select"><option value="default" selected>default</option></select></div>
+                            <div class="form-row" data-key="ssl-profile"><label class="form-label">SSL Inspection</label><select class="form-input ssl-profile-select"><option value="no-inspection" selected>no-inspection</option></select></div>
                             <div class="form-row" data-key="schedule"><label class="form-label">Schedule</label><input class="form-input" type="text" value="all" placeholder="all or schedule name" maxlength="64"></div>
                             <div class="form-row form-row-full form-row-wide" data-key="comment"><label class="form-label">Comment</label><input class="form-input" type="text" placeholder="Optional description" maxlength="255"></div>
                         </div>
@@ -752,9 +760,9 @@
                                 <option value="detect">Detect (alert only)</option>
                             </select>
                         </div>
-                        <div class="form-row" data-key="snapshot-n">
-                            <label class="form-label">Inspect first N packets</label>
-                            <input class="form-input" type="number" min="1" max="64" placeholder="8">
+                        <div class="form-row" data-key="snapshot-bytes">
+                            <label class="form-label">Inspection window (bytes)</label>
+                            <input class="form-input" type="number" min="1024" max="262144" placeholder="16384">
                         </div>
                         <div class="form-actions"><button class="btn btn-primary">Apply</button><button class="btn">Reset</button></div>
                     </div>
@@ -962,8 +970,8 @@
                             <button type="button" class="btn-create" id="ips-add-sig"><span class="btn-create-plus">+</span> Create New</button>
                         </div>
                         <table class="data-table" id="ips-prof-filters">
-                            <thead><tr><th>TYPE</th><th>VALUE</th><th>STATUS</th><th></th></tr></thead>
-                            <tbody><tr><td colspan="4" style="opacity:.6">Lưu profile rồi thêm signature/filter…</td></tr></tbody>
+                            <thead><tr><th>TYPE</th><th>VALUE</th><th>ACTION</th><th>STATUS</th><th></th></tr></thead>
+                            <tbody><tr><td colspan="5" style="opacity:.6">Lưu profile rồi thêm signature/filter…</td></tr></tbody>
                         </table>
                     </div>
                     <div class="modal-footer"><button class="btn btn-primary">Save</button><button class="btn" data-toggle-form="form-ips-profile">Cancel</button></div>
@@ -981,6 +989,13 @@
                             <button type="button" class="btn ips-tab" data-tab="signature">Signature</button>
                             <button type="button" class="btn ips-tab" data-tab="filter">Filter (Category)</button>
                             <span style="flex:1"></span>
+                            <span class="filter-label">Action</span>
+                            <select class="form-input" id="ips-sig-action" style="width:auto">
+                                <option value="default" selected>Default</option>
+                                <option value="block">Block</option>
+                                <option value="alert">Alert</option>
+                                <option value="pass">Pass</option>
+                            </select>
                         </div>
                         <!-- Signature pane -->
                         <div id="ips-pane-signature">
@@ -993,7 +1008,7 @@
                         <!-- Filter (category) pane -->
                         <div id="ips-pane-filter" style="display:none">
                             <div class="form-row"><label class="form-label">Category</label><select class="form-input" id="ips-filter-cat"><option value="all">all (mọi category)</option></select></div>
-                            <p class="form-hint" style="opacity:.6;margin-top:8px">Thêm cả nhóm luật theo category (giữ action gốc của từng rule).</p>
+                            <p class="form-hint" style="opacity:.6;margin-top:8px">Thêm cả nhóm luật theo category, áp Action chọn ở trên cho toàn nhóm (default=giữ action gốc).</p>
                         </div>
                     </div>
                     <div class="modal-footer"><button class="btn btn-primary" id="ips-sig-ok">OK</button><button class="btn" id="ips-sig-cancel">Cancel</button></div>
@@ -1015,7 +1030,7 @@
                     <div class="form-row"><label class="form-label">Daemon</label><span id="ips-stat-running" class="form-value">—</span></div>
                     <div class="form-row"><label class="form-label">Status</label><span id="ips-stat-status" class="form-value">—</span></div>
                     <div class="form-row"><label class="form-label">Mode</label><span id="ips-stat-mode" class="form-value">—</span></div>
-                    <div class="form-row"><label class="form-label">Snapshot N</label><span id="ips-stat-snap" class="form-value">—</span></div>
+                    <div class="form-row"><label class="form-label">Inspection window</label><span id="ips-stat-snap" class="form-value">—</span></div>
                     <div class="form-row"><label class="form-label">Rules loaded</label><span id="ips-stat-rules" class="form-value">—</span></div>
                     <div class="form-row"><label class="form-label">Enforce coverage</label><span id="ips-stat-coverage" class="form-value">—</span></div>
                     <div class="form-row"><label class="form-label">Total alerts</label><span id="ips-stat-alerts" class="form-value">—</span></div>
@@ -1111,6 +1126,49 @@
                 </table>
             </div>
 
+            <!-- ======== SECURITY > SSL INSPECTION PAGE ======== -->
+            <div id="page-sec-ssl" class="page" style="display:none">
+                <div class="page-header">
+                    <h1 class="page-title">SSL INSPECTION</h1>
+                    <button class="btn-create" data-toggle-form="form-ssl-profile"><span class="btn-create-plus">+</span> Create Profile <span class="btn-create-caret">&#9662;</span></button>
+                </div>
+
+                <div class="add-form form-card" id="form-ssl-profile" role="dialog" aria-modal="true" aria-label="SSL inspection profile form">
+                    <div class="form-section"><span class="modal-title-text">NEW SSL INSPECTION PROFILE</span><button class="modal-close" type="button" aria-label="Close" data-toggle-form="form-ssl-profile">&#10005;</button></div>
+                    <div class="modal-body">
+                        <div id="ssl-deep-warning" style="display:none;background:#fff3cd;border:1px solid #ffc107;color:#664d03;padding:12px 14px;border-radius:6px;margin-bottom:14px;line-height:1.5">
+                            <strong>⚠ This profile uses full SSL inspection (deep).</strong>
+                            <div style="margin-top:6px">End users will see <b>certificate warnings</b> unless the firewall CA certificate is installed in their browser. Export it at <b>System &rarr; Certificates</b> and install into the client trust store.</div>
+                            <div style="margin-top:6px">Domains listed under <b>Exempt</b> are spliced (not decrypted).</div>
+                        </div>
+                        <div class="form-grid">
+                            <div class="form-row" data-key="name"><label class="form-label">Name</label><input class="form-input" type="text" placeholder="e.g. deep_lan" maxlength="64"></div>
+                            <div class="form-row" data-key="status"><label class="form-label">Status</label><select class="form-input"><option value="enable" selected>Enabled</option><option value="disable">Disabled</option></select></div>
+                            <div class="form-row" data-key="inspection-mode"><label class="form-label">Inspection Mode</label><select class="form-input"><option value="certificate" selected>Certificate (SNI/cert only — no decrypt)</option><option value="deep">Deep (full MITM decrypt)</option></select></div>
+                            <div class="form-row" data-key="no-sni"><label class="form-label">TLS without SNI</label><select class="form-input"><option value="bump" selected>Bump (decrypt)</option><option value="splice">Splice (bypass)</option></select></div>
+                            <div class="form-row" data-key="untrusted-server-cert"><label class="form-label">Untrusted Server Cert</label><select class="form-input"><option value="block" selected>Block</option><option value="allow">Allow</option></select></div>
+                            <div class="form-row" data-key="unsupported"><label class="form-label">Unsupported (cert-pinning)</label><select class="form-input"><option value="allow" selected>Allow (bypass)</option><option value="block">Block</option></select></div>
+                            <div class="form-row form-row-full form-row-wide" data-key="exempt"><label class="form-label">Exempt domains (SNI)</label><input class="form-input" type="text" placeholder="*.bank.com,*.health.gov"></div>
+                            <div class="form-row form-row-full form-row-wide" data-key="comment"><label class="form-label">Comment</label><input class="form-input" type="text" placeholder="Optional description" maxlength="255"></div>
+                        </div>
+                    </div>
+                    <div class="modal-footer"><button class="btn btn-primary">Save</button><button class="btn" data-toggle-form="form-ssl-profile">Cancel</button></div>
+                </div>
+
+                <div class="toolbar"><div class="toolbar-search"><input type="text" placeholder="Filter profiles..." class="table-filter" data-target="tbl-ssl-profile"><button class="search-btn" type="button">&#9906;</button></div></div>
+                <table class="data-table" data-entity="sslProfiles">
+                    <thead><tr><th class="th-checkbox"><input type="checkbox" class="select-all"></th><th>NAME</th><th>MODE</th><th>STATUS</th><th>COMMENT</th></tr></thead>
+                    <tbody>
+                    </tbody>
+                </table>
+
+                <div class="form-card" style="margin-top:12px">
+                    <div class="form-section">DIAGNOSTICS</div>
+                    <div style="display:flex;justify-content:flex-end;margin-bottom:8px"><button class="btn" id="ssl-diag-btn">Run diagnostics</button></div>
+                    <pre id="ssl-diag-output" style="white-space:pre-wrap;font-size:12px;background:#1e1e1e;color:#ddd;padding:10px;border-radius:4px;min-height:40px;margin:0">(click "Run diagnostics" to check profiles / ssld / CA / steering)</pre>
+                </div>
+            </div>
+
             <!-- ======== SYSTEM > PASSWORD POLICY PAGE ======== -->
             <div id="page-sys-password" class="page" style="display:none">
                 <div class="page-header"><h1 class="page-title">PASSWORD POLICY</h1></div>
@@ -1143,6 +1201,25 @@
                         <label class="form-label">Restart Device</label>
                         <button class="btn btn-danger" id="btn-reboot">Reboot</button>
                     </div>
+                </div>
+            </div>
+
+            <!-- ======== SYSTEM > CERTIFICATES PAGE ======== -->
+            <div id="page-sys-certificates" class="page" style="display:none">
+                <div class="page-header"><h1 class="page-title">CERTIFICATES</h1></div>
+                <div class="form-card">
+                    <div class="form-section">SSL INSPECTION CA</div>
+                    <p style="margin:0 0 10px;line-height:1.5">CA của firewall dùng để ký lại chứng chỉ khi <b>deep SSL inspection</b>. Cài CA này vào trust store của client để trình duyệt không báo lỗi chứng chỉ. CA được sinh tự động lần đầu bật deep inspection.</p>
+                    <div class="form-row"><label class="form-label">CA status</label><span id="cert-ca-status" class="form-input" style="border:none;background:none">(checking…)</span></div>
+                    <div class="form-actions">
+                        <button class="btn btn-primary" id="cert-export-btn">Show CA (PEM)</button>
+                        <button class="btn" id="cert-download-btn">Download .crt</button>
+                    </div>
+                </div>
+                <div class="form-card" style="margin-top:12px;display:none" id="cert-pem-card">
+                    <div class="form-section">CA CERTIFICATE (PEM)</div>
+                    <pre id="cert-pem" style="white-space:pre-wrap;font-size:11px;background:#1e1e1e;color:#ddd;padding:10px;border-radius:4px;margin:0"></pre>
+                    <div style="margin-top:8px;color:#888;font-size:12px">Copy nội dung trên (hoặc Download .crt) → cài vào "Trusted Root Certification Authorities" của client.</div>
                 </div>
             </div>
 

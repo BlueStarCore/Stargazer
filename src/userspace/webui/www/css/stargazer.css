@@ -2446,3 +2446,19 @@ tr.drop-below {
                    background:#fff; cursor:pointer; border-radius:3px; }
 .rf-pager button.active { background:var(--dawn-orange); color:#fff; border-color:var(--dawn-orange); }
 .rf-pager button:disabled { opacity:0.4; cursor:default; }
+
+/* ── Toggle switch (IPS enable trên form policy) ───────────────────────── */
+.switch { position: relative; display: inline-block; width: 46px; height: 24px; flex: 0 0 auto; }
+.switch input { position: absolute; opacity: 0; width: 0; height: 0; margin: 0; }
+.switch .slider {
+    position: absolute; inset: 0; cursor: pointer;
+    background: var(--border-light); border: 1px solid var(--border-dark);
+    border-radius: 24px; transition: background .2s, border-color .2s;
+}
+.switch .slider::before {
+    content: ""; position: absolute; width: 18px; height: 18px; left: 2px; top: 2px;
+    background: #fff; border-radius: 50%; box-shadow: 0 1px 2px rgba(0,0,0,.3);
+    transition: transform .2s;
+}
+.switch input:checked + .slider { background: var(--dawn-orange); border-color: var(--dawn-ember); }
+.switch input:checked + .slider::before { transform: translateX(22px); }

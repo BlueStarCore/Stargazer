@@ -83,39 +83,39 @@ int main(void)
 		CHECK(n == -1, "out path lỗi → -1");
 	}
 
-	printf("== test 6: filter category ghép rule, GIỮ action gốc (không override) ==\n");
+	printf("== test 6 (P7): category + action=block → rewrite drop ==\n");
 	{
 		struct ips_filter f[] = {
-			{ IPS_FT_CATEGORY, "scan" },
+			{ IPS_FT_CATEGORY, "scan", IPS_FA_BLOCK },
 		};
 		int n = ips_compile_filters(repo, f, 1, out);
 		CHECK(n == 1, "ghi 1 rule từ scan");
-		CHECK(file_contains(out, "alert tcp"), "giữ action gốc (alert)");
-		CHECK(!file_contains(out, "drop tcp"), "KHÔNG override action");
+		CHECK(file_contains(out, "drop tcp"), "action block → drop");
+		CHECK(!file_contains(out, "alert tcp"), "không còn alert gốc");
 	}
 
-	printf("== test 7: filter signature theo SID, giữ action gốc ==\n");
+	printf("== test 7 (P7): signature + action=pass → KHÔNG ghi (whitelist) ==\n");
 	{
 		struct ips_filter f[] = {
-			{ IPS_FT_SIGNATURE, "2" },
+			{ IPS_FT_SIGNATURE, "1", IPS_FA_PASS },
 		};
 		int n = ips_compile_filters(repo, f, 1, out);
-		CHECK(n == 1, "tìm + ghi đúng 1 rule sid:2");
-		CHECK(file_contains(out, "alert tcp") && file_contains(out, "sid:2;"),
-		      "sid:2 giữ action gốc (alert)");
-		CHECK(!file_contains(out, "sid:1;"), "không lấy sid khác");
+		CHECK(n == 0, "pass → không ghi rule nào");
+		CHECK(!file_contains(out, "sid:1;"), "sid:1 bị loại khỏi profile");
 	}
 
-	printf("== test 8: nhiều filter kết hợp, đều giữ action gốc ==\n");
+	printf("== test 8 (P7): precedence signature override > category ==\n");
 	{
+		/* category scan (action alert) chứa sid:1; override sid:1 = block.
+		 * sid:1 phải ra DROP, ghi ĐÚNG 1 lần (không alert). */
 		struct ips_filter f[] = {
-			{ IPS_FT_CATEGORY,  "web" },
-			{ IPS_FT_SIGNATURE, "1"   },
+			{ IPS_FT_CATEGORY,  "scan", IPS_FA_ALERT },
+			{ IPS_FT_SIGNATURE, "1",    IPS_FA_BLOCK },
 		};
 		int n = ips_compile_filters(repo, f, 2, out);
-		CHECK(n == 2, "web(1) + sid:1(1) = 2 rule");
-		CHECK(file_contains(out, "sid:1;"), "có sid:1");
-		CHECK(!file_contains(out, "drop tcp"), "KHÔNG override (đều alert gốc)");
+		CHECK(n == 1, "sid:1 ghi đúng 1 lần (precedence dedup)");
+		CHECK(file_contains(out, "drop tcp"), "sid:1 theo override block → drop");
+		CHECK(!file_contains(out, "alert tcp"), "KHÔNG ghi bản category alert");
 	}
 
 	printf("== test 9: catalog JSON liệt kê signature ==\n");
@@ -125,13 +125,29 @@ int main(void)
 		write_file(p, "alert tcp any any -> any 80 (msg:\"ET WEB SQLi\"; "
 			      "reference:cve,2008-1234; sid:2002; rev:3;)\n");
 		char jbuf[8192];
-		int n = ips_catalog_to_json(repo, jbuf, sizeof(jbuf), NULL, 0);
+		int tr = 0;
+		int n = ips_catalog_to_json(repo, jbuf, sizeof(jbuf), NULL, 0, NULL, &tr);
 		CHECK(n > 0, "catalog trả JSON");
 		CHECK(strstr(jbuf, "\"sid\":2002") != NULL, "có sid 2002");
 		CHECK(strstr(jbuf, "ET WEB SQLi") != NULL, "có name (msg)");
 		CHECK(strstr(jbuf, "CVE-2008-1234") != NULL, "có CVE parse");
 		CHECK(strstr(jbuf, "\"category\":\"web\"") != NULL, "category=web");
 		CHECK(jbuf[0] == '[' && jbuf[n-1] == ']', "JSON array hợp lệ");
+		CHECK(tr == 0, "không truncated (buffer đủ)");
+	}
+
+	printf("== test 10 (P7-search): lọc query chỉ trả entry khớp ==\n");
+	{
+		int tr = 0;
+		char jbuf[8192];
+		/* repo có scan(sid1), web(sid2002 'ET WEB SQLi'), malware(sid3) */
+		ips_catalog_to_json(repo, jbuf, sizeof(jbuf), NULL, 0, "SQLi", &tr);
+		CHECK(strstr(jbuf, "\"sid\":2002") != NULL, "khớp 'SQLi' → có sid 2002");
+		CHECK(strstr(jbuf, "\"sid\":1,") == NULL && strstr(jbuf, "\"sid\":3,") == NULL,
+		      "không khớp → loại sid khác");
+		/* query theo sid */
+		ips_catalog_to_json(repo, jbuf, sizeof(jbuf), NULL, 0, "2002", &tr);
+		CHECK(strstr(jbuf, "\"sid\":2002") != NULL, "khớp theo sid");
 	}
 
 	/* dọn */

@@ -9,6 +9,9 @@
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/file.h>   /* flock — serialize tạo CA giữa nhiều ssld */
+#include <sys/stat.h>   /* mkdir — tạo thư mục CA nếu storage persistent thiếu */
+#include <sys/types.h>
 
 #include <openssl/pem.h>
 #include <openssl/x509v3.h>
@@ -53,10 +56,34 @@ static int ca_load(struct ca_ctx *ca, const char *cert_path, const char *key_pat
 	return 0;
 }
 
+/* mkdir -p thư mục chứa file_path (mode 0700). Thư mục CA
+ * (/etc/stargazer/ssl) có thể chưa tồn tại trên storage persistent → ca_save
+ * fopen sẽ ENOENT và CA không bao giờ ghi ra đĩa (ssld vẫn chạy với CA trong
+ * RAM nhưng client không lấy được cert để cài → MITM hỏng). Tạo sẵn để
+ * ca_save ghi được. Bỏ qua lỗi EEXIST ở từng cấp. */
+static void ensure_parent_dir(const char *file_path)
+{
+	char dir[512];
+	snprintf(dir, sizeof(dir), "%s", file_path);
+	char *slash = strrchr(dir, '/');
+	if (!slash || slash == dir)
+		return;
+	*slash = '\0';
+	for (char *p = dir + 1; *p; p++) {
+		if (*p == '/') {
+			*p = '\0';
+			mkdir(dir, 0700);
+			*p = '/';
+		}
+	}
+	mkdir(dir, 0700);
+}
+
 /* Ghi cert (0644) + key (0600) ra đĩa. Trả 0 nếu OK. */
 static int ca_save(const struct ca_ctx *ca,
 		   const char *cert_path, const char *key_path)
 {
+	ensure_parent_dir(cert_path);   /* /etc/stargazer/ssl có thể chưa có */
 	FILE *cf = fopen(cert_path, "w");
 	if (!cf)
 		return -1;
@@ -149,15 +176,36 @@ int ca_load_or_create(struct ca_ctx *ca,
 	if (ca_load(ca, cert_path, key_path) == 0)
 		return 0;                       /* đã có CA — dùng lại */
 
-	if (ca_create(ca) < 0)
-		return -1;
+	/* Nhiều ssld (1/profile) có thể cùng khởi động khi CA chưa tồn tại →
+	 * RACE tạo CA khác nhau (client tin CA-A nhưng ssld-B ký CA-B → cảnh báo
+	 * cert). Serialize bằng flock: instance đầu tạo, các instance sau (chờ
+	 * lock) nạp lại CA vừa tạo → CẢ HỆ chung MỘT CA. */
+	char lock_path[512];
+	snprintf(lock_path, sizeof(lock_path), "%s.lock", key_path);
+	int lfd = open(lock_path, O_CREAT | O_RDWR, 0600);
+	if (lfd >= 0)
+		flock(lfd, LOCK_EX);
 
-	if (ca_save(ca, cert_path, key_path) < 0) {
-		/* không lưu được vẫn dùng được trong phiên, nhưng cảnh báo */
-		fprintf(stderr, "ca: CẢNH BÁO không ghi được CA ra %s/%s: %m\n",
-			cert_path, key_path);
+	/* Re-check dưới lock: instance khác có thể vừa tạo xong. */
+	if (ca_load(ca, cert_path, key_path) == 0) {
+		if (lfd >= 0) { flock(lfd, LOCK_UN); close(lfd); }
+		return 0;
 	}
-	return 0;
+
+	int rc = 0;
+	if (ca_create(ca) < 0) {
+		rc = -1;
+	} else if (ca_save(ca, cert_path, key_path) < 0) {
+		/* CA tạo được trong RAM nhưng KHÔNG ghi ra đĩa → client không lấy
+		 * được cert để cài, mọi flow bump sẽ báo lỗi cert. Coi như fail
+		 * để ssld chạy splice-only (pass-through) thay vì bump bằng một CA
+		 * không thể tin cậy được — trung thực hơn, fail an toàn. */
+		fprintf(stderr, "ca: LỖI không ghi được CA ra %s/%s: %m — "
+			"splice-only\n", cert_path, key_path);
+		rc = -1;
+	}
+	if (lfd >= 0) { flock(lfd, LOCK_UN); close(lfd); }
+	return rc;
 }
 
 int ca_export_cert_pem(const struct ca_ctx *ca, char *buf, size_t cap)

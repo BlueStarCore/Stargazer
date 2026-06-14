@@ -27,9 +27,9 @@ endif
 CORE   := ac.c sig_rule.c
 HDR    := ac.h sig_rule.h
 
-.PHONY: test ac-test sig-test feat-test model-test fusion-test engine-test reload-test ctdump-test nfq-test tls-test tls-policy-test reass-test http-tx-test ipsd sig-dump et rules-fetch clean
+.PHONY: test ac-test sig-test feat-test model-test fusion-test engine-test reload-test ctdump-test nfq-test tls-test tls-policy-test reass-test ipsd sig-dump et rules-fetch clean
 
-test: ac-test sig-test feat-test model-test fusion-test engine-test reload-test ctdump-test nfq-test tls-test tls-policy-test reass-test http-tx-test
+test: ac-test sig-test feat-test model-test fusion-test engine-test reload-test ctdump-test nfq-test tls-test tls-policy-test reass-test
 	@echo "== TẤT CẢ TEST PASS =="
 
 ac-test: $(BUILD)/ac_test
@@ -72,10 +72,6 @@ tls-policy-test: $(BUILD)/tls_policy_test
 reass-test: $(BUILD)/reass_test
 	@echo "--- chạy reass_test (ráp dòng TCP + streaming AC, host) ---"
 	./$(BUILD)/reass_test
-
-http-tx-test: $(BUILD)/http_tx_test
-	@echo "--- chạy http_tx_test (re-arm transaction HTTP, host) ---"
-	./$(BUILD)/http_tx_test
 
 ctdump-test: $(BUILD)/ctdump_test
 	@echo "--- chạy ctdump_test (host, không cần kernel) ---"
@@ -151,13 +147,10 @@ $(BUILD)/tls_policy_test: tls_policy.c tls_policy.h tls_policy_test.c | $(BUILD)
 $(BUILD)/reass_test: ac.c ac.h reass.c reass.h reass_test.c | $(BUILD)
 	$(CC) $(CFLAGS) $(SANIT) -o $@ ac.c reass.c reass_test.c
 
-$(BUILD)/http_tx_test: ac.c reass.c http_tx.c http_tx.h http_tx_test.c | $(BUILD)
-	$(CC) $(CFLAGS) $(SANIT) -o $@ ac.c reass.c http_tx.c http_tx_test.c
-
 # stargazer-ipsd binary (host build, không sanitizer để liên kết tốt)
 IPSD_SRCS := main.c nfq.c ctdump.c feature.c flow_rule.c \
              sig_rule.c sig_reload.c ac.c reass.c \
-             proto_buf.c tls_clienthello.c http_tx.c \
+             proto_buf.c tls_clienthello.c ml_scan.c \
              engine.c fusion.c ips_model.c
 
 $(BUILD)/stargazer-ipsd: $(IPSD_SRCS) model/predict.c $(BUILD)/predict.o | $(BUILD)

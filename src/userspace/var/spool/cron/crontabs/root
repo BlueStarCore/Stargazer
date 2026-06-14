@@ -1,3 +1,7 @@
 # Stargazer IPS signature auto-update — chạy 12:00 hằng ngày.
 # Wrapper tự kiểm security_ips auto-update (disable/daily/weekly) từ .update.conf.
 0 12 * * * /usr/libexec/stargazer/ips-update-cron.sh >/dev/null 2>&1
+
+# Xoay ips-alert.log theo kích thước (mặc định 5 MB, giữ 5 bản) — kiểm mỗi giờ.
+# Rename file rồi SIGHUP ipsd để nó mở lại fd (busybox không có logrotate).
+0 * * * * /usr/libexec/stargazer/ips-log-rotate.sh >/dev/null 2>&1

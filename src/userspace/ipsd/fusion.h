@@ -18,7 +18,8 @@
 /* Giá trị tăng dần theo độ nặng để so sánh trực tiếp. */
 enum ips_verdict { IPS_PASS = 0, IPS_ALERT = 1, IPS_DROP = 2 };
 enum ips_mode    { IPS_MODE_DETECT = 0, IPS_MODE_PREVENT = 1 };
-enum ips_reason  { IPS_R_NONE = 0, IPS_R_SIGNATURE, IPS_R_ML_BLOCK, IPS_R_ML_ALERT };
+enum ips_reason  { IPS_R_NONE = 0, IPS_R_SIGNATURE, IPS_R_ML_BLOCK, IPS_R_ML_ALERT,
+		   IPS_R_FLOW_ANOMALY };
 
 struct ips_config {
 	int    mode;        /* IPS_MODE_*                                      */

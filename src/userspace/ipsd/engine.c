@@ -5,6 +5,23 @@
 #include "engine.h"
 #include "ips_model.h"   /* ips_score */
 #include <string.h>
+#include <stdio.h>
+
+/* Render content bytes kiểu Snort: in được giữ nguyên, còn lại |HH|. Dùng cho
+ * alert của rule KHÔNG có msg → vẫn biết byte nào khớp (manh mối tuning/FP). */
+static void render_content(const struct sig_content *c, char *out, size_t outsz)
+{
+	size_t o = 0;
+	if (!c || !c->data || outsz == 0) { if (outsz) out[0] = '\0'; return; }
+	for (int i = 0; i < c->len && o + 5 < outsz; i++) {
+		uint8_t b = c->data[i];
+		if (b >= 0x20 && b < 0x7f && b != '"' && b != '\\' && b != '|')
+			out[o++] = (char)b;
+		else
+			o += (size_t)snprintf(out + o, outsz - o, "|%02x|", b);
+	}
+	out[o] = '\0';
+}
 
 struct ips_decision ips_evaluate(const struct ips_config *cfg,
 				 const struct sig_ruleset *rs,
@@ -27,22 +44,13 @@ struct ips_decision ips_evaluate_full(const struct ips_config *cfg,
 				 int l2_ready, int l2_sig_idx,
 				 int l2_sig_action)
 {
-	/* [L1-builtin] flow rule tích hợp: SYN-flood, port-scan, known-bad-port...
-	 * Rẻ nhất: chỉ so sánh số nguyên, không đụng payload. */
-	if (fs) {
-		struct flow_rule_match fm;
-		if (flow_rule_match_builtin(fc, fs, &fm) == 0) {
-			struct ips_decision d = ips_fuse(cfg, 0, fm.action, -1.0);
-			d.score        = -1.0;
-			d.ml_evaluated = 0;
-			/* dùng sig_rule == -2 để phân biệt với L2 (≥0) và no-match (-1) */
-			d.sig_rule     = -2;
-			return d;
-		}
-	}
-
-	/* [L1-user signature] ĐÃ GỠ: engine chỉ còn signature dựa-content (L2).
-	 * Rule không content không còn được nạp (xem sig_parse_line). */
+	/* [L1] ĐÃ GỠ HOÀN TOÀN — cả L1-user signature (rule không content) lẫn
+	 * L1-builtin flow-anomaly (SYN-flood/port-scan/URG/ACK-flood/known-bad-port).
+	 * Lý do gỡ builtin: các heuristic per-flow đánh giá flow tại thời điểm SYN
+	 * → mọi kết nối hợp lệ mới cũng trông như "handshake chưa xong" → false
+	 * positive hàng loạt (port-scan flag mọi kết nối). Engine giờ chỉ còn:
+	 * L2 payload signature (Aho-Corasick trên dòng đã ghép) + ML (LightGBM). */
+	(void)fs;   /* không còn dùng flow stats cho L1; ML dùng `feat` đã tính sẵn */
 
 	/* [L2] Payload signature. SHORT-CIRCUIT nếu khớp.
 	 *   l2_ready=1 (P1): kết quả đã tính trên DÒNG đã ghép ở main.c (reass +
@@ -63,16 +71,28 @@ struct ips_decision ips_evaluate_full(const struct ips_config *cfg,
 		struct ips_decision d = ips_fuse(cfg, sig_idx, action, -1.0);
 		d.score        = -1.0;
 		d.ml_evaluated = 0;
-		d.matched_sid  = rs->rules[sig_idx].sid;
-		strncpy(d.matched_msg, rs->rules[sig_idx].msg,
-			sizeof(d.matched_msg) - 1);
-		d.matched_msg[sizeof(d.matched_msg) - 1] = '\0';
+		const struct sig_rule *mr = &rs->rules[sig_idx];
+		d.matched_sid = mr->sid;
+		if (mr->msg[0]) {
+			strncpy(d.matched_msg, mr->msg, sizeof(d.matched_msg) - 1);
+			d.matched_msg[sizeof(d.matched_msg) - 1] = '\0';
+		} else {
+			/* Rule thiếu msg → mô tả bằng nội dung khớp + index để truy vết
+			 * (manh mối "signature nào match" thay vì để trống). */
+			char cb[72];
+			render_content(&mr->content[mr->fast], cb, sizeof(cb));
+			snprintf(d.matched_msg, sizeof(d.matched_msg),
+				 "no-msg rule#%d content=\"%s\"", sig_idx, cb);
+		}
 		return d;
 	}
 
-	/* [ML] Không signature nào khớp → chạy LightGBM để bắt zero-day. */
-	double score = ips_score(feat);
-	struct ips_decision d = ips_fuse(cfg, -1, 0, score);
-	d.ml_evaluated = 1;
+	/* [ML] Không signature khớp → KHÔNG chấm ML ở đây nữa. ML được gọi tại
+	 * CHECKPOINT min(N,K,T) trong process_packet (main.c) — trên feature TÍCH
+	 * LŨY của cả flow + init_win cache, đúng 1 lần/flow. Ở đây trả PASS
+	 * "no-match" (score=-1 → PASS), checkpoint sẽ quyết sau. */
+	(void)feat;
+	struct ips_decision d = ips_fuse(cfg, -1, 0, -1.0);
+	d.ml_evaluated = 0;
 	return d;
 }

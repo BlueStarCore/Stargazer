@@ -181,9 +181,14 @@ $(KERNEL_DIR)/.config: | kernel-source
 			--enable NETFILTER_XT_MATCH_STATE \
 			--enable NETFILTER_XT_MATCH_LIMIT \
 			--enable NETFILTER_XT_TARGET_LOG \
+			--enable NETFILTER_XT_TARGET_REDIRECT \
 			--enable NETFILTER_XT_TARGET_CHECKSUM \
 			--enable NETFILTER_XT_MARK \
 			--enable NETFILTER_XT_CONNMARK \
+			--enable NETFILTER_NETLINK_QUEUE \
+			--enable NETFILTER_XT_TARGET_NFQUEUE \
+			--enable NETFILTER_XT_MATCH_CONNBYTES \
+			--enable NETFILTER_NETLINK_GLUE_CT \
 			--enable NF_LOG_IPV4 \
 			--enable NF_REJECT_IPV4 \
 			--enable NF_LOG_IPV6 \
@@ -551,7 +556,7 @@ $(ATF_MTK_DIR)/.stamp:
 
 rootfs: $(ROOTFS_DIR)/.stamp
 
-$(ROOTFS_DIR)/.stamp: modules busybox dash iptables logind mgmtd cli webd tools
+$(ROOTFS_DIR)/.stamp: modules busybox dash iptables logind mgmtd cli webd ipsd tools
 	@echo "[4/5] Creating rootfs..."
 	@rm -rf $(ROOTFS_DIR)
 	@mkdir -p $(ROOTFS_DIR)
@@ -603,6 +608,33 @@ $(ROOTFS_DIR)/.stamp: modules busybox dash iptables logind mgmtd cli webd tools
 	# Install web daemon + static web UI files
 	cp $(BUILD_DIR)/webd/stargazer-webd $(ROOTFS_DIR)/sbin/stargazer-webd
 	@chmod +x $(ROOTFS_DIR)/sbin/stargazer-webd
+
+	# Install IPS daemon + signature repository (Phase B) — mgmtd supervise ipsd
+	# (ipsd_sync fork+exec); thiếu binary này thì IPS không bao giờ chạy và bật
+	# IPS trên policy sẽ làm NFQUEUE fail-closed (treo traffic).
+	cp $(IPSD_BIN) $(ROOTFS_DIR)/sbin/stargazer-ipsd
+	@chmod +x $(ROOTFS_DIR)/sbin/stargazer-ipsd
+	@# SSL inspection daemon (chỉ cài nếu đã build — cần OpenSSL cross). Guard
+	@# để firmware không vỡ khi ssld chưa build (SSL inspection off-by-default).
+	@if [ -f $(SSLD_BIN) ]; then \
+	    cp $(SSLD_BIN) $(ROOTFS_DIR)/sbin/stargazer-ssld; \
+	    chmod +x $(ROOTFS_DIR)/sbin/stargazer-ssld; \
+	    echo "[rootfs] stargazer-ssld đã cài"; \
+	else echo "[rootfs] stargazer-ssld chưa build — bỏ qua (SSL inspection off)"; fi
+	@mkdir -p $(ROOTFS_DIR)/etc/stargazer/ssl
+	@# Trust store (root CA bundle) cho ssld verify cert server thật (untrusted
+	@# detection). Thiếu nó → mọi cert bị coi untrusted. Lấy bundle Mozilla host.
+	@mkdir -p $(ROOTFS_DIR)/etc/ssl/certs
+	@if [ -f /etc/ssl/certs/ca-certificates.crt ]; then \
+	    cp /etc/ssl/certs/ca-certificates.crt $(ROOTFS_DIR)/etc/ssl/certs/; \
+	    echo "[rootfs] CA bundle (trust store) đã cài"; \
+	else echo "[rootfs] CẢNH BÁO: host không có ca-certificates.crt — ssld verify sẽ coi mọi cert untrusted"; fi
+	@mkdir -p $(ROOTFS_DIR)/etc/stargazer/ips/repo
+	@mkdir -p $(ROOTFS_DIR)/etc/stargazer/ips/profiles
+	@mkdir -p $(ROOTFS_DIR)/etc/stargazer/ips/rules
+	@touch    $(ROOTFS_DIR)/etc/stargazer/ips/rules/active.rules
+	@mkdir -p $(ROOTFS_DIR)/etc/stargazer/logs
+
 	@mkdir -p $(ROOTFS_DIR)/usr/share/stargazer/www
 	cp -r $(PROJECT_ROOT)/src/userspace/webui/www/* $(ROOTFS_DIR)/usr/share/stargazer/www/
 	@find $(ROOTFS_DIR)/usr/share/stargazer/www -type f \( -name '*.html' -o -name '*.js' \) \
@@ -642,6 +674,12 @@ $(ROOTFS_DIR)/.stamp: modules busybox dash iptables logind mgmtd cli webd tools
 	@cp $(USERSPACE_DIR)/etc/sysctl.d/*.conf $(ROOTFS_DIR)/etc/sysctl.d/
 	@cp $(USERSPACE_DIR)/etc/init.d/* $(ROOTFS_DIR)/etc/init.d/
 	@chmod +x $(ROOTFS_DIR)/etc/init.d/*
+
+	# Crontab (crond đọc /var/spool/cron/crontabs) — IPS signature auto-update
+	# + xoay ips-alert.log. crond được /etc/init.d/stargazer khởi động.
+	@mkdir -p $(ROOTFS_DIR)/var/spool/cron/crontabs
+	@cp $(USERSPACE_DIR)/var/spool/cron/crontabs/root \
+	    $(ROOTFS_DIR)/var/spool/cron/crontabs/root
 
 	# Copy init script with version substitution
 	@cp $(USERSPACE_DIR)/init $(ROOTFS_DIR)/init.tmp
@@ -1043,8 +1081,9 @@ IPSD_CORE_SRCS := $(IPSD_DIR)/main.c $(IPSD_DIR)/nfq.c $(IPSD_DIR)/ctdump.c \
                   $(IPSD_DIR)/sig_rule.c $(IPSD_DIR)/sig_reload.c \
                   $(IPSD_DIR)/ac.c $(IPSD_DIR)/reass.c \
                   $(IPSD_DIR)/proto_buf.c $(IPSD_DIR)/tls_clienthello.c \
-                  $(IPSD_DIR)/http_tx.c \
                   $(IPSD_DIR)/engine.c $(IPSD_DIR)/fusion.c \
+                  $(IPSD_DIR)/ml_scan.c \
+                  $(IPSD_DIR)/insp_ipc.c \
                   $(IPSD_DIR)/ips_model.c
 IPSD_PREDICT_C := $(IPSD_DIR)/model/predict.c
 IPSD_PREDICT_O := $(BUILD_DIR)/ipsd/predict.o
@@ -1075,6 +1114,55 @@ $(PCRE2_LIB): $(MUSL_CC)
 	    --disable-jit --prefix=$(PCRE2_PREFIX) >/dev/null && \
 	$(MAKE) -j$$(nproc) >/dev/null && $(MAKE) install >/dev/null
 	@echo "[ipsd] libpcre2: $(PCRE2_LIB)"
+
+# ── SSL inspection (stargazer-ssld): OpenSSL aarch64-musl static + daemon ──
+SSLD_DIR        := $(USERSPACE_DIR)/ssld
+SSLD_BIN        := $(BUILD_DIR)/ssld/stargazer-ssld
+OPENSSL_VERSION := 3.0.15
+OPENSSL_URL     := https://github.com/openssl/openssl/releases/download/openssl-$(OPENSSL_VERSION)/openssl-$(OPENSSL_VERSION).tar.gz
+OPENSSL_DIR     := $(BUSYBOX_CACHE_DIR)/openssl-$(OPENSSL_VERSION)
+OPENSSL_PREFIX  := $(BUILD_DIR)/ssld/openssl-prefix
+OPENSSL_LIB     := $(OPENSSL_PREFIX)/lib/libssl.a
+OPENSSL_CROSS   := $(abspath $(MUSL_CROSS))
+
+SSLD_SRCS := $(SSLD_DIR)/main.c $(SSLD_DIR)/conn.c $(SSLD_DIR)/relay.c \
+             $(SSLD_DIR)/origdst.c $(SSLD_DIR)/ca.c $(SSLD_DIR)/certcache.c \
+             $(SSLD_DIR)/bump.c \
+             $(IPSD_DIR)/tls_clienthello.c $(IPSD_DIR)/tls_policy.c \
+             $(IPSD_DIR)/sig_rule.c $(IPSD_DIR)/ac.c
+
+.PHONY: ssld openssl-cross
+openssl-cross: $(OPENSSL_LIB)
+ssld: $(SSLD_BIN)
+
+# OpenSSL static cho aarch64-musl (no-shared/tests/async/engine — gọn + nhanh).
+# build_libs + install_dev: chỉ thư viện + header, bỏ apps (tiết kiệm thời gian).
+$(OPENSSL_LIB): $(MUSL_CC)
+	@mkdir -p $(BUSYBOX_CACHE_DIR) $(BUILD_DIR)/ssld
+	@if [ ! -d "$(OPENSSL_DIR)" ]; then \
+	    echo "[ssld] Downloading openssl $(OPENSSL_VERSION)..."; \
+	    curl -fSL "$(OPENSSL_URL)" -o "$(BUSYBOX_CACHE_DIR)/openssl.tar.gz"; \
+	    tar -xzf "$(BUSYBOX_CACHE_DIR)/openssl.tar.gz" -C "$(BUSYBOX_CACHE_DIR)"; \
+	    rm -f "$(BUSYBOX_CACHE_DIR)/openssl.tar.gz"; \
+	fi
+	@echo "[ssld] Cross-compiling OpenSSL $(OPENSSL_VERSION) (aarch64-musl static — vài phút)..."
+	cd $(OPENSSL_DIR) && ./Configure linux-aarch64 \
+	    --cross-compile-prefix=$(OPENSSL_CROSS) \
+	    no-shared no-tests no-async no-engine \
+	    --prefix=$(abspath $(OPENSSL_PREFIX)) >/dev/null && \
+	$(MAKE) -j$$(nproc) build_libs >/dev/null && \
+	$(MAKE) install_dev >/dev/null
+	@echo "[ssld] OpenSSL static: $(OPENSSL_LIB)"
+
+$(SSLD_BIN): $(SSLD_SRCS) $(OPENSSL_LIB)
+	@mkdir -p $(BUILD_DIR)/ssld
+	@echo "[ssld] Cross-compiling stargazer-ssld (ARM64 + OpenSSL static)..."
+	$(MUSL_CC) -static -O2 -Wall -Wextra -std=c11 \
+	    -I$(SSLD_DIR) -I$(IPSD_DIR) -I$(OPENSSL_PREFIX)/include \
+	    -o $@ $(SSLD_SRCS) \
+	    $(OPENSSL_PREFIX)/lib/libssl.a $(OPENSSL_PREFIX)/lib/libcrypto.a \
+	    -lpthread
+	@echo "[ssld] binary: $(SSLD_BIN)"
 
 $(IPSD_BIN): $(IPSD_CORE_SRCS) $(IPSD_PREDICT_C)
 	@mkdir -p $(BUILD_DIR)/ipsd

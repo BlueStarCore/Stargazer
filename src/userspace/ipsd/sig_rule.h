@@ -171,6 +171,10 @@ struct sig_rule {
 	uint8_t  flow_flags;         /* P6 — SIG_FLOW_* (0 = không ràng buộc) */
 	uint8_t  fidelity;           /* enum sig_fidelity (FULL=được DROP)  */
 	uint8_t  has_unsup;          /* bitmask sig_unsup (để đếm/log)      */
+	uint32_t prof_mask;          /* per-policy scoping: bitmask profile chứa rule
+				      * (bit i = profile id i, gắn lúc compile bằng
+				      * `sgprof:i;`). 0 = chưa tag → áp mọi flow
+				      * (fail-safe / back-compat).                 */
 	char     msg[SIG_MSG_MAX];
 };
 
@@ -199,6 +203,8 @@ struct flow_ctx {
 	uint8_t  tcp_flags;   /* tổ hợp SIG_TCP_* */
 	uint8_t  established; /* P6 — đã thấy traffic 2 chiều (proxy established) */
 	uint8_t  to_server;  /* P6 — 1 = chiều client→server, 0 = server→client */
+	uint8_t  prof_id;    /* IPS profile id của flow (1..31, từ skb mark/NFQA_MARK);
+			      * 0 = không rõ → áp mọi rule (fail-safe). */
 	const struct flowbit_state *fb;  /* P5 — bitset cờ của flow; NULL = không track */
 	const struct match_buffers *bufs; /* P6 — vùng giao thức; NULL = chỉ RAW */
 };
@@ -221,6 +227,7 @@ int  sig_ruleset_init(struct sig_ruleset *rs);
 #define SIG_LINE_SKIP_UNSUP  3
 #define SIG_LINE_SKIP_REP    4
 #define SIG_LINE_SKIP_NOCONTENT 5   /* rule không content → bỏ (đã gỡ L1 signature) */
+#define SIG_LINE_SKIP_NOSID  6   /* rule không keyword sid → bỏ (malformed/không truy vết, gây FP) */
 
 int  sig_parse_line(struct sig_ruleset *rs, const char *line);
 
@@ -234,6 +241,7 @@ struct sig_load_stats {
 	int skipped_unsupported; /* bỏ: chỉ còn keyword chưa hỗ trợ / quá yếu  */
 	int skipped_reputation;  /* bỏ: reputation/IP-list/catch-all           */
 	int skipped_no_content;  /* bỏ: rule không content (đã gỡ L1 signature)*/
+	int skipped_no_sid;      /* bỏ: rule không keyword sid (malformed/FP)  */
 };
 
 /* Nạp cả file .rules (hỗ trợ comment `#` và nối dòng bằng `\`). `st` có thể

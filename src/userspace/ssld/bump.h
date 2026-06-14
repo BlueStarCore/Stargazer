@@ -30,6 +30,13 @@ struct bump_cfg {
 	int  (*inspect)(const unsigned char *data, int len, int to_server,
 			void *ud);
 	void  *inspect_ud;
+
+	/*
+	 * Gọi khi inspect() trả DROP (prevent): ghi block page (HTTP 403) ra phía
+	 * CLIENT trước khi đóng — kiểu FortiGate. client_ssl là `SSL *` (truyền
+	 * void* để bump.h không phụ thuộc OpenSSL). NULL = đóng thẳng, không trang.
+	 */
+	void (*on_block)(void *client_ssl, void *ud);
 };
 
 /*

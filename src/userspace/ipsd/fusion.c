@@ -67,6 +67,7 @@ const char *ips_reason_str(int r)
 	case IPS_R_SIGNATURE:return "signature";
 	case IPS_R_ML_BLOCK: return "ml-block";
 	case IPS_R_ML_ALERT: return "ml-alert";
+	case IPS_R_FLOW_ANOMALY: return "flow-anomaly";
 	default:             return "?";
 	}
 }

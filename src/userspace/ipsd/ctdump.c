@@ -301,6 +301,108 @@ int ctdump_query(uint32_t src_ip, uint32_t dst_ip,
 	return -1;
 }
 
+/* ---- dump TẤT CẢ flow ---------------------------------------------------- */
+
+/* Parse CTA_TUPLE_ORIG → 5-tuple (host order) vào *f. Trả 0/-1. */
+static int parse_tuple(const void *attrs, int alen, struct ctdump_flow *f)
+{
+	int tl = 0;
+	const void *tuple = sg_nla_find(attrs, alen, SG_CTA_TUPLE_ORIG, &tl);
+	if (!tuple)
+		return -1;
+
+	int il = 0;
+	const void *ip = sg_nla_find(tuple, tl, SG_CTA_TUPLE_IP, &il);
+	if (ip) {
+		int l;
+		const void *s = sg_nla_find(ip, il, SG_CTA_IP_V4_SRC, &l);
+		const void *d = sg_nla_find(ip, il, SG_CTA_IP_V4_DST, &l);
+		if (s) { uint32_t v; memcpy(&v, s, 4); f->src_ip = ntohl(v); }
+		if (d) { uint32_t v; memcpy(&v, d, 4); f->dst_ip = ntohl(v); }
+	}
+
+	int pl = 0;
+	const void *pr = sg_nla_find(tuple, tl, SG_CTA_TUPLE_PROTO, &pl);
+	if (pr) {
+		int l;
+		const void *pn = sg_nla_find(pr, pl, SG_CTA_PROTO_NUM, &l);
+		const void *sp = sg_nla_find(pr, pl, SG_CTA_PROTO_SRC_PORT, &l);
+		const void *dp = sg_nla_find(pr, pl, SG_CTA_PROTO_DST_PORT, &l);
+		if (pn) f->proto = *(const uint8_t *)pn;
+		if (sp) { uint16_t v; memcpy(&v, sp, 2); f->sport = ntohs(v); }
+		if (dp) { uint16_t v; memcpy(&v, dp, 2); f->dport = ntohs(v); }
+	}
+	return 0;
+}
+
+int ctdump_dump_all(ctdump_flow_cb cb, void *ctx)
+{
+	/* Request: nlmsghdr + nfgenmsg, KHÔNG tuple, cờ NLM_F_DUMP → mọi flow. */
+	char req[64];
+	memset(req, 0, sizeof(req));
+	int off = NLMSG_HDRLEN + (int)NLMSG_ALIGN(sizeof(struct sg_nfgenmsg));
+	struct nlmsghdr    *nlh = (struct nlmsghdr *)req;
+	struct sg_nfgenmsg *nfg = (struct sg_nfgenmsg *)(req + NLMSG_HDRLEN);
+	nfg->nfgen_family = AF_INET;
+	nfg->version      = NFNETLINK_V0;
+	nfg->res_id       = 0;
+	nlh->nlmsg_len   = (uint32_t)NLMSG_ALIGN((size_t)off);
+	nlh->nlmsg_type  = (uint16_t)((SG_NFNL_SUBSYS_CTNETLINK << 8) |
+				       SG_IPCTNL_MSG_CT_GET);
+	nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+	nlh->nlmsg_seq   = 1;
+
+	int fd = socket(AF_NETLINK, SOCK_RAW, SG_NETLINK_NETFILTER);
+	if (fd < 0)
+		return -1;
+	struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	struct sockaddr_nl sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.nl_family = AF_NETLINK;
+
+	if (sendto(fd, req, nlh->nlmsg_len, 0,
+		   (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		close(fd);
+		return -1;
+	}
+
+	char *rbuf = malloc(65536);
+	if (!rbuf) { close(fd); return -1; }
+
+	int count = 0, done = 0;
+	while (!done) {
+		ssize_t rn = recv(fd, rbuf, 65536, 0);
+		if (rn <= 0)
+			break;                       /* timeout / lỗi → kết thúc dump */
+
+		struct nlmsghdr *nh;
+		int rem = (int)rn;
+		for (nh = (struct nlmsghdr *)rbuf; NLMSG_OK(nh, rem);
+		     nh = NLMSG_NEXT(nh, rem)) {
+			if (nh->nlmsg_type == NLMSG_DONE ||
+			    nh->nlmsg_type == NLMSG_ERROR) { done = 1; break; }
+
+			const void *attrs = (const char *)NLMSG_DATA(nh) +
+					    NLMSG_ALIGN(sizeof(struct sg_nfgenmsg));
+			int al = (int)nh->nlmsg_len - NLMSG_HDRLEN -
+				 (int)NLMSG_ALIGN(sizeof(struct sg_nfgenmsg));
+			if (al <= 0)
+				continue;
+
+			struct ctdump_flow f;
+			memset(&f, 0, sizeof(f));
+			parse_tuple(attrs, al, &f);
+			ctdump_parse_response(attrs, al, &f.res);  /* memset res bên trong */
+			count++;
+			if (cb && cb(&f, ctx) != 0) { done = 1; break; }
+		}
+	}
+	free(rbuf);
+	close(fd);
+	return count;
+}
+
 /* ---- tiện ích chuyển đổi ------------------------------------------------- */
 
 void ctdump_to_flow_stats(const struct ctdump_result *r,

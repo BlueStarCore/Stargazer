@@ -67,7 +67,7 @@ static int pump_ssl(SSL *from, SSL *to, int to_server,
 		if (n > 0) {
 			if (cfg->inspect &&
 			    cfg->inspect(buf, n, to_server, cfg->inspect_ud)) {
-				return -1;          /* CHẶN */
+				return -2;          /* CHẶN (inspect DROP) — phân biệt lỗi */
 			}
 			if (ssl_write_all(to, buf, n) < 0)
 				return -1;
@@ -122,7 +122,13 @@ int bump_run(int client_fd, const char *sni, const struct sockaddr_in *dst,
 		goto out;
 	SSL_CTX_set_min_proto_version(uctx, TLS1_2_VERSION);
 	if (cfg->verify_upstream) {
-		SSL_CTX_set_default_verify_paths(uctx);
+		/* Trust store để biết cert server THẬT có hợp lệ không: bundle root CA
+		 * ship trong rootfs (/etc/ssl/certs/ca-certificates.crt). KHÔNG có nó
+		 * → OpenSSL không có root nào → MỌI server bị coi untrusted → chặn hết.
+		 * Fallback default paths (OPENSSLDIR) nếu bundle thiếu. */
+		if (SSL_CTX_load_verify_locations(uctx,
+				"/etc/ssl/certs/ca-certificates.crt", NULL) != 1)
+			SSL_CTX_set_default_verify_paths(uctx);
 		SSL_CTX_set_verify(uctx, SSL_VERIFY_PEER, NULL);
 	}
 
@@ -178,7 +184,7 @@ int bump_run(int client_fd, const char *sni, const struct sockaddr_in *dst,
 
 	/* ── [3] relay plaintext hai chiều + soi ────────────────────────── */
 	{
-		int c_open = 1, u_open = 1;
+		int c_open = 1, u_open = 1, blocked = 0;
 		struct pollfd pfd[2];
 		while (c_open || u_open) {
 			pfd[0].fd = c_open ? client_fd : -1;
@@ -194,14 +200,20 @@ int bump_run(int client_fd, const char *sni, const struct sockaddr_in *dst,
 			if (c_open &&
 			    (pfd[0].revents & (POLLIN | POLLHUP | POLLERR))) {
 				int s = pump_ssl(cssl, ussl, 1, cfg);
+				if (s == -2) blocked = 1;
 				if (s <= 0) { c_open = 0; if (s < 0) u_open = 0; }
 			}
-			if (u_open &&
+			if (!blocked && u_open &&
 			    (pfd[1].revents & (POLLIN | POLLHUP | POLLERR))) {
 				int s = pump_ssl(ussl, cssl, 0, cfg);
+				if (s == -2) blocked = 1;
 				if (s <= 0) { u_open = 0; if (s < 0) c_open = 0; }
 			}
+			if (blocked) break;
 		}
+		/* DROP → ghi block page (FortiGate-style) ra client trước khi đóng. */
+		if (blocked && cfg->on_block)
+			cfg->on_block(cssl, cfg->inspect_ud);
 	}
 	rc = 0;
 
