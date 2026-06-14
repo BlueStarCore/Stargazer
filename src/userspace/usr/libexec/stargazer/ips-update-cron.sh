@@ -1,8 +1,8 @@
 #!/bin/sh
 # SPDX-License-Identifier: MIT
-# ips-update-cron.sh — wrapper chạy bởi crond (daily). Đọc .update.conf do
-# mgmtd ghi (auto-update + url_count + url_N); nếu bật thì gọi ips-update.sh
-# cho từng URL. weekly → chỉ chạy Chủ nhật.
+# ips-update-cron.sh — wrapper run by crond (daily). Reads .update.conf written
+# by mgmtd (auto-update + url_count + url_N); if enabled, calls ips-update.sh
+# for each URL. weekly → only runs on Sunday.
 CONF=/etc/stargazer/ips/.update.conf
 UPD=/usr/libexec/stargazer/ips-update.sh
 [ -f "$CONF" ] || exit 0
