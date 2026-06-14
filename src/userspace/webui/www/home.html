@@ -767,8 +767,8 @@
                         <div class="form-actions"><button class="btn btn-primary">Apply</button><button class="btn">Reset</button></div>
                     </div>
                     <div style="margin-top:12px;display:flex;align-items:center;gap:8px">
-                        <span class="form-label" style="margin:0">Hướng dẫn áp dụng</span>
-                        <span class="sg-info" tabindex="0" role="img" aria-label="Hướng dẫn">i<span class="sg-tip">Bật IPS ở đây, sau đó gắn vào policy: Firewall &rarr; Policies &rarr; chọn policy <b>accept</b> &rarr; set <b>IPS Profile = default</b>.</span></span>
+                        <span class="form-label" style="margin:0">How to apply</span>
+                        <span class="sg-info" tabindex="0" role="img" aria-label="Guide">i<span class="sg-tip">Enable IPS here, then attach it to a policy: Firewall &rarr; Policies &rarr; pick an <b>accept</b> policy &rarr; set <b>IPS Profile = default</b>.</span></span>
                     </div>
                 </div>
 
@@ -971,7 +971,7 @@
                         </div>
                         <table class="data-table" id="ips-prof-filters">
                             <thead><tr><th>TYPE</th><th>VALUE</th><th>ACTION</th><th>STATUS</th><th></th></tr></thead>
-                            <tbody><tr><td colspan="5" style="opacity:.6">Lưu profile rồi thêm signature/filter…</td></tr></tbody>
+                            <tbody><tr><td colspan="5" style="opacity:.6">Save the profile, then add signatures/filters…</td></tr></tbody>
                         </table>
                     </div>
                     <div class="modal-footer"><button class="btn btn-primary">Save</button><button class="btn" data-toggle-form="form-ips-profile">Cancel</button></div>
@@ -1002,13 +1002,13 @@
                             <div class="toolbar" style="display:flex;gap:8px;align-items:center"><div class="toolbar-search"><input type="text" id="ips-sig-search" placeholder="Search name / SID / CVE..." class="form-input"></div><span id="ips-sig-count" style="font-size:12px;color:#666;margin-left:auto"></span></div>
                             <table class="data-table" id="ips-sig-table">
                                 <thead><tr><th class="th-checkbox"><input type="checkbox" id="ips-sig-all"></th><th>SID</th><th>NAME</th><th>CATEGORY</th><th>DEFAULT</th><th>CVE</th></tr></thead>
-                                <tbody><tr><td colspan="6">Đang tải…</td></tr></tbody>
+                                <tbody><tr><td colspan="6">Loading…</td></tr></tbody>
                             </table>
                         </div>
                         <!-- Filter (category) pane -->
                         <div id="ips-pane-filter" style="display:none">
-                            <div class="form-row"><label class="form-label">Category</label><select class="form-input" id="ips-filter-cat"><option value="all">all (mọi category)</option></select></div>
-                            <p class="form-hint" style="opacity:.6;margin-top:8px">Thêm cả nhóm luật theo category, áp Action chọn ở trên cho toàn nhóm (default=giữ action gốc).</p>
+                            <div class="form-row"><label class="form-label">Category</label><select class="form-input" id="ips-filter-cat"><option value="all">all (every category)</option></select></div>
+                            <p class="form-hint" style="opacity:.6;margin-top:8px">Add a whole rule group by category; the Action selected above applies to the entire group (default = keep the rule's original action).</p>
                         </div>
                     </div>
                     <div class="modal-footer"><button class="btn btn-primary" id="ips-sig-ok">OK</button><button class="btn" id="ips-sig-cancel">Cancel</button></div>
@@ -1038,7 +1038,7 @@
                 </div>
                 <div class="form-card" style="margin-top:16px">
                     <div class="form-section">RECENT ALERTS</div>
-                    <pre id="ips-alert-log" style="white-space:pre-wrap;word-break:break-word;max-height:420px;overflow:auto;margin:0;font-size:12px">Đang tải...</pre>
+                    <pre id="ips-alert-log" style="white-space:pre-wrap;word-break:break-word;max-height:420px;overflow:auto;margin:0;font-size:12px">Loading...</pre>
                 </div>
             </div>
 
@@ -1209,7 +1209,7 @@
                 <div class="page-header"><h1 class="page-title">CERTIFICATES</h1></div>
                 <div class="form-card">
                     <div class="form-section">SSL INSPECTION CA</div>
-                    <p style="margin:0 0 10px;line-height:1.5">CA của firewall dùng để ký lại chứng chỉ khi <b>deep SSL inspection</b>. Cài CA này vào trust store của client để trình duyệt không báo lỗi chứng chỉ. CA được sinh tự động lần đầu bật deep inspection.</p>
+                    <p style="margin:0 0 10px;line-height:1.5">The firewall CA is used to re-sign certificates during <b>deep SSL inspection</b>. Install this CA into the client trust store so the browser does not report certificate errors. The CA is generated automatically the first time deep inspection is enabled.</p>
                     <div class="form-row"><label class="form-label">CA status</label><span id="cert-ca-status" class="form-input" style="border:none;background:none">(checking…)</span></div>
                     <div class="form-actions">
                         <button class="btn btn-primary" id="cert-export-btn">Show CA (PEM)</button>
@@ -1219,7 +1219,7 @@
                 <div class="form-card" style="margin-top:12px;display:none" id="cert-pem-card">
                     <div class="form-section">CA CERTIFICATE (PEM)</div>
                     <pre id="cert-pem" style="white-space:pre-wrap;font-size:11px;background:#1e1e1e;color:#ddd;padding:10px;border-radius:4px;margin:0"></pre>
-                    <div style="margin-top:8px;color:#888;font-size:12px">Copy nội dung trên (hoặc Download .crt) → cài vào "Trusted Root Certification Authorities" của client.</div>
+                    <div style="margin-top:8px;color:#888;font-size:12px">Copy the content above (or Download .crt) → install it into the client's "Trusted Root Certification Authorities".</div>
                 </div>
             </div>
 

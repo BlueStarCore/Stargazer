@@ -225,7 +225,14 @@ static void *insp_conn_thread(void *arg)
 			struct insp_open_body *o = (struct insp_open_body *)
 				(buf + sizeof(struct insp_hdr));
 			c.fc.proto       = SIG_PROTO_TCP;
-			c.fc.dport       = o->srv_port;
+			/* Plaintext sau giải mã TLS LÀ HTTP ở L7. Hầu hết ET HTTP
+			 * signature scoped $HTTP_PORTS={80,8080,8000,8008} — KHÔNG
+			 * có 443. Nếu đưa cổng TLS thật (443) vào fc.dport thì
+			 * port_match() trượt → MỌI rule HTTP bị bỏ qua âm thầm trên
+			 * HTTPS giải mã (đã chứng minh: dport=443 không khớp, dport=80
+			 * khớp). Chuẩn hoá về 80 để soi như HTTP, độc lập cổng TLS.
+			 * (srv_port gốc vẫn ở o->srv_port nếu cần cho log/leg.) */
+			c.fc.dport       = 80;
 			c.fc.prof_id     = o->profile_id;
 			c.fc.established = 1;   /* leg proxy đã established */
 			o->sni[sizeof(o->sni) - 1] = '\0';

@@ -498,7 +498,7 @@ sg_status_t run_ips_update_now(const char *ids_csv, char *result, size_t rsize)
 						 (int)strcspn(e, "\n"), e);
 				else
 					snprintf(reason, sizeof(reason),
-						 "không chạy được script tải");
+						 "could not run the download script");
 			}
 		} else {
 			updated++;
@@ -519,15 +519,15 @@ sg_status_t run_ips_update_now(const char *ids_csv, char *result, size_t rsize)
 	char rb[256];
 	rebuild_ips_active(rb, sizeof(rb));
 
-	/* Thông báo rõ cho người dùng (toast trên UI). */
+	/* User-facing notice (shown as a toast on the UI). */
 	if (errors > 0) {
 		snprintf(result, rsize,
-			 "Tải thất bại %d ruleset (%s): %s. %d ruleset OK.",
+			 "Failed to download %d ruleset(s) (%s): %s. %d ruleset(s) OK.",
 			 errors, failed[0] ? failed : "?",
-			 reason[0] ? reason : "kiểm tra mạng/URL nguồn", updated);
+			 reason[0] ? reason : "check network / source URL", updated);
 		return SG_ERR_SYSTEM_FAIL;
 	}
-	snprintf(result, rsize, "Đã cập nhật %d ruleset thành công.", updated);
+	snprintf(result, rsize, "Updated %d ruleset(s) successfully.", updated);
 	return SG_OK;
 }
 

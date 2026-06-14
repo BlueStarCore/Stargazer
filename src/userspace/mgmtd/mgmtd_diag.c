@@ -486,7 +486,7 @@ int handle_ssl_diag(int client_fd, const char *user,
 
 			ADD("\n[profile %s]%s\n", id, builtin ? " (builtin)" : "");
 			if (builtin) {
-				ADD("  inspection=none (traffic đi thẳng, không giải mã)\n");
+				ADD("  inspection=none (traffic passes through, not decrypted)\n");
 			} else {
 				ADD("  status=%s\n", en ? "enable" : "disable");
 				ADD("  inspection_mode=%s\n", mode ? mode : "certificate");
@@ -521,7 +521,7 @@ int handle_ssl_diag(int client_fd, const char *user,
 	}
 
 	/* ── Policy nào dùng profile nào ─────────────────────────────────── */
-	ADD("\n--- firewall policy dùng SSL profile ---\n");
+	ADD("\n--- firewall policies using SSL profile ---\n");
 	int n_steer_pol = 0;
 	char *plist = sg_db_list("firewall_policy");
 	if (plist) {
@@ -535,7 +535,7 @@ int handle_ssl_diag(int client_fd, const char *user,
 				int on = act && !strcmp(act, "accept") &&
 					 pst && !strcmp(pst, "enable");
 				ADD("  policy %s -> %s%s\n", pid, prof,
-				    on ? "" : " (policy disable/deny — không steer)");
+				    on ? "" : " (policy disabled/deny — not steered)");
 				if (on) n_steer_pol++;
 			}
 			free(prof); free(act); free(pst);
@@ -543,7 +543,7 @@ int handle_ssl_diag(int client_fd, const char *user,
 		free(plist);
 	}
 	if (n_steer_pol == 0)
-		ADD("  (không policy nào dùng SSL inspection — đều no-inspection)\n");
+		ADD("  (no policy uses SSL inspection — all no-inspection)\n");
 
 	/* ── Steering rule thực tế trong nat PREROUTING ──────────────────── */
 	int steer = natr && strstr(natr, "REDIRECT") != NULL;
@@ -556,36 +556,38 @@ int handle_ssl_diag(int client_fd, const char *user,
 	}
 	free(natr);
 
-	/* ── Chẩn đoán ───────────────────────────────────────────────────── */
-	ADD("\n--- chẩn đoán ---\n");
+	/* ── Diagnostics ─────────────────────────────────────────────────── */
+	ADD("\n--- diagnostics ---\n");
 	if (!bin_ok)
-		ADD("[!] ssld binary THIẾU /sbin/stargazer-ssld → mọi profile inspect "
-		    "sẽ ĐỨT (steering trỏ cổng không ai nghe). Build/cài lại rootfs.\n");
+		ADD("[!] ssld binary MISSING at /sbin/stargazer-ssld → every inspect "
+		    "profile will BREAK (steering points to a port nobody listens "
+		    "on). Rebuild/reinstall rootfs.\n");
 	if (n_active == 0) {
-		ADD("[i] Không profile nào BẬT — chỉ no-inspection, traffic đi thẳng. "
-		    "An toàn, không giải mã.\n");
+		ADD("[i] No profile ENABLED — only no-inspection, traffic passes "
+		    "through. Safe, not decrypted.\n");
 	} else {
 		if (n_running_bad > 0)
-			ADD("[!] %d profile BẬT nhưng ssld không chạy hoặc deep thiếu CA "
-			    "→ HTTPS qua profile đó có thể đứt. Xem log mgmtd; bật lại để "
-			    "ssld sinh CA.\n", n_running_bad);
+			ADD("[!] %d profile(s) ENABLED but ssld not running or deep mode "
+			    "missing CA → HTTPS via that profile may break. Check the "
+			    "mgmtd log; re-enable so ssld generates the CA.\n", n_running_bad);
 		if (n_steer_pol == 0)
-			ADD("[!] Có profile BẬT nhưng KHÔNG policy nào gán → ssld chạy "
-			    "nhưng không traffic nào được steer vào. Gán ssl-profile cho "
+			ADD("[!] Profile ENABLED but NO policy uses it → ssld is running "
+			    "but no traffic is steered to it. Attach the ssl-profile to a "
 			    "firewall policy.\n");
 		else if (!steer)
-			ADD("[!] Có policy gán profile nhưng KHÔNG thấy REDIRECT trong nat "
-			    "PREROUTING → traffic 443 không vào ssld. Apply lại firewall.\n");
+			ADD("[!] Policy attaches a profile but NO REDIRECT found in nat "
+			    "PREROUTING → port 443 traffic does not reach ssld. Re-apply "
+			    "firewall.\n");
 		if (!ca_ok)
-			ADD("[!] CHƯA có CA (/etc/stargazer/ssl/ca-cert.pem) → deep mode "
-			    "chạy SPLICE-only (không giải mã). Bật profile deep lần đầu để "
-			    "ssld sinh CA.\n");
+			ADD("[!] No CA yet (/etc/stargazer/ssl/ca-cert.pem) → deep mode "
+			    "runs SPLICE-only (no decryption). Enable a deep profile once "
+			    "so ssld generates the CA.\n");
 		if (bin_ok && n_running_bad == 0 && n_steer_pol > 0 && steer)
-			ADD("[OK] Hoạt động: %d profile chạy, %d policy steer, steering có.\n",
-			    n_active, n_steer_pol);
+			ADD("[OK] Operational: %d profile(s) running, %d policy steering, "
+			    "steering present.\n", n_active, n_steer_pol);
 		if (ca_ok)
-			ADD("[i] Export CA (execute system ssl-ca-cert) + cài vào client "
-			    "để deep mode không báo cert đỏ.\n");
+			ADD("[i] Export the CA (execute system ssl-ca-cert) and install it "
+			    "on clients so deep mode does not raise cert warnings.\n");
 	}
 
 	send_ok(client_fd, NULL, resp);
@@ -785,7 +787,7 @@ int handle_ips_alerts(int client_fd, const char *user,
 
 	char *out = read_last_lines("/etc/stargazer/logs/ips-alert.log", nlines);
 	if (!out || !out[0]) {
-		send_ok(client_fd, NULL, "(chưa có alert nào)\n");
+		send_ok(client_fd, NULL, "NO ALERTS\n");
 		free(out);
 		return 0;
 	}
@@ -812,12 +814,12 @@ int handle_ips_alerts_clear(int client_fd, const char *user,
 	const char *path = "/etc/stargazer/logs/ips-alert.log";
 	int fd = open(path, O_WRONLY | O_TRUNC | O_CREAT, 0640);
 	if (fd < 0) {
-		send_error(client_fd, SG_ERR_INTERNAL, "không xoá được alert log");
+		send_error(client_fd, SG_ERR_INTERNAL, "could not clear the alert log");
 		return 0;
 	}
 	close(fd);
 	mgmt_log("INFO", "ips-alert.log đã được xoá bởi %s", user ? user : "?");
-	send_ok(client_fd, NULL, "alert log đã xoá\n");
+	send_ok(client_fd, NULL, "alert log cleared\n");
 	return 0;
 }
 
@@ -844,7 +846,7 @@ int handle_ips_scores(int client_fd, const char *user,
 	char *out = read_last_lines("/run/stargazer-ipsd.scores", nlines);
 	if (!out || !out[0]) {
 		send_ok(client_fd, NULL,
-			"(chưa có điểm — ipsd chưa chạy hoặc chưa có flow đủ gói)\n");
+			"(no scores yet — ipsd not running or no flow has enough packets)\n");
 		free(out);
 		return 0;
 	}

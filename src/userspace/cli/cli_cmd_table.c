@@ -1463,9 +1463,9 @@ static int cmd_ssl_cacert(const char *args, const char *permissions)
 	if (resp.payload && resp.payload_len > 0)
 		printf("%s", resp.payload);
 	else
-		printf("  CA chưa tồn tại — tạo SSL inspection profile chế độ "
-		       "deep rồi gán vào firewall policy để stargazer-ssld sinh "
-		       "CA tự động.\n");
+		printf("  CA does not exist yet — create a deep-mode SSL "
+		       "inspection profile and attach it to a firewall policy "
+		       "so stargazer-ssld generates the CA automatically.\n");
 	ipc_resp_free(&resp);
 	return 0;
 }

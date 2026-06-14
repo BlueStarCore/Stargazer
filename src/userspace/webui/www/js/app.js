@@ -4068,7 +4068,7 @@
         if (exportBtn && !exportBtn._wired) {
             exportBtn._wired = 1;
             exportBtn.addEventListener('click', function () {
-                if (!caPem) { showToast('CA chưa có — bật deep SSL inspection để sinh CA', 'error'); return; }
+                if (!caPem) { showToast('CA not available — enable deep SSL inspection to generate it', 'error'); return; }
                 if (pemEl) pemEl.textContent = caPem;
                 if (pemCard) pemCard.style.display = '';
             });
@@ -4076,7 +4076,7 @@
         if (dlBtn && !dlBtn._wired) {
             dlBtn._wired = 1;
             dlBtn.addEventListener('click', function () {
-                if (!caPem) { showToast('CA chưa có', 'error'); return; }
+                if (!caPem) { showToast('CA not available', 'error'); return; }
                 var blob = new Blob([caPem], { type: 'application/x-pem-file' });
                 var a = document.createElement('a');
                 a.href = URL.createObjectURL(blob);
@@ -4090,10 +4090,10 @@
             caPem = (d && d.output) ? d.output : '';
             if (statusEl) statusEl.textContent = caPem
                 ? 'CA present (' + caPem.length + ' bytes PEM)'
-                : 'CA chưa tạo — bật deep SSL inspection để sinh tự động';
+                : 'CA not generated — enable deep SSL inspection to auto-generate it';
         }).catch(function () {
             caPem = '';
-            if (statusEl) statusEl.textContent = 'CA chưa tạo — bật deep SSL inspection để sinh tự động';
+            if (statusEl) statusEl.textContent = 'CA not generated — enable deep SSL inspection to auto-generate it';
         });
     }
 
@@ -4131,10 +4131,10 @@
             var log = document.getElementById('ips-alert-log');
             if (log) log.textContent =
                 (d && d.output && d.output.trim()) ? d.output
-                                                   : '(chưa có alert nào)';
+                                                   : '(no alerts yet)';
         }).catch(function () {
             var log = document.getElementById('ips-alert-log');
-            if (log) log.textContent = '(không tải được alert log)';
+            if (log) log.textContent = '(failed to load alert log)';
         });
         return Promise.all([p1, p2]);
     }
@@ -4281,12 +4281,12 @@
                     api('/ips/update-now', { method: 'POST', body: { ids: ids.join(',') } })
                         .then(function (resp) {
                             showToast((resp && resp.output) ? resp.output
-                                      : ('Đã tải ' + ids.length + ' ruleset'), 'success');
+                                      : ('Downloaded ' + ids.length + ' ruleset(s)'), 'success');
                         })
                         .catch(function (err) {
                             /* err.message mang lý do chi tiết từ backend:
                              * no internet / DNS sai / syntax hỏng / file rỗng… */
-                            showToast('Tải lỗi: ' + (err.message || 'lỗi mạng'), 'error');
+                            showToast('Download error: ' + (err.message || 'network error'), 'error');
                         })
                         .finally(function () {
                             updateBtn.disabled = false;

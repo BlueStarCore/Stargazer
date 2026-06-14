@@ -57,9 +57,11 @@ static int ssl_write_all(SSL *ssl, const unsigned char *buf, int len)
  * Bơm một chiều: đọc plaintext từ `from`, soi, ghi sang `to`.
  * Trả 1 nếu còn mở, 0 nếu EOF/đóng sạch, -1 nếu lỗi hoặc inspect CHẶN.
  * Drain SSL_pending để không kẹt dữ liệu đã nằm trong buffer SSL.
+ * `out_written` (nếu != NULL): cộng dồn số byte đã ghi sang `to` — dùng để
+ * biết response đã bắt đầu gửi cho client chưa (quyết định có chèn block page).
  */
 static int pump_ssl(SSL *from, SSL *to, int to_server,
-		    const struct bump_cfg *cfg)
+		    const struct bump_cfg *cfg, size_t *out_written)
 {
 	unsigned char buf[BUMP_BUF];
 	do {
@@ -71,6 +73,8 @@ static int pump_ssl(SSL *from, SSL *to, int to_server,
 			}
 			if (ssl_write_all(to, buf, n) < 0)
 				return -1;
+			if (out_written)
+				*out_written += (size_t)n;
 			continue;
 		}
 		int e = SSL_get_error(from, n);
@@ -185,6 +189,7 @@ int bump_run(int client_fd, const char *sni, const struct sockaddr_in *dst,
 	/* ── [3] relay plaintext hai chiều + soi ────────────────────────── */
 	{
 		int c_open = 1, u_open = 1, blocked = 0;
+		size_t cli_written = 0;   /* byte response đã gửi tới client */
 		struct pollfd pfd[2];
 		while (c_open || u_open) {
 			pfd[0].fd = c_open ? client_fd : -1;
@@ -199,20 +204,25 @@ int bump_run(int client_fd, const char *sni, const struct sockaddr_in *dst,
 			}
 			if (c_open &&
 			    (pfd[0].revents & (POLLIN | POLLHUP | POLLERR))) {
-				int s = pump_ssl(cssl, ussl, 1, cfg);
+				int s = pump_ssl(cssl, ussl, 1, cfg, NULL);
 				if (s == -2) blocked = 1;
 				if (s <= 0) { c_open = 0; if (s < 0) u_open = 0; }
 			}
 			if (!blocked && u_open &&
 			    (pfd[1].revents & (POLLIN | POLLHUP | POLLERR))) {
-				int s = pump_ssl(ussl, cssl, 0, cfg);
+				int s = pump_ssl(ussl, cssl, 0, cfg, &cli_written);
 				if (s == -2) blocked = 1;
 				if (s <= 0) { u_open = 0; if (s < 0) c_open = 0; }
 			}
 			if (blocked) break;
 		}
-		/* DROP → ghi block page (FortiGate-style) ra client trước khi đóng. */
-		if (blocked && cfg->on_block)
+		/* DROP → ghi block page (FortiGate-style) ra client trước khi đóng.
+		 * CHỈ chèn khi CHƯA byte response nào tới client: nếu response đã bắt
+		 * đầu (DROP ở chiều server→client, vd signature trong response body),
+		 * thì nối thêm HTTP 403 sẽ bị browser hiểu là BODY của response cũ →
+		 * hiện nguyên text "HTTP/1.1 403 Forbidden Content-Type: t...". Trường
+		 * hợp đó chỉ đóng kết nối (client thấy load lỗi, không phải trang giả). */
+		if (blocked && cfg->on_block && cli_written == 0)
 			cfg->on_block(cssl, cfg->inspect_ud);
 	}
 	rc = 0;
