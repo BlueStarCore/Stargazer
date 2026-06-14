@@ -2435,18 +2435,248 @@ static const char *ct_subnet_ifname(const struct ct_localif *lm, int nlm,
 }
 
 /*
+ * ct_classify - resolve a flow's *displayed* policy / iif / oif names from its
+ * raw fields. The session listing (ct_emit_line) and the filtered clear path
+ * (conntrack_delete_by_filter) both call this, so a flow is filtered on exactly
+ * the same names an operator sees in `execute diagnose session status`.
+ *
+ * iif_idx/oif_idx are the ML extension's recorded ingress/egress ifindexes
+ * (0 = none, e.g. local/INPUT flows that never traversed FORWARD). ibuf/obuf
+ * (size IF_NAMESIZE) back the if_indextoname() results; the returned pointers
+ * are either into those buffers or string literals ("-"/"local"/subnet name).
+ */
+static void ct_classify(const char *src, const char *dst,
+			unsigned long mark, unsigned iif_idx, unsigned oif_idx,
+			const struct ct_pol *pmap, int npmap,
+			const struct ct_localif *lm, int nlm,
+			char ibuf[IF_NAMESIZE], char obuf[IF_NAMESIZE],
+			const char **policy_out, const char **iifn_out,
+			const char **oifn_out)
+{
+	unsigned cmkid = (unsigned)(mark >> SG_CMK_PID_SHIFT);
+	const char *policy = ct_policy_name(pmap, npmap, cmkid);
+	const char *iifn = ct_ifname(iif_idx, ibuf, IF_NAMESIZE);
+	const char *oifn = ct_ifname(oif_idx, obuf, IF_NAMESIZE);
+
+	/* A local flow never traversed FORWARD (iif==oif==0). When it is to/from
+	 * a firewall address, label it "local" and resolve the peer's interface
+	 * from the address that owns its subnet — identical to the listing. */
+	if (iif_idx == 0 && oif_idx == 0) {
+		if (ct_addr_is_local(lm, nlm, dst)) {
+			const char *in = ct_subnet_ifname(lm, nlm, src);
+
+			policy = "local";
+			iifn = ct_addr_is_local(lm, nlm, src) ? "local" :
+			       (in ? in : "-");
+			oifn = "local";
+		} else if (ct_addr_is_local(lm, nlm, src)) {
+			const char *eg = ct_subnet_ifname(lm, nlm, dst);
+
+			policy = "local";
+			iifn = "local";
+			oifn = eg ? eg : "-";
+		}
+	}
+	*policy_out = policy;
+	*iifn_out = iifn;
+	*oifn_out = oifn;
+}
+
+/* ── Stateful session filter (shared by listing and filtered clear) ──────────
+ *
+ * A constraint set for `execute diagnose session [list|clear]`. A flow matches
+ * only if it satisfies EVERY supplied field (logical AND), compared against the
+ * same normalized fields the listing shows. Fields left unset (have_* == 0) are
+ * wildcards. An empty payload means "no filter" and never builds one of these.
+ */
+struct ct_filter {
+	int      have_proto, have_src, have_dst, have_policy, have_iif, have_oif;
+	char     proto[12];
+	char     src_ip[INET_ADDRSTRLEN];
+	char     dst_ip[INET_ADDRSTRLEN];
+	int      src_has_port, dst_has_port;
+	unsigned src_port, dst_port;
+	char     policy[64];
+	char     iif[IF_NAMESIZE];
+	char     oif[IF_NAMESIZE];
+};
+
+struct ct_clear_result {
+	long matched;	/* flows that matched the filter             */
+	long deleted;	/* delete requests the kernel ACKed (err==0) */
+	long failed;	/* build/send errors + non-zero/absent ACKs  */
+	int  dump_ok;	/* dump reached a clean NLMSG_DONE           */
+};
+
+/* Split "ip" or "ip:port" into ip + optional port. Returns 0 on success and
+ * sets has_port and port; -1 if the IP is not valid dotted-quad IPv4 or the port
+ * is out of range. */
+static int ct_split_ipport(const char *val, char *ip, size_t ipsz,
+			   int *has_port, unsigned *port)
+{
+	const char *colon = strchr(val, ':');
+	size_t iplen = colon ? (size_t)(colon - val) : strlen(val);
+	struct in_addr a;
+
+	*has_port = 0;
+	*port = 0;
+	if (iplen == 0 || iplen >= ipsz)
+		return -1;
+	memcpy(ip, val, iplen);
+	ip[iplen] = '\0';
+	if (inet_pton(AF_INET, ip, &a) != 1)
+		return -1;
+	if (colon) {
+		char *end = NULL;
+		unsigned long p = strtoul(colon + 1, &end, 10);
+
+		if (end == colon + 1 || *end != '\0' || p > 65535)
+			return -1;
+		*has_port = 1;
+		*port = (unsigned)p;
+	}
+	return 0;
+}
+
+/* Copy a validated string field, rejecting (never truncating) an over-long
+ * value. Length-guarded memcpy keeps the compiler's format-truncation check
+ * happy and honors "no silent caps". Returns 0 / -1 (message in err). */
+static int ct_filter_setstr(char *dst, size_t dstsz, const char *v,
+			    const char *name, char *err, size_t errsz)
+{
+	size_t l = strlen(v);
+
+	if (l >= dstsz) {
+		snprintf(err, errsz, "%s value too long", name);
+		return -1;
+	}
+	memcpy(dst, v, l + 1);
+	return 0;
+}
+
+/*
+ * ct_filter_parse - build a ct_filter from a key=value payload. Recognized
+ * keys: proto, src, dst, policy, iif, oif. Returns the number of constraints
+ * set (>= 0), or -1 on a malformed value (message in err). A return of 0 means
+ * the payload carried no recognized constraint — the clear caller MUST refuse
+ * it rather than fall through to flushing every flow (fail-safe).
+ */
+static int ct_filter_parse(const char *payload, struct ct_filter *f,
+			   char *err, size_t errsz)
+{
+	char v[128];
+	int n = 0;
+
+	memset(f, 0, sizeof(*f));
+
+	extract_val(payload, "proto", v, sizeof(v));
+	if (v[0]) {
+		if (!ct_l4_name(v)) {
+			snprintf(err, errsz, "unknown proto '%.40s'", v);
+			return -1;
+		}
+		if (ct_filter_setstr(f->proto, sizeof(f->proto), v,
+				     "proto", err, errsz) != 0)
+			return -1;
+		f->have_proto = 1; n++;
+	}
+
+	extract_val(payload, "src", v, sizeof(v));
+	if (v[0]) {
+		if (ct_split_ipport(v, f->src_ip, sizeof(f->src_ip),
+				    &f->src_has_port, &f->src_port) != 0) {
+			snprintf(err, errsz, "invalid src '%.40s'", v);
+			return -1;
+		}
+		f->have_src = 1; n++;
+	}
+
+	extract_val(payload, "dst", v, sizeof(v));
+	if (v[0]) {
+		if (ct_split_ipport(v, f->dst_ip, sizeof(f->dst_ip),
+				    &f->dst_has_port, &f->dst_port) != 0) {
+			snprintf(err, errsz, "invalid dst '%.40s'", v);
+			return -1;
+		}
+		f->have_dst = 1; n++;
+	}
+
+	extract_val(payload, "policy", v, sizeof(v));
+	if (v[0]) {
+		if (ct_filter_setstr(f->policy, sizeof(f->policy), v,
+				     "policy", err, errsz) != 0)
+			return -1;
+		f->have_policy = 1; n++;
+	}
+
+	extract_val(payload, "iif", v, sizeof(v));
+	if (v[0]) {
+		if (ct_filter_setstr(f->iif, sizeof(f->iif), v,
+				     "iif", err, errsz) != 0)
+			return -1;
+		f->have_iif = 1; n++;
+	}
+
+	extract_val(payload, "oif", v, sizeof(v));
+	if (v[0]) {
+		if (ct_filter_setstr(f->oif, sizeof(f->oif), v,
+				     "oif", err, errsz) != 0)
+			return -1;
+		f->have_oif = 1; n++;
+	}
+
+	return n;
+}
+
+/* 1 if the classified flow matches every supplied constraint (AND). */
+static int ct_filter_match(const struct ct_filter *f,
+			   const char *proto, const char *src, unsigned sport,
+			   const char *dst, unsigned dport,
+			   const char *policy, const char *iifn,
+			   const char *oifn)
+{
+	if (f->have_proto && strcmp(f->proto, proto) != 0)
+		return 0;
+	if (f->have_src) {
+		if (strcmp(f->src_ip, src) != 0)
+			return 0;
+		if (f->src_has_port && f->src_port != sport)
+			return 0;
+	}
+	if (f->have_dst) {
+		if (strcmp(f->dst_ip, dst) != 0)
+			return 0;
+		if (f->dst_has_port && f->dst_port != dport)
+			return 0;
+	}
+	if (f->have_policy && strcmp(f->policy, policy) != 0)
+		return 0;
+	if (f->have_iif && strcmp(f->iif, iifn) != 0)
+		return 0;
+	if (f->have_oif && strcmp(f->oif, oifn) != 0)
+		return 0;
+	return 1;
+}
+
+static int conntrack_delete_by_filter(const struct ct_filter *f,
+				      struct ct_clear_result *res);
+
+/*
  * ct_emit_line - parse one /proc/net/nf_conntrack line, append a normalized
  * session line to `out`:
  *   proto=<p> state=<S> src=<ip>:<port> dst=<ip>:<port> pkts=<n> bytes=<n> policy=<name> iif=<if> oif=<if>
  * pkts/bytes sum both directions (nf_conntrack_acct); policy is resolved from
  * the flow's connmark via `map`; iif/oif from the ML iface overlay via `imap`.
  * A flow to/from a firewall address that never traversed FORWARD is labelled
- * "local" using `lm`. Returns 0 on success, -1 if unparseable; modifies `line`.
+ * "local" using `lm`. When `filter` is non-NULL, a flow that does not match it
+ * is dropped (returns -1) so the listing shows only matching flows. Returns 0
+ * on success, -1 if unparseable or filtered out; modifies `line`.
  */
 static int ct_emit_line(char *line, struct dynbuf *out,
 			const struct ct_pol *map, int nmap,
 			const struct ct_iface_ent *imap, int nimap,
-			const struct ct_localif *lm, int nlm)
+			const struct ct_localif *lm, int nlm,
+			const struct ct_filter *filter)
 {
 	char proto[12] = "", state[24] = "";
 	char src[INET_ADDRSTRLEN] = "", dst[INET_ADDRSTRLEN] = "";
@@ -2492,41 +2722,22 @@ static int ct_emit_line(char *line, struct dynbuf *out,
 	if (!have_proto || !src[0])
 		return -1;
 
-	unsigned cmkid = (unsigned)(mark >> SG_CMK_PID_SHIFT);
-	const char *policy = ct_policy_name(map, nmap, cmkid);
-
 	/* Overlay the in/out interfaces recorded in the ML extension, matched
 	 * by the original 5-tuple. Local/INPUT flows carry none → "-". */
 	char key[80];
 	ct_flow_key(key, sizeof(key), proto, src, sport, dst, dport);
 	unsigned iif = 0, oif = 0;
 	ct_iface_lookup(imap, nimap, key, &iif, &oif);
+
 	char ibuf[IF_NAMESIZE], obuf[IF_NAMESIZE];
-	const char *iifn = ct_ifname(iif, ibuf, sizeof(ibuf));
-	const char *oifn = ct_ifname(oif, obuf, sizeof(obuf));
+	const char *policy, *iifn, *oifn;
+	ct_classify(src, dst, mark, iif, oif, map, nmap, lm, nlm,
+		    ibuf, obuf, &policy, &iifn, &oifn);
 
-	/* A local flow never traversed FORWARD, so the ML overlay recorded no
-	 * interfaces (iif==oif==0). When such a flow is to/from a firewall
-	 * address, label it "local": the firewall side becomes "local" and the
-	 * peer's interface comes from the address that owns its subnet. */
-	if (iif == 0 && oif == 0) {
-		if (ct_addr_is_local(lm, nlm, dst)) {
-			const char *in = ct_subnet_ifname(lm, nlm, src);
-
-			policy = "local";
-			/* src may itself be a firewall address (box talking to
-			 * its own IP) — then the ingress is local too. */
-			iifn = ct_addr_is_local(lm, nlm, src) ? "local" :
-			       (in ? in : "-");
-			oifn = "local";
-		} else if (ct_addr_is_local(lm, nlm, src)) {
-			const char *eg = ct_subnet_ifname(lm, nlm, dst);
-
-			policy = "local";
-			iifn = "local";
-			oifn = eg ? eg : "-";
-		}
-	}
+	/* Listing filter: drop flows that don't match every supplied field. */
+	if (filter && !ct_filter_match(filter, proto, src, sport, dst, dport,
+				       policy, iifn, oifn))
+		return -1;
 
 	char l[320];
 	int n = snprintf(l, sizeof(l),
@@ -2619,7 +2830,7 @@ int conntrack_flush_all(void)
 int handle_show_sessions(int client_fd, const char *user,
 			 const char *payload, const sg_request_hdr_t *hdr)
 {
-	(void)payload; (void)hdr;
+	(void)hdr;
 
 	const char *perms = get_user_permissions(user);
 	if (!has_permission(perms, "monitor")) {
@@ -2628,8 +2839,25 @@ int handle_show_sessions(int client_fd, const char *user,
 		return 0;
 	}
 
-	FILE *fp = fopen("/proc/net/nf_conntrack", "r");
-	if (!fp) {
+	/* Optional filter: list only matching flows. A malformed value is a hard
+	 * error; a payload with no recognized field lists everything (benign for
+	 * a read-only listing). */
+	struct ct_filter filt;
+	const struct ct_filter *fp = NULL;
+	if (payload && payload[0]) {
+		char err[96];
+		int nset = ct_filter_parse(payload, &filt, err, sizeof(err));
+
+		if (nset < 0) {
+			send_error(client_fd, SG_ERR_INVALID_ARG, err);
+			return 0;
+		}
+		if (nset > 0)
+			fp = &filt;
+	}
+
+	FILE *fp_ct = fopen("/proc/net/nf_conntrack", "r");
+	if (!fp_ct) {
 		send_ok(client_fd, "not_available",
 			"Connection tracking not available\n");
 		return 0;
@@ -2637,7 +2865,7 @@ int handle_show_sessions(int client_fd, const char *user,
 
 	struct dynbuf out;
 	if (dbuf_init(&out, 8192) < 0) {
-		fclose(fp);
+		fclose(fp_ct);
 		send_error(client_fd, SG_ERR_SYSTEM_FAIL, "out of memory");
 		return 0;
 	}
@@ -2659,12 +2887,12 @@ int handle_show_sessions(int client_fd, const char *user,
 
 	long count = 0;
 	char line[1024];
-	while (fgets(line, sizeof(line), fp)) {
+	while (fgets(line, sizeof(line), fp_ct)) {
 		if (ct_emit_line(line, &out, pmap, npmap, imap, nimap,
-				 lmap, nlmap) == 0)
+				 lmap, nlmap, fp) == 0)
 			count++;
 	}
-	fclose(fp);
+	fclose(fp_ct);
 	free(pmap);
 	free(imap);
 	free(lmap);
@@ -2738,7 +2966,7 @@ int handle_session_stats(int client_fd, const char *user,
 int handle_session_clear(int client_fd, const char *user,
 			 const char *payload, const sg_request_hdr_t *hdr)
 {
-	(void)payload; (void)hdr;
+	(void)hdr;
 
 	const char *perms = get_user_permissions(user);
 	if (!has_permission(perms, "admin")) {
@@ -2754,14 +2982,47 @@ int handle_session_clear(int client_fd, const char *user,
 		return 0;
 	}
 
-	if (conntrack_flush_all() < 0) {
-		send_error(client_fd, SG_ERR_SYSTEM_FAIL,
-			   "conntrack flush failed");
+	/* No filter → legacy flush-all fast path (one netlink DELETE, no dump). */
+	if (!payload || !payload[0]) {
+		if (conntrack_flush_all() < 0) {
+			send_error(client_fd, SG_ERR_SYSTEM_FAIL,
+				   "conntrack flush failed");
+			return 0;
+		}
+		char resp[64];
+		snprintf(resp, sizeof(resp), "mode=all\nflushed=%ld\n", before);
+		send_ok(client_fd, NULL, resp);
 		return 0;
 	}
 
-	char resp[64];
-	snprintf(resp, sizeof(resp), "flushed=%ld\n", before);
+	/* Filtered clear. A payload with no recognized constraint is refused —
+	 * never silently widen a typo'd filter into a full flush. */
+	struct ct_filter f;
+	char err[96];
+	int nset = ct_filter_parse(payload, &f, err, sizeof(err));
+	if (nset < 0) {
+		send_error(client_fd, SG_ERR_INVALID_ARG, err);
+		return 0;
+	}
+	if (nset == 0) {
+		send_error(client_fd, SG_ERR_INVALID_ARG,
+			   "no valid filter fields (proto|src|dst|policy|iif|oif)");
+		return 0;
+	}
+
+	struct ct_clear_result r = {0};
+	if (conntrack_delete_by_filter(&f, &r) < 0) {
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL,
+			   "conntrack filtered clear failed");
+		return 0;
+	}
+
+	/* Honest accounting: report matched/deleted/failed and whether the dump
+	 * completed, so a partial sweep is never reported as a clean clear. */
+	char resp[128];
+	snprintf(resp, sizeof(resp),
+		 "mode=filter\nmatched=%ld\ndeleted=%ld\nfailed=%ld\ndump_complete=%d\n",
+		 r.matched, r.deleted, r.failed, r.dump_ok);
 	send_ok(client_fd, NULL, resp);
 	return 0;
 }
@@ -3440,6 +3701,235 @@ int conntrack_mark_dirty_by_policy(unsigned int pid)
 	return rc;
 }
 
+/*
+ * conntrack_delete_by_filter - dump conntrack and delete every flow matching
+ * the filter, addressing each by echoing its dumped CTA_TUPLE_ORIG in an
+ * IPCTNL_MSG_CT_DELETE (the in-process equivalent of "conntrack -D ...").
+ *
+ * Each flow is classified (policy / iif / oif) with ct_classify() — the exact
+ * names the session listing shows — so an operator clears precisely what they
+ * saw. Two NFNETLINK sockets stream concurrently like the dirty-by-policy path:
+ * the read socket dumps, and as each matching flow arrives its DELETE is sent
+ * on the write socket with NLM_F_ACK; ACKs are drained in a window so the reply
+ * queue cannot back up. No flow is buffered (constant memory).
+ *
+ * Fills *res (matched/deleted/failed/dump_ok). Returns 0 once the sockets are
+ * set up and the dump ran, -1 on a hard setup failure (socket/send/OOM). A
+ * delete that returns a non-zero ACK (e.g. ENOENT — the flow ended between dump
+ * and delete) counts as failed, reported honestly rather than hidden.
+ */
+static int conntrack_delete_by_filter(const struct ct_filter *f,
+				      struct ct_clear_result *res)
+{
+	const size_t WINDOW = 64;
+	int rfd, wfd;
+	struct sockaddr_nl sa;
+	struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+	size_t sent = 0, fails = 0, outstanding = 0;
+	long matched = 0;
+	int done = 0, dump_ok = 0;
+	char rbuf[32768];	/* dump batch                              */
+	char abuf[8192];	/* ACK drain — must be distinct from rbuf  */
+
+	struct ct_pol *pmap = NULL;
+	int npmap = ct_policy_map_build(&pmap);
+	if (npmap < 0)
+		npmap = 0;	/* no policy names → policy= matches only "-" */
+	struct ct_localif *lmap = NULL;
+	int nlmap = ct_localif_build(&lmap);
+	if (nlmap < 0)
+		nlmap = 0;
+
+	rfd = socket(AF_NETLINK, SOCK_RAW, SG_NETLINK_NETFILTER);
+	if (rfd < 0) {
+		free(pmap);
+		free(lmap);
+		return -1;
+	}
+	wfd = socket(AF_NETLINK, SOCK_RAW, SG_NETLINK_NETFILTER);
+	if (wfd < 0) {
+		close(rfd);
+		free(pmap);
+		free(lmap);
+		return -1;
+	}
+	setsockopt(rfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(wfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	memset(&sa, 0, sizeof(sa));
+	sa.nl_family = AF_NETLINK;
+
+	/* Dump request (whole IPv4 table; the per-flow filter is applied below). */
+	{
+		struct {
+			struct nlmsghdr    nlh;
+			struct sg_nfgenmsg nfg;
+		} req;
+		memset(&req, 0, sizeof(req));
+		req.nlh.nlmsg_len    = NLMSG_LENGTH(sizeof(req.nfg));
+		req.nlh.nlmsg_type   = (SG_NFNL_SUBSYS_CTNETLINK << 8) |
+				       SG_IPCTNL_MSG_CT_GET;
+		req.nlh.nlmsg_flags  = NLM_F_REQUEST | NLM_F_DUMP;
+		req.nlh.nlmsg_seq    = 1;
+		req.nfg.nfgen_family = AF_INET;
+		if (sendto(rfd, &req, req.nlh.nlmsg_len, 0,
+			   (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+			close(rfd);
+			close(wfd);
+			free(pmap);
+			free(lmap);
+			return -1;
+		}
+	}
+
+	while (!done) {
+		ssize_t rn = recv(rfd, rbuf, sizeof(rbuf), 0);
+		struct nlmsghdr *nh;
+		int rem;
+
+		if (rn <= 0)
+			break;		/* timeout/error: dump_ok stays 0 */
+		rem = (int)rn;
+		for (nh = (struct nlmsghdr *)rbuf; NLMSG_OK(nh, rem);
+		     nh = NLMSG_NEXT(nh, rem)) {
+			const void *attrs, *mlp, *tup, *mp;
+			int alen, ml_len = 0, tlen = 0, mlen2 = 0;
+			struct sg_nf_conn_ml ml;
+			char src[INET_ADDRSTRLEN] = "", dst[INET_ADDRSTRLEN] = "";
+			unsigned sport = 0, dport = 0;
+			const char *pname = NULL;
+			unsigned long mark = 0;
+			char ibuf[IF_NAMESIZE], obuf[IF_NAMESIZE];
+			const char *policy, *iifn, *oifn;
+			char msg[512];
+			struct nlmsghdr *dnlh = (struct nlmsghdr *)msg;
+			struct sg_nfgenmsg *dnfg =
+				(struct sg_nfgenmsg *)(msg + NLMSG_HDRLEN);
+			int doff = NLMSG_HDRLEN +
+				   NLMSG_ALIGN(sizeof(struct sg_nfgenmsg));
+
+			if (nh->nlmsg_type == NLMSG_DONE) {
+				done = 1;
+				dump_ok = 1;
+				break;
+			}
+			if (nh->nlmsg_type == NLMSG_ERROR) {
+				done = 1;
+				break;
+			}
+			attrs = (const char *)NLMSG_DATA(nh) +
+				NLMSG_ALIGN(sizeof(struct sg_nfgenmsg));
+			alen = (int)nh->nlmsg_len - NLMSG_HDRLEN -
+			       (int)NLMSG_ALIGN(sizeof(struct sg_nfgenmsg));
+			if (alen <= 0)
+				continue;
+
+			/* Original tuple — needed both to match and to address
+			 * the delete (echoed back verbatim). */
+			tup = sg_nla_find(attrs, alen, SG_CTA_TUPLE_ORIG, &tlen);
+			if (!tup || tlen <= 0 || tlen > 128)
+				continue;
+			{
+				int l = 0;
+				const void *ip = sg_nla_find(tup, tlen,
+							     SG_CTA_TUPLE_IP, &l);
+				const void *pr;
+
+				if (ip) {
+					int il = 0;
+					const void *s = sg_nla_find(ip, l,
+							SG_CTA_IP_V4_SRC, &il);
+					const void *d = sg_nla_find(ip, l,
+							SG_CTA_IP_V4_DST, &il);
+					if (s) inet_ntop(AF_INET, s, src, sizeof(src));
+					if (d) inet_ntop(AF_INET, d, dst, sizeof(dst));
+				}
+				l = 0;
+				pr = sg_nla_find(tup, tlen, SG_CTA_TUPLE_PROTO, &l);
+				if (pr) {
+					int pnl = 0, spl = 0, dpl = 0;
+					const void *pn = sg_nla_find(pr, l,
+							SG_CTA_PROTO_NUM, &pnl);
+					const void *sp = sg_nla_find(pr, l,
+							SG_CTA_PROTO_SRC_PORT, &spl);
+					const void *dp = sg_nla_find(pr, l,
+							SG_CTA_PROTO_DST_PORT, &dpl);
+					if (pn && pnl >= 1)
+						pname = ct_proto_name(*(const uint8_t *)pn);
+					if (sp && spl >= 2)
+						sport = ntohs(*(const uint16_t *)sp);
+					if (dp && dpl >= 2)
+						dport = ntohs(*(const uint16_t *)dp);
+				}
+			}
+			if (!pname || !src[0] || !dst[0])
+				continue;	/* can't classify or address it */
+
+			/* connmark → policy; ML iface indexes → iif/oif. */
+			mp = sg_nla_find(attrs, alen, SG_CTA_MARK, &mlen2);
+			if (mp && mlen2 >= 4)
+				mark = ntohl(*(const uint32_t *)mp);
+			memset(&ml, 0, sizeof(ml));
+			mlp = sg_nla_find(attrs, alen, SG_CTA_ML, &ml_len);
+			if (mlp)
+				memcpy(&ml, mlp, ml_len < (int)sizeof(ml) ?
+				       (size_t)ml_len : sizeof(ml));
+
+			ct_classify(src, dst, mark, ml.iif, ml.oif,
+				    pmap, npmap, lmap, nlmap,
+				    ibuf, obuf, &policy, &iifn, &oifn);
+
+			if (!ct_filter_match(f, pname, src, sport, dst, dport,
+					     policy, iifn, oifn))
+				continue;
+
+			matched++;
+
+			/* Build CT_DELETE addressing this exact flow. */
+			memset(msg, 0, sizeof(msg));
+			if (sg_nla_put(msg, &doff, sizeof(msg),
+				       SG_CTA_TUPLE_ORIG | SG_NLA_F_NESTED,
+				       tup, tlen) < 0) {
+				fails++;
+				continue;
+			}
+			dnlh->nlmsg_len    = (uint32_t)doff;
+			dnlh->nlmsg_type   = (SG_NFNL_SUBSYS_CTNETLINK << 8) |
+					     SG_IPCTNL_MSG_CT_DELETE;
+			dnlh->nlmsg_flags  = NLM_F_REQUEST | NLM_F_ACK;
+			dnlh->nlmsg_seq    = (unsigned int)(1000 + sent);
+			dnfg->nfgen_family = AF_INET;
+
+			if (sendto(wfd, msg, doff, 0,
+				   (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+				fails++;
+			} else {
+				sent++;
+				outstanding++;
+				if (outstanding >= WINDOW)
+					sg_drain_ct_acks(wfd, abuf, sizeof(abuf),
+							 &outstanding, &fails, 0);
+			}
+		}
+	}
+
+	/* Reconcile in-flight ACKs; an unconfirmed delete counts as failed. */
+	sg_drain_ct_acks(wfd, abuf, sizeof(abuf), &outstanding, &fails, 0);
+	fails += outstanding;
+
+	close(rfd);
+	close(wfd);
+	free(pmap);
+	free(lmap);
+
+	res->matched = matched;
+	res->failed  = (long)fails;
+	res->deleted = matched - (long)fails;
+	if (res->deleted < 0)
+		res->deleted = 0;
+	res->dump_ok = dump_ok;
+	return 0;
+}
+
 /* ── SG_CMD_SHOW_BOOT_CONFIG (651) ─────────────────────────────────────── */
 
 int handle_show_boot_config(int client_fd, const char *user,
@@ -3777,6 +4267,133 @@ int handle_diag_busybox_list(int client_fd, const char *user,
 			buf_appendf(resp, sizeof(resp), &pos, "%s\n", path);
 		}
 		closedir(d);
+	}
+
+	send_ok(client_fd, NULL, resp);
+	return 0;
+}
+
+/* ── SG_CMD_SYS_LIST (617) ────────────────────────────────────────────── */
+
+#define SYS_LIST_MAX      512   /* max binaries collected per group */
+#define SYS_LIST_NAMELEN  48    /* max basename length kept            */
+
+static int sys_list_namecmp(const void *a, const void *b)
+{
+	return strcmp((const char *)a, (const char *)b);
+}
+
+/*
+ * Enumerate every executable under /bin, /sbin, /usr/bin, /usr/sbin and
+ * return them grouped (busybox applets vs standalone binaries), sorted and
+ * word-wrapped, ready for the CLI to print verbatim. Backs the
+ * `execute system ?` listing.
+ *
+ * Admin-only, matching the `execute system` command itself. The CLI is
+ * sandboxed (no getdents64/readlinkat), so this enumeration runs in mgmtd.
+ */
+int handle_sys_list(int client_fd, const char *user,
+		    const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)payload; (void)hdr;
+
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "admin")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "admin permission required");
+		return 0;
+	}
+
+	static const char *dirs[] = {
+		"/bin", "/sbin", "/usr/bin", "/usr/sbin", NULL
+	};
+
+	/* static (not stack): two 24 KiB arrays — handler runs serially. */
+	static char applets[SYS_LIST_MAX][SYS_LIST_NAMELEN];
+	static char standalone[SYS_LIST_MAX][SYS_LIST_NAMELEN];
+	int n_applet = 0, n_stand = 0;
+
+	for (int i = 0; dirs[i]; i++) {
+		DIR *d = opendir(dirs[i]);
+		if (!d)
+			continue;
+		struct dirent *de;
+		while ((de = readdir(d)) != NULL) {
+			if (de->d_name[0] == '.')
+				continue;
+
+			char path[512];
+			int n = snprintf(path, sizeof(path), "%s/%s",
+					 dirs[i], de->d_name);
+			if (n <= 0 || (size_t)n >= sizeof(path))
+				continue;
+
+			/* Only runnable files (resolves symlinks). */
+			if (access(path, X_OK) != 0)
+				continue;
+
+			/* Skip implausibly long basenames (keeps the copy
+			 * below bounded and the compiler's truncation check
+			 * satisfied). */
+			size_t nlen = strlen(de->d_name);
+			if (nlen >= SYS_LIST_NAMELEN)
+				continue;
+
+			char target[256];
+			ssize_t tlen = readlink(path, target, sizeof(target) - 1);
+			int is_applet = (tlen > 0 &&
+					 (target[tlen] = '\0',
+					  strcmp(target, "/bin/busybox") == 0));
+
+			char (*arr)[SYS_LIST_NAMELEN] =
+				is_applet ? applets : standalone;
+			int *cnt = is_applet ? &n_applet : &n_stand;
+
+			/* Dedup by basename across directories. */
+			int dup = 0;
+			for (int k = 0; k < *cnt; k++) {
+				if (strcmp(arr[k], de->d_name) == 0) {
+					dup = 1;
+					break;
+				}
+			}
+			if (dup || *cnt >= SYS_LIST_MAX)
+				continue;
+			memcpy(arr[(*cnt)++], de->d_name, nlen + 1);
+		}
+		closedir(d);
+	}
+
+	qsort(applets, n_applet, SYS_LIST_NAMELEN, sys_list_namecmp);
+	qsort(standalone, n_stand, SYS_LIST_NAMELEN, sys_list_namecmp);
+
+	char resp[SG_RESPONSE_MAX];
+	size_t pos = 0;
+	resp[0] = '\0';
+
+	/* Two groups, each word-wrapped at ~72 cols with a 4-space indent. */
+	for (int g = 0; g < 2; g++) {
+		char (*arr)[SYS_LIST_NAMELEN] = g ? standalone : applets;
+		int cnt = g ? n_stand : n_applet;
+		buf_appendf(resp, sizeof(resp), &pos, "  %s (%d):\n",
+			    g ? "Standalone binaries" : "BusyBox applets", cnt);
+		int col = 0;
+		for (int k = 0; k < cnt; k++) {
+			int wlen = (int)strlen(arr[k]);
+			if (col == 0) {
+				buf_appendf(resp, sizeof(resp), &pos, "    ");
+				col = 4;
+			} else if (col + 2 + wlen > 72) {
+				buf_appendf(resp, sizeof(resp), &pos, "\n    ");
+				col = 4;
+			} else {
+				buf_appendf(resp, sizeof(resp), &pos, "  ");
+				col += 2;
+			}
+			buf_appendf(resp, sizeof(resp), &pos, "%s", arr[k]);
+			col += wlen;
+		}
+		buf_appendf(resp, sizeof(resp), &pos, "\n");
 	}
 
 	send_ok(client_fd, NULL, resp);

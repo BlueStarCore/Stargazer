@@ -109,6 +109,8 @@ typedef enum {
 	SG_CMD_SHOW_CONFIG   = 613,   /* Reserved: not yet implemented   */
 	SG_CMD_SHOW_STATS    = 614,
 	SG_CMD_SYS_FACTORY_RESET = 615, /* Factory reset to defaults         */
+	SG_CMD_SYS_EXEC      = 616,   /* Run a system binary as root (execvp, no shell) */
+	SG_CMD_SYS_LIST      = 617,   /* List runnable binaries in PATH (for `execute system ?`) */
 	SG_CMD_WHOAMI        = 620,   /* Get caller's profile+permissions */
 
 	/* Firewall/routing diagnostics (63x) */
@@ -294,6 +296,7 @@ static inline int sg_cmd_audit_skip(sg_cmd_t cmd)
 	case SG_CMD_HISTORY_LOAD:
 	case SG_CMD_LOG_AUDIT:
 	case SG_CMD_LOG_SYSTEM:
+	case SG_CMD_SYS_LIST:        /* read-only binary enumeration, fires on `?` */
 	case SG_CMD_LOG_MGMTD:
 	case SG_CMD_DIAG_STARGAZER_LOG:
 	case SG_CMD_DIAG_STORAGE:

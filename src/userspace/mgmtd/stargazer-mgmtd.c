@@ -5220,6 +5220,24 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			if (new_seq_str[0]) {
 				int new_seq = atoi(new_seq_str);
 				if (new_seq > 0) {
+					/* Reserve sequence 1 for the immutable
+					 * default-deny catch-all so a normal policy
+					 * can't push it off the bottom of the chain
+					 * (over-block) or be shadowed by it. NOTE:
+					 * immutable entries already returned at the
+					 * immutability check (~line 4946), so only
+					 * normal policies reach here. default-deny is
+					 * seeded at sequence=1 and is immutable, so 1
+					 * is a stable floor. */
+					if (strcmp(db_type, "firewall_policy") == 0 &&
+					    new_seq <= 1) {
+						free(existing);
+						send_error(client_fd,
+							   SG_ERR_INVALID_ARG,
+							   "sequence must be >= 2 (1 is "
+							   "reserved for default-deny)");
+						return 0;
+					}
 					if (is_new_entry) {
 						seq_insert_at(db_type, new_seq,
 							      db_id);
@@ -5945,7 +5963,43 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			return 0;
 		}
 
+		/* Immutable entries (built-in default-deny) cannot be modified.
+		 * CFG_SET already rejects this, but the CLI applies BEFORE it
+		 * saves — without the same guard here the change hits the live
+		 * ruleset and only fails at the save step ("applied but failed
+		 * to save"). Reject up front. Boot replay calls apply_config()
+		 * directly and never reaches this dispatch, so the built-in
+		 * default-deny still applies at startup. */
+		{
+			char *cur = sg_db_get(type_str, id_str);
+			if (cur) {
+				int imm = is_immutable(cur);
+				free(cur);
+				if (imm) {
+					send_error(client_fd, SG_ERR_BUILTIN,
+						   "Immutable object cannot be modified");
+					return 0;
+				}
+			}
+		}
+
 		const char *data = nl2 + 1;
+
+		/* Mirror the CFG_SET/CFG_INSERT sequence floor here so the apply
+		 * is rejected up front. Otherwise CFG_APPLY "succeeds" and only
+		 * the later CFG_SET save fails, surfacing as the confusing
+		 * "Applied but save failed". Immutable entries already returned
+		 * above, so this only gates normal policies. */
+		if (strcmp(type_str, "firewall_policy") == 0) {
+			char seqv[VALBUFSZ];
+			extract_val(data, "sequence", seqv, sizeof(seqv));
+			if (seqv[0] && atoi(seqv) <= 1) {
+				send_error(client_fd, SG_ERR_INVALID_ARG,
+					   "sequence must be >= 2 (1 is reserved "
+					   "for default-deny)");
+				return 0;
+			}
+		}
 
 		/* Validate field formats AND required-key completeness.
 		 * CFG_APPLY always receives full payloads — CLI loads
@@ -6085,16 +6139,27 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			return 0;
 		}
 
-		/* Builtin policies cannot be reordered */
+		/* The built-in default-deny is immutable (not "builtin"), so reject
+		 * moving it; and a normal policy must not move to/below the
+		 * catch-all's slot (would collide at seq 1 and shadow everything).
+		 * Mirrors the CFG_SET sequence guard so the GUI's /move
+		 * (CFG_INSERT) path can't bypass it. */
 		{
 			char bi[VALBUFSZ];
 			extract_val(entry_data, "builtin", bi, sizeof(bi));
-			if (strcmp(bi, "yes") == 0) {
+			if (strcmp(bi, "yes") == 0 || is_immutable(entry_data)) {
 				free(entry_data);
 				send_error(client_fd, SG_ERR_BUILTIN,
-					   "Builtin policy cannot be moved");
+					   "Immutable/builtin policy cannot be moved");
 				return 0;
 			}
+		}
+		if (strcmp(db_type, "firewall_policy") == 0 && new_seq <= 1) {
+			free(entry_data);
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "sequence must be >= 2 (1 is reserved for "
+				   "default-deny)");
+			return 0;
 		}
 
 		/* Read old sequence */
@@ -6875,6 +6940,12 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		return handle_net_nslookup(client_fd, user, payload, hdr);
 	case SG_CMD_NET_ARPING:
 		return handle_net_arping(client_fd, user, payload, hdr);
+
+	/* ── Arbitrary system binary (fnsysctl-style, admin-only) ────── */
+	case SG_CMD_SYS_EXEC:
+		return handle_sys_exec(client_fd, user, payload, hdr);
+	case SG_CMD_SYS_LIST:
+		return handle_sys_list(client_fd, user, payload, hdr);
 
 	/* ── System diagnostics (handlers in mgmtd_diag.c) ───────────── */
 	case SG_CMD_DIAG_CPU:

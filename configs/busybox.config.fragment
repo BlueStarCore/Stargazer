@@ -1,5 +1,5 @@
 #
-# Stargazer NGFW — BusyBox applet whitelist (51 applets)
+# Stargazer NGFW — BusyBox applet whitelist (62 applets)
 #
 # This fragment is appended to the output of `make allnoconfig` and then
 # `make oldconfig` is run to resolve dependencies. It is the SINGLE source
@@ -21,6 +21,11 @@ CONFIG_STATIC=y
 CONFIG_LFS=y
 CONFIG_LONG_OPTS=y
 CONFIG_DESKTOP=y
+# SHOW_USAGE is the parent gate for all applet usage/`--help` text. Without
+# it, oldconfig force-disables FEATURE_VERBOSE_USAGE (which depends on it),
+# so `<applet> --help` prints nothing. Enable both so busybox applets show
+# usage the way standalone binaries (iptables) do.
+CONFIG_SHOW_USAGE=y
 CONFIG_FEATURE_VERBOSE_USAGE=y
 CONFIG_FEATURE_SYSLOG=y
 CONFIG_FEATURE_IPV6=y
@@ -259,9 +264,57 @@ CONFIG_STTY=y
 # `echo` — defensive (dash builtin handles most cases)
 CONFIG_ECHO=y
 
-# `sha256sum` — hash dedup cho IPS signature auto-update (ips-update.sh)
-CONFIG_SHA256SUM=y
-# `crond` — chạy lịch auto-update IPS signature
+# ── System inspection (10) ──────────────────────────────────────────────────
+# Read-only diagnostic applets reachable as root via `execute system <cmd>`
+# (mgmtd handle_sys_exec). None of these write or destroy state; they let an
+# admin inspect the filesystem, disks, memory and processes from the CLI the
+# way FortiOS `fnsysctl` does. Adding them here must stay in lock-step with
+# the BUSYBOX-WHITELIST selftest array in cli_diagnose_busybox.c.
+
+# Human-readable sizes (-h): shared libbb feature used by df, du, ls -lh,
+# free. Without it those applets reject `-h` with "invalid option".
+CONFIG_FEATURE_HUMAN_READABLE=y
+
+# `ls` — list directory contents
+CONFIG_LS=y
+CONFIG_FEATURE_LS_FILETYPES=y
+CONFIG_FEATURE_LS_SORTFILES=y
+CONFIG_FEATURE_LS_TIMESTAMPS=y
+CONFIG_FEATURE_LS_USERNAME=y
+CONFIG_FEATURE_LS_RECURSIVE=y
+
+# `df` — filesystem disk-space usage
+CONFIG_DF=y
+CONFIG_FEATURE_DF_FANCY=y
+
+# `du` — per-directory disk usage
+CONFIG_DU=y
+
+# `ps` — process snapshot
+CONFIG_PS=y
+
+# `free` — memory usage summary
+CONFIG_FREE=y
+
+# `uptime` — load average and time since boot
+CONFIG_UPTIME=y
+
+# `top` — live process monitor (also backs `execute diagnose top`)
+CONFIG_TOP=y
+CONFIG_FEATURE_TOP_CPU_USAGE_PERCENTAGE=y
+CONFIG_FEATURE_TOP_DECIMALS=y
+
+# `tail` — show end of a file/log
+CONFIG_TAIL=y
+
+# `wc` — count lines/words/bytes
+CONFIG_WC=y
+
+# `stat` — file/inode metadata
+CONFIG_STAT=y
+
+# `crond` — scheduled IPS signature auto-update (ips-update.sh)
+# (sha256sum, used by the same update flow, is already enabled above.)
 CONFIG_CROND=y
 CONFIG_FEATURE_CROND_D=y
 CONFIG_FEATURE_CROND_CALL_SENDMAIL=n
