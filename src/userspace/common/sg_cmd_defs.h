@@ -122,10 +122,12 @@ X("execute diagnose nat policy",           "Show kernel NAT table rules",       
 
 X("execute diagnose routes",               "Show routing table",                       "admin",           0,  cmd_diag_routes)
 
-X("execute diagnose session",              "Session table diagnostics",               "monitor",         1,  cmd_diag_session)
-X("execute diagnose session status",       "Show live session table",                 "monitor",         0,  NULL)
+X("execute diagnose session",              "Session table diagnostics",               "monitor",        -1,  cmd_diag_session)
+X("execute diagnose session status",       "Show live session table (filtered)",      "monitor",        -1,  NULL)
+X("execute diagnose session list",         "Show live session table (filtered)",      "monitor",        -1,  NULL)
 X("execute diagnose session stats",        "Show session counters and module status", "monitor",         0,  NULL)
-X("execute diagnose session clear",        "Flush all active connections (conntrack)", "admin",          0,  NULL)
+X("execute diagnose session filter",       "Define reusable filter: <field> <value> ... | clear", "monitor", -1,  NULL)
+X("execute diagnose session clear",        "Clear sessions matching the filter (all if none set)", "admin", 0,  NULL)
 X("execute diagnose session ml",           "Per-flow ML features (conntrack CTA_ML)",  "monitor",         0,  NULL)
 
 X("execute diagnose dhcp",                 "DHCP diagnostics",                        "monitor",         0,  NULL)
