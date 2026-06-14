@@ -153,7 +153,9 @@ kernel-config:
 	@if [ ! -f "$(KERNEL_DIR)/.config" ]; then \
 		echo "Configuring kernel for BPI-R4 (MT7988A)..."; \
 		$(MAKE) -C $(KERNEL_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) mt7988a_bpi-r4_defconfig; \
-		$(KERNEL_DIR)/scripts/config --file $(KERNEL_DIR)/.config \
+	fi
+	@echo "Enforcing Stargazer kernel options (idempotent)..."
+	@$(KERNEL_DIR)/scripts/config --file $(KERNEL_DIR)/.config \
 			--enable NETFILTER \
 			--enable NF_CONNTRACK \
 			--enable NF_NAT \
@@ -196,9 +198,11 @@ kernel-config:
 			--enable VIRTIO --enable VIRTIO_PCI --enable VIRTIO_NET \
 			--enable VIRTIO_BLK --enable VIRTIO_MMIO \
 			--enable MODULES --enable MODULE_UNLOAD \
-			--enable EXT4_FS --enable SQUASHFS; \
-		$(MAKE) -C $(KERNEL_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) olddefconfig; \
-	fi
+			--enable EXT4_FS --enable SQUASHFS \
+			--enable IP_SET --enable IP_SET_HASH_IP --enable NETFILTER_XT_SET \
+			--enable SERIAL_AMBA_PL011 --enable SERIAL_AMBA_PL011_CONSOLE \
+			--enable PCI_HOST_GENERIC --enable RTC_DRV_PL031 --enable HW_RANDOM_VIRTIO
+	@$(MAKE) -C $(KERNEL_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) olddefconfig
 
 # =============================================================================
 # 2. Modules
@@ -218,8 +222,11 @@ $(BUILD_DIR)/modules/$(MODULE_NAME).ko &: $(KERNEL_IMAGE) $(SRC_WATCH)
 		[ -f $(KERNEL_DIR)/net/netfilter/$$m ] && \
 		cp $(KERNEL_DIR)/net/netfilter/$$m $(BUILD_DIR)/modules/ || true; \
 	done
-	# Copy af_packet.ko — CONFIG_PACKET=m; required for udhcpc PF_PACKET sockets
-	cp $(KERNEL_DIR)/net/packet/af_packet.ko $(BUILD_DIR)/modules/
+	# Copy af_packet.ko only if built as a module (CONFIG_PACKET=m). When
+	# PACKET=y (built-in) the .ko does not exist and AF_PACKET is always
+	# present for udhcpc — skipping the copy is not an error.
+	@[ -f $(KERNEL_DIR)/net/packet/af_packet.ko ] && \
+		cp $(KERNEL_DIR)/net/packet/af_packet.ko $(BUILD_DIR)/modules/ || true
 	@echo "[2/5] Module ready: $@"
 
 # =============================================================================

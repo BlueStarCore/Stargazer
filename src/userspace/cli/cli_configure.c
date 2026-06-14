@@ -1203,7 +1203,7 @@ static int context_entry(const char *type_name, const char *label,
 			printf("  Changes discarded.\n");
 			break;
 		} else {
-			printf("  Unknown command: %s (try '?')\n", cmd);
+			printf("  Unknown command: \"%s\", try '?' \n", cmd);
 		}
 	}
 
@@ -1500,7 +1500,7 @@ static int context_table(const char *type_name, const char *label)
 				continue;
 			break;
 		} else {
-			printf("  Unknown command: %s (try '?')\n", cmd);
+			printf("  Unknown command: \"%s\", try '?' \n", cmd);
 		}
 	}
 
@@ -1776,7 +1776,7 @@ static int context_single(const char *type_name, const char *label)
 			printf("  Changes discarded.\n");
 			break;
 		} else {
-			printf("  Unknown: %s (try '?')\n", cmd);
+			printf("  Unknown: \"%s\", try '?' \n", cmd);
 		}
 	}
 

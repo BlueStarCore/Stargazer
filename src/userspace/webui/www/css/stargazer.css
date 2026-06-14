@@ -2070,6 +2070,22 @@ tr[data-builtin="yes"] .td-drag {
     cursor: default;
 }
 
+/* Immutable rows (built-in default-deny policy): locked — greyed out,
+   not editable, not draggable. */
+tr[data-immutable="yes"] {
+    color: var(--gray-text-dim);
+    cursor: not-allowed;
+}
+tr[data-immutable="yes"] .td-drag {
+    visibility: hidden;
+}
+
+/* Read-only edit modal (immutable entries, e.g. default-deny policy):
+   fields are disabled; grey the body to signal it cannot be changed. */
+.form-locked .modal-body {
+    opacity: 0.6;
+}
+
 /* Row being dragged */
 tr.drag-active {
     opacity: 0.4;

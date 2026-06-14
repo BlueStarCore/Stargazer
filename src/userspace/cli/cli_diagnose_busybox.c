@@ -90,6 +90,29 @@ static const char *whitelist[] = {
 	"/bin/uname",
 	"/bin/stty",
 	"/bin/echo",
+	/* system inspection — read-only, reachable via `execute system` */
+	"/bin/ls",
+	"/bin/df",
+	"/usr/bin/du",
+	"/bin/ps",
+	"/usr/bin/free",
+	"/usr/bin/uptime",
+	"/usr/bin/top",
+	"/usr/bin/tail",
+	"/usr/bin/wc",
+	"/bin/stat",
+	/*
+	 * Firmware + shutdown applets enabled in busybox.config.fragment
+	 * (tar/gunzip/sha256sum for firmware packages, halt/reboot for
+	 * shutdown.sh) that predate this list. They ship on the rootfs, so
+	 * the enumeration sees them — they must be whitelisted or BBX-WL-2
+	 * reports them as extras.
+	 */
+	"/bin/tar",
+	"/bin/gunzip",
+	"/usr/bin/sha256sum",
+	"/sbin/halt",
+	"/sbin/reboot",
 	/*
 	 * /bin/sh is NOT in the whitelist: although busybox.links emits a
 	 * /bin/sh entry at build time, the rootfs install step overrides it

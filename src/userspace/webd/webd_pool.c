@@ -339,8 +339,8 @@ static void flow_login(work_item_t *item)
 	}
 
 	if (resp2.status != SG_OK) {
-		char *json = json_error("Session creation failed", NULL);
-		send_result(item->conn_id, 500, json, json ? strlen(json) : 0);
+		/* Surface mgmtd's reason rather than a generic string. */
+		send_ipc_error(item->conn_id, resp2.status, resp2.extra);
 		webd_ipc_resp_free(&resp2);
 		return;
 	}
@@ -763,9 +763,8 @@ static void flow_config_create(work_item_t *item)
 			return;
 		}
 		if (resp2.status != SG_OK) {
-			char *json = json_error("Applied but save failed", NULL);
-			send_result(item->conn_id, 500, json,
-				    json ? strlen(json) : 0);
+			/* Surface mgmtd's reason rather than a generic string. */
+			send_ipc_error(item->conn_id, resp2.status, resp2.extra);
 			webd_ipc_resp_free(&resp2);
 			return;
 		}
@@ -981,8 +980,8 @@ static void flow_config_update(work_item_t *item)
 	}
 	free(set_payload);
 	if (set_resp.status != SG_OK) {
-		char *json = json_error("Applied but save failed", NULL);
-		send_result(item->conn_id, 500, json, json ? strlen(json) : 0);
+		/* Surface mgmtd's reason rather than a generic string. */
+		send_ipc_error(item->conn_id, set_resp.status, set_resp.extra);
 		webd_ipc_resp_free(&set_resp);
 		return;
 	}

@@ -400,10 +400,15 @@
                     return;
                 }
                 if (res.status === 403) {
-                    showToast('Permission denied', 'error');
-                    var e = new Error('Permission denied');
-                    e.status = 403;
-                    throw e;
+                    /* Surface mgmtd's verbatim reason (e.g. "Immutable object
+                     * cannot be modified") rather than a generic string. */
+                    return res.json().catch(function () { return {}; }).then(function (err) {
+                        var msg = err.error || 'Permission denied';
+                        showToast(msg, 'error');
+                        var e = new Error(msg);
+                        e.status = 403;
+                        throw e;
+                    });
                 }
                 if (!res.ok) {
                     return res.json().catch(function () { return {}; }).then(function (err) {
@@ -1655,6 +1660,7 @@
     function resetModalForm(form) {
         form.dataset.editMode = 'false';
         form.dataset.editRowId = '';
+        applyFormLock(form, false);   /* clear any read-only lock from a prior immutable open */
         form.querySelectorAll('.admin-create-only').forEach(function (el) {
             el.style.display = '';
         });
@@ -2353,6 +2359,27 @@
         ]);
     }
 
+    /* Lock a form to read-only — used for immutable entries (e.g. the
+     * built-in default-deny policy). Greys + disables every field and the
+     * Save button so the user can view but not change it; the title gains a
+     * "(read-only)" suffix. Called with locked=false to clear the state. */
+    function applyFormLock(form, locked) {
+        form.classList.toggle('form-locked', locked);
+        var lockBody = form.querySelector('.modal-body');
+        if (lockBody) {
+            lockBody.querySelectorAll('input, select, textarea').forEach(function (el) {
+                el.disabled = locked;
+            });
+        }
+        var save = form.querySelector('.modal-footer .btn-primary');
+        if (save) save.disabled = locked;
+        if (locked) {
+            var t = form.querySelector('.modal-title-text');
+            if (t && t.textContent.indexOf('(read-only)') === -1)
+                t.textContent += '  (read-only)';
+        }
+    }
+
     function openEditModal(entity, row) {
         var config = ENTITIES[entity];
         var form = document.getElementById(config.formId);
@@ -2361,6 +2388,7 @@
         var rowId = row.dataset.rowId || '';
         setModalEditMode(form, config, rowId);
         hideCreateOnlyFields(form);
+        applyFormLock(form, row.dataset.immutable === 'yes');
         openModal(config.formId);
 
         /* Selects must be filled BEFORE populateForm runs, otherwise
@@ -2504,15 +2532,18 @@
 
         var isEditable = !config.editableFilter || config.editableFilter(row);
         var isBuiltin = row.dataset.builtin === 'yes';
+        var isLocked = isBuiltin || row.dataset.immutable === 'yes';
         var items = ctxMenu.querySelectorAll('.context-menu-item');
         items.forEach(function (it) {
             var act = it.dataset.action;
             if (act === 'delete') {
-                it.classList.toggle('ctx-hidden', !isEditable || isBuiltin);
+                /* Immutable/builtin entries can't be deleted (backend rejects). */
+                it.classList.toggle('ctx-hidden', !isEditable || isLocked);
             } else if (act === 'edit') {
+                /* Edit stays available — openEditModal opens it read-only. */
                 it.classList.toggle('ctx-hidden', !isEditable);
             } else if (act === 'enable' || act === 'disable') {
-                it.classList.toggle('ctx-hidden', !config.hasStatus || !isEditable);
+                it.classList.toggle('ctx-hidden', !config.hasStatus || !isEditable || isLocked);
             }
         });
         /* Hide separator if no status actions */
@@ -2734,6 +2765,14 @@
             var newSeq = (e.clientY < mid) ? targetSeq + 1 : targetSeq;
             if (newSeq < 1) newSeq = 1;
             if (newSeq > 9999) newSeq = 9999;
+
+            /* The immutable default-deny catch-all must stay at the bottom:
+             * dropping a policy below it would collide at sequence 1 and the
+             * catch-all would then shadow every rule (over-block). */
+            if (target.dataset.immutable === 'yes' && e.clientY >= mid) {
+                showToast('Cannot move a policy below the default-deny policy.', 'error');
+                return;
+            }
 
             var rowId = dragRow.dataset.rowId;
             api('/config/' + cfgType(dragEntity) + '/' + rowId + '/move', {
@@ -3172,10 +3211,13 @@
         var frag = document.createDocumentFragment();
         rows.forEach(function (row, idx) {
             var isBuiltin = (row.builtin === 'yes') || config.allBuiltin;
+            var isImmutable = (row.immutable === 'yes');
+            var isLocked = isBuiltin || isImmutable;
 
             var tr = document.createElement('tr');
             tr.dataset.rowId = String(row.id || row.name || idx);
             if (isBuiltin) tr.dataset.builtin = 'yes';
+            if (isImmutable) tr.dataset.immutable = 'yes';
 
             /* Checkbox column — disabled for builtin entries */
             var tdCb = document.createElement('td');
@@ -3183,9 +3225,9 @@
             var cb = document.createElement('input');
             cb.type = 'checkbox';
             cb.className = 'row-select';
-            if (isBuiltin) {
+            if (isLocked) {
                 cb.disabled = true;
-                cb.title = 'Built-in entry';
+                cb.title = isImmutable ? 'Immutable (default-deny)' : 'Built-in entry';
             }
             tdCb.appendChild(cb);
             tr.appendChild(tdCb);
@@ -3194,7 +3236,7 @@
             if (config.orderable) {
                 var tdDrag = document.createElement('td');
                 tdDrag.className = 'td-drag';
-                if (!isBuiltin) {
+                if (!isLocked) {
                     tdDrag.textContent = '\u2807';  /* ⠇ drag handle */
                     tr.draggable = true;
                 }
@@ -3724,6 +3766,10 @@
         if (!config) return;
         var form = document.getElementById(config.formId);
         if (!form) return;
+        if (form.classList.contains('form-locked')) {
+            showToast('This entry is read-only and cannot be modified.', 'error');
+            return;
+        }
         var body = form.querySelector('.modal-body');
         if (!body) return;
 
