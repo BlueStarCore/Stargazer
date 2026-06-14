@@ -7,22 +7,36 @@
 
 #define _GNU_SOURCE
 #include "mgmtd_apply.h"
+#include "mgmtd_internal.h"
 #include "sg_db.h"
 
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <net/if.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+
+/* IFF_LOWER_UP (0x10000) is in <linux/if.h>, which conflicts with <net/if.h>
+ * on glibc systems.  Define it directly — it is a stable kernel ABI constant. */
+#ifndef IFF_LOWER_UP
+#define IFF_LOWER_UP 0x10000
+#endif
 
 sg_status_t apply_settings(const char *id, const char *data,
 			   char *result, size_t rsize)
 {
 	(void)id;
-	char hostname[VALBUFSZ], ipfwd[VALBUFSZ];
+	char hostname[VALBUFSZ], ipfwd[VALBUFSZ], fqdnttl[VALBUFSZ];
 	extract_val(data, "hostname", hostname, sizeof(hostname));
 	extract_val(data, "ip-forward", ipfwd, sizeof(ipfwd));
+	extract_val(data, "fqdn-ttl", fqdnttl, sizeof(fqdnttl));
 
 	if (hostname[0]) {
 		if (!sg_is_safe_id(hostname)) {
@@ -43,6 +57,21 @@ sg_status_t apply_settings(const char *id, const char *data,
 	} else if (strcmp(ipfwd, "disable") == 0) {
 		FILE *fp = fopen("/proc/sys/net/ipv4/ip_forward", "w");
 		if (fp) { fprintf(fp, "0\n"); fclose(fp); }
+	}
+
+	if (fqdnttl[0]) {
+		/* Registry validated the range (uint:60:86400) at CFG_SET;
+		 * re-check here so a corrupt DB cannot zero the timeout
+		 * (0 = permanent entries — unbounded over-blocking). */
+		long ttl = strtol(fqdnttl, NULL, 10);
+		if (ttl >= 60 && ttl <= 86400 &&
+		    (uint32_t)ttl != sg_ipset_entry_timeout()) {
+			sg_ipset_set_entry_timeout((uint32_t)ttl);
+			/* Apply to existing members now — otherwise each
+			 * keeps its old TTL until a resolve re-confirms it. */
+			fqdn_restamp_all();
+			mgmt_log("INFO", "fqdn-ttl set to %lds", ttl);
+		}
 	}
 
 	snprintf(result, rsize, "System settings applied.");
@@ -151,12 +180,73 @@ static int apply_allowaccess(const char *iface, const char *services)
 
 /* ── udhcpc lifecycle (via supervisor) ──────────────────────────────── */
 
-/* Stop udhcpc for this interface via the supervisor */
+/*
+ * Kill any orphan udhcpc processes for this interface by scanning /proc.
+ * Called before starting a new supervised instance to ensure clean state.
+ * Orphans arise when mgmtd is restarted without a clean shutdown.
+ */
+static void dhcpc_kill_orphans(const char *iface)
+{
+	DIR *pd = opendir("/proc");
+	if (!pd)
+		return;
+
+	struct dirent *pe;
+	while ((pe = readdir(pd)) != NULL) {
+		/* Only numeric entries are PIDs */
+		if (pe->d_name[0] < '1' || pe->d_name[0] > '9')
+			continue;
+
+		char cmdpath[280];
+		snprintf(cmdpath, sizeof(cmdpath), "/proc/%s/cmdline",
+			 pe->d_name);
+		int fd = open(cmdpath, O_RDONLY);
+		if (fd < 0)
+			continue;
+
+		/* Read cmdline (NUL-separated argv) */
+		char buf[512];
+		ssize_t n = read(fd, buf, sizeof(buf) - 1);
+		close(fd);
+		if (n <= 0)
+			continue;
+		buf[n] = '\0';
+
+		/* Check: argv[0] contains "udhcpc" */
+		if (!strstr(buf, "udhcpc"))
+			continue;
+
+		/* Scan remaining args for "-i <iface>" */
+		int found_i = 0;
+		for (ssize_t i = 0; i < n; ) {
+			const char *arg = buf + i;
+			size_t alen = strlen(arg);
+			if (strcmp(arg, "-i") == 0)
+				found_i = 1;
+			else if (found_i && strcmp(arg, iface) == 0) {
+				pid_t pid = (pid_t)atoi(pe->d_name);
+				kill(pid, SIGTERM);
+				mgmt_log("INFO",
+					 "dhcpc_stop: killed orphan udhcpc"
+					 " pid %d on %s", (int)pid, iface);
+				break;
+			} else {
+				found_i = 0;
+			}
+			i += (ssize_t)alen + 1;
+			if (i >= n) break;
+		}
+	}
+	closedir(pd);
+}
+
+/* Stop udhcpc for this interface: supervisor + any orphans */
 static void dhcpc_stop(const char *iface)
 {
 	char name[80];
 	snprintf(name, sizeof(name), "udhcpc.%s", iface);
 	supervisor_stop(name);
+	dhcpc_kill_orphans(iface);
 }
 
 /*
@@ -172,7 +262,10 @@ static void dhcpc_start(const char *iface)
 	snprintf(name, sizeof(name), "udhcpc.%s", iface);
 	const char *argv[] = {
 		"/sbin/udhcpc", "-i", iface,
-		"-f",   /* foreground — mgmtd is direct parent */
+		"-f",           /* foreground — mgmtd is direct parent   */
+		"-t", "0",      /* unlimited DISCOVER retries (no exit)  */
+		"-T", "3",      /* 3s per-packet timeout                 */
+		"-A", "20",     /* 20s between retry rounds              */
 		"-s", "/usr/share/udhcpc/default.script",
 		NULL
 	};
@@ -224,12 +317,14 @@ sg_status_t apply_interface(const char *id, const char *data,
 {
 	char mode[VALBUFSZ], ip[VALBUFSZ], status[VALBUFSZ];
 	char mtu[VALBUFSZ], desc[VALBUFSZ], allowaccess[VALBUFSZ];
+	char sys_flag[VALBUFSZ];
 	extract_val(data, "mode", mode, sizeof(mode));
 	extract_val(data, "ip", ip, sizeof(ip));
 	extract_val(data, "status", status, sizeof(status));
 	extract_val(data, "mtu", mtu, sizeof(mtu));
 	extract_val(data, "description", desc, sizeof(desc));
 	extract_val(data, "allowaccess", allowaccess, sizeof(allowaccess));
+	extract_val(data, "system", sys_flag, sizeof(sys_flag));
 
 	/* Default mode to static if not set */
 	if (!mode[0])
@@ -288,8 +383,19 @@ sg_status_t apply_interface(const char *id, const char *data,
 	/* Always stop existing udhcpc first — mode may have changed */
 	dhcpc_stop(id);
 
-	/* Link state */
-	if (strcmp(status, "up") == 0) {
+	/* Link state.
+	 * DSA master interfaces (system=yes) must never go admin-down:
+	 * bringing the master down makes all slave ports lowerlayerdown,
+	 * causing the kernel operstate to diverge from the configured state
+	 * of every downstream port.  Always force them admin-up. */
+	if (strcmp(sys_flag, "yes") == 0) {
+		const char *a[] = {"ip", "link", "set", id, "up", NULL};
+		char *out = safe_exec(a);
+		if (out && out[0])
+			mgmt_log("WARN", "ip link set %s up (system iface): %s",
+				 id, out);
+		free(out);
+	} else if (strcmp(status, "up") == 0) {
 		const char *a[] = {"ip", "link", "set", id, "up", NULL};
 		char *out = safe_exec(a);
 		if (out && out[0])
@@ -313,27 +419,26 @@ sg_status_t apply_interface(const char *id, const char *data,
 		free(out);
 	}
 
-	/* Address: DHCP or static */
+	/* Address: DHCP or static
+	 * For static mode, try adding new IP before flushing to minimize
+	 * connection drop on management interface changes. */
 	if (strcmp(mode, "dhcp") == 0) {
 		/* Flush any static IP before starting DHCP */
 		const char *a1[] = {"ip", "addr", "flush", "dev", id, NULL};
 		free(safe_exec(a1));
-		/* Start udhcpc if interface is up */
-		if (strcmp(status, "down") != 0)
-			dhcpc_start(id);
 	} else {
-		/* Static mode */
+		/* Static mode: flush then assign.  Flush first avoids stale
+		 * addresses surviving a mode change; a brief IP-less window
+		 * is acceptable since the firewall is already enforcing policy. */
+		const char *a_flush[] = {"ip", "addr", "flush", "dev", id, NULL};
+		free(safe_exec(a_flush));
 		if (ip[0]) {
-			const char *a1[] = {"ip", "addr", "flush", "dev",
-					    id, NULL};
-			free(safe_exec(a1));
-			const char *a2[] = {"ip", "addr", "add", ip, "dev",
-					    id, NULL};
-			char *out = safe_exec(a2);
+			const char *a_add[] = {"ip", "addr", "add", ip,
+					       "dev", id, NULL};
+			char *out = safe_exec(a_add);
 			if (out && out[0]) {
 				snprintf(result, rsize,
-					 "IP %s failed on %s: %s",
-					 ip, id, out);
+					 "IP %s failed on %s: %s", ip, id, out);
 				free(out);
 				return SG_ERR_SYSTEM_FAIL;
 			}
@@ -348,6 +453,32 @@ sg_status_t apply_interface(const char *id, const char *data,
 		return SG_ERR_SYSTEM_FAIL;
 	}
 
+	/* DHCP replies (router UDP/67 → client UDP/68) arrive as INPUT on
+	 * this interface and would be dropped by the allowaccess chain's
+	 * default DROP.  Insert an explicit ACCEPT before that DROP so
+	 * udhcpc can receive OFFER/ACK packets.
+	 *
+	 * udhcpc is started AFTER this rule is in place — eliminates the
+	 * race where a fast OFFER/ACK could arrive while the chain still
+	 * has only the default DROP. */
+	if (strcmp(mode, "dhcp") == 0) {
+		char dhcp_chain[32];
+		snprintf(dhcp_chain, sizeof(dhcp_chain), "SG_IN_%s", id);
+		const char *dhcp_rule[] = {
+			"iptables", "-I", dhcp_chain, "1",
+			"-p", "udp", "--sport", "67", "--dport", "68",
+			"-j", "ACCEPT", NULL
+		};
+		if (ipt_exec(dhcp_rule) != 0)
+			mgmt_log("ERROR",
+				 "apply_interface: DHCP ACCEPT rule failed for %s"
+				 " — udhcpc replies will be dropped", id);
+
+		/* Start udhcpc now that the ACCEPT rule is installed */
+		if (strcmp(status, "down") != 0)
+			dhcpc_start(id);
+	}
+
 	/* Signal webd to rebind listeners (allowaccess may have changed).
 	 * Best-effort: if webd isn't running yet (boot), this is a no-op. */
 	{
@@ -357,5 +488,147 @@ sg_status_t apply_interface(const char *id, const char *data,
 	}
 
 	snprintf(result, rsize, "Interface %s configured (%s).", id, mode);
+	return SG_OK;
+}
+
+/* Write a single value to a sysfs module parameter file. Returns 0 on success. */
+/*
+ * handle_netlink_link_event — process one RTM_NEWLINK message.
+ *
+ * When a DHCP interface loses carrier (IFF_LOWER_UP clears):
+ *   - stop udhcpc and flush the stale lease IP immediately
+ * When a DHCP interface gains carrier (IFF_LOWER_UP sets):
+ *   - start udhcpc if not already running
+ */
+void handle_netlink_link_event(int nl_fd)
+{
+	char buf[4096];
+	ssize_t n = recv(nl_fd, buf, sizeof(buf), MSG_DONTWAIT);
+	if (n <= 0)
+		return;
+
+	for (struct nlmsghdr *nh = (struct nlmsghdr *)buf;
+	     NLMSG_OK(nh, (unsigned)n);
+	     nh = NLMSG_NEXT(nh, n)) {
+
+		if (nh->nlmsg_type != RTM_NEWLINK)
+			continue;
+
+		struct ifinfomsg *ifi = NLMSG_DATA(nh);
+		if (ifi->ifi_flags & IFF_LOOPBACK)
+			continue;
+
+		/* Extract interface name */
+		char iface[IFNAMSIZ] = "";
+		struct rtattr *rta = IFLA_RTA(ifi);
+		int rta_len = (int)IFLA_PAYLOAD(nh);
+		for (; RTA_OK(rta, rta_len); rta = RTA_NEXT(rta, rta_len)) {
+			if (rta->rta_type == IFLA_IFNAME) {
+				snprintf(iface, sizeof(iface), "%s",
+					 (char *)RTA_DATA(rta));
+				break;
+			}
+		}
+		if (!iface[0])
+			continue;
+
+		/* Only act on DHCP client interfaces */
+		char *mode = sg_db_get_val("system_interface", iface, "mode");
+		int is_dhcp = mode && strcmp(mode, "dhcp") == 0;
+		free(mode);
+		if (!is_dhcp)
+			continue;
+
+		int carrier_up = (ifi->ifi_flags & IFF_LOWER_UP) != 0;
+
+		if (!carrier_up) {
+			mgmt_log("INFO",
+				 "carrier lost on %s (dhcp) — flushing lease",
+				 iface);
+			dhcpc_stop(iface);
+			const char *flush[] = {
+				"ip", "addr", "flush", "dev", iface, NULL
+			};
+			free(safe_exec(flush));
+			char sf[80];
+			snprintf(sf, sizeof(sf), "/var/run/dhcp-status.%s",
+				 iface);
+			remove(sf);
+		} else {
+			char supname[80];
+			snprintf(supname, sizeof(supname), "udhcpc.%s", iface);
+			if (supervisor_get_pid(supname) <= 0) {
+				mgmt_log("INFO",
+					 "carrier on %s (dhcp) — starting udhcpc",
+					 iface);
+				dhcpc_start(iface);
+			}
+		}
+	}
+}
+
+/* ── apply_session_ttl ──────────────────────────────────────────────────── */
+
+sg_status_t apply_session_ttl(const char *id, const char *data,
+			      char *result, size_t rsize)
+{
+	(void)id;
+
+	/* Map each configured idle timeout onto its nf_conntrack timeout sysctl
+	 * under /proc/sys/net/netfilter/. Each entry is a config key, the sysctl
+	 * name to write, and the default applied when the key is unset. */
+	static const struct { const char *key; const char *sysctl; const char *def; } map[] = {
+		{ "tcp-syn-sent",    "nf_conntrack_tcp_timeout_syn_sent",   "120"  },
+		{ "tcp-syn-recv",    "nf_conntrack_tcp_timeout_syn_recv",   "60"   },
+		{ "tcp-established", "nf_conntrack_tcp_timeout_established", "3600" },
+		{ "tcp-fin-wait",    "nf_conntrack_tcp_timeout_fin_wait",   "120"  },
+		{ "tcp-close-wait",  "nf_conntrack_tcp_timeout_close_wait", "60"   },
+		{ "tcp-last-ack",    "nf_conntrack_tcp_timeout_last_ack",   "30"   },
+		{ "tcp-time-wait",   "nf_conntrack_tcp_timeout_time_wait",  "120"  },
+		{ "tcp-close",       "nf_conntrack_tcp_timeout_close",      "10"   },
+		{ "udp",             "nf_conntrack_udp_timeout",            "180"  },
+		{ "icmp",            "nf_conntrack_icmp_timeout",           "60"   },
+		{ "other",           "nf_conntrack_generic_timeout",        "300"  },
+		{ NULL, NULL, NULL }
+	};
+
+	int applied = 0, failed = 0;
+
+	for (int i = 0; map[i].key; i++) {
+		char val[VALBUFSZ];
+		char path[160];
+		extract_val(data, map[i].key, val, sizeof(val));
+
+		snprintf(path, sizeof(path),
+			 "/proc/sys/net/netfilter/%s", map[i].sysctl);
+		FILE *fp = fopen(path, "w");
+		if (!fp) {
+			failed++;
+			continue;
+		}
+		int ok = (fprintf(fp, "%s\n", val[0] ? val : map[i].def) >= 0);
+		if (fclose(fp) != 0)
+			ok = 0;
+		if (ok)
+			applied++;
+		else
+			failed++;
+	}
+
+	/* If no sysctl could be written the timeouts are unavailable (the
+	 * /proc/sys/net/netfilter/ files exist only when nf_conntrack is
+	 * loaded) — report failure rather than success. */
+	if (applied == 0) {
+		snprintf(result, rsize,
+			 "Connection tracking timeouts unavailable "
+			 "(is nf_conntrack loaded?)");
+		return SG_ERR_SYSTEM_FAIL;
+	}
+	if (failed)
+		snprintf(result, rsize,
+			 "Applied %d timeout(s); %d could not be set.",
+			 applied, failed);
+	else
+		snprintf(result, rsize, "Session timeouts applied.");
 	return SG_OK;
 }

@@ -15,6 +15,7 @@
 #include "stargazer_ipc.h"
 
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -154,6 +155,47 @@ static void send_ipc_error(unsigned long conn_id, uint32_t status,
 /* ── Helper: parse key=value payload into JSON object ────────────────── */
 
 /*
+ * json_appendf — grow-to-fit formatted append into a heap buffer.
+ *
+ * Measures the formatted length first, grows *buf so the whole result
+ * fits, then writes it. This avoids the over-read class where a fixed
+ * local buffer is filled by a truncating snprintf and then copied using
+ * snprintf's (un-truncated) return value as the length; it also never
+ * truncates a value mid-byte, so the emitted JSON stays well-formed even
+ * for arbitrarily long config values.
+ *
+ * Returns 0 on success, -1 on OOM (the caller still owns *buf and must
+ * free it).
+ */
+static int json_appendf(char **buf, size_t *cap, size_t *len,
+			const char *fmt, ...)
+{
+	va_list ap;
+	int need;
+
+	va_start(ap, fmt);
+	need = vsnprintf(NULL, 0, fmt, ap);
+	va_end(ap);
+	if (need < 0)
+		return -1;
+
+	while (*len + (size_t)need + 1 > *cap) {
+		size_t ncap = *cap * 2;
+		char *tmp = realloc(*buf, ncap);
+		if (!tmp)
+			return -1;
+		*buf = tmp;
+		*cap = ncap;
+	}
+
+	va_start(ap, fmt);
+	vsnprintf(*buf + *len, *cap - *len, fmt, ap);
+	va_end(ap);
+	*len += (size_t)need;
+	return 0;
+}
+
+/*
  * Convert "key=val\nkey2=val2\n" to JSON object string.
  * If id is provided, prepends "id" field.
  * Returns heap-allocated string, caller frees.
@@ -182,11 +224,10 @@ static char *kv_to_json(const char *kv, const char *id)
 	if (id && id[0]) {
 		char *esc_id = json_escape(id);
 		if (esc_id) {
-			char id_frag[512];
-			int n = snprintf(id_frag, sizeof(id_frag),
-					 "\"id\":\"%s\"", esc_id);
+			int rc = json_appendf(&buf, &cap, &len,
+					      "\"id\":\"%s\"", esc_id);
 			free(esc_id);
-			if (n > 0) APPEND(id_frag, (size_t)n);
+			if (rc != 0) { free(buf); return NULL; }
 		}
 	}
 
@@ -231,13 +272,12 @@ static char *kv_to_json(const char *kv, const char *id)
 				p = nl ? nl + 1 : p + line_len;
 				continue;
 			}
-			char frag[2048];
-			int n = snprintf(frag, sizeof(frag),
-					 "\"%s\":\"%s\"",
-					 esc_key, esc_val);
+			int rc = json_appendf(&buf, &cap, &len,
+					      "\"%s\":\"%s\"",
+					      esc_key, esc_val);
 			free(esc_key);
 			free(esc_val);
-			if (n > 0) APPEND(frag, (size_t)n);
+			if (rc != 0) { free(buf); return NULL; }
 
 			p = nl ? nl + 1 : p + line_len;
 		}
@@ -299,8 +339,8 @@ static void flow_login(work_item_t *item)
 	}
 
 	if (resp2.status != SG_OK) {
-		char *json = json_error("Session creation failed", NULL);
-		send_result(item->conn_id, 500, json, json ? strlen(json) : 0);
+		/* Surface mgmtd's reason rather than a generic string. */
+		send_ipc_error(item->conn_id, resp2.status, resp2.extra);
 		webd_ipc_resp_free(&resp2);
 		return;
 	}
@@ -576,6 +616,9 @@ static void flow_config_list(work_item_t *item)
 	/* Optional search filter from payload */
 	const char *search = item->payload;
 	int first = 1;
+	/* Hoisted so the BUF_APPEND OOM goto (which jumps to list_done) does
+	 * not leak the current entry_json — list_done frees it (NULL-safe). */
+	char *entry_json = NULL;
 
 	for (int i = 0; i < nids; i++) {
 		char get_payload[512];
@@ -592,6 +635,19 @@ static void flow_config_list(work_item_t *item)
 			continue;
 		}
 
+		/* For system_interface, skip system-managed entries (DSA master).
+		 * These have system=yes in the DB and must never appear in
+		 * user-facing config lists or dropdown selects. */
+		if (strcmp(type, "system_interface") == 0 &&
+		    entry_resp.payload) {
+			const char *kv = entry_resp.payload;
+			if (strncmp(kv, "system=yes", 10) == 0 ||
+			    strstr(kv, "\nsystem=yes")) {
+				webd_ipc_resp_free(&entry_resp);
+				continue;
+			}
+		}
+
 		/* Apply search filter — check both entry ID and kv data */
 		if (search && search[0]) {
 			int match = 0;
@@ -606,7 +662,7 @@ static void flow_config_list(work_item_t *item)
 			}
 		}
 
-		char *entry_json = kv_to_json(entry_resp.payload, ids[i]);
+		entry_json = kv_to_json(entry_resp.payload, ids[i]);
 		webd_ipc_resp_free(&entry_resp);
 
 		if (entry_json) {
@@ -614,6 +670,7 @@ static void flow_config_list(work_item_t *item)
 			size_t elen = strlen(entry_json);
 			BUF_APPEND(entry_json, elen);
 			free(entry_json);
+			entry_json = NULL;
 			first = 0;
 		}
 	}
@@ -622,6 +679,7 @@ static void flow_config_list(work_item_t *item)
 	BUF_APPEND("\0", 1);
 
 list_done:
+	free(entry_json);	/* NULL unless a BUF_APPEND OOM jumped here */
 	for (int i = 0; i < nids; i++) free(ids[i]);
 #undef BUF_APPEND
 
@@ -705,9 +763,8 @@ static void flow_config_create(work_item_t *item)
 			return;
 		}
 		if (resp2.status != SG_OK) {
-			char *json = json_error("Applied but save failed", NULL);
-			send_result(item->conn_id, 500, json,
-				    json ? strlen(json) : 0);
+			/* Surface mgmtd's reason rather than a generic string. */
+			send_ipc_error(item->conn_id, resp2.status, resp2.extra);
 			webd_ipc_resp_free(&resp2);
 			return;
 		}
@@ -819,7 +876,10 @@ static void flow_config_update(work_item_t *item)
 	}
 	webd_ipc_resp_free(&get_resp);
 
-	/* Append new kv, skipping name= and id= routing keys */
+	/* Append new kv, skipping id= (routing key — section identifier,
+	 * not a config field).  name= is a real schema field for all types
+	 * (required for firewall_policy, firewall_address, firewall_service)
+	 * and must NOT be stripped here. */
 	if (item->payload) {
 		const char *p = item->payload;
 		while (*p) {
@@ -827,8 +887,7 @@ static void flow_config_update(work_item_t *item)
 			size_t ll = nl ? (size_t)(nl - p) : strlen(p);
 			if (ll > 0) {
 				int is_routing =
-					(ll > 5 && strncmp(p, "name=", 5) == 0) ||
-					(ll > 3 && strncmp(p, "id=",   3) == 0);
+					(ll > 3 && strncmp(p, "id=", 3) == 0);
 				if (!is_routing) {
 					while (mlen + ll + 1 >= merge_cap) {
 						merge_cap *= 2;
@@ -921,8 +980,8 @@ static void flow_config_update(work_item_t *item)
 	}
 	free(set_payload);
 	if (set_resp.status != SG_OK) {
-		char *json = json_error("Applied but save failed", NULL);
-		send_result(item->conn_id, 500, json, json ? strlen(json) : 0);
+		/* Surface mgmtd's reason rather than a generic string. */
+		send_ipc_error(item->conn_id, set_resp.status, set_resp.extra);
 		webd_ipc_resp_free(&set_resp);
 		return;
 	}
@@ -1038,6 +1097,19 @@ static void flow_resources(work_item_t *item)
 	sys_resources_t r;
 	fetch_resources(item, &r);
 
+	/* Read the active conntrack flow count from mgmtd (SG_CMD_SESSION_STATS).
+	 * session_count() counts web UI logins, not network flows. */
+	long long net_sessions = 0;
+	webd_ipc_response_t sr = {0};   /* zero-init: webd_ipc_resp_free is always called */
+	if (webd_ipc_send(SG_CMD_SESSION_STATS, item->username,
+			  item->session_tag, "", &sr) == 0 &&
+	    sr.status == SG_OK && sr.payload) {
+		const char *kv = strstr(sr.payload, "active=");
+		if (kv)
+			net_sessions = strtoll(kv + 7, NULL, 10);
+	}
+	webd_ipc_resp_free(&sr);   /* safe: free(NULL) is a no-op when IPC failed */
+
 	char *json = malloc(512);
 	if (json)
 		snprintf(json, 512,
@@ -1048,14 +1120,14 @@ static void flow_resources(work_item_t *item)
 			 "\"disk_pct\":%d,"
 			 "\"disk_used_mb\":%lu,"
 			 "\"disk_total_mb\":%lu,"
-			 "\"sessions\":%d,"
+			 "\"sessions\":%lld,"
 			 "\"sessions_max\":65536,"
 			 "\"cpu_cores\":%d,"
 			 "\"cpu_mhz\":%d}",
 			 r.cpu_pct,
 			 r.mem_pct, r.mem_used_mb, r.mem_total_mb,
 			 r.disk_pct, r.disk_used_mb, r.disk_total_mb,
-			 session_count(),
+			 net_sessions,
 			 r.cpu_cores, r.cpu_mhz);
 
 	send_result(item->conn_id, 200, json, json ? strlen(json) : 0);
@@ -1144,12 +1216,20 @@ static void flow_res_disk(work_item_t *item)
 	}
 
 	unsigned long blocks = 0, bavail = 0, frsize = 0;
+	unsigned long lblocks = 0, lbavail = 0, lfrsize = 0;
+	int logs_present = 0;
 	unsigned long long emmc_bytes = 0;
 	if (resp.payload) {
 		const char *p;
 		if ((p = strstr(resp.payload, "sgdata_blocks=")) != NULL) blocks = strtoul(p + 14, NULL, 10);
 		if ((p = strstr(resp.payload, "sgdata_bavail=")) != NULL) bavail = strtoul(p + 14, NULL, 10);
 		if ((p = strstr(resp.payload, "sgdata_frsize=")) != NULL) frsize = strtoul(p + 14, NULL, 10);
+		/* sglogs_* is only emitted when /etc/stargazer/logs is a distinct
+		 * mount (the large eMMC partition sg-partinit grows on first boot);
+		 * absent on dev hosts / before partinit. */
+		if ((p = strstr(resp.payload, "sglogs_blocks=")) != NULL) { lblocks = strtoul(p + 14, NULL, 10); logs_present = 1; }
+		if ((p = strstr(resp.payload, "sglogs_bavail=")) != NULL) lbavail = strtoul(p + 14, NULL, 10);
+		if ((p = strstr(resp.payload, "sglogs_frsize=")) != NULL) lfrsize = strtoul(p + 14, NULL, 10);
 		if ((p = strstr(resp.payload, "emmc_bytes=")) != NULL)    emmc_bytes = strtoull(p + 11, NULL, 10);
 	}
 	webd_ipc_resp_free(&resp);
@@ -1157,14 +1237,20 @@ static void flow_res_disk(work_item_t *item)
 	unsigned long total_mb = blocks * frsize / (1024 * 1024);
 	unsigned long free_mb = bavail * frsize / (1024 * 1024);
 	unsigned long used_mb = total_mb - free_mb;
+	unsigned long logs_total_mb = lblocks * lfrsize / (1024 * 1024);
+	unsigned long logs_free_mb = lbavail * lfrsize / (1024 * 1024);
+	unsigned long logs_used_mb = logs_total_mb - logs_free_mb;
 	unsigned long emmc_mb = (unsigned long)(emmc_bytes / (1024 * 1024));
 
-	char *json = malloc(256);
+	char *json = malloc(320);
 	if (json)
-		snprintf(json, 256,
+		snprintf(json, 320,
 			 "{\"total_mb\":%lu,\"used_mb\":%lu,\"free_mb\":%lu,"
-			 "\"emmc_mb\":%lu}",
-			 total_mb, used_mb, free_mb, emmc_mb);
+			 "\"emmc_mb\":%lu,\"logs_present\":%d,"
+			 "\"logs_total_mb\":%lu,\"logs_used_mb\":%lu,"
+			 "\"logs_free_mb\":%lu}",
+			 total_mb, used_mb, free_mb, emmc_mb, logs_present,
+			 logs_total_mb, logs_used_mb, logs_free_mb);
 	send_result(item->conn_id, 200, json, json ? strlen(json) : 0);
 }
 
@@ -1185,7 +1271,9 @@ static void flow_res_proctop(work_item_t *item)
 
 	/* Parse uptime and process list from kv response.
 	 * Format: uptime=X\nloadavg=X\nmem_total_kb=X\nmem_avail_kb=X\n
-	 *         proc PID COMM STATE UTIME STIME VSIZE RSS_KB\n... */
+	 *         proc=PID COMM STATE UTIME STIME VSIZE RSS_KB\n...
+	 * (process rows use the kv "proc=" prefix, matching mgmtd's
+	 *  handle_diag_proctop emitter — see mgmtd_diag.c). */
 	char uptime[64] = "0";
 	long mem_total_kb = 0, mem_avail_kb = 0;
 
@@ -1226,7 +1314,9 @@ static void flow_res_proctop(work_item_t *item)
 			  "{\"uptime\":\"%s\",\"mem_total_kb\":%ld,"
 			  "\"mem_avail_kb\":%ld,\"procs\":[",
 			  uptime, mem_total_kb, mem_avail_kb);
-	if (hn > 0) J_APP(hdr, (size_t)hn);
+	/* clamp to the source buffer: snprintf returns the untruncated
+	 * length, copying that many bytes would over-read hdr */
+	if (hn > 0) J_APP(hdr, (size_t)hn < sizeof(hdr) ? (size_t)hn : sizeof(hdr) - 1);
 
 	/* Parse proc lines */
 	int first = 1;
@@ -1236,8 +1326,8 @@ static void flow_res_proctop(work_item_t *item)
 			const char *nl = strchr(line, '\n');
 			size_t llen = nl ? (size_t)(nl - line) : strlen(line);
 
-			if (llen > 5 && strncmp(line, "proc ", 5) == 0) {
-				/* proc PID COMM STATE UTIME STIME VSIZE RSS_KB */
+			if (llen > 5 && strncmp(line, "proc=", 5) == 0) {
+				/* proc=PID COMM STATE UTIME STIME VSIZE RSS_KB */
 				int pid = 0;
 				char comm[64] = "", st = '?';
 				unsigned long ut = 0, stm = 0, vsz = 0;
@@ -1255,7 +1345,7 @@ static void flow_res_proctop(work_item_t *item)
 					pid, ec ? ec : comm, st,
 					ut + stm, rss);
 				free(ec);
-				if (fn > 0) J_APP(frag, (size_t)fn);
+				if (fn > 0) J_APP(frag, (size_t)fn < sizeof(frag) ? (size_t)fn : sizeof(frag) - 1);
 				first = 0;
 			}
 
@@ -1267,6 +1357,126 @@ static void flow_res_proctop(work_item_t *item)
 	J_APP("\0", 1);
 
 pt_done:
+	webd_ipc_resp_free(&resp);
+#undef J_APP
+
+	if (json)
+		send_result(item->conn_id, 200, json, len > 0 ? len - 1 : 0);
+	else {
+		char *j = json_error("Out of memory", NULL);
+		send_result(item->conn_id, 500, j, j ? strlen(j) : 0);
+	}
+}
+
+/* GET /api/system/resources/percore — per-core jiffies, frequency, die temp.
+ *
+ * The mgmtd DIAG_CPU reply already carries the per-cpu /proc/stat lines
+ * (cpu0..cpuN) plus per-core cpufreq<N>= and thermal_zone0=. We forward
+ * the raw busy/total jiffie counters so the browser can compute an
+ * instantaneous per-core utilisation from the delta between polls, rather
+ * than a flat since-boot average. */
+static void flow_res_percore(work_item_t *item)
+{
+	webd_ipc_response_t resp;
+	if (webd_ipc_send(SG_CMD_DIAG_CPU, item->username,
+			  item->session_tag, "", &resp) != 0) {
+		char *json = json_error("Backend unavailable", NULL);
+		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
+		return;
+	}
+	if (resp.status != SG_OK) {
+		send_ipc_error(item->conn_id, resp.status, resp.extra);
+		webd_ipc_resp_free(&resp);
+		return;
+	}
+
+	/* Per-core current frequency (kHz), indexed by core number. */
+	long freq_khz[64];
+	for (int i = 0; i < 64; i++)
+		freq_khz[i] = 0;
+	/* SoC die temperature (m°C → °C); the A73 cluster shares one sensor. */
+	int temp_c = 0;
+
+	if (resp.payload) {
+		const char *p;
+		for (int i = 0; i < 64; i++) {
+			char key[16];
+			int kn = snprintf(key, sizeof(key), "cpufreq%d=", i);
+			if (kn > 0 && (p = strstr(resp.payload, key)) != NULL)
+				freq_khz[i] = atol(p + kn);
+		}
+		if ((p = strstr(resp.payload, "thermal_zone0=")) != NULL)
+			temp_c = atoi(p + 14) / 1000;
+	}
+
+	size_t cap = 4096, len = 0;
+	char *json = malloc(cap);
+	if (!json) {
+		webd_ipc_resp_free(&resp);
+		char *j = json_error("Out of memory", NULL);
+		send_result(item->conn_id, 500, j, j ? strlen(j) : 0);
+		return;
+	}
+
+#define J_APP(s, n) do { \
+	while (len + (n) >= cap) { \
+		cap *= 2; \
+		char *tmp = realloc(json, cap); \
+		if (!tmp) { free(json); json = NULL; goto pc_done; } \
+		json = tmp; \
+	} \
+	memcpy(json + len, (s), (n)); \
+	len += (n); \
+} while (0)
+
+	char hdr[64];
+	int hn = snprintf(hdr, sizeof(hdr),
+			  "{\"temp_c\":%d,\"cores\":[", temp_c);
+	if (hn > 0) J_APP(hdr, (size_t)hn < sizeof(hdr) ? (size_t)hn : sizeof(hdr) - 1);
+
+	int first = 1;
+	if (resp.payload) {
+		const char *line = resp.payload;
+		while (*line) {
+			const char *nl = strchr(line, '\n');
+			size_t llen = nl ? (size_t)(nl - line) : strlen(line);
+
+			/* Per-core line: "cpu<N> user nice system idle ..."
+			 * (skip the aggregate "cpu " line — no digit). */
+			if (llen > 3 && strncmp(line, "cpu", 3) == 0 &&
+			    isdigit((unsigned char)line[3])) {
+				int core = atoi(line + 3);
+				const char *f = line + 3;
+				while (*f && *f != ' ') f++;   /* past cpuN */
+				unsigned long u=0, n=0, s=0, idle=0, w=0,
+					      irq=0, sirq=0, steal=0;
+				sscanf(f, "%lu %lu %lu %lu %lu %lu %lu %lu",
+				       &u, &n, &s, &idle, &w, &irq, &sirq, &steal);
+				unsigned long total = u+n+s+idle+w+irq+sirq+steal;
+				unsigned long busy  = total - idle - w;
+
+				long fk = (core >= 0 && core < 64)
+					? freq_khz[core] : 0;
+				char frag[160];
+				int fn = snprintf(frag, sizeof(frag),
+					"%s{\"core\":%d,\"busy\":%lu,"
+					"\"total\":%lu,\"freq_mhz\":%ld,"
+					"\"temp_c\":%d}",
+					first ? "" : ",",
+					core, busy, total,
+					fk / 1000, temp_c);
+				if (fn > 0) J_APP(frag, (size_t)fn < sizeof(frag) ? (size_t)fn : sizeof(frag) - 1);
+				first = 0;
+			}
+
+			line = nl ? nl + 1 : line + llen;
+		}
+	}
+
+	J_APP("]}", 2);
+	J_APP("\0", 1);
+
+pc_done:
 	webd_ipc_resp_free(&resp);
 #undef J_APP
 
@@ -1442,19 +1652,161 @@ static void flow_firmware_progress(work_item_t *item)
 
 	if (total < 1) total = 1;
 	int percent = step * 100 / total;
-	int done = (strcmp(status_str, "success") == 0 ||
-		    strcmp(status_str, "error") == 0);
+	int done    = (strcmp(status_str, "done") == 0 ||
+		       strcmp(status_str, "error") == 0);
+	int is_err  = (strcmp(status_str, "error") == 0);
 
 	char *esc_msg = json_escape(message);
+	char *esc_sts = json_escape(status_str);
 	char *json = malloc(512);
 	if (json)
 		snprintf(json, 512,
-			 "{\"percent\":%d,\"done\":%s,\"message\":\"%s\"}",
+			 "{\"percent\":%d,\"done\":%s,\"error\":%s,"
+			 "\"status\":\"%s\",\"message\":\"%s\"}",
 			 percent, done ? "true" : "false",
+			 is_err ? "true" : "false",
+			 esc_sts ? esc_sts : "",
 			 esc_msg ? esc_msg : "");
 	free(esc_msg);
+	free(esc_sts);
 	send_result(item->conn_id, 200, json, json ? strlen(json) : 0);
 	webd_ipc_resp_free(&resp);
+}
+
+static void flow_iface_live(work_item_t *item)
+{
+	/* Call SG_CMD_SHOW_IFACES and parse the fixed-width text table into
+	 * a JSON array so the web UI can overlay live operstate on the
+	 * config-DB interface list. */
+	webd_ipc_response_t resp;
+	if (webd_ipc_send(SG_CMD_SHOW_IFACES, item->username,
+			  item->session_tag, "", &resp) != 0) {
+		char *json = json_error("Backend unavailable", NULL);
+		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
+		return;
+	}
+	if (resp.status != SG_OK) {
+		send_ipc_error(item->conn_id, resp.status, resp.extra);
+		webd_ipc_resp_free(&resp);
+		return;
+	}
+
+	/* Parse "Name             Status   IP                    Description"
+	 * table — skip header line, then split each row on whitespace. */
+	size_t cap = 512, len = 0;
+	char *json = malloc(cap);
+	if (!json) {
+		webd_ipc_resp_free(&resp);
+		char *j = json_error("Out of memory", NULL);
+		send_result(item->conn_id, 500, j, j ? strlen(j) : 0);
+		return;
+	}
+
+#define IL_APP(s, n) do { \
+	while (len + (n) >= cap) { \
+		cap *= 2; \
+		char *tmp = realloc(json, cap); \
+		if (!tmp) { free(json); json = NULL; goto il_done; } \
+		json = tmp; \
+	} \
+	memcpy(json + len, (s), (n)); \
+	len += (n); \
+} while (0)
+
+	IL_APP("{\"interfaces\":[", 15);
+
+	int first = 1;
+	int header_skipped = 0;
+	const char *p = resp.payload ? resp.payload : "";
+	while (*p) {
+		const char *nl = strchr(p, '\n');
+		size_t llen = nl ? (size_t)(nl - p) : strlen(p);
+
+		/* Skip the header row (starts with "Name") */
+		if (!header_skipped) {
+			header_skipped = 1;
+			p = nl ? nl + 1 : p + llen;
+			continue;
+		}
+		if (llen == 0) { p = nl ? nl + 1 : p + llen; continue; }
+
+		/* Parse: name(16) status(8) ip(21) ... — split on spaces */
+		char row[256];
+		if (llen >= sizeof(row)) llen = sizeof(row) - 1;
+		memcpy(row, p, llen);
+		row[llen] = '\0';
+
+		char name[32] = "", status[16] = "", ip[32] = "-";
+		sscanf(row, "%31s %15s %31s", name, status, ip);
+
+		if (!name[0]) { p = nl ? nl + 1 : p + llen; continue; }
+
+		/* Normalise lowerlayerdown → down */
+		if (strcmp(status, "lowerlayerdown") == 0)
+			snprintf(status, sizeof(status), "down");
+
+		char *en = json_escape(name);
+		char *es = json_escape(status);
+		char *ei = json_escape(ip);
+		if (!en || !es || !ei) { free(en); free(es); free(ei); goto il_done; }
+
+		char frag[256];
+		int fn = snprintf(frag, sizeof(frag),
+				  "%s{\"name\":\"%s\",\"status\":\"%s\",\"ip\":\"%s\"}",
+				  first ? "" : ",", en, es, ei);
+		free(en); free(es); free(ei);
+		if (fn > 0) IL_APP(frag, (size_t)fn < sizeof(frag) ? (size_t)fn : sizeof(frag) - 1);
+		first = 0;
+
+		p = nl ? nl + 1 : p + llen;
+	}
+
+	IL_APP("]}", 2);
+	IL_APP("\0", 1);
+
+il_done:
+	webd_ipc_resp_free(&resp);
+#undef IL_APP
+
+	if (json)
+		send_result(item->conn_id, 200, json, len > 0 ? len - 1 : 0);
+	else {
+		char *j = json_error("Out of memory", NULL);
+		send_result(item->conn_id, 500, j, j ? strlen(j) : 0);
+	}
+}
+
+static void flow_firmware_upload(work_item_t *item)
+{
+	/* item->payload = "path=/tmp/sg-fw-upload.<rand>\n" (per-upload file).
+	 * On the success path mgmtd consumes and removes the staged file; on a
+	 * failure path it may never have received or finished it, so remove it
+	 * here. Parse the path out for the failure cleanup. */
+	char stage[96] = {0};
+	if (item->payload && strncmp(item->payload, "path=", 5) == 0) {
+		snprintf(stage, sizeof(stage), "%s", item->payload + 5);
+		char *nl = strchr(stage, '\n');
+		if (nl) *nl = '\0';
+	}
+
+	webd_ipc_response_t resp;
+	if (webd_ipc_send(SG_CMD_UPGRADE_FROM_FILE, item->username,
+			  item->session_tag,
+			  item->payload ? item->payload : "", &resp) != 0) {
+		if (stage[0]) unlink(stage);	/* mgmtd never got the file */
+		char *json = json_error("Backend unavailable", NULL);
+		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
+		return;
+	}
+	if (resp.status != SG_OK) {
+		if (stage[0]) unlink(stage);	/* upgrade rejected/failed */
+		send_ipc_error(item->conn_id, resp.status, resp.extra);
+		webd_ipc_resp_free(&resp);
+		return;
+	}
+	webd_ipc_resp_free(&resp);
+	char *json = strdup("{\"ok\":true}");
+	send_result(item->conn_id, 200, json, json ? strlen(json) : 0);
 }
 
 static void flow_reboot(work_item_t *item)
@@ -1523,6 +1875,301 @@ static void flow_whoami(work_item_t *item)
 	webd_ipc_resp_free(&resp);
 }
 
+/* Helper: extract value of "key=value" from a space-delimited line.
+ * Copies into dst (len bytes), returns dst or "" if not found. */
+static const char *kv_extract(const char *line, const char *key,
+			       char *dst, size_t len)
+{
+	dst[0] = '\0';
+	size_t klen = strlen(key);
+	const char *p = line;
+	while (*p) {
+		if (strncmp(p, key, klen) == 0 && p[klen] == '=') {
+			p += klen + 1;
+			size_t i = 0;
+			while (*p && *p != ' ' && *p != '\n' && i + 1 < len)
+				dst[i++] = *p++;
+			dst[i] = '\0';
+			return dst;
+		}
+		/* advance to next word */
+		while (*p && *p != ' ' && *p != '\n') p++;
+		while (*p == ' ') p++;
+	}
+	return dst;
+}
+
+/* GET /api/monitor/ips — IPS daemon status (key=value → JSON object). */
+static void flow_ips_status(work_item_t *item)
+{
+	webd_ipc_response_t resp;
+	if (webd_ipc_send(SG_CMD_IPS_STATUS, item->username,
+			  item->session_tag, "", &resp) != 0) {
+		char *json = json_error("Backend unavailable", NULL);
+		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
+		return;
+	}
+	if (resp.status != SG_OK) {
+		send_ipc_error(item->conn_id, resp.status, resp.extra);
+		webd_ipc_resp_free(&resp);
+		return;
+	}
+	/* resp.payload is "status=...\nmode=...\n..." → kv_to_json gives a flat object. */
+	char *json = kv_to_json(resp.payload ? resp.payload : "", NULL);
+	send_result(item->conn_id, 200, json, json ? strlen(json) : 0);
+	webd_ipc_resp_free(&resp);
+}
+
+/* GET /api/monitor/ips-alerts — recent IPS alert log lines (raw → {"output":...}). */
+static void flow_ips_alerts(work_item_t *item)
+{
+	webd_ipc_response_t resp;
+	if (webd_ipc_send(SG_CMD_IPS_ALERTS, item->username,
+			  item->session_tag,
+			  item->payload ? item->payload : "", &resp) != 0) {
+		char *json = json_error("Backend unavailable", NULL);
+		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
+		return;
+	}
+	if (resp.status != SG_OK) {
+		send_ipc_error(item->conn_id, resp.status, resp.extra);
+		webd_ipc_resp_free(&resp);
+		return;
+	}
+	/* Wrap raw log text as {"output":"..."} (same shape as flow_diagnose). */
+	size_t raw_len = resp.payload ? resp.payload_len : 0;
+	size_t esc_cap = raw_len * 2 + 64;
+	char *json = malloc(esc_cap);
+	if (json) {
+		size_t pos = 0;
+		pos += (size_t)snprintf(json + pos, esc_cap - pos, "{\"output\":\"");
+		if (resp.payload) {
+			for (size_t i = 0; i < raw_len && pos + 8 < esc_cap; i++) {
+				char ch = resp.payload[i];
+				if (ch == '"')       { json[pos++] = '\\'; json[pos++] = '"'; }
+				else if (ch == '\\') { json[pos++] = '\\'; json[pos++] = '\\'; }
+				else if (ch == '\n') { json[pos++] = '\\'; json[pos++] = 'n'; }
+				else if (ch == '\r') { json[pos++] = '\\'; json[pos++] = 'r'; }
+				else if (ch == '\t') { json[pos++] = '\\'; json[pos++] = 't'; }
+				else if ((unsigned char)ch >= 0x20) { json[pos++] = ch; }
+			}
+		}
+		pos += (size_t)snprintf(json + pos, esc_cap - pos, "\"}");
+		send_result(item->conn_id, 200, json, pos);
+	} else {
+		char *j = json_error("Out of memory", NULL);
+		send_result(item->conn_id, 500, j, j ? strlen(j) : 0);
+	}
+	webd_ipc_resp_free(&resp);
+}
+
+/* GET /api/ips/alerts-json — mgmtd trả SẴN JSON array [{...}]. Gửi nguyên văn,
+ * KHÔNG qua flow_simple/kv_to_json (nó tưởng payload là key=value → băm nát). */
+static void flow_ips_alerts_json(work_item_t *item)
+{
+	webd_ipc_response_t resp;
+	if (webd_ipc_send(SG_CMD_IPS_ALERTS_JSON, item->username,
+			  item->session_tag,
+			  item->payload ? item->payload : "", &resp) != 0) {
+		char *json = json_error("Backend unavailable", NULL);
+		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
+		return;
+	}
+	if (resp.status != SG_OK) {
+		send_ipc_error(item->conn_id, resp.status, resp.extra);
+		webd_ipc_resp_free(&resp);
+		return;
+	}
+	if (resp.payload && resp.payload_len > 0) {
+		char *body = malloc(resp.payload_len + 1);
+		if (body) {
+			memcpy(body, resp.payload, resp.payload_len);
+			body[resp.payload_len] = '\0';
+			send_result(item->conn_id, 200, body, resp.payload_len);
+		} else {
+			char *j = json_error("Out of memory", NULL);
+			send_result(item->conn_id, 500, j, j ? strlen(j) : 0);
+		}
+	} else {
+		send_result(item->conn_id, 200, strdup("[]"), 2);
+	}
+	webd_ipc_resp_free(&resp);
+}
+
+/* GET /api/ips/signatures — catalog signature (mgmtd trả sẵn JSON object
+ * {items,truncated}). payload mang "q=<từ khoá>" để lọc server-side. */
+static void flow_ips_signatures(work_item_t *item)
+{
+	webd_ipc_response_t resp;
+	const char *q = item->payload ? item->payload : "";
+	if (webd_ipc_send(SG_CMD_IPS_SIGNATURES, item->username,
+			  item->session_tag, q, &resp) != 0) {
+		char *json = json_error("Backend unavailable", NULL);
+		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
+		return;
+	}
+	if (resp.status != SG_OK) {
+		send_ipc_error(item->conn_id, resp.status, resp.extra);
+		webd_ipc_resp_free(&resp);
+		return;
+	}
+	/* payload đã là JSON object → gửi nguyên (item->payload do dispatcher free) */
+	const char *body = resp.payload ? resp.payload : "{\"items\":[],\"truncated\":0}";
+	char *out = strdup(body);
+	send_result(item->conn_id, 200, out, out ? strlen(out) : 0);
+	webd_ipc_resp_free(&resp);
+}
+
+static void flow_monitor_sessions(work_item_t *item)
+{
+	/* Call SG_CMD_SHOW_SESSIONS; parse the procfs text into JSON. */
+	webd_ipc_response_t resp;
+	if (webd_ipc_send(SG_CMD_SHOW_SESSIONS, item->username,
+			  item->session_tag, "", &resp) != 0) {
+		char *json = json_error("Backend unavailable", NULL);
+		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
+		return;
+	}
+	if (resp.status != SG_OK ||
+	    strcmp(resp.extra, "not_available") == 0) {
+		/* conntrack unavailable → empty result, not an error */
+		char *j = strdup("{\"active\":0,\"loaded\":false,\"sessions\":[]}");
+		send_result(item->conn_id, 200, j, j ? strlen(j) : 0);
+		webd_ipc_resp_free(&resp);
+		return;
+	}
+
+	const char *text = resp.payload ? resp.payload : "";
+
+	/* Header line: "active=N" (conntrack flow count). */
+	long long active = 0;
+	const char *hdr = strstr(text, "active=");
+	if (hdr) {
+		char tmp[32];
+		kv_extract(hdr, "active", tmp, sizeof(tmp));
+		active = strtoll(tmp, NULL, 10);
+	}
+
+	/* Build JSON output */
+	size_t cap = 8192, pos = 0;
+	char *json = malloc(cap);
+	if (!json) {
+		webd_ipc_resp_free(&resp);
+		char *j = json_error("Out of memory", NULL);
+		send_result(item->conn_id, 500, j, j ? strlen(j) : 0);
+		return;
+	}
+
+#define SJ_APP(s, n) do { \
+	while (pos + (n) + 1 >= cap) { \
+		cap *= 2; char *_t = realloc(json, cap); \
+		if (!_t) { free(json); webd_ipc_resp_free(&resp); \
+			char *_j = json_error("Out of memory", NULL); \
+			send_result(item->conn_id, 500, _j, _j ? strlen(_j) : 0); \
+			return; } \
+		json = _t; } \
+	memcpy(json + pos, (s), (n)); pos += (n); \
+} while (0)
+
+	char hbuf[96];
+	int hlen = snprintf(hbuf, sizeof(hbuf),
+		"{\"active\":%lld,\"loaded\":true,\"sessions\":[", active);
+	if (hlen > 0) SJ_APP(hbuf, (size_t)hlen);
+
+	/* Parse session rows — skip lines starting with '#' */
+	int first = 1;
+	const char *p = text;
+	while (*p) {
+		const char *nl = strchr(p, '\n');
+		size_t ll = nl ? (size_t)(nl - p) : strlen(p);
+
+		if (ll == 0 || p[0] == '#') {
+			p = nl ? nl + 1 : p + ll;
+			continue;
+		}
+
+		/* Copy line for kv_extract */
+		char line[512];
+		size_t cp = ll < sizeof(line) - 1 ? ll : sizeof(line) - 1;
+		memcpy(line, p, cp);
+		line[cp] = '\0';
+
+		char proto[12], state[24], src[64], dst[64], pkts[32], bytes[32];
+		char policy[64], iif[24], oif[24];
+
+		kv_extract(line, "proto",  proto,  sizeof(proto));
+		kv_extract(line, "state",  state,  sizeof(state));
+		kv_extract(line, "src",    src,    sizeof(src));
+		kv_extract(line, "dst",    dst,    sizeof(dst));
+		kv_extract(line, "pkts",   pkts,   sizeof(pkts));
+		kv_extract(line, "bytes",  bytes,  sizeof(bytes));
+		kv_extract(line, "policy", policy, sizeof(policy));
+		kv_extract(line, "iif",    iif,    sizeof(iif));
+		kv_extract(line, "oif",    oif,    sizeof(oif));
+
+		if (!proto[0]) {
+			p = nl ? nl + 1 : p + ll;
+			continue;
+		}
+		if (!policy[0]) { policy[0] = '-'; policy[1] = '\0'; }
+		if (!iif[0])    { iif[0]    = '-'; iif[1]    = '\0'; }
+		if (!oif[0])    { oif[0]    = '-'; oif[1]    = '\0'; }
+
+		if (!first) SJ_APP(",", 1);
+		first = 0;
+
+		char entry[448];
+		int elen = snprintf(entry, sizeof(entry),
+			"{\"proto\":\"%s\",\"state\":\"%s\",\"src\":\"%s\","
+			"\"dst\":\"%s\",\"pkts\":\"%s\",\"bytes\":\"%s\","
+			"\"policy\":\"%s\",\"iif\":\"%s\",\"oif\":\"%s\"}",
+			proto, state, src, dst, pkts, bytes, policy, iif, oif);
+		if (elen > 0 && (size_t)elen < sizeof(entry))
+			SJ_APP(entry, (size_t)elen);
+
+		p = nl ? nl + 1 : p + ll;
+	}
+
+	SJ_APP("]}", 2);
+	json[pos] = '\0';
+
+	send_result(item->conn_id, 200, json, pos);
+	webd_ipc_resp_free(&resp);
+}
+
+static void flow_monitor_dhcp(work_item_t *item)
+{
+	/* Call SG_CMD_DIAG_DHCP_LEASES; mgmtd returns JSON directly. */
+	webd_ipc_response_t resp;
+	if (webd_ipc_send(SG_CMD_DIAG_DHCP_LEASES, item->username,
+			  item->session_tag, "", &resp) != 0) {
+		char *json = json_error("Backend unavailable", NULL);
+		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
+		return;
+	}
+	if (resp.status != SG_OK) {
+		send_ipc_error(item->conn_id, resp.status, resp.extra);
+		webd_ipc_resp_free(&resp);
+		return;
+	}
+
+	if (resp.payload && resp.payload_len > 0) {
+		char *json = malloc(resp.payload_len + 1);
+		if (json) {
+			memcpy(json, resp.payload, resp.payload_len);
+			json[resp.payload_len] = '\0';
+			send_result(item->conn_id, 200, json, resp.payload_len);
+		} else {
+			char *j = json_error("Out of memory", NULL);
+			send_result(item->conn_id, 500, j, j ? strlen(j) : 0);
+		}
+	} else {
+		char *json = strdup("{\"leases\":[]}");
+		send_result(item->conn_id, 200, json, json ? strlen(json) : 0);
+	}
+	webd_ipc_resp_free(&resp);
+}
+
 /* ── Worker thread entry point ───────────────────────────────────────── */
 
 static void *worker_fn(void *arg)
@@ -1549,6 +2196,14 @@ static void *worker_fn(void *arg)
 
 		/* Dispatch by flow type */
 		switch (item.flow_type) {
+		case FLOW_MONITOR_DHCP:     flow_monitor_dhcp(&item);     break;
+		case FLOW_MONITOR_SESSIONS: flow_monitor_sessions(&item); break;
+		case FLOW_IPS_STATUS:       flow_ips_status(&item);       break;
+		case FLOW_IPS_ALERTS:       flow_ips_alerts(&item);       break;
+		case FLOW_IPS_SIGS:         flow_ips_signatures(&item);   break;
+		case FLOW_IPS_UPDATE:       flow_diagnose(&item);         break;
+		case FLOW_IPS_ALERTS_JSON:  flow_ips_alerts_json(&item);   break;
+		case FLOW_IPS_UPDATE_LOG:   flow_diagnose(&item);         break;
 		case FLOW_LOGIN:         flow_login(&item);           break;
 		case FLOW_CONFIG_LIST:   flow_config_list(&item);     break;
 		case FLOW_CONFIG_CREATE: flow_config_create(&item);   break;
@@ -1564,9 +2219,12 @@ static void *worker_fn(void *arg)
 		case FLOW_RES_RAM:      flow_res_ram(&item);         break;
 		case FLOW_RES_DISK:     flow_res_disk(&item);        break;
 		case FLOW_RES_PROCTOP:  flow_res_proctop(&item);     break;
+		case FLOW_RES_PERCORE:  flow_res_percore(&item);     break;
 		case FLOW_ADMIN_CREATE: flow_admin_create(&item);    break;
-		case FLOW_CONFIG_MOVE:  flow_simple(&item);          break;
-		default:                 flow_simple(&item);          break;
+		case FLOW_CONFIG_MOVE:    flow_simple(&item);           break;
+		case FLOW_IFACE_LIVE:     flow_iface_live(&item);      break;
+		case FLOW_FIRMWARE_UPLOAD: flow_firmware_upload(&item); break;
+		default:                  flow_simple(&item);           break;
 		}
 
 		free(item.payload);

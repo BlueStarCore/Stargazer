@@ -748,6 +748,7 @@ static int interruptible_sleep_ms(int ms)
 void diag_show_top(int interval, int max_procs)
 {
 	if (interval < 1) interval = 1;
+	if (interval > 3600) interval = 3600;	/* upper-bound so interval*1000 cannot overflow int */
 	if (max_procs < 1) max_procs = 20;
 
 	/* RSS is now reported in kB directly from VmRSS (no page conversion) */

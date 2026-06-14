@@ -32,7 +32,7 @@ ensure_admin_account() {
 
 	if grep -q '^admin:' /etc/passwd 2>/dev/null; then
 		# Admin exists — ensure shell is correct, but preserve existing UID
-		_ea_cur_uid=$(grep '^admin:' /etc/passwd | head -1 | cut -d: -f3)
+		_ea_cur_uid=$(grep '^admin:' /etc/passwd | head -n 1 | cut -d: -f3)
 		if [ "$_ea_cur_uid" = "0" ]; then
 			# Migrate UID 0 admin to unprivileged UID (VULN-06)
 			_ea_tmp=$(mktemp /etc/passwd.XXXXXX 2>/dev/null) || _ea_tmp="/etc/passwd.tmp.$$"

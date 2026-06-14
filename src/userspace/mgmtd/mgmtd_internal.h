@@ -18,6 +18,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 /* ── Constants ───────────────────────────────────────────────────────────── */
 
@@ -118,6 +119,8 @@ int handle_upgrade_cancel(int client_fd, const char *user,
 			  const char *payload, const sg_request_hdr_t *hdr);
 int handle_upgrade_test_setup(int client_fd, const char *user,
 			      const char *payload, const sg_request_hdr_t *hdr);
+int handle_upgrade_from_file(int client_fd, const char *user,
+			     const char *payload, const sg_request_hdr_t *hdr);
 
 /* ── Network diagnostic handlers (defined in mgmtd_network.c) ────────────── */
 
@@ -130,6 +133,10 @@ int handle_net_nslookup(int client_fd, const char *user,
 int handle_net_arping(int client_fd, const char *user,
 		      const char *payload, const sg_request_hdr_t *hdr);
 
+/* Run an arbitrary system binary as root (execvp, no shell). Admin-only. */
+int handle_sys_exec(int client_fd, const char *user,
+		    const char *payload, const sg_request_hdr_t *hdr);
+
 /* ── System diagnostics handlers (defined in mgmtd_diag.c) ───────────────── */
 
 int handle_diag_cpu(int client_fd, const char *user,
@@ -138,6 +145,24 @@ int handle_diag_ram(int client_fd, const char *user,
 		    const char *payload, const sg_request_hdr_t *hdr);
 int handle_diag_disk(int client_fd, const char *user,
 		     const char *payload, const sg_request_hdr_t *hdr);
+int handle_ssl_cacert(int client_fd, const char *user,
+		      const char *payload, const sg_request_hdr_t *hdr);
+int handle_ssl_diag(int client_fd, const char *user,
+		    const char *payload, const sg_request_hdr_t *hdr);
+int handle_ips_status(int client_fd, const char *user,
+		      const char *payload, const sg_request_hdr_t *hdr);
+int handle_ips_alerts(int client_fd, const char *user,
+		      const char *payload, const sg_request_hdr_t *hdr);
+int handle_ips_alerts_clear(int client_fd, const char *user,
+			    const char *payload, const sg_request_hdr_t *hdr);
+int handle_ips_scores(int client_fd, const char *user,
+		      const char *payload, const sg_request_hdr_t *hdr);
+int handle_ips_signatures(int client_fd, const char *user,
+			  const char *payload, const sg_request_hdr_t *hdr);
+int handle_ips_alerts_json(int client_fd, const char *user,
+			   const char *payload, const sg_request_hdr_t *hdr);
+int handle_ips_update_log(int client_fd, const char *user,
+			  const char *payload, const sg_request_hdr_t *hdr);
 int handle_diag_iface_stats(int client_fd, const char *user,
 			    const char *payload, const sg_request_hdr_t *hdr);
 int handle_diag_proctop(int client_fd, const char *user,
@@ -156,8 +181,16 @@ int handle_diag_ntp(int client_fd, const char *user,
 		    const char *payload, const sg_request_hdr_t *hdr);
 int handle_diag_busybox_list(int client_fd, const char *user,
 			     const char *payload, const sg_request_hdr_t *hdr);
+int handle_sys_list(int client_fd, const char *user,
+		    const char *payload, const sg_request_hdr_t *hdr);
 int handle_show_sessions(int client_fd, const char *user,
 			 const char *payload, const sg_request_hdr_t *hdr);
+int handle_session_clear(int client_fd, const char *user,
+			 const char *payload, const sg_request_hdr_t *hdr);
+int handle_session_stats(int client_fd, const char *user,
+			 const char *payload, const sg_request_hdr_t *hdr);
+int handle_session_ml(int client_fd, const char *user,
+		      const char *payload, const sg_request_hdr_t *hdr);
 int handle_show_boot_config(int client_fd, const char *user,
 			    const char *payload, const sg_request_hdr_t *hdr);
 int handle_debug_state_get(int client_fd, const char *user,
@@ -170,6 +203,25 @@ int handle_history_save(int client_fd, const char *user,
 			const char *payload, const sg_request_hdr_t *hdr);
 int handle_history_load(int client_fd, const char *user,
 			const char *payload, const sg_request_hdr_t *hdr);
+
+/* ── Supervisor helpers (defined in stargazer-mgmtd.c) ───────────────────── */
+
+int   supervisor_get_restart_count(const char *name);
+pid_t supervisor_get_pid(const char *name);
+
+/* ── Carrier monitoring (defined in mgmtd_apply_iface.c) ─────────────────── */
+
+void handle_netlink_link_event(int nl_fd);
+
+/* ── DHCP client diagnostic (defined in stargazer-mgmtd.c) ──────────────── */
+
+int handle_diag_dhcp_client(int client_fd, const char *user,
+			     const char *payload, const sg_request_hdr_t *hdr);
+
+/* ── DHCP server lease list (defined in mgmtd_diag.c) ───────────────────── */
+
+int handle_diag_dhcp_leases(int client_fd, const char *user,
+			     const char *payload, const sg_request_hdr_t *hdr);
 
 /* ── Log handlers (defined in stargazer-mgmtd.c) ─────────────────────────── */
 

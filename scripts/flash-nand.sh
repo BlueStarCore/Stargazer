@@ -149,7 +149,7 @@ if [ -z "$UBI_MTD" ]; then
 		[ -f "$mtd_dev" ] || continue
 		pname=$(cat "$mtd_dev")
 		if [ "$pname" = "ubi" ]; then
-			mtd_num=$(echo "$mtd_dev" | grep -o 'mtd[0-9]*' | head -1)
+			mtd_num=$(echo "$mtd_dev" | grep -o 'mtd[0-9]*' | head -n 1)
 			UBI_MTD="/dev/$mtd_num"
 			break
 		fi
@@ -190,7 +190,7 @@ while [ "$vol_idx" -lt 20 ]; do
 	[ -e "$vol_dev" ] || { vol_idx=$((vol_idx + 1)); continue; }
 
 	vol_name=$(ubinfo "$vol_dev" 2>/dev/null | grep "Name:" | awk '{print $NF}')
-	vol_size=$(ubinfo "$vol_dev" 2>/dev/null | grep "Size:" | head -1 | awk '{print $NF}')
+	vol_size=$(ubinfo "$vol_dev" 2>/dev/null | grep "Size:" | head -n 1 | awk '{print $NF}')
 	echo "  Volume $vol_idx: name=$vol_name size=$vol_size"
 
 	if [ "$vol_name" = "kernel" ]; then

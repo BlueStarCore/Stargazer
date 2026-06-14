@@ -39,4 +39,4 @@ exec qemu-system-aarch64 \
     -append "console=ttyAMA0 rw" \
     -nographic -no-reboot \
     -netdev tap,id=lan,ifname=tap-lan-vm,script=no,downscript=no \
-    -device virtio-net-pci,netdev=lan,mac=52:54:00:12:03:64
+    -device virtio-net-device,netdev=lan,mac=52:54:00:12:03:64

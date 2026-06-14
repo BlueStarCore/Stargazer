@@ -2,7 +2,6 @@
 # Stargazer NGFW - Kernel modules build
 
 obj-m += pkt_forward.o
-# obj-m += session.o    # Enable for Phase 2
 
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules KBUILD_MODPOST_WARN=1

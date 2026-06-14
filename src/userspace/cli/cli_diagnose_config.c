@@ -3087,6 +3087,36 @@ cleanup:
 }
 
 /*
+ * Query the first interface from system_interface DB.
+ * NAT tests need a real dstintf — only seeded interfaces (wan, lan1…) qualify.
+ * Returns 1 on success (buf filled), 0 if DB has no interfaces.
+ */
+static int get_test_iface(char *buf, size_t bufsz)
+{
+	struct ipc_response resp;
+	buf[0] = '\0';
+	if (ipc_send_str(SG_CMD_CFG_LIST, "system_interface", &resp) != 0 ||
+	    resp.status != SG_OK || !resp.payload) {
+		ipc_resp_free(&resp);
+		return 0;
+	}
+	const char *p = resp.payload;
+	while (*p) {
+		const char *eol = strchr(p, '\n');
+		size_t len = eol ? (size_t)(eol - p) : strlen(p);
+		if (len > 0 && len < bufsz) {
+			memcpy(buf, p, len);
+			buf[len] = '\0';
+			ipc_resp_free(&resp);
+			return 1;
+		}
+		p += len + (eol ? 1 : 0);
+	}
+	ipc_resp_free(&resp);
+	return 0;
+}
+
+/*
  * test_ipc_ref_existence — Server-side reference existence validation.
  * Reject nonexistent references; accept builtin "all" object.
  */
@@ -3137,29 +3167,30 @@ static void test_ipc_ref_existence(void)
 		  "status=enable\n",
 		  SG_OK);
 
-	/* NAT with nonexistent address → SG_ERR_NOT_FOUND */
-	ipc_check("CFG_SET NAT with nonexistent srcaddr -> NOT_FOUND",
-		  SG_CMD_CFG_SET,
-		  "network_nat:__diag_natexist\n"
-		  "type=snat\n"
-		  "srcintf=any\n"
-		  "dstintf=eth0\n"
-		  "srcaddr=__nonexistent_addr\n"
-		  "dstaddr=all\n"
-		  "status=enable\n",
-		  SG_ERR_NOT_FOUND);
+	/* NAT tests need a real dstintf (SNAT requires a concrete interface) */
+	char nat_iface[64];
+	char nat_payload[512];
+	if (get_test_iface(nat_iface, sizeof(nat_iface))) {
+		/* NAT with nonexistent address → SG_ERR_NOT_FOUND */
+		snprintf(nat_payload, sizeof(nat_payload),
+			 "network_nat:__diag_natexist\n"
+			 "type=snat\nsrcintf=any\ndstintf=%s\n"
+			 "srcaddr=__nonexistent_addr\ndstaddr=all\n"
+			 "status=enable\n", nat_iface);
+		ipc_check("CFG_SET NAT with nonexistent srcaddr -> NOT_FOUND",
+			  SG_CMD_CFG_SET, nat_payload, SG_ERR_NOT_FOUND);
 
-	/* NAT with raw CIDR → SG_OK (ref-or-cidr accepts CIDR) */
-	ipc_check("CFG_SET NAT with raw CIDR srcaddr -> OK",
-		  SG_CMD_CFG_SET,
-		  "network_nat:__diag_natcidr\n"
-		  "type=snat\n"
-		  "srcintf=any\n"
-		  "dstintf=eth0\n"
-		  "srcaddr=192.168.1.0/24\n"
-		  "dstaddr=all\n"
-		  "status=enable\n",
-		  SG_OK);
+		/* NAT with raw CIDR → SG_OK (ref-or-cidr accepts CIDR) */
+		snprintf(nat_payload, sizeof(nat_payload),
+			 "network_nat:__diag_natcidr\n"
+			 "type=snat\nsrcintf=any\ndstintf=%s\n"
+			 "srcaddr=192.168.1.0/24\ndstaddr=all\n"
+			 "status=enable\n", nat_iface);
+		ipc_check("CFG_SET NAT with raw CIDR srcaddr -> OK",
+			  SG_CMD_CFG_SET, nat_payload, SG_OK);
+	} else {
+		printf("  SKIP [IPC/200] NAT ref tests — no interface in DB\n");
+	}
 
 	/* Cleanup */
 	{
@@ -3254,9 +3285,16 @@ static void test_ipc_nat_ref(void)
 {
 	struct ipc_response resp;
 	int conn;
+	char test_iface[64];
+	char payload[512];
 
 	printf(C_CYAN "\n  --- IPC: NAT address object reference ---"
 	       C_NC "\n");
+
+	if (!get_test_iface(test_iface, sizeof(test_iface))) {
+		printf("  SKIP [nat-ref] no interface in system_interface DB\n");
+		return;
+	}
 
 	/* 1. Create address object */
 	tc_total++;
@@ -3280,15 +3318,12 @@ static void test_ipc_nat_ref(void)
 
 	/* 2. Create NAT rule referencing the address */
 	tc_total++;
-	conn = ipc_send_str(SG_CMD_CFG_SET,
-			    "network_nat:__diag_natref\n"
-			    "type=snat\n"
-			    "srcintf=any\n"
-			    "dstintf=eth0\n"
-			    "srcaddr=__diag_nataddr\n"
-			    "dstaddr=all\n"
-			    "status=enable\n",
-			    &resp);
+	snprintf(payload, sizeof(payload),
+		 "network_nat:__diag_natref\n"
+		 "type=snat\nsrcintf=any\ndstintf=%s\n"
+		 "srcaddr=__diag_nataddr\ndstaddr=all\n"
+		 "status=enable\n", test_iface);
+	conn = ipc_send_str(SG_CMD_CFG_SET, payload, &resp);
 	if (conn < 0 || resp.status != SG_OK) {
 		tc_fail++;
 		printf(C_RED "  FAIL" C_NC

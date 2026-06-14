@@ -332,7 +332,7 @@ debug_get() {
 	_dg_key="$1"
 	_dg_def="$2"
 	debug_state_init
-	_dg_val=$(grep "^${_dg_key}=" "$STARGAZER_DEBUG_STATE_FILE" 2>/dev/null | tail -1 | cut -d= -f2-)
+	_dg_val=$(grep "^${_dg_key}=" "$STARGAZER_DEBUG_STATE_FILE" 2>/dev/null | sed -n '$p' | cut -d= -f2-)
 	if [ -z "$_dg_val" ] && [ -n "$_dg_def" ]; then
 		echo "$_dg_def"
 		return
@@ -668,6 +668,12 @@ cfg_rollback_revision() {
 		return 1
 	}
 
+	# Snapshot the CURRENT running config as a new revision BEFORE overwriting
+	# it, so the rollback is itself reversible (a bad rollback can be rolled
+	# back). Without this, the pre-rollback state is lost.
+	_rb_saved=$(cfg_record_revision "pre-rollback snapshot (before rollback to rev ${_rb_rev})" 2>/dev/null | tail -n1)
+	[ -n "$_rb_saved" ] && echo "  Saved current config as revision $_rb_saved"
+
 	sqlite3 -separator '|' "$STARGAZER_DB_PATH" "SELECT domain_file, content FROM config_revision_files WHERE rev=${_rb_rev};" \
 	| while IFS='|' read -r _f _c; do
 		_tmp="${_f}.rollback.$$"
@@ -744,10 +750,16 @@ _cfg_set_direct() {
 			"[${_cs_section}]")
 				_cs_found=1
 				_cs_skip=1
-				echo "[${_cs_section}]" >> "$_cs_tmp"
-				cat "$_cs_data" >> "$_cs_tmp"
-				echo "" >> "$_cs_tmp"
-				_cs_wrote=1
+				# Emit the replacement only for the FIRST match; if
+				# the file already holds a duplicate of this section
+				# (partial earlier write / hand-edit), skip the extra
+				# occurrences instead of writing the payload twice.
+				if [ "$_cs_wrote" -eq 0 ]; then
+					echo "[${_cs_section}]" >> "$_cs_tmp"
+					cat "$_cs_data" >> "$_cs_tmp"
+					echo "" >> "$_cs_tmp"
+					_cs_wrote=1
+				fi
 				continue
 				;;
 			"["*)
@@ -888,6 +900,34 @@ cfg_list_types() {
 # Parse all sections and call _apply_config_direct for each.
 # Used for boot-time replay of saved configuration (runs as root).
 
+# ── _replay_apply_section(section, datafile) ─────────────────────────────────
+# Apply one replayed config section. Prefer mgmtd via CFG_SET (200): that
+# writes the DB and runs the SAME apply a normal "set" does — full FORWARD
+# chain rebuild in sequence order, NAT in sequence order, conntrack
+# re-evaluation — so a rollback/replay through mgmtd reproduces the firewall
+# exactly, with one source of truth. Only when mgmtd is down (recovery) fall
+# back to the degraded direct path (no firewall_policy, conf-driven). The raw
+# section header ("type" or "type:id") is what CFG_SET expects.
+_replay_apply_section() {
+	_ras_section="$1"
+	_ras_file="$2"
+	if _ipc_available; then
+		# Same CFG_SET payload as cfg_set(): "section\ndata\n".
+		_ras_payload=$(printf '%s\n' "$_ras_section"; cat "$_ras_file"; printf '\n')
+		ipc_send 200 "$_ras_payload"
+		if [ "$IPC_RC" -ne 0 ]; then
+			echo "  apply '$_ras_section' failed: ${IPC_EXTRA:-error}"
+			return 1
+		fi
+		return 0
+	fi
+	# Fallback: mgmtd unavailable (recovery) — degraded direct apply.
+	_ras_type="${_ras_section%%:*}"
+	_ras_id="${_ras_section#*:}"
+	[ "$_ras_type" = "$_ras_id" ] && _ras_id="0"
+	_apply_config_direct "$_ras_type" "$_ras_id" "$_ras_file" 2>/dev/null
+}
+
 cfg_replay() {
 	_cr_file="$1"
 	[ ! -f "$_cr_file" ] && return
@@ -899,10 +939,7 @@ cfg_replay() {
 			"["*"]")
 				# Apply previous section if any
 				if [ -n "$_cr_section" ] && [ -s "$_cr_tmp" ]; then
-					_cr_type="${_cr_section%%:*}"
-					_cr_id="${_cr_section#*:}"
-					[ "$_cr_type" = "$_cr_id" ] && _cr_id="0"
-					_apply_config_direct "$_cr_type" "$_cr_id" "$_cr_tmp" 2>/dev/null
+					_replay_apply_section "$_cr_section" "$_cr_tmp"
 				fi
 				# Start new section
 				_cr_section="${_cr_line#\[}"
@@ -920,10 +957,7 @@ cfg_replay() {
 
 	# Apply last section
 	if [ -n "$_cr_section" ] && [ -s "$_cr_tmp" ]; then
-		_cr_type="${_cr_section%%:*}"
-		_cr_id="${_cr_section#*:}"
-		[ "$_cr_type" = "$_cr_id" ] && _cr_id="0"
-		_apply_config_direct "$_cr_type" "$_cr_id" "$_cr_tmp" 2>/dev/null
+		_replay_apply_section "$_cr_section" "$_cr_tmp"
 	fi
 
 	rm -f "$_cr_tmp"
@@ -1263,7 +1297,7 @@ _delete_system_user_direct() {
 _get_valid_keys() {
 	case "$1" in
 		network_route_static) echo "dst gateway device distance status comment" ;;
-		network_nat)          echo "type srcintf dstintf srcaddr dstaddr dstport mapped-ip mapped-port status" ;;
+		network_nat)          echo "type srcintf dstintf protocol srcaddr dstaddr dstport mapped-ip mapped-port status" ;;
 		system_interface)     echo "ip status mtu description" ;;
 		system_settings)      echo "hostname ip-forward timezone" ;;
 		system_hostname)      echo "hostname" ;;
@@ -1407,6 +1441,7 @@ cfg_value_kind() {
 		system_password-policy:min-length) echo "uint:0:128" ;;
 		system_password-policy:min-uppercase|system_password-policy:min-lowercase|system_password-policy:min-digit|system_password-policy:min-special) echo "uint:0:128" ;;
 		network_nat:type) echo "enum:snat,dnat" ;;
+		network_nat:protocol) echo "enum:tcp,udp,tcp+udp,all" ;;
 		network_nat:srcaddr|network_nat:dstaddr) echo "cidr-or:any,all" ;;
 		network_nat:dstport|network_nat:mapped-port) echo "uint:1:65535" ;;
 		system_interface:status) echo "enum:up,down" ;;
@@ -1666,6 +1701,7 @@ _show_valid_keys() {
 			echo "    type         snat | dnat"
 			echo "    srcintf      Source interface (for SNAT)"
 			echo "    dstintf      Destination interface"
+			echo "    protocol     tcp | udp | tcp+udp | all"
 			echo "    srcaddr      Source address/mask"
 			echo "    dstaddr      Destination address/mask"
 			echo "    dstport      Destination port (for DNAT)"
@@ -1825,17 +1861,28 @@ _apply_config_direct() {
 		network_nat)
 			_type=$(grep '^type=' "$_apply_file" 2>/dev/null | cut -d= -f2-)
 			_srcintf=$(grep '^srcintf=' "$_apply_file" 2>/dev/null | cut -d= -f2-)
+			_dstintf=$(grep '^dstintf=' "$_apply_file" 2>/dev/null | cut -d= -f2-)
+			_srcaddr=$(grep '^srcaddr=' "$_apply_file" 2>/dev/null | cut -d= -f2-)
+			_dstaddr=$(grep '^dstaddr=' "$_apply_file" 2>/dev/null | cut -d= -f2-)
+			_protocol=$(grep '^protocol=' "$_apply_file" 2>/dev/null | cut -d= -f2-)
 			_dstport=$(grep '^dstport=' "$_apply_file" 2>/dev/null | cut -d= -f2-)
 			_mapped_ip=$(grep '^mapped-ip=' "$_apply_file" 2>/dev/null | cut -d= -f2-)
 			_mapped_port=$(grep '^mapped-port=' "$_apply_file" 2>/dev/null | cut -d= -f2-)
 			_status=$(grep '^status=' "$_apply_file" 2>/dev/null | cut -d= -f2-)
 			[ "$_status" = "disable" ] && return
+			# Backward compat: entries written before the protocol field
+			[ -z "$_protocol" ] && _protocol=all
 			case "$_type" in
 				snat|dnat) ;;
 				*) echo "  Error: invalid NAT type '$_type' (snat|dnat)"; return 1 ;;
 			esac
 			[ -n "$_srcintf" ] && ! _is_iface_name "$_srcintf" && {
 				echo "  Error: invalid srcintf '$_srcintf'"
+				return 1
+			}
+			[ -n "$_dstintf" ] && [ "$_dstintf" != any ] && [ "$_dstintf" != all ] \
+				&& ! _is_iface_name "$_dstintf" && {
+				echo "  Error: invalid dstintf '$_dstintf'"
 				return 1
 			}
 			[ -n "$_dstport" ] && ! _is_uint_range "$_dstport" 1 65535 && {
@@ -1850,16 +1897,96 @@ _apply_config_direct() {
 				echo "  Error: invalid mapped-port '$_mapped_port' (1-65535)"
 				return 1
 			}
+			case "$_protocol" in
+				tcp|udp|tcp+udp|all) ;;
+				*) echo "  Error: invalid protocol '$_protocol' (tcp|udp|tcp+udp|all)"; return 1 ;;
+			esac
+			# Append a nat rule only if an identical one is not present, so
+			# repeated replay/rollback does not pile up duplicates.
+			_nat_add() {  # $1=chain, rest=rule spec
+				_c=$1; shift
+				iptables -t nat -C "$_c" "$@" 2>/dev/null || \
+					iptables -t nat -A "$_c" "$@" 2>&1 | sed 's/^/  /'
+			}
+			# Resolve a NAT srcaddr/dstaddr to a CIDR for -s/-d, mirroring
+			# mgmtd resolve_address(): empty/any/all/0.0.0.0/0 -> match-all
+			# (echo ""), a raw CIDR -> itself, a named firewall_address ->
+			# its subnet (looked up in the same DB mgmtd reads). An fqdn
+			# object or any unresolvable/invalid reference -> "SKIP" so the
+			# caller drops the whole rule (fail-closed, as mgmtd does).
+			_resolve_nat_addr() {
+				case "$1" in
+					""|any|all|0.0.0.0/0) echo ""; return 0 ;;
+				esac
+				if _is_cidr "$1"; then
+					[ "$1" = "0.0.0.0/0" ] && { echo ""; return 0; }
+					echo "$1"; return 0
+				fi
+				command -v sqlite3 >/dev/null 2>&1 && [ -f "$STARGAZER_DB_PATH" ] || {
+					echo "SKIP"; return 0; }
+				_rna_q=$(printf '%s' "$1" | sed "s/'/''/g")
+				_rna_t=$(sqlite3 "$STARGAZER_DB_PATH" "SELECT value FROM config WHERE type='firewall_address' AND id='${_rna_q}' AND key='type' LIMIT 1;" 2>/dev/null)
+				[ "$_rna_t" = fqdn ] && { echo "SKIP"; return 0; }
+				_rna_s=$(sqlite3 "$STARGAZER_DB_PATH" "SELECT value FROM config WHERE type='firewall_address' AND id='${_rna_q}' AND key='subnet' LIMIT 1;" 2>/dev/null)
+				{ [ -z "$_rna_s" ] || ! _is_cidr "$_rna_s"; } && { echo "SKIP"; return 0; }
+				[ "$_rna_s" = "0.0.0.0/0" ] && { echo ""; return 0; }
+				echo "$_rna_s"; return 0
+			}
+			_sa=$(_resolve_nat_addr "$_srcaddr")
+			_da=$(_resolve_nat_addr "$_dstaddr")
+			if [ "$_sa" = SKIP ] || [ "$_da" = SKIP ]; then
+				echo "  NAT rule $_apply_id skipped (unresolved or fqdn address — fail-closed)"
+				return 0
+			fi
+			# Build the -s/-d match prefix (resolved CIDRs only — safe to
+			# pass unquoted). Same -s/-d that mgmtd's append_addr_match emits.
+			_match=""
+			[ -n "$_sa" ] && _match="$_match -s $_sa"
+			[ -n "$_da" ] && _match="$_match -d $_da"
 			case "$_type" in
 				snat)
-					[ -n "$_srcintf" ] && iptables -t nat -A POSTROUTING -o "$_srcintf" -j MASQUERADE 2>&1 | sed 's/^/  /'
-					echo "  SNAT rule $_apply_id applied."
+					# SNAT/MASQUERADE binds to the OUTGOING interface
+					# (dstintf), like mgmtd — not srcintf. mgmtd also only
+					# emits SNAT when dstintf is a real interface.
+					if [ -n "$_dstintf" ] && [ "$_dstintf" != any ] && [ "$_dstintf" != all ]; then
+						_nat_add POSTROUTING $_match -o "$_dstintf" -j MASQUERADE
+						echo "  SNAT rule $_apply_id applied."
+					else
+						echo "  SNAT rule $_apply_id skipped (no outgoing interface)"
+					fi
 					;;
 				dnat)
-					if [ -n "$_dstport" ] && [ -n "$_mapped_ip" ]; then
+					if [ -n "$_mapped_ip" ]; then
 						_target="$_mapped_ip"
 						[ -n "$_mapped_port" ] && _target="${_target}:${_mapped_port}"
-						iptables -t nat -A PREROUTING -p tcp --dport "$_dstport" -j DNAT --to-destination "$_target" 2>&1 | sed 's/^/  /'
+						# DNAT binds to the incoming interface (srcintf) when set.
+						_imatch="$_match"
+						[ -n "$_srcintf" ] && [ "$_srcintf" != any ] && [ "$_srcintf" != all ] \
+							&& _imatch="$_imatch -i $_srcintf"
+						# Emit one DNAT rule for a protocol, adding --dport
+						# only when a dstport is set — mirrors mgmtd's
+						# emit_dnat_rule (mgmtd_apply_nat.c), which always
+						# installs the -p rule and treats dstport as optional.
+						_dnat_proto() {
+							if [ -n "$_dstport" ]; then
+								_nat_add PREROUTING $_imatch -p "$1" --dport "$_dstport" -j DNAT --to-destination "$_target"
+							else
+								_nat_add PREROUTING $_imatch -p "$1" -j DNAT --to-destination "$_target"
+							fi
+						}
+						case "$_protocol" in
+							all)
+								# 1:1 NAT, all protocols (dstport ignored)
+								_nat_add PREROUTING $_imatch -j DNAT --to-destination "$_target"
+								;;
+							tcp+udp)
+								_dnat_proto tcp
+								_dnat_proto udp
+								;;
+							tcp|udp)
+								_dnat_proto "$_protocol"
+								;;
+						esac
 						echo "  DNAT rule $_apply_id applied."
 					fi
 					;;

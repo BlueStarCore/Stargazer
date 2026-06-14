@@ -51,6 +51,15 @@ scripts/config --enable CONFIG_IP_NF_MANGLE
 scripts/config --enable CONFIG_IPV6
 scripts/config --enable CONFIG_IP6_NF_IPTABLES
 
+# ipset — backs FQDN address objects: mgmtd keeps one hash:ip set per
+# fqdn object (refreshed via DNS), iptables matches it with -m set.
+# Built-in (=y), not =m: the flat /lib/modules/stargazer loader has no
+# dependency resolution and the data plane must not depend on load order.
+scripts/config --enable CONFIG_IP_SET
+scripts/config --set-val CONFIG_IP_SET_MAX 256
+scripts/config --enable CONFIG_IP_SET_HASH_IP
+scripts/config --enable CONFIG_NETFILTER_XT_SET
+
 # QEMU virtio drivers
 log_info "Enabling QEMU/KVM virtio drivers..."
 scripts/config --enable CONFIG_VIRTIO

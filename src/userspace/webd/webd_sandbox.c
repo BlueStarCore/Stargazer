@@ -6,7 +6,7 @@
  * Allows network I/O (Mongoose HTTP serving), AF_UNIX IPC,
  * threading primitives (futex), and static file reads.
  *
- * Blocks: fork, clone, clone3, execve, ptrace, openat O_WRONLY/O_RDWR,
+ * Blocks: fork, clone, clone3, execve, ptrace, openat O_RDWR,
  *         non-AF_UNIX/AF_INET sockets.
  */
 
@@ -28,6 +28,7 @@
 /* aarch64 syscall numbers (asm-generic/unistd.h) */
 #define SC_openat           56
 #define SC_close            57
+#define SC_unlinkat         35
 #define SC_lseek            62
 #define SC_read             63
 #define SC_write            64
@@ -71,11 +72,15 @@
 #define SC_epoll_create1    20
 #define SC_epoll_ctl        21
 #define SC_epoll_pwait      22
+#define SC_ioctl            29
 
 /* Socket constants */
 #define AF_UNIX_VAL     1
 #define AF_INET_VAL     2
 #define SOCK_STREAM_VAL 1
+
+/* ioctl request numbers */
+#define SIOCGIFADDR_VAL 0x8915  /* get interface IPv4 address (read-only) */
 
 /* PROT_EXEC = 0x4 */
 #define PROT_EXEC_VAL   4
@@ -83,6 +88,7 @@
 /* O_WRONLY=1, O_RDWR=2 */
 #define O_ACCMODE_MASK  3
 #define O_RDONLY_VAL    0
+#define O_WRONLY_VAL    1
 
 /* seccomp_data offsets */
 #define OFF_NR   offsetof(struct seccomp_data, nr)
@@ -163,14 +169,16 @@ int webd_sandbox_install(void)
 		SC_ALLOW(SC_setsockopt),
 		SC_ALLOW(SC_getsockopt),
 
-		/* ── openat: O_RDONLY only (for static file serving) ─ */
-		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SC_openat, 0, 5),
-		/* Load arg2 (flags) and check O_ACCMODE bits */
+		/* ── openat: O_RDONLY (file serving) and O_WRONLY (firmware
+		 *    upload staging to /tmp/sg-fw-upload.<rand>, opened
+		 *    O_WRONLY|O_CREAT|O_EXCL — NOT mkstemp, which is O_RDWR);
+		 *    O_RDWR is never required and remains blocked. */
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SC_openat, 0, 6),
 		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_ARG2),
 		BPF_STMT(BPF_ALU | BPF_AND | BPF_K, O_ACCMODE_MASK),
-		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, O_RDONLY_VAL, 0, 1),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, O_RDONLY_VAL, 1, 0),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, O_WRONLY_VAL, 0, 1),
 		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
-		/* Not O_RDONLY → deny */
 		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_DEFAULT),
 
 		/* ── Memory management ───────────────────────────── */
@@ -229,7 +237,23 @@ int webd_sandbox_install(void)
 		/* ── Misc ────────────────────────────────────────── */
 		SC_ALLOW(SC_fcntl),
 		SC_ALLOW(SC_newfstatat),
+		/* unlinkat: clean up this process's own firmware staging temp
+		 * (/tmp/sg-fw-upload.*) on the upload error paths. unlink() is
+		 * unlinkat on aarch64; without this, an upload error path would
+		 * be killed by the filter. Bounded: webd can already create and
+		 * O_TRUNC files it owns, so deleting its own temps adds little. */
+		SC_ALLOW(SC_unlinkat),
 		SC_ALLOW(SC_exit_group),
+
+		/* ── ioctl: SIOCGIFADDR only ─────────────────────
+		 * Required by bind_listeners()/rebind_listeners() to read the
+		 * kernel-assigned IP of DHCP interfaces after lease acquisition. */
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SC_ioctl, 0, 5),
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_ARG1),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SIOCGIFADDR_VAL, 0, 1),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_NR),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_DEFAULT),
 
 		/* ── Default: KILL ───────────────────────────────── */
 		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_DEFAULT),

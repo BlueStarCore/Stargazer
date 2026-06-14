@@ -86,6 +86,37 @@ int seq_auto_assign(const char *type, char *data, size_t data_sz)
 	return 0;
 }
 
+/* ── cmkid_auto_assign ──────────────────────────────────────────────── *
+ *
+ * Assign a stable connmark id (cmkid) to a new firewall_policy entry. The
+ * cmkid is stamped into a flow's connmark (bits 8-31) by the ACCEPT rule that
+ * permits it, so the live-flow re-evaluation path can tell which policy owns a
+ * flow. Unlike "sequence", cmkid must NOT change when rules are reordered.
+ *
+ * cmkid = max(existing cmkid) + 1. Reuse after a delete is harmless: deleting
+ * a policy triggers a dirty-all re-evaluation, so no live flow keeps a stamp
+ * that could collide with a later policy reusing the number.
+ */
+int cmkid_auto_assign(const char *type, char *data, size_t data_sz)
+{
+	if (sg_kv_has_key(data, "cmkid"))
+		return 0;
+
+	char *max_str = sg_db_get_max_int(type, "cmkid");
+	int next = (max_str ? atoi(max_str) : 0) + 1;
+	free(max_str);
+
+	char suffix[32];
+	int slen = snprintf(suffix, sizeof(suffix), "cmkid=%d\n", next);
+
+	size_t cur_len = strlen(data);
+	if (cur_len + (size_t)slen + 1 > data_sz)
+		return -1;
+
+	memcpy(data + cur_len, suffix, (size_t)slen + 1);
+	return 0;
+}
+
 /* seq_compute_position — REMOVED.
  * No longer needed with atomic iptables-restore rebuild.
  * Rule ordering is now implicit in the generated ruleset
@@ -95,7 +126,11 @@ int seq_auto_assign(const char *type, char *data, size_t data_sz)
 /* ── Internal helpers ───────────────────────────────────────────────── */
 
 struct seq_entry {
-	char  id[64];
+	/* SG_SAFE_ID_MAX (64) + NUL: sg_is_safe_id accepts ids of length
+	 * exactly 64, so a 64-byte buffer would truncate one to 63 and the
+	 * later sg_db_set_val would target a non-existent row, silently
+	 * leaving that entry at its old sequence (wrong chain order). */
+	char  id[SG_SAFE_ID_MAX + 1];
 	int   seq;
 };
 
@@ -173,8 +208,16 @@ static int collect_seq_range(const char *type, int lo, int hi,
 				}
 				entries = nb;
 			}
-			snprintf(entries[n].id,
-				 sizeof(entries[n].id), "%s", tok);
+			int idn = snprintf(entries[n].id,
+					   sizeof(entries[n].id), "%s", tok);
+			if (idn < 0 || (size_t)idn >= sizeof(entries[n].id)) {
+				/* id too long to store without truncation —
+				 * abort rather than reorder against a wrong id. */
+				free(entries);
+				free(list);
+				*out = NULL;
+				return -1;
+			}
 			entries[n].seq = seq;
 			n++;
 		}
@@ -185,15 +228,6 @@ static int collect_seq_range(const char *type, int lo, int hi,
 	return n;
 }
 
-/* ── seq_has_collision ──────────────────────────────────────────────── */
-
-int seq_has_collision(const char *type, int seq, const char *exclude_id)
-{
-	struct seq_entry *entries = NULL;
-	int n = collect_seq_range(type, seq, seq, exclude_id, &entries);
-	free(entries);
-	return n > 0;
-}
 
 /* ── seq_rotate ─────────────────────────────────────────────────────── *
  *
@@ -259,4 +293,31 @@ int seq_rotate(const char *type, int old_seq, int new_seq,
 
 	free(entries);
 	return rotated;
+}
+
+/* ── seq_insert_at ──────────────────────────────────────────────────── */
+
+int seq_insert_at(const char *type, int target_seq, const char *exclude_id)
+{
+	struct seq_entry *entries = NULL;
+	int n = collect_seq_range(type, target_seq, 9999, exclude_id, &entries);
+
+	if (n <= 0) {
+		free(entries);
+		return 0;
+	}
+
+	/* Shift highest first to avoid intermediate collisions */
+	qsort(entries, (size_t)n, sizeof(entries[0]), seq_cmp_desc);
+
+	int shifted = 0;
+	for (int i = 0; i < n; i++) {
+		char val[16];
+		snprintf(val, sizeof(val), "%d", entries[i].seq + 1);
+		if (sg_db_set_val(type, entries[i].id, "sequence", val) == 0)
+			shifted++;
+	}
+
+	free(entries);
+	return shifted;
 }

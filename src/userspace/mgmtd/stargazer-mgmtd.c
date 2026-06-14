@@ -43,6 +43,9 @@
 #include <sys/mount.h>
 #include <sys/wait.h>
 #include <poll.h>
+#include <net/if.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 
 #include "stargazer_ipc.h"
 #include "password_policy.h"
@@ -99,6 +102,16 @@ void debug_buf_push(const char *fmt, ...)
 static volatile sig_atomic_t g_running = 1;
 static volatile sig_atomic_t g_child_died = 0;
 int g_listen_fd = -1;  /* listen socket fd, for child to close after fork */
+
+/*
+ * Kernel-verified UID of the current request's peer, set from SO_PEERCRED
+ * once per connection in the accept loop before handle_request() runs.
+ * Safe as file-scope state because the daemon services one request at a
+ * time (single-threaded poll loop). Handlers that must restrict a command
+ * to a specific caller (e.g. root-only events) read this. (uid_t)-1 means
+ * "not yet established".
+ */
+static uid_t g_peer_uid = (uid_t)-1;
 
 /* ── Process supervisor ────────────────────────────────────────────────── */
 
@@ -176,6 +189,10 @@ char *safe_exec(const char *const argv[])
 	/* Parent */
 	close(pipefd[1]);
 
+	/* Hard cap: iptables/ip output is never legitimately large.
+	 * Prevents memory exhaustion if a child misbehaves. */
+#define SAFE_EXEC_MAX_OUTPUT (4 * 1024 * 1024)  /* 4 MiB */
+
 	size_t bufsize = 4096, used = 0;
 	char *buf = malloc(bufsize);
 	if (!buf) { close(pipefd[0]); waitpid(pid, NULL, 0); return NULL; }
@@ -183,6 +200,13 @@ char *safe_exec(const char *const argv[])
 	ssize_t n;
 	char tmp[1024];
 	while ((n = read(pipefd[0], tmp, sizeof(tmp))) > 0) {
+		if (used + (size_t)n + 1 > SAFE_EXEC_MAX_OUTPUT) {
+			fprintf(stderr, "[mgmtd] safe_exec: output cap reached\n");
+			free(buf);
+			close(pipefd[0]);
+			waitpid(pid, NULL, 0);
+			return NULL;
+		}
 		while (used + (size_t)n + 1 > bufsize) {
 			bufsize *= 2;
 			char *nb = realloc(buf, bufsize);
@@ -261,6 +285,12 @@ char *pipe_exec_stdin(const char *const argv[],
 	ssize_t n;
 	char tmp[1024];
 	while ((n = read(out_fd[0], tmp, sizeof(tmp))) > 0) {
+		/* Same exhaustion cap as safe_exec: a misbehaving child must
+		 * not be able to grow the single-threaded daemon without bound. */
+		if (used + (size_t)n + 1 > SAFE_EXEC_MAX_OUTPUT) {
+			free(buf); close(out_fd[0]); waitpid(pid, NULL, 0);
+			return NULL;
+		}
 		while (used + (size_t)n + 1 > bufsz) {
 			bufsz *= 2;
 			char *nb = realloc(buf, bufsz);
@@ -310,6 +340,16 @@ int ipt_exec(const char *const argv[])
 				cmd[pos++] = ' ';
 			int n = snprintf(cmd + pos, sizeof(cmd) - (size_t)pos,
 					 "%s", argv[i]);
+			/* snprintf returns the untruncated length; a long argv
+			 * element would push pos past cmd and make the
+			 * cmd[pos]='\0' below an out-of-bounds write. Stop at a
+			 * full buffer instead. */
+			if (n < 0)
+				break;
+			if ((size_t)n >= sizeof(cmd) - (size_t)pos) {
+				pos = (int)sizeof(cmd) - 1;
+				break;
+			}
 			pos += n;
 		}
 		cmd[pos] = '\0';
@@ -406,11 +446,15 @@ void flush_nat_rules(void)
 void flush_forward_chain(void)
 {
 	const char *ff[] = {"iptables", "-F", "FORWARD", NULL};
+	const char *fi[] = {"iptables", "-A", "FORWARD",
+			    "-m", "conntrack", "--ctstate", "INVALID",
+			    "-j", "DROP", NULL};
 	const char *fe[] = {"iptables", "-A", "FORWARD",
 			    "-m", "conntrack",
 			    "--ctstate", "ESTABLISHED,RELATED",
 			    "-j", "ACCEPT", NULL};
 	ipt_exec(ff);
+	ipt_exec(fi);
 	ipt_exec(fe);
 	fprintf(stderr, "[mgmtd] flush: FORWARD chain\n");
 }
@@ -809,6 +853,393 @@ int handle_log_clear_audit(int client_fd, const char *user,
 	return 0;
 }
 
+/*
+ * handle_diag_stargazer_log — Filter dmesg for stargazer init messages.
+ * Shows [stargazer], sgdata, _sg_prepare, mmcblk0p related messages.
+ */
+int handle_diag_stargazer_log(int client_fd, const char *user,
+			      const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)payload;
+	(void)hdr;
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "Requires 'monitor' permission");
+		return 0;
+	}
+
+	const char *argv[] = {
+		"sh", "-c",
+		"/bin/dmesg | /bin/grep -E '\\[stargazer\\]|sgdata|_sg_prepare|mmcblk0p'",
+		NULL
+	};
+	char *out = safe_exec(argv);
+	if (!out || !out[0]) {
+		free(out);
+		send_ok(client_fd, NULL, "  No stargazer messages found in kernel log.\n");
+		return 0;
+	}
+
+	send_ok(client_fd, NULL, out);
+	free(out);
+	return 0;
+}
+
+/*
+ * rsp_appendf — bounded formatted append into a fixed response buffer.
+ *
+ * Returns the new offset, never advancing past cap-1. A raw
+ * "pos += snprintf(buf+pos, cap-pos, ...)" is unsafe: snprintf returns
+ * the untruncated length, so once it truncates, pos overshoots cap and
+ * the next "cap - pos" underflows to a huge size_t with buf+pos past the
+ * allocation. This stops cleanly at a full buffer instead.
+ */
+static size_t rsp_appendf(char *buf, size_t cap, size_t pos,
+			  const char *fmt, ...)
+	__attribute__((format(printf, 4, 5)));
+
+static size_t rsp_appendf(char *buf, size_t cap, size_t pos,
+			  const char *fmt, ...)
+{
+	va_list ap;
+	int n;
+
+	if (pos >= cap)
+		return cap ? cap - 1 : 0;
+	va_start(ap, fmt);
+	n = vsnprintf(buf + pos, cap - pos, fmt, ap);
+	va_end(ap);
+	if (n < 0)
+		return pos;
+	if ((size_t)n >= cap - pos)
+		return cap - 1;		/* truncated: buffer full */
+	return pos + (size_t)n;
+}
+
+/*
+ * handle_diag_storage — Show storage device and mount status.
+ * Reports partition devices, mount points, blkid info, and database status.
+ */
+int handle_diag_storage(int client_fd, const char *user,
+		       const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)payload;
+	(void)hdr;
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "Requires 'monitor' permission");
+		return 0;
+	}
+
+	char *buf = malloc(SG_RESPONSE_MAX);
+	if (!buf) {
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL, "Out of memory");
+		return 0;
+	}
+	size_t pos = 0;
+
+	/* Storage devices */
+	pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
+			"Storage devices:\n");
+	const char *argv1[] = {"sh", "-c",
+			       "/bin/ls -la /dev/mmcblk0p* 2>/dev/null || echo '  No eMMC partitions found'",
+			       NULL};
+	char *out1 = safe_exec(argv1);
+	if (out1) {
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos, "%s", out1);
+		free(out1);
+	}
+
+	/* Mount points */
+	pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
+			"\nStorage mount points:\n");
+	const char *argv2[] = {"sh", "-c",
+			       "/bin/mount | /bin/grep -E 'stargazer|mmcblk'",
+			       NULL};
+	char *out2 = safe_exec(argv2);
+	if (out2 && out2[0]) {
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos, "%s", out2);
+		free(out2);
+	} else {
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
+				"  No stargazer/mmcblk mounts found\n");
+		free(out2);
+	}
+
+	/* Partition info */
+	pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
+			"\nPartition info:\n");
+	const char *argv3[] = {"blkid", "/dev/mmcblk0p5", NULL};
+	char *out3 = safe_exec(argv3);
+	if (out3 && out3[0]) {
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
+				"/dev/mmcblk0p5: %s", out3);
+		free(out3);
+	} else {
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
+				"/dev/mmcblk0p5: not found or unformatted\n");
+		free(out3);
+	}
+
+	const char *argv4[] = {"blkid", "/dev/mmcblk0p6", NULL};
+	char *out4 = safe_exec(argv4);
+	if (out4 && out4[0]) {
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
+				"/dev/mmcblk0p6: %s", out4);
+		free(out4);
+	} else {
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
+				"/dev/mmcblk0p6: not found or unformatted\n");
+		free(out4);
+	}
+
+	/* Database status */
+	pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
+			"\nConfig database:\n");
+	const char *argv5[] = {"sh", "-c",
+			       "/bin/ls -lh /etc/stargazer/stargazer.db 2>/dev/null || echo '  Database not found'",
+			       NULL};
+	char *out5 = safe_exec(argv5);
+	if (out5) {
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos, "%s", out5);
+		free(out5);
+	}
+
+	send_ok(client_fd, NULL, buf);
+	free(buf);
+	return 0;
+}
+
+/*
+ * handle_diag_dhcp_client — DHCP client status for all or one interface.
+ *
+ * Payload: empty (all DHCP interfaces) or "<iface>" (one interface).
+ *
+ * For each DHCP-mode interface reports:
+ *   - Supervisor status (udhcpc.<iface>): PID, restart count
+ *   - Lease state from /var/run/dhcp-status.<iface>
+ *   - Current kernel-assigned IP from ip addr
+ */
+int handle_diag_dhcp_client(int client_fd, const char *user,
+			     const char *payload,
+			     const sg_request_hdr_t *hdr)
+{
+	(void)hdr;
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "Requires 'monitor' permission");
+		return 0;
+	}
+
+	char *buf = malloc(SG_RESPONSE_MAX);
+	if (!buf) {
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL, "Out of memory");
+		return 0;
+	}
+	size_t pos = 0;
+
+	/* Build list of DHCP-mode interfaces to inspect */
+	char *iface_list[16];
+	int   iface_count = 0;
+
+	/* If caller specified one interface, use it directly */
+	char req_iface[32] = {0};
+	if (payload && payload[0] && sg_is_iface_name(payload)) {
+		size_t plen = strlen(payload);
+		if (plen >= sizeof(req_iface))
+			plen = sizeof(req_iface) - 1;
+		memcpy(req_iface, payload, plen);
+	}
+
+	if (req_iface[0]) {
+		/* Single interface requested */
+		char *mode = sg_db_get_val("system_interface", req_iface, "mode");
+		if (mode && strcmp(mode, "dhcp") == 0)
+			iface_list[iface_count++] = strdup(req_iface);
+		else if (!mode)
+			iface_list[iface_count++] = strdup(req_iface);
+		free(mode);
+	} else {
+		/* All interfaces in DHCP mode */
+		char *list = sg_db_list("system_interface");
+		if (list) {
+			char *p = list;
+			while (*p && iface_count < 16) {
+				char *nl = strchr(p, '\n');
+				size_t len = nl ? (size_t)(nl - p) : strlen(p);
+				if (len > 0 && len < 32) {
+					char iname[32];
+					memcpy(iname, p, len);
+					iname[len] = '\0';
+					char *mode = sg_db_get_val(
+						"system_interface", iname,
+						"mode");
+					if (mode &&
+					    strcmp(mode, "dhcp") == 0)
+						iface_list[iface_count++] =
+							strdup(iname);
+					free(mode);
+				}
+				if (!nl)
+					break;
+				p = nl + 1;
+			}
+			free(list);
+		}
+	}
+
+	if (iface_count == 0) {
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
+				"No DHCP client interfaces configured.\n");
+		send_ok(client_fd, NULL, buf);
+		free(buf);
+		return 0;
+	}
+
+	for (int i = 0; i < iface_count; i++) {
+		const char *iface = iface_list[i];
+		pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
+				"Interface: %s\n", iface);
+
+		/* ── Supervisor status ─────────────────────────────── */
+		char sup_name[80];
+		snprintf(sup_name, sizeof(sup_name), "udhcpc.%s", iface);
+		pid_t upid = supervisor_get_pid(sup_name);
+		int   ucnt = supervisor_get_restart_count(sup_name);
+
+		if (upid > 0) {
+			pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
+					"  udhcpc:     running (pid %d,"
+					" restarts %d)\n",
+					(int)upid, ucnt);
+		} else if (ucnt == -1) {
+			pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
+					"  udhcpc:     NOT running"
+					" (not tracked — restart limit hit"
+					" or never started)\n");
+		} else {
+			pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
+					"  udhcpc:     NOT running"
+					" (restarts %d)\n", ucnt);
+		}
+
+		/* ── Orphan check via /proc ─────────────────────────
+		 * Catches processes not tracked by the supervisor
+		 * (e.g., from a previous mgmtd instance). */
+		{
+			DIR *pd = opendir("/proc");
+			if (pd) {
+				struct dirent *pe;
+				while ((pe = readdir(pd)) != NULL) {
+					if (pe->d_name[0] < '1' ||
+					    pe->d_name[0] > '9')
+						continue;
+					char cp[280];
+					snprintf(cp, sizeof(cp),
+						 "/proc/%s/cmdline",
+						 pe->d_name);
+					int cfd = open(cp, O_RDONLY);
+					if (cfd < 0) continue;
+					char cb[512];
+					ssize_t cn = read(cfd, cb,
+							  sizeof(cb) - 1);
+					close(cfd);
+					if (cn <= 0) continue;
+					cb[cn] = '\0';
+					if (!strstr(cb, "udhcpc")) continue;
+					int fi = 0;
+					for (ssize_t ci = 0; ci < cn; ) {
+						const char *arg = cb + ci;
+						size_t al = strlen(arg);
+						if (strcmp(arg, "-i") == 0) {
+							fi = 1;
+						} else if (fi &&
+							   strcmp(arg, iface)
+							   == 0) {
+							pid_t op =
+							  (pid_t)atoi(
+							    pe->d_name);
+							pos = rsp_appendf(
+							  buf,
+							  SG_RESPONSE_MAX,
+							  pos,
+							  "  orphan:     "
+							  "pid %d (not"
+							  " supervisor-"
+							  "tracked)\n",
+							  (int)op);
+							break;
+						} else {
+							fi = 0;
+						}
+						ci += (ssize_t)al + 1;
+						if (ci >= cn) break;
+					}
+				}
+				closedir(pd);
+			}
+		}
+
+		/* ── Lease state from status file ─────────────────── */
+		char sf[64];
+		snprintf(sf, sizeof(sf), "/var/run/dhcp-status.%s", iface);
+		FILE *fp = fopen(sf, "r");
+		if (fp) {
+			char line[128];
+			while (fgets(line, sizeof(line), fp)) {
+				size_t llen = strlen(line);
+				while (llen > 0 &&
+				       (line[llen-1] == '\n' ||
+					line[llen-1] == '\r'))
+					line[--llen] = '\0';
+				if (!line[0]) continue;
+				pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
+						  "  %s\n", line);
+			}
+			fclose(fp);
+		} else {
+			pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
+					"  lease:      (no status file)\n");
+		}
+
+		/* ── Kernel-assigned IP ──────────────────────────── */
+		const char *ip_argv[] = {
+			"ip", "-4", "-o", "addr", "show", iface, NULL
+		};
+		char *ipout = safe_exec(ip_argv);
+		if (ipout && ipout[0]) {
+			char *inet_p = strstr(ipout, "inet ");
+			if (inet_p) {
+				inet_p += 5;
+				char *sp = strchr(inet_p, ' ');
+				if (sp) *sp = '\0';
+				pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
+						  "  ip:         %s\n",
+						  inet_p);
+			} else {
+				pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
+						  "  ip:         (none)\n");
+			}
+		} else {
+			pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
+					"  ip:         (none)\n");
+		}
+		free(ipout);
+
+		if (i + 1 < iface_count)
+			pos = rsp_appendf(buf, SG_RESPONSE_MAX, pos,
+					"\n");
+		free(iface_list[i]);
+	}
+
+	send_ok(client_fd, NULL, buf);
+	free(buf);
+	return 0;
+}
+
 /* ── Signal handling ────────────────────────────────────────────────────── */
 
 static void sig_handler(int sig)
@@ -1003,6 +1434,12 @@ pid_t supervisor_get_pid(const char *name)
 	if (e && e->pid > 0)
 		return e->pid;
 	return 0;
+}
+
+int supervisor_get_restart_count(const char *name)
+{
+	child_entry_t *e = sup_find(name);
+	return e ? e->restart_count : -1;
 }
 
 /*
@@ -1239,36 +1676,27 @@ int send_stream_chunk(int fd, const char *data, size_t len)
 }
 
 /*
- * stream_exec — fork+exec argv, stream child stdout/stderr to client_fd.
+ * stream_exec_body — blocking poll loop that streams a child process to client_fd.
  *
- * Uses poll() to monitor both the child pipe and the client socket.
- * If the client disconnects (Ctrl+C), the child is killed immediately
- * instead of waiting for the next line of output.
- *
- * Returns 1 (took ownership of client_fd — caller must not close it).
+ * Called only from a forked child of stream_exec() so the mgmtd main loop
+ * remains free to accept new IPC connections while a diagnostic command runs.
  */
-int stream_exec(int client_fd, const char *const argv[])
+static void stream_exec_body(int client_fd, const char *const argv[])
 {
 	int pipefd[2];
 	if (pipe(pipefd) < 0) {
-		mgmt_log("ERROR", "stream_exec: pipe() failed: %s",
-			 strerror(errno));
-		send_error(client_fd, SG_ERR_SYSTEM_FAIL,
-			   "Internal error");
-		return 0;
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL, "Internal error");
+		return;
 	}
 	pid_t pid = fork();
 	if (pid < 0) {
-		mgmt_log("ERROR", "stream_exec: fork() failed: %s",
-			 strerror(errno));
 		close(pipefd[0]);
 		close(pipefd[1]);
-		send_error(client_fd, SG_ERR_SYSTEM_FAIL,
-			   "Internal error");
-		return 0;
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL, "Internal error");
+		return;
 	}
 	if (pid == 0) {
-		/* Child: redirect stdout+stderr to pipe, exec */
+		/* Grand-child: redirect stdout+stderr to pipe, exec command */
 		close(pipefd[0]);
 		dup2(pipefd[1], STDOUT_FILENO);
 		dup2(pipefd[1], STDERR_FILENO);
@@ -1278,7 +1706,6 @@ int stream_exec(int client_fd, const char *const argv[])
 	}
 	close(pipefd[1]);
 
-	/* Parent: poll pipe (child output) + client socket (disconnect) */
 	struct pollfd pfds[2];
 	pfds[0].fd = pipefd[0];
 	pfds[0].events = POLLIN;
@@ -1291,24 +1718,22 @@ int stream_exec(int client_fd, const char *const argv[])
 		if (ret < 0) {
 			if (errno == EINTR)
 				continue;
-			break; /* poll error */
+			break;
 		}
 		if (ret == 0)
-			break; /* 30s timeout — child stalled */
+			break; /* 30 s timeout — command stalled */
 
-		/* Check client socket first: disconnect → kill child */
 		if (pfds[1].revents & (POLLIN | POLLHUP | POLLERR)) {
 			kill(pid, SIGTERM);
 			killed = 1;
 			break;
 		}
 
-		/* Child has output ready */
 		if (pfds[0].revents & POLLIN) {
 			char buf[1024];
 			ssize_t n = read(pipefd[0], buf, sizeof(buf));
 			if (n <= 0)
-				break; /* EOF or error */
+				break;
 			if (send_stream_chunk(client_fd, buf, (size_t)n) < 0) {
 				kill(pid, SIGTERM);
 				killed = 1;
@@ -1316,9 +1741,7 @@ int stream_exec(int client_fd, const char *const argv[])
 			}
 		}
 
-		/* Child pipe closed (EOF) */
 		if (pfds[0].revents & (POLLHUP | POLLERR)) {
-			/* Drain any remaining data */
 			for (;;) {
 				char buf[1024];
 				ssize_t n = read(pipefd[0], buf, sizeof(buf));
@@ -1341,6 +1764,84 @@ int stream_exec(int client_fd, const char *const argv[])
 		waitpid(pid, NULL, 0);
 	if (!killed)
 		send_ok(client_fd, NULL, NULL);
+	close(client_fd);
+}
+
+/*
+ * stream_exec — double-fork so the mgmtd main loop stays responsive and
+ * no blanket waitpid(-1) is needed (which would race with the supervisor).
+ *
+ * Pattern:
+ *   Parent → forks wrapper → wrapper forks inner → wrapper exits immediately
+ *   Parent reaps wrapper via synchronous waitpid (returns in < 1 ms).
+ *   Inner is reparented to init which reaps it automatically.
+ *
+ * The inner child runs stream_exec_body() (blocking) while the parent
+ * is already back in accept().  No zombie accumulation, no waitpid race.
+ *
+ * Returns 1 (parent has closed client_fd — caller must not close it again).
+ */
+int stream_exec(int client_fd, const char *const argv[])
+{
+	pid_t wrapper = fork();
+	if (wrapper < 0) {
+		mgmt_log("ERROR", "stream_exec: fork failed: %s",
+			 strerror(errno));
+		send_error(client_fd, SG_ERR_SYSTEM_FAIL, "Internal error");
+		close(client_fd);
+		return 1;
+	}
+
+	if (wrapper == 0) {
+		/*
+		 * First child (wrapper).
+		 *
+		 * 1. Close the listen socket — must not be inherited.
+		 * 2. Reset signal handlers (SIGCHLD inherited from parent
+		 *    writes to g_child_died which is meaningless here).
+		 *    Keep SIGPIPE as SIG_IGN — stream_exec_body relies on
+		 *    write() returning EPIPE rather than crashing.
+		 * 3. Close all inherited fds except client_fd: SQLite,
+		 *    netlink socket, log file, etc.
+		 * 4. Double-fork: inner child is reparented to init so the
+		 *    parent (mgmtd) never needs to waitpid(-1) for it.
+		 */
+		if (g_listen_fd >= 0)
+			close(g_listen_fd);
+
+		signal(SIGCHLD, SIG_DFL);
+		signal(SIGTERM, SIG_DFL);
+		signal(SIGINT,  SIG_DFL);
+		/* SIGPIPE stays SIG_IGN (inherited) */
+
+		for (int fd = 3; fd < 256; fd++) {
+			if (fd != client_fd)
+				close(fd);   /* EBADF on unopened fds is fine */
+		}
+
+		pid_t inner = fork();
+		if (inner < 0) {
+			send_error(client_fd, SG_ERR_SYSTEM_FAIL,
+				   "Internal error");
+			close(client_fd);
+			_exit(1);
+		}
+		if (inner > 0) {
+			/* Wrapper exits immediately; inner is adopted by init */
+			close(client_fd);
+			_exit(0);
+		}
+		/* Inner child: run the blocking stream loop */
+		stream_exec_body(client_fd, argv);
+		_exit(0);
+	}
+
+	/*
+	 * Parent: reap the wrapper child synchronously.
+	 * It exits almost instantly (just forks and _exits), so this
+	 * blocks for < 1 ms — no appreciable delay on the accept() path.
+	 */
+	waitpid(wrapper, NULL, 0);
 	close(client_fd);
 	return 1;
 }
@@ -1447,6 +1948,16 @@ static int mgmtd_first_boot_seed(void)
 {
 	mgmt_log("INFO", "first boot — seeding default configuration");
 
+	/* Seed the whole default config in one transaction: every write below
+	 * (and the final seeded-flag stamp) either all commit or all roll back.
+	 * On failure the DB is left empty, so the next boot is BOOT_FIRST and
+	 * re-seeds rather than seeing a half-seeded state. sg_db_set joins this
+	 * transaction (it owns BEGIN/COMMIT only at top level). */
+	if (sg_db_begin() != 0) {
+		mgmt_log("ERROR", "first-boot seed: cannot begin transaction");
+		return -1;
+	}
+
 	/* ── Admin profiles ─────────────────────────────────────────── */
 	if (sg_db_set("system_admin-profile", "read-write",
 		      "permissions=monitor,configure,admin\n"
@@ -1493,41 +2004,102 @@ static int mgmtd_first_boot_seed(void)
 	 * mgmtd_reconcile_config() Phase 2 — runs every boot,
 	 * idempotent, also handles upgrade migration. */
 
-	/* ── Default interfaces ──────────────────────────────────────── */
-	/* lan3: LAN management interface — only seed if the hardware
-	 * actually exists.  On non-BPI-R4 platforms (e.g. QEMU) lan3
-	 * does not exist and mgmtd_sync_interfaces() will create entries
-	 * for whatever NICs the platform actually has. */
-	if (iface_exists("lan3")) {
-		if (sg_db_set("system_interface", "lan3",
-			      "mode=static\n"
-			      "ip=" MGMT_DEFAULT_IP "\n"
-			      "status=up\n"
-			      "mtu=1500\n"
-			      "allowaccess=ping http https\n") != 0) goto fail;
-	} else {
-		mgmt_log("INFO",
-			 "first-boot: skipping lan3 seed (hardware not present)");
-	}
+	/* Interface seeding is handled entirely by mgmtd_sync_interfaces()
+	 * which runs after the NIC wait — it assigns the management IP to
+	 * the correct first NIC on every platform (BPI-R4 lan3, QEMU eth0).
+	 * Seeding here would race with slow-probing hardware and produce
+	 * inconsistent allowaccess values depending on which path ran. */
+
+	/* ── IPS ruleset sources (builtin defaults) ──────────────────── */
+	/* Seeded non-critically: if they fail, don't block boot */
+#define ET_BASE "https://rules.emergingthreats.net/open/snort-2.9.0/rules/"
+	sg_db_set("security_ips-ruleset", "et-botcc",
+		  "description=ET open/botcc (Command-and-Control)\n"
+		  "url=" ET_BASE "emerging-botcc.rules\n"
+		  "enabled=disable\nbuiltin=yes\n");
+	sg_db_set("security_ips-ruleset", "et-botcc-portgrouped",
+		  "description=ET open/botcc.portgrouped\n"
+		  "url=" ET_BASE "emerging-botcc.portgrouped.rules\n"
+		  "enabled=disable\nbuiltin=yes\n");
+	sg_db_set("security_ips-ruleset", "et-compromised",
+		  "description=ET open/compromised (Known bad hosts)\n"
+		  "url=" ET_BASE "emerging-compromised.rules\n"
+		  "enabled=disable\nbuiltin=yes\n");
+	sg_db_set("security_ips-ruleset", "et-drop",
+		  "description=ET open/drop (Spamhaus DROP list)\n"
+		  "url=" ET_BASE "emerging-drop.rules\n"
+		  "enabled=disable\nbuiltin=yes\n");
+	sg_db_set("security_ips-ruleset", "et-dshield",
+		  "description=ET open/dshield (DShield blocklist)\n"
+		  "url=" ET_BASE "emerging-dshield.rules\n"
+		  "enabled=disable\nbuiltin=yes\n");
+	sg_db_set("security_ips-ruleset", "et-exploit",
+		  "description=ET open/exploit (Exploit kits)\n"
+		  "url=" ET_BASE "emerging-exploit.rules\n"
+		  "enabled=disable\nbuiltin=yes\n");
+	sg_db_set("security_ips-ruleset", "et-dos",
+		  "description=ET open/dos (Denial-of-Service)\n"
+		  "url=" ET_BASE "emerging-dos.rules\n"
+		  "enabled=disable\nbuiltin=yes\n");
+	sg_db_set("security_ips-ruleset", "et-trojan",
+		  "description=ET open/trojan (Trojan activity)\n"
+		  "url=" ET_BASE "emerging-trojan.rules\n"
+		  "enabled=disable\nbuiltin=yes\n");
+	sg_db_set("security_ips-ruleset", "et-scan",
+		  "description=ET open/scan (Port scan detection)\n"
+		  "url=" ET_BASE "emerging-scan.rules\n"
+		  "enabled=disable\nbuiltin=yes\n");
+	sg_db_set("security_ips-ruleset", "et-policy",
+		  "description=ET open/policy (Policy violations)\n"
+		  "url=" ET_BASE "emerging-policy.rules\n"
+		  "enabled=disable\nbuiltin=yes\n");
+	sg_db_set("security_ips-ruleset", "abuse-feodo",
+		  "description=abuse.ch/Feodo Tracker (botnet C2)\n"
+		  "url=https://feodotracker.abuse.ch/downloads/feodotracker.rules\n"
+		  "enabled=disable\nbuiltin=yes\n");
+	sg_db_set("security_ips-ruleset", "abuse-sslbl",
+		  "description=abuse.ch/SSL IP Blacklist\n"
+		  "url=https://sslbl.abuse.ch/blacklist/sslipblacklist.rules\n"
+		  "enabled=disable\nbuiltin=yes\n");
+	sg_db_set("security_ips-ruleset", "abuse-urlhaus",
+		  "description=abuse.ch/URLhaus (malware distribution)\n"
+		  "url=https://urlhaus.abuse.ch/downloads/urlhaus.rules\n"
+		  "enabled=disable\nbuiltin=yes\n");
+#undef ET_BASE
 
 	/* Verify critical tables populated before stamping flag */
 	for (size_t i = 0; i < N_CRITICAL; i++) {
 		if (sg_db_count(critical_tables[i]) == 0) {
 			mgmt_log("ERROR", "seed verify: %s has 0 entries",
 				 critical_tables[i]);
+			sg_db_rollback();
 			return -1;
 		}
 	}
 
-	/* Stamp the seeded flag LAST — if seeding partially fails,
-	 * next boot retries as BOOT_FIRST (no flag, all tables empty). */
-	sg_db_set_val("system_meta", "0", "seeded", "1");
+	/* Stamp the seeded flag LAST, inside the same transaction. If it
+	 * fails, the rollback below drops the whole seed so the next boot
+	 * retries as BOOT_FIRST (no half-seeded BOOT_COMPROMISED state). */
+	if (sg_db_set_val("system_meta", "0", "seeded", "1") != 0) {
+		mgmt_log("ERROR", "first-boot seed: failed to stamp seeded "
+			 "flag; rolling back the whole seed");
+		sg_db_rollback();
+		return -1;
+	}
+
+	/* Commit the entire seed atomically. */
+	if (sg_db_commit() != 0) {
+		mgmt_log("ERROR", "first-boot seed: commit failed; rolling back");
+		sg_db_rollback();
+		return -1;
+	}
 
 	mgmt_log("INFO", "default configuration seeded successfully");
 	return 0;
 
 fail:
 	mgmt_log("ERROR", "seed failed — database write error");
+	sg_db_rollback();
 	return -1;
 }
 
@@ -1624,19 +2196,33 @@ static void mgmtd_reconcile_config(void)
 			  "builtin=yes\n"
 			  "immutable=yes\n"
 			  "comment=Match all services\n" },
+			{ "security_ips-profile", "default",
+			  "name=default\n"
+			  "status=enable\n"
+			  "categories=all\n"
+			  "builtin=yes\n"
+			  "immutable=yes\n"
+			  "comment=Default IPS profile (all signatures)\n" },
+			{ "security_ssl-inspection-profile", "no-inspection",
+			  "name=no-inspection\n"
+			  "status=enable\n"
+			  "inspection-mode=certificate\n"
+			  "builtin=yes\n"
+			  "immutable=yes\n"
+			  "comment=Built-in: no SSL inspection (read-only)\n" },
 			{ "firewall_policy", "1",
 			  "name=default-deny\n"
 			  "srcintf=any\n"
 			  "dstintf=any\n"
 			  "srcaddr=all\n"
 			  "dstaddr=all\n"
-			  "action=deny\n"
+			  "action=drop\n"
 			  "service=all\n"
 			  "status=enable\n"
 			  "sequence=1\n"
 			  "builtin=yes\n"
 			  "immutable=yes\n"
-			  "comment=Default deny all traffic\n" },
+			  "comment=Default drop all traffic\n" },
 			{ NULL, NULL, NULL }
 		};
 
@@ -1706,6 +2292,87 @@ static void mgmtd_reconcile_config(void)
 				mgmt_log("ERROR",
 					 "reconcile: failed to overwrite %s:%s",
 					 btype, bid);
+			}
+		}
+	}
+
+	/* ── Phase 2b: seed missing built-in IPS ruleset sources ─────
+	 *
+	 * INSERT-only: never overwrites existing entries so that the user's
+	 * enabled/disabled choice survives firmware upgrades.  Runs on every
+	 * boot, so rulesets added by new firmware land even when the DB was
+	 * originally seeded by an older build (BOOT_NORMAL path). */
+	{
+#define ET_BASE "https://rules.emergingthreats.net/open/snort-2.9.0/rules/"
+		static const struct { const char *id; const char *data; } ips_rs[] = {
+			{ "et-botcc",
+			  "description=ET open/botcc (Command-and-Control)\n"
+			  "url=" ET_BASE "emerging-botcc.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "et-botcc-portgrouped",
+			  "description=ET open/botcc.portgrouped\n"
+			  "url=" ET_BASE "emerging-botcc.portgrouped.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "et-compromised",
+			  "description=ET open/compromised (Known bad hosts)\n"
+			  "url=" ET_BASE "emerging-compromised.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "et-drop",
+			  "description=ET open/drop (Spamhaus DROP list)\n"
+			  "url=" ET_BASE "emerging-drop.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "et-dshield",
+			  "description=ET open/dshield (DShield blocklist)\n"
+			  "url=" ET_BASE "emerging-dshield.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "et-exploit",
+			  "description=ET open/exploit (Exploit kits)\n"
+			  "url=" ET_BASE "emerging-exploit.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "et-dos",
+			  "description=ET open/dos (Denial-of-Service)\n"
+			  "url=" ET_BASE "emerging-dos.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "et-trojan",
+			  "description=ET open/trojan (Trojan activity)\n"
+			  "url=" ET_BASE "emerging-trojan.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "et-scan",
+			  "description=ET open/scan (Port scan detection)\n"
+			  "url=" ET_BASE "emerging-scan.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "et-policy",
+			  "description=ET open/policy (Policy violations)\n"
+			  "url=" ET_BASE "emerging-policy.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "abuse-feodo",
+			  "description=abuse.ch/Feodo Tracker (botnet C2)\n"
+			  "url=https://feodotracker.abuse.ch/downloads/feodotracker.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "abuse-sslbl",
+			  "description=abuse.ch/SSL IP Blacklist\n"
+			  "url=https://sslbl.abuse.ch/blacklist/sslipblacklist.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "abuse-urlhaus",
+			  "description=abuse.ch/URLhaus (malware distribution)\n"
+			  "url=https://urlhaus.abuse.ch/downloads/urlhaus.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ NULL, NULL }
+		};
+#undef ET_BASE
+		for (int i = 0; ips_rs[i].id; i++) {
+			char *existing = sg_db_get("security_ips-ruleset",
+						   ips_rs[i].id);
+			if (existing) { free(existing); continue; }
+			if (sg_db_set("security_ips-ruleset",
+				      ips_rs[i].id, ips_rs[i].data) == 0) {
+				mgmt_log("INFO", "reconcile: seeded ruleset %s",
+					 ips_rs[i].id);
+				changes++;
+			} else {
+				mgmt_log("ERROR",
+					 "reconcile: failed to seed ruleset %s",
+					 ips_rs[i].id);
 			}
 		}
 	}
@@ -1821,6 +2488,45 @@ static void mgmtd_reconcile_config(void)
 		}
 	}
 
+	/* ── Phase 4b: backfill connmark ids (firewall_policy) ──────
+	 *
+	 * Every policy needs a stable cmkid so its ACCEPT rule can stamp
+	 * the flows it permits. Assign monotonically to any policy lacking
+	 * one (e.g. rows created before this feature, or the seeded base
+	 * policy). cmkid never gets reused, so we start above the max. */
+	{
+		char *list = sg_db_list("firewall_policy");
+		if (list) {
+			char *max_str =
+				sg_db_get_max_int("firewall_policy", "cmkid");
+			int next_cmkid = (max_str ? atoi(max_str) : 0) + 1;
+			free(max_str);
+
+			char *saveptr = NULL;
+			for (char *tok = strtok_r(list, "\n", &saveptr);
+			     tok;
+			     tok = strtok_r(NULL, "\n", &saveptr)) {
+				char *existing = sg_db_get_val(
+					"firewall_policy", tok, "cmkid");
+				if (existing) {
+					free(existing);
+					continue;
+				}
+				char val[16];
+				snprintf(val, sizeof(val), "%d", next_cmkid);
+				sg_db_set_val("firewall_policy", tok,
+					      "cmkid", val);
+				mgmt_log("INFO",
+					 "reconcile: backfilled "
+					 "firewall_policy:%s cmkid=%d",
+					 tok, next_cmkid);
+				next_cmkid++;
+				changes++;
+			}
+			free(list);
+		}
+	}
+
 	/* ── Phase 5: purge stale types ───────────────────────────── */
 
 	char *db_types = sg_db_list_types();
@@ -1896,6 +2602,104 @@ static int read_iface_mtu(const char *name)
 		val = -1;
 	fclose(fp);
 	return val;
+}
+
+/*
+ * Return 1 if the interface has any netdev upper layers (DSA master,
+ * bridge master, bonding master, etc.).  These are system-managed
+ * interfaces that users should not configure directly.
+ *
+ * Linux exposes upper devices as "upper_<name>" symlinks under
+ * /sys/class/net/<iface>/.  A single match is sufficient.
+ */
+/* Read a single integer from a sysfs file.  Returns -1 on failure. */
+static int read_sysfs_int(const char *path)
+{
+	FILE *f = fopen(path, "r");
+	if (!f)
+		return -1;
+	int val = -1;
+	if (fscanf(f, "%d", &val) != 1)
+		val = -1;
+	fclose(f);
+	return val;
+}
+
+static int read_iface_has_upper(const char *name)
+{
+	/* Method 1: upper_* entries in the interface's own sysfs dir.
+	 * Created by older DSA drivers and bonding/bridge setups. */
+	char path[64];
+	snprintf(path, sizeof(path), "/sys/class/net/%.15s", name);
+	DIR *d = opendir(path);
+	if (d) {
+		struct dirent *ent;
+		while ((ent = readdir(d)) != NULL) {
+			if (strncmp(ent->d_name, "upper_", 6) == 0) {
+				closedir(d);
+				return 1;
+			}
+		}
+		closedir(d);
+	}
+
+	/* Method 2: lower_<name> symlink on any other interface.
+	 * Some DSA drivers create lower_* on slaves instead of upper_* on
+	 * the master. */
+	char lower_target[48];
+	snprintf(lower_target, sizeof(lower_target), "lower_%.15s", name);
+	DIR *nd = opendir("/sys/class/net");
+	if (nd) {
+		struct dirent *ne;
+		while ((ne = readdir(nd)) != NULL) {
+			if (ne->d_name[0] == '.')
+				continue;
+			if (strcmp(ne->d_name, name) == 0)
+				continue;
+			char lpath[96];
+			snprintf(lpath, sizeof(lpath),
+				 "/sys/class/net/%.31s/%.32s",
+				 ne->d_name, lower_target);
+			struct stat st;
+			if (lstat(lpath, &st) == 0) {
+				closedir(nd);
+				return 1;
+			}
+		}
+		closedir(nd);
+	}
+
+	/* Method 3: iflink/ifindex comparison — guaranteed by the kernel for
+	 * every DSA slave regardless of driver.  A slave's iflink equals the
+	 * master's ifindex.  A non-slave's iflink equals its own ifindex.
+	 * The MT7988A DSA driver on BPI-R4 creates neither upper_* nor
+	 * lower_* symlinks, so this is the only reliable detection path. */
+	char ifidx_path[64];
+	snprintf(ifidx_path, sizeof(ifidx_path),
+		 "/sys/class/net/%.15s/ifindex", name);
+	int master_ifindex = read_sysfs_int(ifidx_path);
+	if (master_ifindex <= 0)
+		return 0;
+
+	DIR *sd = opendir("/sys/class/net");
+	if (!sd)
+		return 0;
+	struct dirent *se;
+	int found = 0;
+	while (!found && (se = readdir(sd)) != NULL) {
+		if (se->d_name[0] == '.')
+			continue;
+		if (strcmp(se->d_name, name) == 0)
+			continue;
+		char iflink_path[64];
+		snprintf(iflink_path, sizeof(iflink_path),
+			 "/sys/class/net/%.31s/iflink", se->d_name);
+		int slave_iflink = read_sysfs_int(iflink_path);
+		if (slave_iflink > 0 && slave_iflink == master_ifindex)
+			found = 1;
+	}
+	closedir(sd);
+	return found;
 }
 
 /*
@@ -1993,6 +2797,7 @@ static void mgmtd_sync_interfaces(int is_first_boot)
 
 	/* 4. Create/protect entries for each discovered NIC */
 	for (int i = 0; i < nic_count; i++) {
+		int is_dsa_master = read_iface_has_upper(nics[i]);
 		char *existing = sg_db_get("system_interface", nics[i]);
 
 		if (!existing) {
@@ -2002,11 +2807,25 @@ static void mgmtd_sync_interfaces(int is_first_boot)
 				cur_mtu = 1500;
 
 			char seed[256];
-			if (is_first_boot && i == mgmt_idx) {
+			if (is_dsa_master) {
+				/* DSA/bridge master — kept up by mgmtd but hidden
+				 * from the user CLI.  No IP, no DHCP client. */
+				snprintf(seed, sizeof(seed),
+					 "mode=static\n"
+					 "ip=0.0.0.0/0\n"
+					 "status=up\n"
+					 "mtu=%d\n"
+					 "builtin=yes\n"
+					 "system=yes\n", cur_mtu);
+				sg_db_set("system_interface", nics[i], seed);
+				mgmt_log("INFO",
+					 "interface %s: created (DSA master, mtu %d, system)",
+					 nics[i], cur_mtu);
+			} else if (is_first_boot && i == mgmt_idx) {
 				snprintf(seed, sizeof(seed),
 					 "mode=static\n"
 					 "ip=" MGMT_DEFAULT_IP "\n"
-					 "allowaccess=ping\n"
+					 "allowaccess=ping http https\n"
 					 "status=up\n"
 					 "mtu=%d\n"
 					 "builtin=yes\n", cur_mtu);
@@ -2042,12 +2861,23 @@ static void mgmtd_sync_interfaces(int is_first_boot)
 					 nics[i], cur_mtu);
 			}
 		} else {
-			/* Existing NIC — ensure builtin=yes */
+			/* Existing NIC — ensure builtin=yes and keep system=yes
+			 * consistent with current hardware topology.
+			 * Also force status=up for DSA masters: if the DB ever
+			 * records status=down for the master, replay brings all
+			 * slave ports to lowerlayerdown and the kernel operstate
+			 * diverges from every downstream port's configured state. */
 			sg_db_set_val("system_interface", nics[i],
 				      "builtin", "yes");
+			if (is_dsa_master) {
+				sg_db_set_val("system_interface", nics[i],
+					      "system", "yes");
+				sg_db_set_val("system_interface", nics[i],
+					      "status", "up");
+			}
 			free(existing);
-			mgmt_log("INFO", "interface %s: protected (builtin)",
-				 nics[i]);
+			mgmt_log("INFO", "interface %s: protected (builtin%s)",
+				 nics[i], is_dsa_master ? ", system" : "");
 		}
 	}
 
@@ -2155,19 +2985,30 @@ static char *mgmtd_show_interfaces(void)
 		"%-16s %-8s %-21s %s\n", "Name", "Status", "IP", "Description");
 
 	for (int i = 0; i < nic_count; i++) {
-		/* Read operstate from sysfs */
-		char state[16] = "unknown";
-		char spath[64];
-		snprintf(spath, sizeof(spath), "/sys/class/net/%.15s/operstate",
-			 nics[i]);
-		FILE *fp = fopen(spath, "r");
-		if (fp) {
-			if (fgets(state, sizeof(state), fp)) {
-				char *nl = strchr(state, '\n');
-				if (nl) *nl = '\0';
-			}
-			fclose(fp);
+		/* Skip system-managed interfaces (DSA master, etc.).
+		 * Prefer the live sysfs check over the DB flag: the DB entry
+		 * may predate the system=yes field being written. */
+		int is_sys = read_iface_has_upper(nics[i]);
+		if (!is_sys) {
+			char *sys_flag = sg_db_get_val("system_interface", nics[i],
+						       "system");
+			is_sys = sys_flag && strcmp(sys_flag, "yes") == 0;
+			free(sys_flag);
 		}
+		if (is_sys) {
+			free(nics[i]);
+			continue;
+		}
+
+		/* Read admin state from config DB (what the user configured).
+		 * Sysfs operstate reflects physical carrier and is shown by
+		 * diagnose tools; "show interfaces" reflects config intent. */
+		char *db_status = sg_db_get_val("system_interface", nics[i],
+						"status");
+		char state[16];
+		snprintf(state, sizeof(state), "%s",
+			 (db_status && db_status[0]) ? db_status : "up");
+		free(db_status);
 
 		/* Get IP address via ip command */
 		char ip[32] = "-";
@@ -2194,6 +3035,11 @@ static char *mgmtd_show_interfaces(void)
 		char line[256];
 		int n = snprintf(line, sizeof(line), "%-16s %-8s %-21s %s\n",
 				 nics[i], state, ip, desc ? desc : "");
+		/* snprintf returns the untruncated length; the config
+		 * 'description' is uncapped, so clamp to what line actually
+		 * holds before it is used as a copy length below. */
+		if (n > 0 && (size_t)n >= sizeof(line))
+			n = (int)sizeof(line) - 1;
 
 		/* Grow buffer if needed */
 		while (used + (size_t)n + 1 > bufsz) {
@@ -2441,9 +3287,104 @@ static int scrub_config_entry(const char *type, const char *id,
  */
 static int g_replaying = 1;
 
-static void mgmtd_replay_config(void)
+/*
+ * replay_routes_only - flush and re-apply all static routes from the DB.
+ *
+ * Called after a DHCP lease is obtained on a WAN interface so that static
+ * routes whose gateway became reachable only after the lease are installed.
+ * Uses the same flush+apply pattern as mgmtd_replay_config().
+ */
+static void replay_routes_only(void)
 {
 	char result[512];
+	flush_static_routes();
+
+	char *list = sg_db_list("network_route_static");
+	if (!list)
+		return;
+
+	const char *p = list;
+	while (*p) {
+		const char *eol = strchr(p, '\n');
+		size_t len = eol ? (size_t)(eol - p) : strlen(p);
+		if (len == 0) { p++; continue; }
+
+		char id[256];
+		if (len >= sizeof(id)) len = sizeof(id) - 1;
+		memcpy(id, p, len);
+		id[len] = '\0';
+
+		char *data = sg_db_get("network_route_static", id);
+		if (data) {
+			sg_status_t rc = apply_config("network_route_static", id,
+						      data, result, sizeof(result));
+			fprintf(stderr, "[mgmtd] dhcp-route %s %s: %s\n",
+				rc == SG_OK ? "OK" : "FAIL", id, result);
+			free(data);
+		}
+		p = eol ? eol + 1 : p + len;
+	}
+	free(list);
+}
+
+static int handle_dhcp_lease_event(int client_fd, const char *user,
+				   const char *payload,
+				   const sg_request_hdr_t *hdr)
+{
+	(void)user; (void)hdr;
+
+	/*
+	 * This command mutates the live routing table (flush / replay) and
+	 * is exempt from session-tag validation because its real caller is
+	 * udhcpc, which runs as root with no login session. Authorize on the
+	 * kernel-verified peer UID instead: only root may trigger it. Without
+	 * this, any process whose UID is in the stargazer group (the socket
+	 * is 0660 root:stargazer) — e.g. a monitor-only admin — could flush
+	 * every static route. Fail closed.
+	 */
+	if (g_peer_uid != 0) {
+		mgmt_log("WARN", "DHCP_LEASE_EVENT from non-root uid %u denied",
+			 (unsigned)g_peer_uid);
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "Requires root (udhcpc)");
+		return 0;
+	}
+
+	char iface[IFNAMSIZ], action[16];
+	extract_val(payload, "iface",  iface,  sizeof(iface));
+	extract_val(payload, "action", action, sizeof(action));
+
+	if (!sg_is_iface_name(iface)) {
+		send_error(client_fd, SG_ERR_INVALID_VAL,
+			   "Invalid interface name");
+		return 0;
+	}
+
+	if (strcmp(action, "bound") == 0 || strcmp(action, "renew") == 0) {
+		fprintf(stderr,
+			"[mgmtd] dhcp-lease %s on %s — re-applying static routes\n",
+			action, iface);
+		replay_routes_only();
+		send_ok(client_fd, NULL, "Routes re-applied\n");
+	} else if (strcmp(action, "deconfig") == 0) {
+		/* WAN IP gone — static routes referencing the former gateway
+		 * are now unreachable and must be removed.  They will be
+		 * re-installed on the next bound/renew. */
+		flush_static_routes();
+		send_ok(client_fd, NULL, "routes flushed\n");
+	} else {
+		send_error(client_fd, SG_ERR_INVALID_VAL, "Unknown action");
+	}
+	return 0;
+}
+
+/* Re-apply the whole DB to the kernel. Returns the number of per-type
+ * apply failures (0 = full success). Boot ignores the count (best-effort);
+ * rollback surfaces it so a partial re-apply is not reported as success. */
+static int mgmtd_replay_config(void)
+{
+	char result[512];
+	int fails = 0;
 
 	/* Single config types (id="0").
 	 * Order: settings first, then services that depend on them. */
@@ -2452,6 +3393,7 @@ static void mgmtd_replay_config(void)
 		"system_password-policy", /* load before admin auth checks */
 		"network_dns",            /* write /etc/resolv.conf */
 		"system_ntp",             /* write /etc/ntp.conf */
+		"system_session-ttl",     /* nf_conntrack idle-timeout sysctls */
 		NULL
 	};
 	for (int i = 0; single_types[i]; i++) {
@@ -2472,9 +3414,11 @@ static void mgmtd_replay_config(void)
 			if (rc == SG_OK)
 				fprintf(stderr, "[mgmtd] replay %s: %s\n",
 					single_types[i], result);
-			else
+			else {
 				fprintf(stderr, "[mgmtd] replay FAIL %s: %s\n",
 					single_types[i], result);
+				fails++;
+			}
 			free(data);
 		}
 	}
@@ -2504,6 +3448,11 @@ static void mgmtd_replay_config(void)
 			fprintf(stderr, "[mgmtd] replay firewall_policy: %s%s\n",
 				rc == SG_OK ? "" : "FAIL ",
 				rb_result);
+			if (rc != SG_OK) fails++;
+			/* IPS Phase B: build active.rules from active profiles
+			 * after policy is loaded — ipsd loads this on start. */
+			rebuild_ips_active(rb_result, sizeof(rb_result));
+			fprintf(stderr, "[mgmtd] replay ips: %s\n", rb_result);
 			continue;
 		}
 		if (strcmp(table_types[i], "network_nat") == 0) {
@@ -2513,6 +3462,7 @@ static void mgmtd_replay_config(void)
 			fprintf(stderr, "[mgmtd] replay network_nat: %s%s\n",
 				rc == SG_OK ? "" : "FAIL ",
 				rb_result);
+			if (rc != SG_OK) fails++;
 			continue;
 		}
 
@@ -2571,9 +3521,11 @@ static void mgmtd_replay_config(void)
 				if (rc == SG_OK)
 					fprintf(stderr, "[mgmtd] replay %s:%s: %s\n",
 						table_types[i], id, result);
-				else
+				else {
 					fprintf(stderr, "[mgmtd] replay FAIL %s:%s: %s\n",
 						table_types[i], id, result);
+					fails++;
+				}
 				free(data);
 			}
 
@@ -2585,6 +3537,112 @@ static void mgmtd_replay_config(void)
 
 	/* Enable ref existence checks now that all config is loaded */
 	g_replaying = 0;
+	return fails;
+}
+
+/*
+ * Rollback reconcile helpers. Run after a revision restore and before
+ * mgmtd_replay_config() (which only re-applies entries still in the DB) to
+ * tear down the runtime state of entries that existed before the rollback
+ * but not after. old_list is the newline-separated id list captured before
+ * the restore (strtok_r mutates it; the caller passes a throwaway copy).
+ */
+static void rollback_reconcile_dhcp(char *old_list)
+{
+	if (!old_list)
+		return;
+	char *save = NULL;
+	for (char *id = strtok_r(old_list, "\n", &save); id;
+	     id = strtok_r(NULL, "\n", &save)) {
+		char *d = sg_db_get("network_dhcp-server", id);
+		if (d) { free(d); continue; }	/* still present after rollback */
+		unapply_dhcp(id);		/* pool removed → stop its dhcpd */
+	}
+}
+
+static void rollback_reconcile_admins(char *old_list)
+{
+	if (!old_list)
+		return;
+	char *save = NULL;
+	for (char *id = strtok_r(old_list, "\n", &save); id;
+	     id = strtok_r(NULL, "\n", &save)) {
+		char *d = sg_db_get("system_admin", id);
+		if (d)
+			free(d);	/* survives — replay refreshes it */
+		else
+			delete_system_user(id);	/* removed → drop OS account */
+		/* Every pre-rollback admin's permissions/password may have
+		 * changed; purge their sessions so they re-authenticate (the
+		 * acting user was an admin before, so this can log them out). */
+		session_tag_purge_user(id);
+	}
+}
+
+/*
+ * collect_fqdn_address_ids — newline-separated ids of fqdn-type
+ * firewall_address objects currently in the DB. Captured BEFORE a restore
+ * so the rollback can destroy the ipsets of fqdn objects it removes (their
+ * type is gone from the DB after the restore). Heap string, caller frees.
+ */
+static char *collect_fqdn_address_ids(void)
+{
+	char *list = sg_db_list("firewall_address");
+	if (!list)
+		return NULL;
+	size_t cap = 256, len = 0;
+	char *out = malloc(cap);
+	if (!out) { free(list); return NULL; }
+	out[0] = '\0';
+	char *save = NULL;
+	for (char *id = strtok_r(list, "\n", &save); id;
+	     id = strtok_r(NULL, "\n", &save)) {
+		char *t = sg_db_get_val("firewall_address", id, "type");
+		int is_fqdn = (t && strcmp(t, "fqdn") == 0);
+		free(t);
+		if (!is_fqdn)
+			continue;
+		size_t n = strlen(id);
+		if (len + n + 2 > cap) {
+			while (len + n + 2 > cap) cap *= 2;
+			char *nb = realloc(out, cap);
+			if (!nb) { free(out); free(list); return NULL; }
+			out = nb;
+		}
+		memcpy(out + len, id, n);
+		len += n;
+		out[len++] = '\n';
+		out[len] = '\0';
+	}
+	free(list);
+	return out;
+}
+
+/*
+ * rollback_reconcile_fqdn — destroy the runtime hash:ip ipset of every fqdn
+ * address object that the restore removed or changed away from fqdn type.
+ * old_list is the pre-restore fqdn id list from collect_fqdn_address_ids
+ * (strtok_r mutates it). The ipset is owned by the fqdn object and is not
+ * touched by replay or the FORWARD rebuild, so it must be destroyed here.
+ */
+static void rollback_reconcile_fqdn(char *old_list)
+{
+	if (!old_list)
+		return;
+	char *save = NULL;
+	for (char *id = strtok_r(old_list, "\n", &save); id;
+	     id = strtok_r(NULL, "\n", &save)) {
+		/* Keep the ipset only if the object still exists AND is still
+		 * fqdn-type. If the rollback removed it OR reverted its type
+		 * (e.g. fqdn -> ipmask), the set is orphaned and must go —
+		 * a surviving row with a changed type would otherwise leak. */
+		char *t = sg_db_get_val("firewall_address", id, "type");
+		int still_fqdn = (t && strcmp(t, "fqdn") == 0);
+		free(t);
+		if (still_fqdn)
+			continue;
+		fqdn_object_removed(id);
+	}
 }
 
 /* ── Session tag table ──────────────────────────────────────────────────── */
@@ -2712,6 +3770,58 @@ void extract_val(const char *data, const char *key,
 	}
 }
 
+/*
+ * policy_reeval_scope — after an in-place firewall_policy edit, decide which
+ * live flows must be re-evaluated.  Returns the policy's cmkid to dirty ONLY
+ * that policy's own flows, or 0 to dirty ALL flows.
+ *
+ * Narrowing to cmkid(P) is correct only when the edit cannot change which
+ * flows P matches, cannot move P, and cannot make a disabled P newly active.
+ * In those cases the only live flows whose verdict can change are the ones P
+ * already permitted (they carry cmkid(P)); every other flow keeps matching the
+ * same policy at the same position, so its verdict is unchanged.
+ *
+ * If ANY match/position field changes (srcintf, dstintf, srcaddr, dstaddr,
+ * service, schedule, sequence) or a disabled policy is being enabled, the edit
+ * can re-shadow flows that belong to OTHER policies (which carry a different
+ * cmkid) — those would be missed by a narrow pass, so we fall back to all.
+ * Defaults to 0 (dirty-all) on any doubt; under-dirtying would fail open.
+ *
+ * Both old_data and new_data are full, default-backfilled entry payloads, so
+ * every shadow-relevant key is present in each.
+ */
+static unsigned policy_reeval_scope(const char *old_data, const char *new_data)
+{
+	if (!old_data || !new_data)
+		return 0;
+
+	/* Match/position keys: any change can re-shadow other policies' flows. */
+	static const char *shadow_keys[] = {
+		"srcintf", "dstintf", "srcaddr", "dstaddr",
+		"service", "schedule", "sequence", NULL
+	};
+	char ov[VALBUFSZ], nv[VALBUFSZ];
+	for (int i = 0; shadow_keys[i]; i++) {
+		extract_val(old_data, shadow_keys[i], ov, sizeof(ov));
+		extract_val(new_data, shadow_keys[i], nv, sizeof(nv));
+		if (strcmp(ov, nv) != 0)
+			return 0;	/* selector or order changed → all */
+	}
+
+	/* Enabling a previously-disabled policy inserts it into the chain, which
+	 * can shadow other policies' flows.  Disabling it, or leaving it enabled
+	 * while only action/comment changed, affects this policy's flows only. */
+	extract_val(old_data, "status", ov, sizeof(ov));
+	extract_val(new_data, "status", nv, sizeof(nv));
+	if (strcmp(ov, "enable") != 0 && strcmp(nv, "enable") == 0)
+		return 0;		/* disabled → enabled → all */
+
+	/* Safe to narrow: only this policy's own flows can change verdict. */
+	char cmk[VALBUFSZ];
+	extract_val(new_data, "cmkid", cmk, sizeof(cmk));
+	return (unsigned)atoi(cmk);	/* 0 (unstamped) → all, also safe */
+}
+
 /* ── Apply config to running system ─────────────────────────────────────── */
 
 static sg_status_t apply_config(const char *type, const char *id,
@@ -2741,6 +3851,9 @@ static sg_status_t apply_config(const char *type, const char *id,
 
 	if (strcmp(type, "system_ntp") == 0)
 		return apply_ntp(id, data, result, rsize);
+
+	if (strcmp(type, "system_session-ttl") == 0)
+		return apply_session_ttl(id, data, result, rsize);
 
 	/* ── Inline handlers (tightly coupled to monolith statics) ───── */
 	if (strcmp(type, "system_admin-profile") == 0) {
@@ -3028,6 +4141,10 @@ static void usage_cascade(const char *type, const char *id,
 	if (need_fw_rebuild) {
 		char rb[512];
 		rebuild_forward_chain(rb, sizeof(rb));
+		/* A cascade (renamed/deleted address or service) can change which
+		 * flows a policy matches and can re-shadow others, so re-evaluate
+		 * every live flow against the rebuilt chain. */
+		conntrack_reeval_after_policy_change(0);
 		char amsg[512];
 		snprintf(amsg, sizeof(amsg),
 			 "cascade from %.64s:%.64s: %.256s", type, id, rb);
@@ -3055,23 +4172,26 @@ int check_references(const char *type, const char *id,
 	sg_ref_entry_t refs[16];
 	int nrefs = sg_reg_find_referencing(type, refs, 16);
 
+	/* Đếm TỔNG số entry đang tham chiếu (gộp mọi field/type). */
+	int total = 0;
 	for (int i = 0; i < nrefs; i++) {
 		char *found = sg_db_find_referencing(refs[i].type,
 						     refs[i].key, id);
 		if (found) {
-			/* Extract first referencing entry for the message */
-			const char *nl = strchr(found, '\n');
-			size_t flen = nl ? (size_t)(nl - found) : strlen(found);
-			char first[128];
-			if (flen >= sizeof(first)) flen = sizeof(first) - 1;
-			memcpy(first, found, flen);
-			first[flen] = '\0';
-
-			snprintf(errbuf, errsz,
-				 "Referenced by %s (%s)", first, refs[i].key);
+			int cnt = 0;
+			for (const char *p = found; *p; p++)
+				if (*p == '\n') cnt++;
+			if (cnt == 0 && found[0])   /* không có '\n' cuối */
+				cnt = 1;
+			total += cnt;
 			free(found);
-			return -1;
 		}
+	}
+	if (total > 0) {
+		/* FortiGate-style. */
+		snprintf(errbuf, errsz,
+			 "The entry is used by other %d entries", total);
+		return -1;
 	}
 	return 0;
 }
@@ -3246,6 +4366,12 @@ sg_status_t validate_cfg_data(const char *type, const char *data,
 		}
 	}
 
+	/* Part 3: cross-field semantics (e.g. firewall_address type ipmask
+	 * needs subnet, type fqdn needs fqdn).  Full payload only — partial
+	 * CFG_APPLY data goes through validate_cfg_fields() and skips this. */
+	if (sg_check_entry_semantics(type, data, errbuf, errsz) != 0)
+		return SG_ERR_INVALID_ARG;
+
 	return SG_OK;
 }
 
@@ -3389,6 +4515,13 @@ static int handle_supervisor_test(int client_fd, const char *user,
 	     tok && nlines < 16;
 	     tok = strtok_r(NULL, "\n", &sp))
 		lines[nlines++] = tok;
+
+	if (nlines == 0) {
+		/* A newline-only payload passes the !payload[0] guard but
+		 * yields zero tokens — lines[0] would be uninitialized. */
+		send_error(client_fd, SG_ERR_MISSING_ARG, "No operation");
+		return 0;
+	}
 
 	const char *op = lines[0];
 
@@ -3702,6 +4835,7 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 	    cmd != SG_CMD_AUTH_LOGIN &&
 	    cmd != SG_CMD_AUTH_CHANGE_PW &&
 	    cmd != SG_CMD_AUTH_LOGIN_OK &&
+	    cmd != SG_CMD_DHCP_LEASE_EVENT &&   /* udhcpc runs as root, no session */
 	    strcmp(user, "__webd") != 0) {
 		if (!session_tag_validate(user, hdr->session_tag)) {
 			send_error(client_fd, SG_ERR_SESSION_EXPIRED,
@@ -3965,6 +5099,18 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			return 0;
 		}
 
+		/* Giới hạn số SSL inspection profile — mỗi profile chạy 1 ssld
+		 * riêng, nên chặn tạo quá nhiều (DoS process). Built-in
+		 * no-inspection không bị chặn (update bị immutable chặn ở trên). */
+		if (is_new_entry &&
+		    strcmp(db_type, "security_ssl-inspection-profile") == 0 &&
+		    sg_db_count(db_type) >= 8) {
+			free(existing);
+			send_error(client_fd, SG_ERR_INVALID_VAL,
+				   "Đã đạt giới hạn 8 SSL inspection profile");
+			return 0;
+		}
+
 		/* Build clean data: strip builtin=, password=, password-hash= */
 		char clean[SG_PAYLOAD_MAX];
 		size_t cpos = 0;
@@ -3982,6 +5128,7 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 				continue;
 			}
 			if (cpos + ll + 1 >= sizeof(clean)) {
+				free(existing);
 				send_error(client_fd, SG_ERR_INVALID_ARG,
 					   "Config payload too large");
 				return 0;
@@ -3992,22 +5139,13 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			dp += ll;
 			if (el) dp++;
 		}
-		/* Re-append preserved internal fields */
+		/* Re-append the builtin flag stripped above, so it survives the
+		 * write back to the DB. */
 		if (was_builtin) {
 			const char *tag = "builtin=yes\n";
 			size_t tlen = strlen(tag);
 			if (cpos + tlen >= sizeof(clean)) {
-				send_error(client_fd, SG_ERR_INVALID_ARG,
-					   "Config payload too large");
-				return 0;
-			}
-			memcpy(clean + cpos, tag, tlen);
-			cpos += tlen;
-		}
-		if (was_immutable) {
-			const char *tag = "immutable=yes\n";
-			size_t tlen = strlen(tag);
-			if (cpos + tlen >= sizeof(clean)) {
+				free(existing);
 				send_error(client_fd, SG_ERR_INVALID_ARG,
 					   "Config payload too large");
 				return 0;
@@ -4060,18 +5198,302 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			seq_auto_assign(db_type, clean, sizeof(clean));
 		}
 
+		/* Auto-assign a stable connmark id for new firewall policies so
+		 * ACCEPT rules can stamp the owning policy onto each flow (used
+		 * by the live-flow re-evaluation on policy change). */
+		if (is_new_entry && strcmp(db_type, "firewall_policy") == 0) {
+			cmkid_auto_assign(db_type, clean, sizeof(clean));
+		}
+
+		/* Auto-reorder sequences so "set sequence N" always wins.
+		 *
+		 * New entry with explicit sequence: shift all entries at
+		 * >= N up by 1 to make room (seq_auto_assign already ran
+		 * and skipped the key, so the explicit value is preserved).
+		 *
+		 * Existing entry changing sequence: rotate the affected
+		 * range so no collisions occur without inflating numbers. */
+		if (seq_type_is_orderable(db_type)) {
+			char new_seq_str[VALBUFSZ];
+			extract_val(clean, "sequence", new_seq_str,
+				    sizeof(new_seq_str));
+			if (new_seq_str[0]) {
+				int new_seq = atoi(new_seq_str);
+				if (new_seq > 0) {
+					/* Reserve sequence 1 for the immutable
+					 * default-deny catch-all so a normal policy
+					 * can't push it off the bottom of the chain
+					 * (over-block) or be shadowed by it. NOTE:
+					 * immutable entries already returned at the
+					 * immutability check (~line 4946), so only
+					 * normal policies reach here. default-deny is
+					 * seeded at sequence=1 and is immutable, so 1
+					 * is a stable floor. */
+					if (strcmp(db_type, "firewall_policy") == 0 &&
+					    new_seq <= 1) {
+						free(existing);
+						send_error(client_fd,
+							   SG_ERR_INVALID_ARG,
+							   "sequence must be >= 2 (1 is "
+							   "reserved for default-deny)");
+						return 0;
+					}
+					if (is_new_entry) {
+						seq_insert_at(db_type, new_seq,
+							      db_id);
+					} else {
+						char old_seq_str[VALBUFSZ];
+						extract_val(existing,
+							    "sequence",
+							    old_seq_str,
+							    sizeof(old_seq_str));
+						int old_seq = old_seq_str[0]
+							? atoi(old_seq_str) : 0;
+						if (old_seq > 0 &&
+						    old_seq != new_seq)
+							seq_rotate(db_type,
+								   old_seq,
+								   new_seq,
+								   db_id);
+					}
+				}
+			}
+		}
+
+		/*
+		 * Name-as-id rename (firewall_service, firewall_address):
+		 * The section key IS the object name.  If the 'name' field
+		 * in the payload differs from db_id, the user is renaming the
+		 * object.  A plain sg_db_set would update the data under the
+		 * old key while the 'name' field disagrees — policies that
+		 * reference the old name would still resolve, but the UI would
+		 * show inconsistent names.
+		 *
+		 * Instead, perform an atomic rename:
+		 *   1. Reject if the new name is already taken.
+		 *   2. Write the entry under the new key.
+		 *   3. For every referencing field (e.g. service= in policies,
+		 *      srcaddr=/dstaddr= in policies/NAT), replace the stored
+		 *      value with the new name via sg_db_set_val.
+		 *   4. Delete the old key.
+		 *   5. Trigger a chain rebuild if any firewall_policy or
+		 *      network_nat entry was patched.
+		 */
+		if (!is_new_entry &&
+		    (strcmp(db_type, "firewall_service") == 0 ||
+		     strcmp(db_type, "firewall_address") == 0)) {
+			char new_name[VALBUFSZ];
+			extract_val(clean, "name", new_name, sizeof(new_name));
+			if (new_name[0] && strcmp(new_name, db_id) != 0) {
+				char *conflict = sg_db_get(db_type, new_name);
+				if (conflict) {
+					free(conflict);
+					free(existing);
+					send_error(client_fd, SG_ERR_INVALID_VAL,
+						   "Name already in use");
+					return 0;
+				}
+
+				/* Rename in one transaction: write the new key,
+				 * cascade the new name into every referencing
+				 * field, delete the old key — all commit together
+				 * or all roll back, so the entry never exists under
+				 * both names. sg_db_set/_set_val join this
+				 * transaction (they own BEGIN/COMMIT only at top
+				 * level). */
+				if (sg_db_begin() != 0) {
+					free(existing);
+					send_error(client_fd, SG_ERR_IO_FAIL,
+						   "Rename failed");
+					return 0;
+				}
+				if (sg_db_set(db_type, new_name, clean) != 0) {
+					sg_db_rollback();
+					free(existing);
+					send_error(client_fd, SG_ERR_IO_FAIL,
+						   "Rename failed");
+					return 0;
+				}
+
+				/* Patch every referencing entry */
+				sg_ref_entry_t refs[16];
+				int nrefs = sg_reg_find_referencing(db_type,
+								    refs, 16);
+				int need_fw_rebuild  = 0;
+				int need_nat_rebuild = 0;
+				int cascade_ok = 1;
+				/* Buffer cascade audit lines and emit them only
+				 * AFTER commit succeeds — audit_log writes to a
+				 * flat file outside the transaction, so logging
+				 * inside the loop would record "updated" for refs
+				 * that a later rollback discards. */
+				char **caud = NULL;
+				int n_caud = 0, cap_caud = 0;
+				for (int i = 0; i < nrefs && cascade_ok; i++) {
+					char *found = sg_db_find_referencing(
+						refs[i].type, refs[i].key,
+						db_id);
+					if (!found)
+						continue;
+					char *sp = NULL;
+					for (char *e = strtok_r(found, "\n",
+								&sp);
+					     e;
+					     e = strtok_r(NULL, "\n", &sp)) {
+						char et[256], eid[256];
+						sg_db_parse_section(
+							e, et, sizeof(et),
+							eid, sizeof(eid));
+						/* A failed cascade write must
+						 * abort the whole rename — else
+						 * COMMIT would persist a partial
+						 * (dangling/duplicate) rename. */
+						if (sg_db_set_val(et, eid,
+							      refs[i].key,
+							      new_name) != 0) {
+							cascade_ok = 0;
+							break;
+						}
+						if (strcmp(et, "firewall_policy")
+						    == 0)
+							need_fw_rebuild = 1;
+						if (strcmp(et, "network_nat")
+						    == 0)
+							need_nat_rebuild = 1;
+						char amsg[512];
+						snprintf(amsg, sizeof(amsg),
+							 "OK %.32s:%.32s "
+							 "(rename cascade "
+							 "%.32s:%.32s->%.32s)"
+							 ": %.32s updated",
+							 et, eid, db_type,
+							 db_id, new_name,
+							 refs[i].key);
+						/* Defer: buffer now, log post-commit. */
+						if (n_caud == cap_caud) {
+							int ncap = cap_caud ? cap_caud * 2 : 8;
+							char **nb = realloc(caud,
+								(size_t)ncap * sizeof(*caud));
+							if (nb) { caud = nb; cap_caud = ncap; }
+						}
+						if (n_caud < cap_caud) {
+							char *dup = strdup(amsg);
+							if (dup) caud[n_caud++] = dup;
+						}
+					}
+					free(found);
+				}
+
+				/* Delete the old key and commit — but only if
+				 * the cascade fully succeeded; otherwise roll the
+				 * entire rename back (atomicity contract). */
+				if (!cascade_ok ||
+				    sg_db_del(db_type, db_id) != 0 ||
+				    sg_db_commit() != 0) {
+					sg_db_rollback();
+					for (int a = 0; a < n_caud; a++)
+						free(caud[a]);
+					free(caud);
+					free(existing);
+					send_error(client_fd, SG_ERR_IO_FAIL,
+						   "Rename failed");
+					return 0;
+				}
+
+				/* Commit succeeded — now the cascade audit lines
+				 * reflect persisted state, so emit them. */
+				for (int a = 0; a < n_caud; a++) {
+					audit_log("__cascade", "200", caud[a]);
+					free(caud[a]);
+				}
+				free(caud);
+
+				if (need_fw_rebuild) {
+					char rb[512];
+					rebuild_forward_chain(rb, sizeof(rb));
+					conntrack_reeval_after_policy_change(0);
+				}
+				if (need_nat_rebuild) {
+					char rb[512];
+					rebuild_nat_chains(rb, sizeof(rb));
+				}
+
+				/* fqdn object renamed → its set name changed
+				 * with it.  The rebuild above already emits
+				 * rules for the new set; drop the old one and
+				 * kick a resolve so the new set fills fast. */
+				if (strcmp(db_type, "firewall_address") == 0) {
+					char at[VALBUFSZ];
+					extract_val(clean, "type", at,
+						    sizeof(at));
+					if (strcmp(at, "fqdn") == 0) {
+						fqdn_object_removed(db_id);
+						fqdn_refresh_kick();
+					}
+				}
+
+				free(existing);
+				send_ok(client_fd, "Config saved", NULL);
+				return 0;
+			}
+		}
+
+		/* security_ips-filter: persist rồi biên dịch lại ruleset IPS
+		 * (không đụng FORWARD chain — filter chỉ đổi nội dung ruleset).
+		 * Validate generic theo registry. */
+		if (strcmp(db_type, "security_ips-filter") == 0) {
+			char vr[512];
+			sg_status_t vrc = validate_cfg_data(db_type, clean,
+							    vr, sizeof(vr));
+			if (vrc != SG_OK) {
+				free(existing);
+				send_error(client_fd, vrc, vr);
+				return 0;
+			}
+			if (sg_db_set(db_type, db_id, clean) != 0) {
+				free(existing);
+				send_error(client_fd, SG_ERR_IO_FAIL,
+					   "Failed to write config");
+				return 0;
+			}
+			char ir[256];
+			rebuild_ips_active(ir, sizeof(ir));
+			free(existing);
+			send_ok(client_fd, "Config saved", NULL);
+			return 0;
+		}
+
 		/* Firewall/NAT types: persist first, then atomic rebuild.
 		 * The rebuild reads ALL entries from DB, so the new data
 		 * must be in the DB before we can generate the chain.
 		 * If rebuild fails, we rollback the DB change. */
 		if (strcmp(db_type, "firewall_policy") == 0 ||
-		    strcmp(db_type, "network_nat") == 0) {
+		    strcmp(db_type, "network_nat") == 0 ||
+		    strcmp(db_type, "security_ssl-inspection-profile") == 0 ||
+		    strcmp(db_type, "security_ips") == 0 ||
+		    strcmp(db_type, "security_ips-profile") == 0 ||
+		    strcmp(db_type, "security_ips-filter") == 0) {
 			/* Validate fields without touching the kernel */
 			char val_result[512];
 			sg_status_t val_rc;
 			if (strcmp(db_type, "firewall_policy") == 0)
 				val_rc = validate_firewall_policy(
 					db_id, clean,
+					val_result, sizeof(val_result));
+			else if (strcmp(db_type, "security_ssl-inspection-profile") == 0)
+				/* generic field validation (CFG_TABLE) */
+				val_rc = validate_cfg_data(
+					db_type, clean,
+					val_result, sizeof(val_result));
+			else if (strcmp(db_type, "security_ips") == 0)
+				val_rc = validate_ips(
+					db_id, clean,
+					val_result, sizeof(val_result));
+			else if (strcmp(db_type, "security_ips-profile") == 0 ||
+				 strcmp(db_type, "security_ips-filter") == 0)
+				/* generic field validation (CFG_TABLE) */
+				val_rc = validate_cfg_data(
+					db_type, clean,
 					val_result, sizeof(val_result));
 			else
 				val_rc = validate_nat(
@@ -4093,13 +5515,31 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 				return 0;
 			}
 
-			/* Atomic rebuild from DB */
+			/* Atomic rebuild from DB. SSL-inspection steering lives in
+			 * the *nat table (emit_ssl_steering inside rebuild_nat_chains),
+			 * so it rebuilds the NAT chains like network_nat does. */
 			char rb_result[512];
 			sg_status_t rb_rc;
-			if (strcmp(db_type, "firewall_policy") == 0)
+			if (strcmp(db_type, "firewall_policy") == 0 ||
+			    strcmp(db_type, "security_ips") == 0 ||
+			    strcmp(db_type, "security_ips-profile") == 0 ||
+			    strcmp(db_type, "security_ips-filter") == 0) {
 				rb_rc = rebuild_forward_chain(
 					rb_result, sizeof(rb_result));
-			else
+				/* A firewall policy's ssl-profile binding drives
+				 * the SSL-inspection steering (REDIRECT in *nat
+				 * PREROUTING) and the ssld lifecycle — both live
+				 * in rebuild_nat_chains (emit_ssl_steering +
+				 * ssld_sync). The FORWARD rebuild above never
+				 * touches them, so binding/unbinding an
+				 * ssl-profile on a policy would otherwise leave
+				 * steering + ssld stale (HTTPS not inspected, or
+				 * a dangling REDIRECT). Rebuild NAT too. */
+				if (rb_rc == SG_OK &&
+				    strcmp(db_type, "firewall_policy") == 0)
+					rb_rc = rebuild_nat_chains(
+						rb_result, sizeof(rb_result));
+			} else
 				rb_rc = rebuild_nat_chains(
 					rb_result, sizeof(rb_result));
 			if (rb_rc != SG_OK) {
@@ -4112,8 +5552,40 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 				send_error(client_fd, rb_rc, rb_result);
 				return 0;
 			}
+
+			/* IPS (Phase B): đổi profile/policy/ips → biên dịch lại
+			 * active.rules theo categories đang dùng + hot-reload ipsd.
+			 * Không fail-toàn-bộ nếu compile lỗi (chain đã apply OK);
+			 * chỉ log. */
+			if (strcmp(db_type, "security_ips") == 0 ||
+			    strcmp(db_type, "security_ips-profile") == 0 ||
+			    strcmp(db_type, "security_ips-filter") == 0 ||
+			    strcmp(db_type, "firewall_policy") == 0) {
+				char ips_r[256];
+				rebuild_ips_active(ips_r, sizeof(ips_r));
+			}
+			/* Re-evaluate live flows against the rebuilt chain so a
+			 * policy change applies to already-open connections.
+			 * Decide the scope while we still hold both the old
+			 * (existing) and new (clean) entry:
+			 *  - a NEW policy can shadow flows that matched other
+			 *    policies → dirty ALL (0);
+			 *  - an in-place edit that only changes this policy's
+			 *    action (no selector/order/enable change) affects
+			 *    only its own flows → dirty just cmkid(P);
+			 *  - anything policy_reeval_scope is unsure about → 0.
+			 * NAT rebuilds don't affect FORWARD verdicts. */
+			unsigned reeval_cmkid = 0;   /* 0 = dirty all */
+			if (strcmp(db_type, "firewall_policy") == 0 &&
+			    !is_new_entry)
+				reeval_cmkid =
+					policy_reeval_scope(existing, clean);
+
 			free(existing);
 			existing = NULL;
+
+			if (strcmp(db_type, "firewall_policy") == 0)
+				conntrack_reeval_after_policy_change(reeval_cmkid);
 
 			send_ok(client_fd, "Config saved", NULL);
 			return 0;
@@ -4209,6 +5681,15 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 				free(admins);
 			}
 		}
+
+		/* A static route change can move a live flow's egress interface.
+		 * Interface-matched policies are not re-checked on the fast
+		 * path, so a flow that should now be denied on the new egress
+		 * would keep being accepted. Routing can't be narrowed by
+		 * cmkid, so dirty all flows to force re-evaluation against the
+		 * new routing on their next packet. */
+		if (strcmp(db_type, "network_route_static") == 0)
+			conntrack_reeval_after_policy_change(0);
 
 		if (cascade_warn[0]) {
 			char msg[768];
@@ -4351,9 +5832,39 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			/* Stop udhcpd daemon, remove firewall rule and
 			 * runtime files for this DHCP pool. */
 			unapply_dhcp(db_id);
+		} else if (strcmp(db_type, "firewall_address") == 0) {
+			/* fqdn-type objects own an ipset — destroy it so it
+			 * doesn't leak.  The reference check above guarantees
+			 * no FORWARD rule still matches the set. */
+			char *adata = sg_db_get(db_type, db_id);
+			if (adata) {
+				char at[VALBUFSZ];
+				extract_val(adata, "type", at, sizeof(at));
+				if (strcmp(at, "fqdn") == 0)
+					fqdn_object_removed(db_id);
+				free(adata);
+			}
 		}
 		/* Firewall/NAT: no per-rule unapply needed — atomic
 		 * rebuild after DB delete handles everything. */
+
+		/* Capture the policy's cmkid before deletion so we can dirty
+		 * only its own live flows. Deleting P changes the verdict of
+		 * exactly the flows P was permitting — those carry cmkid(P).
+		 * Flows that matched other policies still match them at the
+		 * same position, so their verdict is unchanged. (A DENY/DROP
+		 * policy stamps nothing and has no live flows, so its cmkid
+		 * dirties nothing — which is correct.) */
+		unsigned del_cmkid = 0;
+		if (strcmp(db_type, "firewall_policy") == 0) {
+			char *pdata = sg_db_get(db_type, db_id);
+			if (pdata) {
+				char cmk[VALBUFSZ];
+				extract_val(pdata, "cmkid", cmk, sizeof(cmk));
+				del_cmkid = (unsigned)atoi(cmk);
+				free(pdata);
+			}
+		}
 
 		if (sg_db_del(db_type, db_id) != 0) {
 			send_error(client_fd, SG_ERR_IO_FAIL, "Failed to delete section");
@@ -4364,9 +5875,30 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		if (strcmp(db_type, "firewall_policy") == 0) {
 			char rb[512];
 			rebuild_forward_chain(rb, sizeof(rb));
-		} else if (strcmp(db_type, "network_nat") == 0) {
+			/* The deleted policy may have bound an ssl-profile, whose
+			 * steering REDIRECT lives in *nat PREROUTING. Rebuild NAT
+			 * so that dangling steering is dropped + ssld re-synced;
+			 * the FORWARD rebuild above does not touch it. */
+			rebuild_nat_chains(rb, sizeof(rb));
+			/* Only the deleted policy's own flows can change verdict
+			 * (cmkid 0 here → dirty all, also safe). */
+			conntrack_reeval_after_policy_change(del_cmkid);
+			char ir[256]; rebuild_ips_active(ir, sizeof(ir));
+		} else if (strcmp(db_type, "security_ips-filter") == 0 ||
+			   strcmp(db_type, "security_ips-profile") == 0) {
+			/* Xóa filter/profile → biên dịch lại ruleset IPS */
+			char ir[256]; rebuild_ips_active(ir, sizeof(ir));
+		} else if (strcmp(db_type, "network_nat") == 0 ||
+			   strcmp(db_type, "security_ssl-inspection-profile") == 0) {
+			/* Xóa SSL profile → rebuild nat (gỡ steering policy trỏ
+			 * profile đã mất) + ssld_sync (dừng ssld của profile đó). */
 			char rb[512];
 			rebuild_nat_chains(rb, sizeof(rb));
+		} else if (strcmp(db_type, "network_route_static") == 0) {
+			/* Removing a route can move a live flow's egress
+			 * interface; dirty all flows so interface-matched
+			 * policies are re-checked against the new routing. */
+			conntrack_reeval_after_policy_change(0);
 		}
 
 		send_ok(client_fd, "Deleted", NULL);
@@ -4431,7 +5963,43 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			return 0;
 		}
 
+		/* Immutable entries (built-in default-deny) cannot be modified.
+		 * CFG_SET already rejects this, but the CLI applies BEFORE it
+		 * saves — without the same guard here the change hits the live
+		 * ruleset and only fails at the save step ("applied but failed
+		 * to save"). Reject up front. Boot replay calls apply_config()
+		 * directly and never reaches this dispatch, so the built-in
+		 * default-deny still applies at startup. */
+		{
+			char *cur = sg_db_get(type_str, id_str);
+			if (cur) {
+				int imm = is_immutable(cur);
+				free(cur);
+				if (imm) {
+					send_error(client_fd, SG_ERR_BUILTIN,
+						   "Immutable object cannot be modified");
+					return 0;
+				}
+			}
+		}
+
 		const char *data = nl2 + 1;
+
+		/* Mirror the CFG_SET/CFG_INSERT sequence floor here so the apply
+		 * is rejected up front. Otherwise CFG_APPLY "succeeds" and only
+		 * the later CFG_SET save fails, surfacing as the confusing
+		 * "Applied but save failed". Immutable entries already returned
+		 * above, so this only gates normal policies. */
+		if (strcmp(type_str, "firewall_policy") == 0) {
+			char seqv[VALBUFSZ];
+			extract_val(data, "sequence", seqv, sizeof(seqv));
+			if (seqv[0] && atoi(seqv) <= 1) {
+				send_error(client_fd, SG_ERR_INVALID_ARG,
+					   "sequence must be >= 2 (1 is reserved "
+					   "for default-deny)");
+				return 0;
+			}
+		}
 
 		/* Validate field formats AND required-key completeness.
 		 * CFG_APPLY always receives full payloads — CLI loads
@@ -4571,16 +6139,27 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			return 0;
 		}
 
-		/* Builtin policies cannot be reordered */
+		/* The built-in default-deny is immutable (not "builtin"), so reject
+		 * moving it; and a normal policy must not move to/below the
+		 * catch-all's slot (would collide at seq 1 and shadow everything).
+		 * Mirrors the CFG_SET sequence guard so the GUI's /move
+		 * (CFG_INSERT) path can't bypass it. */
 		{
 			char bi[VALBUFSZ];
 			extract_val(entry_data, "builtin", bi, sizeof(bi));
-			if (strcmp(bi, "yes") == 0) {
+			if (strcmp(bi, "yes") == 0 || is_immutable(entry_data)) {
 				free(entry_data);
 				send_error(client_fd, SG_ERR_BUILTIN,
-					   "Builtin policy cannot be moved");
+					   "Immutable/builtin policy cannot be moved");
 				return 0;
 			}
+		}
+		if (strcmp(db_type, "firewall_policy") == 0 && new_seq <= 1) {
+			free(entry_data);
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "sequence must be >= 2 (1 is reserved for "
+				   "default-deny)");
+			return 0;
 		}
 
 		/* Read old sequence */
@@ -4610,9 +6189,12 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 
 		/* Step 3: Atomic rebuild from DB */
 		char result[512];
-		if (strcmp(db_type, "firewall_policy") == 0)
+		if (strcmp(db_type, "firewall_policy") == 0) {
 			rebuild_forward_chain(result, sizeof(result));
-		else
+			/* Reordering changes priority and thus shadowing —
+			 * re-evaluate all live flows. */
+			conntrack_reeval_after_policy_change(0);
+		} else
 			rebuild_nat_chains(result, sizeof(result));
 
 		send_ok(client_fd, result, NULL);
@@ -4676,10 +6258,8 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		}
 		send_ok(client_fd, "Shutting down...", NULL);
 		(void)audit_log(user, "system_poweroff", "");
-		/* Close DB so /etc/stargazer can be cleanly unmounted */
 		sg_db_close();
-		/* Give time for response to be sent */
-		usleep(100000);
+		sync();
 		{
 			const char *argv[] = {"/sbin/poweroff", NULL};
 			free(safe_exec(argv));
@@ -4695,9 +6275,8 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		}
 		send_ok(client_fd, "Rebooting...", NULL);
 		(void)audit_log(user, "system_reboot", "");
-		/* Close DB so /etc/stargazer can be cleanly unmounted */
 		sg_db_close();
-		usleep(100000);
+		sync();
 		{
 			const char *argv[] = {"/sbin/reboot", NULL};
 			free(safe_exec(argv));
@@ -4717,6 +6296,86 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		return handle_upgrade_progress(client_fd, user, payload, hdr);
 	case SG_CMD_UPGRADE_CANCEL:
 		return handle_upgrade_cancel(client_fd, user, payload, hdr);
+	case SG_CMD_UPGRADE_FROM_FILE:
+		return handle_upgrade_from_file(client_fd, user, payload, hdr);
+
+	case SG_CMD_DHCP_LEASE_EVENT:
+		return handle_dhcp_lease_event(client_fd, user, payload, hdr);
+
+	case SG_CMD_IPS_REBUILD: {
+		/* Internal trigger (ips-update.sh sau khi cập nhật repo): biên
+		 * dịch lại active.rules theo profiles + hot-reload ipsd. Chỉ đọc
+		 * config DB sẵn có, fail-closed verify — không nhận dữ liệu ngoài. */
+		(void)user;
+		char rb[256];
+		rebuild_ips_active(rb, sizeof(rb));
+		send_ok(client_fd, NULL, rb);  /* rb vào payload → CLI/Web in được lý do */
+		return 0;
+	}
+
+	case SG_CMD_IPS_UPDATE_NOW: {
+		(void)user;
+		/*
+		 * Downloads can take a while.  Double-fork so the mgmtd MAIN loop
+		 * stays responsive (it keeps serving other IPC while the inner
+		 * child downloads).  KHÁC bản cũ: inner child GIỮ client_fd và
+		 * GỬI ĐÚNG kết quả (thành công/lỗi + lý do) về cho webd → UI hiện
+		 * toast thật, thay vì "Update started in background" rồi vứt kết
+		 * quả (khiến lỗi tải/syntax bị ẩn, người dùng không biết vì sao
+		 * custom rule không xuất hiện).
+		 *
+		 * Inner child reparent về init (không zombie); parent reap wrapper
+		 * và trả "owned"=1 để main loop không đụng client_fd (inner sở hữu).
+		 * Inner mở SQLite handle riêng — không share sqlite3* qua fork.
+		 */
+		char ids_copy[512] = "";
+		if (payload && payload[0])
+			snprintf(ids_copy, sizeof(ids_copy), "%s", payload);
+
+		pid_t mid = fork();
+		if (mid < 0) {
+			send_error(client_fd, SG_ERR_SYSTEM_FAIL, "fork failed");
+			return 0;
+		}
+		if (mid == 0) {
+			/* Wrapper — KHÔNG đóng client_fd (để inner thừa kế + trả lời) */
+			if (g_listen_fd >= 0) close(g_listen_fd);
+			pid_t inner = fork();
+			if (inner == 0) {
+				/* Inner child — reparented to init, sở hữu client_fd */
+				sg_db_close();
+				if (sg_db_open(SG_DB_PATH) != 0) {
+					send_error(client_fd, SG_ERR_SYSTEM_FAIL,
+						   "DB open failed");
+					_exit(1);
+				}
+				char rb[4096];
+				sg_status_t st = run_ips_update_now(
+					ids_copy[0] ? ids_copy : NULL,
+					rb, sizeof(rb));
+				if (st == SG_OK)
+					send_ok(client_fd, NULL, rb);
+				else
+					send_error(client_fd, st, rb);
+				sg_db_close();
+				close(client_fd);
+				_exit(0);
+			}
+			close(client_fd);   /* wrapper bỏ bản sao; chỉ inner giữ kênh */
+			_exit(0);           /* wrapper exits → inner reparented to init */
+		}
+		waitpid(mid, NULL, 0);  /* reap wrapper (<1ms) */
+		close(client_fd);       /* parent bỏ bản sao; inner sở hữu fd */
+		return 1;               /* owned → main loop KHÔNG đóng client_fd */
+	}
+
+	case SG_CMD_IPS_RULESETS_RELOAD: {
+		(void)user;
+		char rb[4096];
+		ips_rulesets_reload_custom(rb, sizeof(rb));
+		send_ok(client_fd, NULL, rb);   /* rb → payload so webd emits {"output":"..."} */
+		return 0;
+	}
 
 	case SG_CMD_SHOW_STATUS: {
 		char status_buf[512];
@@ -4846,6 +6505,163 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		return 0;
 	}
 
+	case SG_CMD_COMMIT: {
+		/* Snapshot the current config as a named revision. */
+		const char *perms = get_user_permissions(user);
+		if (!has_permission(perms, "configure") &&
+		    !has_permission(perms, "admin")) {
+			send_error(client_fd, SG_ERR_PERM_DENIED,
+				   "Requires 'configure' permission");
+			return 0;
+		}
+		char msg[256] = "";
+		if (payload && payload[0])
+			snprintf(msg, sizeof(msg), "%s", payload);
+		int rev = sg_db_revision_create(user, msg);
+		if (rev < 0) {
+			send_error(client_fd, SG_ERR_IO_FAIL,
+				   "Failed to record revision");
+			return 0;
+		}
+		sg_db_revision_prune(50);	/* bound history after the commit */
+		char out[64];
+		snprintf(out, sizeof(out), "Saved revision %d\n", rev);
+		mgmt_log("INFO", "config commit: rev %d by %s", rev, user);
+		send_ok(client_fd, NULL, out);
+		return 0;
+	}
+
+	case SG_CMD_REVISIONS: {
+		const char *perms = get_user_permissions(user);
+		if (!has_permission(perms, "monitor")) {
+			send_error(client_fd, SG_ERR_PERM_DENIED,
+				   "Requires 'monitor' permission");
+			return 0;
+		}
+		char *list = sg_db_revision_list();
+		if (!list) {
+			send_ok(client_fd, "empty", "  No revisions.\n");
+			return 0;
+		}
+		if (!list[0]) {
+			free(list);
+			send_ok(client_fd, "empty", "  No revisions.\n");
+			return 0;
+		}
+		send_ok(client_fd, NULL, list);
+		free(list);
+		return 0;
+	}
+
+	case SG_CMD_ROLLBACK: {
+		/* Restore the config to a revision and re-apply it to the
+		 * kernel. The current config is snapshotted first so the
+		 * rollback is itself reversible. */
+		const char *perms = get_user_permissions(user);
+		/* Requires 'admin': a rollback restores the WHOLE config table,
+		 * including admin-gated types (system_admin, admin-profile,
+		 * password-policy) that CFG_SET/CFG_DEL require 'admin' to
+		 * change. Gating at 'configure' would let a configure-only user
+		 * reinstate old admins / weaken policy via rollback. */
+		if (!has_permission(perms, "admin")) {
+			send_error(client_fd, SG_ERR_PERM_DENIED,
+				   "Requires 'admin' permission "
+				   "(rollback can restore admin accounts/policy)");
+			return 0;
+		}
+		if (!payload || !payload[0]) {
+			send_error(client_fd, SG_ERR_MISSING_ARG,
+				   "Usage: configure rollback <revision>");
+			return 0;
+		}
+		char *endp = NULL;
+		long rev = strtol(payload, &endp, 10);
+		while (endp && (*endp == ' ' || *endp == '\t' ||
+				*endp == '\n' || *endp == '\r'))
+			endp++;
+		if (endp == payload || *endp != '\0' ||
+		    rev <= 0 || rev > 0x7fffffff) {
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "Invalid revision number");
+			return 0;
+		}
+		if (!sg_db_revision_exists((int)rev)) {
+			send_error(client_fd, SG_ERR_NOT_FOUND,
+				   "Revision not found");
+			return 0;
+		}
+		/* Reversible: snapshot current state before overwriting it. */
+		char snapmsg[96];
+		snprintf(snapmsg, sizeof(snapmsg),
+			 "pre-rollback snapshot (before rollback to rev %ld)",
+			 rev);
+		int snap = sg_db_revision_create(user, snapmsg);
+		if (snap < 0) {
+			send_error(client_fd, SG_ERR_IO_FAIL,
+				   "Failed to snapshot current config; rollback aborted");
+			return 0;
+		}
+		/* Capture the entries that exist BEFORE the restore for the
+		 * types whose runtime state replay cannot tear down (it only
+		 * re-applies surviving entries). After the restore we reconcile
+		 * the ones the rollback removed. */
+		char *old_dhcp   = sg_db_list("network_dhcp-server");
+		char *old_admins = sg_db_list("system_admin");
+		char *old_fqdn   = collect_fqdn_address_ids();
+
+		/* Restore the config table (atomic). */
+		if (sg_db_revision_restore((int)rev) != 0) {
+			free(old_dhcp);
+			free(old_admins);
+			free(old_fqdn);
+			send_error(client_fd, SG_ERR_IO_FAIL,
+				   "Failed to restore revision; config unchanged");
+			return 0;
+		}
+
+		/* Tear down runtime state of entries the rollback removed
+		 * (stop orphaned dhcpd pools; delete OS accounts for admins no
+		 * longer in config + purge every pre-rollback admin's sessions
+		 * so changed/removed privileges force re-auth; destroy ipsets of
+		 * removed fqdn address objects). Replay only re-applies survivors;
+		 * firewall/NAT/routes are fully flush-rebuilt from the DB by it. */
+		rollback_reconcile_dhcp(old_dhcp);
+		rollback_reconcile_admins(old_admins);
+		rollback_reconcile_fqdn(old_fqdn);
+		free(old_dhcp);
+		free(old_admins);
+		free(old_fqdn);
+
+		/* Reconcile the kernel to the restored DB: this flushes and
+		 * rebuilds firewall/NAT/routes and re-applies every surviving
+		 * type, exactly as boot replay does. */
+		int replay_fails = mgmtd_replay_config();
+		/* Re-evaluate live flows against the rolled-back policy. */
+		conntrack_reeval_after_policy_change(0);
+		/* Prune the revision history after the restore has consumed the
+		 * target revision (so pruning cannot remove a revision still in
+		 * use by this rollback). */
+		sg_db_revision_prune(50);
+		mgmt_log("INFO", "config rollback to rev %ld by %s "
+			 "(current saved as rev %d, %d apply failure(s))",
+			 rev, user, snap, replay_fails);
+		char out[160];
+		if (replay_fails > 0)
+			/* DB is restored correctly, but some components did not
+			 * re-apply to the kernel — do not report clean success. */
+			snprintf(out, sizeof(out),
+				 "Rolled back to revision %ld (current saved as rev %d) "
+				 "with %d component(s) failing to apply — see log; "
+				 "a reboot fully reconciles\n",
+				 rev, snap, replay_fails);
+		else
+			snprintf(out, sizeof(out),
+				 "Rolled back to revision %ld (current saved as rev %d)\n",
+				 rev, snap);
+		send_ok(client_fd, NULL, out);
+		return 0;
+	}
+
 	case SG_CMD_WHOAMI: {
 		/* Return caller's profile and permissions from database */
 		char *udata = sg_db_get("system_admin", user);
@@ -4921,14 +6737,15 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			return 0;
 		}
 		const char *argv[] = {
-			"iptables", "-L", "INPUT", "-n", "-v", NULL
+			"iptables", "-L", "FORWARD", "-n", "-v",
+			"--line-numbers", NULL
 		};
 		char *out = safe_exec(argv);
 		if (out && out[0])
 			send_ok(client_fd, NULL, out);
 		else
 			send_ok(client_fd, "empty",
-				"  No INPUT chain rules found.\n"
+				"  No FORWARD chain rules found.\n"
 				"  (is iptables available?)\n");
 		free(out);
 		return 0;
@@ -4979,6 +6796,94 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		fclose(fp);
 		send_ok(client_fd, NULL, buf);
 		free(buf);
+		return 0;
+	}
+
+	case SG_CMD_DIAG_FW_IPSET: {
+		const char *perms = get_user_permissions(user);
+		if (!has_permission(perms, "monitor")) {
+			mgmt_log("WARN", "user '%s' denied FW_IPSET (no monitor perm)", user);
+			send_error(client_fd, SG_ERR_PERM_DENIED,
+				   "Requires 'monitor' permission");
+			return 0;
+		}
+
+		char name[VALBUFSZ] = "";
+		if (payload && payload[0])
+			extract_val(payload, "name", name, sizeof(name));
+		if (!name[0]) {
+			send_error(client_fd, SG_ERR_MISSING_ARG,
+				   "Usage: diagnose firewall ipset <address-object>");
+			return 0;
+		}
+
+		/* The object must exist and be fqdn-type — only those own
+		 * an ipset.  This also turns a typo into a clear error
+		 * instead of a misleading "set not found". */
+		char *data = sg_db_get("firewall_address", name);
+		if (!data) {
+			send_error(client_fd, SG_ERR_ENTRY_NOT_FOUND,
+				   "No such firewall address object");
+			return 0;
+		}
+		char atype[VALBUFSZ], fqdn[SG_NET_TARGET_MAX + 1];
+		extract_val(data, "type", atype, sizeof(atype));
+		extract_val(data, "fqdn", fqdn, sizeof(fqdn));
+		free(data);
+		if (strcmp(atype, "fqdn") != 0) {
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "Not an fqdn-type object — only fqdn "
+				   "objects own an ipset");
+			return 0;
+		}
+
+		char set[64];
+		sg_fqdn_set_name(name, set, sizeof(set));
+
+		size_t msz = 32768;
+		char *members = malloc(msz);
+		char *out = malloc(msz + 512);
+		if (!members || !out) {
+			free(members);
+			free(out);
+			send_error(client_fd, SG_ERR_INTERNAL, "Out of memory");
+			return 0;
+		}
+
+		int n = sg_ipset_list(set, members, msz);
+		if (n == -ENOENT) {
+			snprintf(out, msz + 512,
+				 "  Object : %s\n"
+				 "  FQDN   : %s\n"
+				 "  ipset  : %s\n\n"
+				 "  Set does not exist in the kernel — no "
+				 "FORWARD rule references this object yet\n"
+				 "  (rules are built on policy apply).\n",
+				 name, fqdn, set);
+			send_ok(client_fd, NULL, out);
+		} else if (n < 0) {
+			char err[160];
+			snprintf(err, sizeof(err),
+				 "ipset list failed: %s (%d)",
+				 n > -4096 ? strerror(-n) : "ipset error", -n);
+			mgmt_log("ERROR", "FW_IPSET %s: %s", set, err);
+			send_error(client_fd, SG_ERR_INTERNAL, err);
+		} else {
+			snprintf(out, msz + 512,
+				 "  Object : %s\n"
+				 "  FQDN   : %s\n"
+				 "  ipset  : %s\n"
+				 "  TTL    : %us (system settings fqdn-ttl)\n"
+				 "  Members: %d%s\n\n%s",
+				 name, fqdn, set, sg_ipset_entry_timeout(), n,
+				 n == 0 ? "  (empty set matches NOTHING — "
+					  "resolver worker has not populated "
+					  "it; check mgmtd log)" : "",
+				 members);
+			send_ok(client_fd, NULL, out);
+		}
+		free(members);
+		free(out);
 		return 0;
 	}
 
@@ -5036,6 +6941,12 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 	case SG_CMD_NET_ARPING:
 		return handle_net_arping(client_fd, user, payload, hdr);
 
+	/* ── Arbitrary system binary (fnsysctl-style, admin-only) ────── */
+	case SG_CMD_SYS_EXEC:
+		return handle_sys_exec(client_fd, user, payload, hdr);
+	case SG_CMD_SYS_LIST:
+		return handle_sys_list(client_fd, user, payload, hdr);
+
 	/* ── System diagnostics (handlers in mgmtd_diag.c) ───────────── */
 	case SG_CMD_DIAG_CPU:
 		return handle_diag_cpu(client_fd, user, payload, hdr);
@@ -5043,6 +6954,34 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		return handle_diag_ram(client_fd, user, payload, hdr);
 	case SG_CMD_DIAG_DISK:
 		return handle_diag_disk(client_fd, user, payload, hdr);
+
+	case SG_CMD_SSL_CACERT:
+		return handle_ssl_cacert(client_fd, user, payload, hdr);
+
+	case SG_CMD_SSL_DIAG:
+		return handle_ssl_diag(client_fd, user, payload, hdr);
+
+	case SG_CMD_IPS_STATUS:
+		return handle_ips_status(client_fd, user, payload, hdr);
+
+	case SG_CMD_IPS_ALERTS:
+		return handle_ips_alerts(client_fd, user, payload, hdr);
+
+	case SG_CMD_IPS_ALERTS_CLEAR:
+		return handle_ips_alerts_clear(client_fd, user, payload, hdr);
+
+	case SG_CMD_IPS_SCORES:
+		return handle_ips_scores(client_fd, user, payload, hdr);
+
+	case SG_CMD_IPS_SIGNATURES:
+		return handle_ips_signatures(client_fd, user, payload, hdr);
+
+	case SG_CMD_IPS_ALERTS_JSON:
+		return handle_ips_alerts_json(client_fd, user, payload, hdr);
+
+	case SG_CMD_IPS_UPDATE_LOG:
+		return handle_ips_update_log(client_fd, user, payload, hdr);
+
 	case SG_CMD_DIAG_IFACE_STATS:
 		return handle_diag_iface_stats(client_fd, user, payload, hdr);
 	case SG_CMD_DIAG_PROCTOP:
@@ -5062,6 +7001,12 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		return handle_diag_ntp(client_fd, user, payload, hdr);
 	case SG_CMD_DIAG_BUSYBOX_LIST:
 		return handle_diag_busybox_list(client_fd, user, payload, hdr);
+	case SG_CMD_SESSION_CLEAR:
+		return handle_session_clear(client_fd, user, payload, hdr);
+	case SG_CMD_SESSION_STATS:
+		return handle_session_stats(client_fd, user, payload, hdr);
+	case SG_CMD_SESSION_ML:
+		return handle_session_ml(client_fd, user, payload, hdr);
 	case SG_CMD_SHOW_SESSIONS:
 		return handle_show_sessions(client_fd, user, payload, hdr);
 	case SG_CMD_SHOW_BOOT_CONFIG:
@@ -5088,6 +7033,14 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		return handle_log_mgmtd(client_fd, user, payload, hdr);
 	case SG_CMD_LOG_CLEAR_AUDIT:
 		return handle_log_clear_audit(client_fd, user, payload, hdr);
+	case SG_CMD_DIAG_STARGAZER_LOG:
+		return handle_diag_stargazer_log(client_fd, user, payload, hdr);
+	case SG_CMD_DIAG_STORAGE:
+		return handle_diag_storage(client_fd, user, payload, hdr);
+	case SG_CMD_DIAG_DHCP_CLIENT:
+		return handle_diag_dhcp_client(client_fd, user, payload, hdr);
+	case SG_CMD_DIAG_DHCP_LEASES:
+		return handle_diag_dhcp_leases(client_fd, user, payload, hdr);
 
 	case SG_CMD_PING:
 		send_ok(client_fd, "pong", NULL);
@@ -5151,6 +7104,29 @@ static int handle_request(int client_fd, sg_request_hdr_t *hdr,
 	}
 
 	return rc;
+}
+
+/* ── Carrier monitoring ─────────────────────────────────────────────────── */
+
+static int open_netlink_link_socket(void)
+{
+	int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+	if (fd < 0) {
+		mgmt_log("WARN", "netlink socket: %s — carrier monitoring disabled",
+			 strerror(errno));
+		return -1;
+	}
+	struct sockaddr_nl sa = {
+		.nl_family = AF_NETLINK,
+		.nl_groups = RTMGRP_LINK,
+	};
+	if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		mgmt_log("WARN", "netlink bind: %s — carrier monitoring disabled",
+			 strerror(errno));
+		close(fd);
+		return -1;
+	}
+	return fd;
 }
 
 /* ── Main ───────────────────────────────────────────────────────────────── */
@@ -5225,6 +7201,36 @@ int main(void)
 	 * Idempotent — runs every boot, handles upgrade migration. */
 	mgmtd_reconcile_config();
 
+	/* Wait for ethernet NICs to appear — the MTK GMAC + DSA subsystem
+	 * probes asynchronously and may not be visible in /sys/class/net by
+	 * the time mgmtd starts.  Poll up to 5 seconds then proceed. */
+	{
+		int ms = 0;
+		while (ms < 5000) {
+			DIR *nd = opendir("/sys/class/net");
+			if (nd) {
+				int found = 0;
+				struct dirent *ne;
+				while ((ne = readdir(nd)) != NULL) {
+					if (ne->d_name[0] == '.' ||
+					    strcmp(ne->d_name, "lo") == 0)
+						continue;
+					if (read_net_type(ne->d_name) == 1) {
+						found = 1;
+						break;
+					}
+				}
+				closedir(nd);
+				if (found) break;
+			}
+			usleep(100000);
+			ms += 100;
+		}
+		if (ms > 0)
+			mgmt_log("INFO",
+				 "waited %dms for ethernet interfaces", ms);
+	}
+
 	/* Discover NICs, create/protect interface entries */
 	mgmtd_sync_interfaces(boot == BOOT_FIRST);
 
@@ -5236,6 +7242,13 @@ int main(void)
 	 * iptables rules, routes, interfaces all consistent with the DB.
 	 * This may take several seconds on large configs. */
 	mgmtd_replay_config();
+
+	/* Re-sync after replay: DSA slave interfaces are now registered by the
+	 * kernel (the master had to come up first), so read_iface_has_upper()
+	 * can now correctly identify the DSA master and write system=yes to its
+	 * DB entry.  This is a no-op on all subsequent boots once the flag is
+	 * persisted. */
+	mgmtd_sync_interfaces(0);
 
 	mgmt_log("INFO", "config replay complete");
 
@@ -5274,6 +7287,8 @@ int main(void)
 		return 1;
 	}
 
+	int nl_fd = open_netlink_link_socket();
+
 	/* Start webd under supervision — unconditional (SRC_ALWAYS).
 	 * Must start AFTER socket listen() so webd's bind_listeners()
 	 * can connect to mgmtd and query interface allowaccess config. */
@@ -5300,14 +7315,35 @@ int main(void)
 			reap_children();
 		}
 
-		struct pollfd pfd = { .fd = sfd, .events = POLLIN };
-		int pr = poll(&pfd, 1, 5000);
+		/* Periodic FQDN re-resolve (detached worker, never blocks
+		 * this loop — see mgmtd_fqdn.c) */
+		fqdn_refresh_tick();
+
+		struct pollfd pfds[2];
+		int nfds = 0;
+		pfds[nfds].fd = sfd;
+		pfds[nfds].events = POLLIN;
+		nfds++;
+		if (nl_fd >= 0) {
+			pfds[nfds].fd = nl_fd;
+			pfds[nfds].events = POLLIN;
+			nfds++;
+		}
+
+		int pr = poll(pfds, (nfds_t)nfds, 5000);
 		if (pr < 0) {
 			if (errno == EINTR) continue;
 			mgmt_log("ERROR", "poll: %s", strerror(errno));
 			continue;
 		}
 		if (pr == 0) continue;  /* timeout, loop back for reap */
+
+		/* Carrier events from kernel — process before accepting IPC */
+		if (nl_fd >= 0 && pfds[1].revents & POLLIN)
+			handle_netlink_link_event(nl_fd);
+
+		if (!(pfds[0].revents & POLLIN))
+			continue;
 
 		int cfd = accept(sfd, NULL, NULL);
 		if (cfd < 0) {
@@ -5376,6 +7412,7 @@ int main(void)
 			socklen_t cred_len = sizeof(cred);
 			if (getsockopt(cfd, SOL_SOCKET, SO_PEERCRED,
 				       &cred, &cred_len) == 0) {
+				g_peer_uid = cred.uid;
 				/*
 				 * Verify the client-claimed username matches
 				 * the kernel-verified UID. If the claimed user
@@ -5422,6 +7459,10 @@ int main(void)
 				continue;
 			}
 		}
+#else
+		/* Test harness has no SO_PEERCRED; treat the peer as root
+		 * so root-gated handlers remain exercisable under test. */
+		g_peer_uid = 0;
 #endif
 
 		/* Handle request (with verified username)

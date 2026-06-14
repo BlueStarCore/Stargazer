@@ -34,11 +34,32 @@ X("configure rollback",                     "Rollback configuration to revision"
 
 X("execute",                                "Execute commands and operations",          NULL,              0,  NULL)
 
-X("execute system",                         "System management commands",              "admin",           0,  NULL)
+X("execute system",                         "Run a system binary (direct exec, no shell); see subcommands below", "admin", -1, cmd_system)
 X("execute system shutdown",                "Shut down the system",                    "admin",           0,  cmd_sys_shutdown)
 X("execute system reboot",                  "Reboot the system",                       "admin",           0,  cmd_sys_reboot)
 X("execute system factory-reboot",         "Factory reset and reboot",                "admin",           0,  cmd_sys_factory_reboot)
 X("execute system factory-shutdown",       "Factory reset and shutdown",              "admin",           0,  cmd_sys_factory_shutdown)
+X("execute system ssl-ca-cert",             "Print SSL-inspection CA cert (PEM) to install on clients", "configure,admin", 0, cmd_ssl_cacert)
+X("execute diagnose ips",                   "IPS engine diagnostics",                                   "admin",           0, NULL)
+X("execute diagnose ips status",            "IPS daemon status and configuration",                      "admin",           0, cmd_diag_ips_status)
+X("execute diagnose ips alerts",            "Show recent IPS alert log entries",                        "admin",           1, cmd_diag_ips_alerts)
+X("execute diagnose ips alerts-clear",      "Clear (truncate) the IPS alert log",                       "admin",           0, cmd_diag_ips_alerts_clear)
+X("execute diagnose ips scores",            "Per-flow ML scores (behavioral scoring loop)",             "admin",           1, cmd_diag_ips_scores)
+X("execute diagnose ssl",                   "SSL inspection diagnostics (ssld, CA, steering)",          "admin",           0, cmd_diag_ssl)
+X("execute ips",                            "IPS operations",                                           "admin",           0, NULL)
+X("execute ips reload",                     "Reload IPS ruleset and hot-reload daemon (no traffic drop)","admin",           0, cmd_ips_reload)
+X("execute ips update-now",                 "Download enabled rulesets and rebuild active signatures",  "admin",           0, cmd_ips_update_now)
+X("show ips profile",                       "List IPS profiles and their signature filters",            "monitor",         0, cmd_show_ips_profiles)
+X("show ips filter",                        "Show signature filters for a specific profile",            "monitor",         1, cmd_show_ips_filters)
+/* Menu/discovery entries only (handler = NULL): they surface under
+ * `configure security` in tab/?-help, but must NOT match as dispatch handlers —
+ * a handler here would swallow the type path so cli_configure sees empty args.
+ * With NULL handler, dispatch falls through to the catch-all `configure`, which
+ * passes the full path ("security ssl-inspection-profile") to cli_configure to
+ * build the type_key and enter the context. Same pattern as `configure commit`. */
+X("configure security ips-profile",         "Create or edit IPS signature profiles",                   "configure,admin", 0, NULL)
+X("configure security ips-filter",          "Create or edit per-profile signature filters",            "configure,admin", 0, NULL)
+X("configure security ssl-inspection-profile", "Configure SSL inspection profiles (FortiGate-style)",  "configure,admin", 0, NULL)
 
 X("execute firmware",                       "Firmware management",                     "admin",           0,  NULL)
 X("execute firmware upgrade",               "Upgrade firmware from URL",               "admin",           1,  cmd_fw_upgrade)
@@ -100,7 +121,9 @@ X("execute diagnose selftest database",     "Database health tests (full)",     
 X("execute diagnose selftest disk",         "Disk partition health tests (full)",      "admin",           0,  NULL)
 X("execute diagnose selftest dhcp",         "DHCP client/server cross-validation",     "admin",           0,  NULL)
 X("execute diagnose selftest supervisor",  "Supervisor process management tests",      "admin",           0,  NULL)
-X("execute diagnose selftest webd",       "Web API handler tests",                    "admin",           0,  NULL)
+X("execute diagnose selftest webd",         "Web API handler tests (full)",            "admin",           0,  NULL)
+X("execute diagnose selftest busybox",      "BusyBox applet whitelist check (full)",   "admin",           0,  NULL)
+X("execute diagnose selftest session",      "Session tracking tests (full)",           "admin",           0,  NULL)
 X("execute diagnose pentest",              "Run security penetration tests",          "admin",           1,  cmd_diag_pentest)
 X("execute diagnose pentest full",         "Full pentest with SEC-1..18",             "admin",           0,  NULL)
 
@@ -108,8 +131,27 @@ X("execute diagnose firewall",              "Firewall diagnostics",             
 X("execute diagnose firewall policy",       "Show firewall policy and rules",          "admin",           1,  cmd_diag_fw_policy)
 X("execute diagnose firewall policy nat",   "Show NAT rules",                          "admin",           0,  NULL)
 X("execute diagnose firewall conntrack",    "Show connection tracking entries",         "admin",           0,  cmd_diag_fw_conntrack)
+X("execute diagnose firewall ipset",        "Show FQDN object ipset membership",        "admin",           1,  cmd_diag_fw_ipset)
+
+X("execute diagnose system",                "System diagnostics",                      "monitor",         0,  NULL)
+X("execute diagnose system bootlog",        "Show kernel boot log (dmesg)",            "monitor",         0,  cmd_diagnose_system_bootlog)
+X("execute diagnose system stargazer-log",  "Show stargazer init messages",            "monitor",         0,  cmd_diagnose_system_stargazer_log)
+X("execute diagnose system storage",        "Show storage mount status",               "monitor",         0,  cmd_diagnose_system_storage)
 
 X("execute diagnose nat",                  "NAT diagnostics",                         "admin",           0,  NULL)
 X("execute diagnose nat policy",           "Show kernel NAT table rules",             "admin",           0,  cmd_diag_nat_policy)
 
 X("execute diagnose routes",               "Show routing table",                       "admin",           0,  cmd_diag_routes)
+
+X("execute diagnose session",              "Session table diagnostics",               "monitor",        -1,  cmd_diag_session)
+X("execute diagnose session status",       "Show live session table (filtered)",      "monitor",        -1,  NULL)
+X("execute diagnose session list",         "Show live session table (filtered)",      "monitor",        -1,  NULL)
+X("execute diagnose session stats",        "Show session counters and module status", "monitor",         0,  NULL)
+X("execute diagnose session filter",       "Define reusable filter: <field> <value> ... | clear", "monitor", -1,  NULL)
+X("execute diagnose session clear",        "Clear sessions matching the filter (all if none set)", "admin", 0,  NULL)
+X("execute diagnose session ml",           "Per-flow ML features (conntrack CTA_ML)",  "monitor",         0,  NULL)
+
+X("execute diagnose dhcp",                 "DHCP diagnostics",                        "monitor",         0,  NULL)
+X("execute diagnose dhcp client",          "Show DHCP client status (all interfaces)", "monitor",        1,  cmd_diag_dhcp_client)
+X("execute diagnose dhcp client <iface>",  "Show DHCP client status for one interface", "monitor",      0,  NULL)
+

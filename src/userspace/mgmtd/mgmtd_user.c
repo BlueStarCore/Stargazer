@@ -331,10 +331,16 @@ static void add_user_to_group(const char *username, const char *groupname)
 	FILE *out = fdopen(tfd, "w");
 	if (!out) { close(tfd); unlink(tmppath); fclose(fp); return; }
 
-	char line[MAX_LINE];
+	/* getline (dynamic buffer): a fixed fgets(line, MAX_LINE) buffer
+	 * splits a group line longer than the buffer into two fgets reads,
+	 * and the rewrite below would then write a truncated entry plus an
+	 * orphan tail line — corrupting /etc/group. The stargazer group line
+	 * grows with every admin, so this is reachable over time. */
+	char *line = NULL;
+	size_t linecap = 0;
 	size_t glen = strlen(groupname);
 
-	while (fgets(line, sizeof(line), fp)) {
+	while (getline(&line, &linecap, fp) != -1) {
 		if (strncmp(line, groupname, glen) == 0 && line[glen] == ':') {
 			/* Found the group line — check if user already in it */
 			size_t len = strlen(line);
@@ -378,6 +384,7 @@ static void add_user_to_group(const char *username, const char *groupname)
 		}
 	}
 
+	free(line);
 	fclose(fp);
 	fclose(out);
 	rename(tmppath, "/etc/group");
@@ -656,6 +663,10 @@ int handle_admin_create(int client_fd, const char *user,
 		 "profile=%s\nenforce-change-password=enable\n"
 		 "enforce-password-policy=enable\n", newprof);
 	if (sg_db_set("system_admin", newuser, cfgdata) != 0) {
+		/* Roll back the just-created OS account so it doesn't persist
+		 * without a config row (it would have a login shell but never
+		 * appear in admin listings). */
+		delete_system_user(newuser);
 		send_error(client_fd, SG_ERR_IO_FAIL, "config write failed");
 		return 0;
 	}
@@ -865,9 +876,14 @@ int handle_admin_set_enf(int client_fd, const char *user,
 				  "enforce-change-password=%s\n", val);
 	newdata[ndoff] = '\0';
 
-	sg_db_set("system_admin", target, newdata);
+	int wrc = sg_db_set("system_admin", target, newdata);
 	free(existing);
 	free(newdata);
+	if (wrc != 0) {
+		/* Do not report a security flag applied when the write failed. */
+		send_error(client_fd, SG_ERR_IO_FAIL, "config write failed");
+		return 0;
+	}
 	admin_notify_change(target);
 	send_ok(client_fd, "Enforce policy updated", NULL);
 	return 0;
@@ -1095,10 +1111,13 @@ int handle_auth_login(int client_fd, const char *user,
 	if (!sp) {
 		/* User not found — fail after crypt (timing constant) */
 	} else if (sp->sp_pwdp[0] == '!' || sp->sp_pwdp[0] == '*') {
-		/* Locked account (shadow-level lock, e.g. passwd -l) */
-		explicit_bzero(password, sizeof(password));
-		send_error(client_fd, SG_ERR_LOCKED, "Account is locked");
-		return 0;
+		/* Shadow-locked account (passwd -l, or a freshly-created admin
+		 * whose password is unset). Do NOT early-return a distinct
+		 * status: that would leak account existence/state via a unique
+		 * error code and a faster (no-compare) response. crypt() already
+		 * ran above for timing parity; leave auth_ok=0 so this falls
+		 * through to the same "Invalid credentials" + lockout path as a
+		 * wrong password. (A '!'/'*' hash can never equal a crypt result.) */
 	} else if (sp->sp_pwdp[0] == '\0' && password[0] == '\0') {
 		/* Empty password (first-login) */
 		auth_ok = 1;
@@ -1193,7 +1212,9 @@ int handle_auth_login(int client_fd, const char *user,
  * SG_CMD_AUTH_CHANGE_PW — Change password during forced login flow.
  *
  * Payload: "username\nnew_password\nsource\n"
- *   source = "admin-flag" or "policy-mismatch"
+ *   source = "first-login"     (empty password, initial setup)
+ *            "admin-flag"      (enforce-change-password enabled)
+ *            "policy-mismatch" (password doesn't meet updated policy)
  *
  * On success: updates shadow, clears enforce flag if admin-flag,
  *             audits event, returns SG_OK.
@@ -1278,8 +1299,10 @@ int handle_auth_change_pw(int client_fd, const char *user,
 	}
 	explicit_bzero(new_pw, sizeof(new_pw));
 
-	/* If source=admin-flag, clear the enforce-change-password flag */
-	if (strcmp(source, "admin-flag") == 0) {
+	/* Clear enforce-change-password flag for admin-flag and first-login.
+	 * Both represent initial/forced password setup, not voluntary change. */
+	if (strcmp(source, "admin-flag") == 0 ||
+	    strcmp(source, "first-login") == 0) {
 		sg_db_set_val("system_admin", target,
 			      "enforce-change-password", "disable");
 	}

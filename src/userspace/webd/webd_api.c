@@ -14,10 +14,14 @@
 #include "stargazer_ipc.h"
 #include "sg_validate.h"
 
+#include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 /* ── Login rate limiter ──────────────────────────────────────────────── */
 
@@ -51,7 +55,8 @@ static int type_uses_name_as_id(const char *type)
 	return strcmp(type, "firewall_address") == 0 ||
 	       strcmp(type, "firewall_service") == 0 ||
 	       strcmp(type, "system_admin") == 0 ||
-	       strcmp(type, "system_admin-profile") == 0;
+	       strcmp(type, "system_admin-profile") == 0 ||
+	       strcmp(type, "security_ips-profile") == 0;
 }
 
 static void reply_json(struct mg_connection *c, int status, const char *json)
@@ -591,6 +596,13 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 
 		/* GET /api/config/{type}/{id} — get single entry */
 		if (nseg >= 3 && mg_str_eq(hm->method, "GET")) {
+			/* Validate entry ID to prevent injection attacks */
+			if (!sg_is_safe_id(segs[2])) {
+				reply_json(c, 400,
+					   "{\"error\":\"Invalid entry ID\"}");
+				return -1;
+			}
+
 			char section[512];
 			snprintf(section, sizeof(section), "%s:%s\n",
 				 type, segs[2]);
@@ -749,6 +761,13 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 
 		/* PUT /api/config/{type}/{id} — update entry */
 		if (nseg >= 3 && mg_str_eq(hm->method, "PUT")) {
+			/* Validate entry ID to prevent injection attacks */
+			if (!sg_is_safe_id(segs[2])) {
+				reply_json(c, 400,
+					   "{\"error\":\"Invalid entry ID\"}");
+				return -1;
+			}
+
 			char *kv_raw = json_body_to_kv(hm->body);
 			if (!kv_raw) {
 				reply_json(c, 400,
@@ -787,6 +806,13 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 
 		/* DELETE /api/config/{type}/{id} — delete entry */
 		if (nseg >= 3 && mg_str_eq(hm->method, "DELETE")) {
+			/* Validate entry ID to prevent injection attacks */
+			if (!sg_is_safe_id(segs[2])) {
+				reply_json(c, 400,
+					   "{\"error\":\"Invalid entry ID\"}");
+				return -1;
+			}
+
 			char payload[512];
 			snprintf(payload, sizeof(payload), "%s:%s\n",
 				 type, segs[2]);
@@ -819,6 +845,13 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 		/* PATCH /api/config/{type}/{id}/move — reorder entry */
 		if (nseg >= 4 && strcmp(segs[3], "move") == 0 &&
 		    mg_str_eq(hm->method, "PATCH")) {
+			/* Validate the entry id before it reaches mgmtd, like the
+			 * GET/PUT/DELETE single-entry routes. */
+			if (!sg_is_safe_id(segs[2])) {
+				reply_json(c, 400,
+					   "{\"error\":\"Invalid id\"}");
+				return -1;
+			}
 			/* Body: {"sequence": N} */
 			char *kv_raw = json_body_to_kv(hm->body);
 			if (!kv_raw) {
@@ -875,7 +908,7 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 	/* ── /api/system/... ─────────────────────────────────────────── */
 	if (strcmp(segs[0], "system") == 0 && nseg >= 2) {
 
-		/* GET /api/system/resources[/detail|ram|disk|proctop] */
+		/* GET /api/system/resources[/detail|ram|disk|proctop|percore] */
 		if (strcmp(segs[1], "resources") == 0 &&
 		    mg_str_eq(hm->method, "GET")) {
 			int flow = FLOW_RESOURCES;
@@ -888,6 +921,8 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 					flow = FLOW_RES_DISK;
 				else if (strcmp(segs[2], "proctop") == 0)
 					flow = FLOW_RES_PROCTOP;
+				else if (strcmp(segs[2], "percore") == 0)
+					flow = FLOW_RES_PERCORE;
 			}
 
 			work_item_t item;
@@ -947,14 +982,144 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 				return 0;
 			}
 
-			/* POST /api/system/firmware/upgrade — stub */
+			/* POST /api/system/firmware/upgrade — multipart upload */
 			if (nseg >= 3 &&
 			    strcmp(segs[2], "upgrade") == 0 &&
 			    mg_str_eq(hm->method, "POST")) {
-				reply_json(c, 501,
-					   "{\"error\":\"Firmware upload not yet implemented\"}");
+
+				/* Find the "firmware" part in multipart body */
+				struct mg_http_part part;
+				size_t mofs = 0;
+				int found = 0;
+				while ((mofs = mg_http_next_multipart(
+						hm->body, mofs, &part)) > 0) {
+					if (mg_str_eq(part.name, "firmware")) {
+						found = 1;
+						break;
+					}
+				}
+
+				if (!found || part.body.len == 0) {
+					reply_json(c, 400,
+						   "{\"error\":\"No firmware file in upload\"}");
+					return -1;
+				}
+
+				/* Write to a UNIQUE staging file so two concurrent
+				 * uploads cannot race on a shared path (one
+				 * client's bytes flashed under another's request).
+				 * NOT mkstemp(): it opens O_RDWR, which the webd
+				 * seccomp filter kills (only O_RDONLY/O_WRONLY are
+				 * allowed). Generate an [A-Za-z0-9] suffix — which
+				 * also satisfies mgmtd's strict path check — and
+				 * open O_WRONLY|O_CREAT|O_EXCL so creation is atomic
+				 * against collisions. */
+				static const char A36[] =
+					"abcdefghijklmnopqrstuvwxyz0123456789";
+				static unsigned long stage_seq;
+				char stage[64];
+				int sfd = -1;
+				for (int att = 0; att < 128 && sfd < 0; att++) {
+					unsigned long v =
+						(stage_seq++ + (unsigned long)att)
+							* 2654435761UL
+						^ (unsigned long)(uintptr_t)&att;
+					char suf[11];
+					for (int i = 0; i < 10; i++) {
+						suf[i] = A36[v % 36];
+						v /= 36;
+					}
+					suf[10] = '\0';
+					snprintf(stage, sizeof(stage),
+						 "/tmp/sg-fw-upload.%s", suf);
+					sfd = open(stage,
+						   O_WRONLY | O_CREAT | O_EXCL,
+						   0600);
+				}
+				if (sfd < 0) {
+					reply_json(c, 500,
+						   "{\"error\":\"Cannot create firmware staging file\"}");
+					return -1;
+				}
+				/* Write with raw write(2), NOT stdio: fdopen() on a
+				 * writable stream issues ioctl(TIOCGWINSZ) (musl
+				 * line-buffering probe) which the webd seccomp
+				 * filter does not allow and would KILL the worker.
+				 * The body is one contiguous buffer. */
+				const char *wbuf = part.body.buf;
+				size_t wtot = part.body.len, woff = 0;
+				int wok = 1;
+				while (woff < wtot) {
+					ssize_t wn = write(sfd, wbuf + woff,
+							   wtot - woff);
+					if (wn < 0) {
+						if (errno == EINTR)
+							continue;
+						wok = 0;
+						break;
+					}
+					woff += (size_t)wn;
+				}
+				if (close(sfd) != 0)
+					wok = 0;
+				if (!wok) {
+					unlink(stage);
+					reply_json(c, 500,
+						   "{\"error\":\"Failed to write firmware staging file\"}");
+					return -1;
+				}
+
+				/* Dispatch IPC to mgmtd to process staged file */
+				char upbuf[96];
+				snprintf(upbuf, sizeof(upbuf), "path=%s\n", stage);
+				char *upayload = strdup(upbuf);
+				if (!upayload) {
+					unlink(stage);
+					reply_json(c, 500,
+						   "{\"error\":\"Out of memory\"}");
+					return -1;
+				}
+
+				work_item_t item;
+				memset(&item, 0, sizeof(item));
+				item.conn_id = c->id;
+				item.flow_type = FLOW_FIRMWARE_UPLOAD;
+				snprintf(item.username,
+					 sizeof(item.username),
+					 "%s", sess.username);
+				item.session_tag = sess.ipc_session_tag;
+				item.payload = upayload;
+				item.payload_len = strlen(upayload);
+
+				if (webd_pool_enqueue(&item) != 0) {
+					free(upayload);
+					unlink(stage); /* mgmtd never got the path */
+					reply_json(c, 503,
+						   "{\"error\":\"Server busy\"}");
+					return -1;
+				}
+				return 0;
+			}
+		}
+
+		/* GET /api/system/interfaces/live — live kernel operstate overlay */
+		if (strcmp(segs[1], "interfaces") == 0 &&
+		    nseg >= 3 && strcmp(segs[2], "live") == 0 &&
+		    mg_str_eq(hm->method, "GET")) {
+			work_item_t item;
+			memset(&item, 0, sizeof(item));
+			item.conn_id = c->id;
+			item.flow_type = FLOW_IFACE_LIVE;
+			snprintf(item.username, sizeof(item.username),
+				 "%s", sess.username);
+			item.session_tag = sess.ipc_session_tag;
+
+			if (webd_pool_enqueue(&item) != 0) {
+				reply_json(c, 503,
+					   "{\"error\":\"Server busy\"}");
 				return -1;
 			}
+			return 0;
 		}
 
 		/* POST /api/system/reboot */
@@ -994,6 +1159,286 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 
 		reply_json(c, 404, "{\"error\":\"Not found\"}");
 		return -1;
+	}
+
+	/* ── /api/monitor/sessions ──────────────────────────────────── */
+	if (strcmp(segs[0], "monitor") == 0 && nseg == 2 &&
+	    strcmp(segs[1], "sessions") == 0 &&
+	    mg_str_eq(hm->method, "GET")) {
+
+		work_item_t item;
+		memset(&item, 0, sizeof(item));
+		item.conn_id = c->id;
+		item.ipc_cmd = SG_CMD_SHOW_SESSIONS;
+		item.flow_type = FLOW_MONITOR_SESSIONS;
+		snprintf(item.username, sizeof(item.username),
+			 "%s", sess.username);
+		item.session_tag = sess.ipc_session_tag;
+
+		if (webd_pool_enqueue(&item) != 0) {
+			reply_json(c, 503, "{\"error\":\"Server busy\"}");
+			return -1;
+		}
+		return 0;
+	}
+
+	/* ── /api/monitor/ips ── IPS daemon status (key=value JSON) ──── */
+	if (strcmp(segs[0], "monitor") == 0 && nseg == 2 &&
+	    strcmp(segs[1], "ips") == 0 &&
+	    mg_str_eq(hm->method, "GET")) {
+
+		work_item_t item;
+		memset(&item, 0, sizeof(item));
+		item.conn_id = c->id;
+		item.ipc_cmd = SG_CMD_IPS_STATUS;
+		item.flow_type = FLOW_IPS_STATUS;
+		snprintf(item.username, sizeof(item.username), "%s", sess.username);
+		item.session_tag = sess.ipc_session_tag;
+		if (webd_pool_enqueue(&item) != 0) {
+			reply_json(c, 503, "{\"error\":\"Server busy\"}");
+			return -1;
+		}
+		return 0;
+	}
+
+	/* ── /api/monitor/ssl ── SSL inspection diagnostics ──────────── */
+	if (strcmp(segs[0], "monitor") == 0 && nseg == 2 &&
+	    strcmp(segs[1], "ssl") == 0 && mg_str_eq(hm->method, "GET")) {
+		work_item_t item;
+		memset(&item, 0, sizeof(item));
+		item.conn_id = c->id;
+		item.ipc_cmd = SG_CMD_SSL_DIAG;
+		item.flow_type = FLOW_IPS_UPDATE;   /* flow_diagnose → {"output":...} */
+		snprintf(item.username, sizeof(item.username), "%s", sess.username);
+		item.session_tag = sess.ipc_session_tag;
+		if (webd_pool_enqueue(&item) != 0) {
+			reply_json(c, 503, "{\"error\":\"Server busy\"}");
+			return -1;
+		}
+		return 0;
+	}
+
+	/* ── /api/monitor/ssl-cacert ── SSL inspection CA cert (PEM) ──── */
+	if (strcmp(segs[0], "monitor") == 0 && nseg == 2 &&
+	    strcmp(segs[1], "ssl-cacert") == 0 && mg_str_eq(hm->method, "GET")) {
+		work_item_t item;
+		memset(&item, 0, sizeof(item));
+		item.conn_id = c->id;
+		item.ipc_cmd = SG_CMD_SSL_CACERT;
+		item.flow_type = FLOW_IPS_UPDATE;
+		snprintf(item.username, sizeof(item.username), "%s", sess.username);
+		item.session_tag = sess.ipc_session_tag;
+		if (webd_pool_enqueue(&item) != 0) {
+			reply_json(c, 503, "{\"error\":\"Server busy\"}");
+			return -1;
+		}
+		return 0;
+	}
+
+	/* ── /api/monitor/ips-alerts ── recent IPS alerts (default 20) ─ */
+	if (strcmp(segs[0], "monitor") == 0 && nseg == 2 &&
+	    strcmp(segs[1], "ips-alerts") == 0 &&
+	    mg_str_eq(hm->method, "GET")) {
+
+		work_item_t item;
+		memset(&item, 0, sizeof(item));
+		item.conn_id = c->id;
+		item.ipc_cmd = SG_CMD_IPS_ALERTS;
+		item.flow_type = FLOW_IPS_ALERTS;
+		snprintf(item.username, sizeof(item.username), "%s", sess.username);
+		item.session_tag = sess.ipc_session_tag;
+		if (webd_pool_enqueue(&item) != 0) {
+			reply_json(c, 503, "{\"error\":\"Server busy\"}");
+			return -1;
+		}
+		return 0;
+	}
+
+	/* ── /api/ips/signatures ── catalog signature cho modal Add Sig ── */
+	if (strcmp(segs[0], "ips") == 0 && nseg == 2 &&
+	    strcmp(segs[1], "signatures") == 0 &&
+	    mg_str_eq(hm->method, "GET")) {
+
+		/* ?q= search → forward to mgmtd (response IPC limited to 64KB,
+		 * so large rulesets must be filtered server-side). */
+		char *search = query_param(hm->query, "q");
+
+		work_item_t item;
+		memset(&item, 0, sizeof(item));
+		item.conn_id = c->id;
+		item.ipc_cmd = SG_CMD_IPS_SIGNATURES;
+		item.flow_type = FLOW_IPS_SIGS;
+		snprintf(item.username, sizeof(item.username), "%s", sess.username);
+		item.session_tag = sess.ipc_session_tag;
+		if (search && search[0]) {
+			size_t n = strlen(search) + 3; /* "q=" + NUL */
+			item.payload = malloc(n);
+			if (item.payload) {
+				snprintf(item.payload, n, "q=%s", search);
+				item.payload_len = strlen(item.payload);
+			}
+		}
+		free(search);
+		if (webd_pool_enqueue(&item) != 0) {
+			free(item.payload);
+			reply_json(c, 503, "{\"error\":\"Server busy\"}");
+			return -1;
+		}
+		return 0;
+	}
+
+	/* ── /api/ips/alerts-json ── structured JSON alert log ────────── */
+	if (strcmp(segs[0], "ips") == 0 && nseg == 2 &&
+	    strcmp(segs[1], "alerts-json") == 0 &&
+	    mg_str_eq(hm->method, "GET")) {
+
+		work_item_t item;
+		memset(&item, 0, sizeof(item));
+		item.conn_id = c->id;
+		item.ipc_cmd = SG_CMD_IPS_ALERTS_JSON;
+		item.flow_type = FLOW_IPS_ALERTS_JSON;
+		snprintf(item.username, sizeof(item.username), "%s", sess.username);
+		item.session_tag = sess.ipc_session_tag;
+		/* forward optional ?lines=N query param */
+		if (hm->query.len > 0) {
+			char qbuf[64] = "";
+			struct mg_str q = hm->query;
+			if (q.len < sizeof(qbuf)) {
+				memcpy(qbuf, q.buf, q.len); qbuf[q.len] = '\0';
+			}
+			snprintf(item.extra, sizeof(item.extra), "%s", qbuf);
+		}
+		if (webd_pool_enqueue(&item) != 0) {
+			reply_json(c, 503, "{\"error\":\"Server busy\"}");
+			return -1;
+		}
+		return 0;
+	}
+
+	/* ── GET /api/ips/update-log ── tail ips-update.log ─────────────────── */
+	if (strcmp(segs[0], "ips") == 0 && nseg == 2 &&
+	    strcmp(segs[1], "update-log") == 0 &&
+	    mg_str_eq(hm->method, "GET")) {
+
+		work_item_t item;
+		memset(&item, 0, sizeof(item));
+		item.conn_id  = c->id;
+		item.ipc_cmd  = SG_CMD_IPS_UPDATE_LOG;
+		item.flow_type = FLOW_IPS_UPDATE_LOG;
+		snprintf(item.username, sizeof(item.username), "%s", sess.username);
+		item.session_tag = sess.ipc_session_tag;
+		if (webd_pool_enqueue(&item) != 0) {
+			reply_json(c, 503, "{\"error\":\"Server busy\"}");
+			return -1;
+		}
+		return 0;
+	}
+
+	/* ── POST /api/ips/reload ── hot-reload ipsd (rebuild active.rules) ── */
+	if (strcmp(segs[0], "ips") == 0 && nseg == 2 &&
+	    strcmp(segs[1], "reload") == 0 &&
+	    mg_str_eq(hm->method, "POST")) {
+
+		work_item_t item;
+		memset(&item, 0, sizeof(item));
+		item.conn_id = c->id;
+		item.ipc_cmd = SG_CMD_IPS_REBUILD;
+		item.flow_type = FLOW_SIMPLE;
+		snprintf(item.username, sizeof(item.username), "%s", sess.username);
+		item.session_tag = sess.ipc_session_tag;
+		if (webd_pool_enqueue(&item) != 0) {
+			reply_json(c, 503, "{\"error\":\"Server busy\"}");
+			return -1;
+		}
+		return 0;
+	}
+
+	/* ── POST /api/ips/rulesets-reload ── scan custom dir + upsert DB ─── */
+	if (strcmp(segs[0], "ips") == 0 && nseg == 2 &&
+	    strcmp(segs[1], "rulesets-reload") == 0 &&
+	    mg_str_eq(hm->method, "POST")) {
+
+		work_item_t item;
+		memset(&item, 0, sizeof(item));
+		item.conn_id  = c->id;
+		item.ipc_cmd  = SG_CMD_IPS_RULESETS_RELOAD;
+		item.flow_type = FLOW_IPS_UPDATE;   /* uses flow_diagnose → {"output":"..."} */
+		snprintf(item.username, sizeof(item.username), "%s", sess.username);
+		item.session_tag = sess.ipc_session_tag;
+		if (webd_pool_enqueue(&item) != 0) {
+			reply_json(c, 503, "{\"error\":\"Server busy\"}");
+			return -1;
+		}
+		return 0;
+	}
+
+	/* ── POST /api/ips/update-now ── download rulesets + rebuild ──────── */
+	if (strcmp(segs[0], "ips") == 0 && nseg == 2 &&
+	    strcmp(segs[1], "update-now") == 0 &&
+	    mg_str_eq(hm->method, "POST")) {
+
+		work_item_t item;
+		memset(&item, 0, sizeof(item));
+		item.conn_id = c->id;
+		item.ipc_cmd = SG_CMD_IPS_UPDATE_NOW;
+		item.flow_type = FLOW_IPS_UPDATE;
+		snprintf(item.username, sizeof(item.username), "%s", sess.username);
+		item.session_tag = sess.ipc_session_tag;
+		/* Optional: "ids" = comma-separated ruleset IDs to download */
+		char *ids_val = json_str(hm->body, "$.ids");
+		if (ids_val && ids_val[0]) {
+			item.payload = strdup(ids_val);
+			item.payload_len = item.payload ? strlen(item.payload) : 0;
+		}
+		free(ids_val);
+		if (webd_pool_enqueue(&item) != 0) {
+			reply_json(c, 503, "{\"error\":\"Server busy\"}");
+			return -1;
+		}
+		return 0;
+	}
+
+	/* ── POST /api/ips/alerts-clear ── truncate alert log ─────────────── */
+	if (strcmp(segs[0], "ips") == 0 && nseg == 2 &&
+	    strcmp(segs[1], "alerts-clear") == 0 &&
+	    mg_str_eq(hm->method, "POST")) {
+
+		/* Qua mgmtd (root): /etc/stargazer/logs là 0700 root, webd (uid 900)
+		 * KHÔNG truncate trực tiếp được — trước đây open() fail âm thầm mà
+		 * vẫn báo {ok:true}. Giờ uỷ thác cho mgmtd xoá thật. */
+		work_item_t item;
+		memset(&item, 0, sizeof(item));
+		item.conn_id  = c->id;
+		item.ipc_cmd  = SG_CMD_IPS_ALERTS_CLEAR;
+		item.flow_type = FLOW_SIMPLE;
+		snprintf(item.username, sizeof(item.username), "%s", sess.username);
+		item.session_tag = sess.ipc_session_tag;
+		if (webd_pool_enqueue(&item) != 0) {
+			reply_json(c, 503, "{\"error\":\"Server busy\"}");
+			return -1;
+		}
+		return 0;
+	}
+
+	/* ── /api/monitor/dhcp-leases ───────────────────────────────── */
+	if (strcmp(segs[0], "monitor") == 0 && nseg == 2 &&
+	    strcmp(segs[1], "dhcp-leases") == 0 &&
+	    mg_str_eq(hm->method, "GET")) {
+
+		work_item_t item;
+		memset(&item, 0, sizeof(item));
+		item.conn_id = c->id;
+		item.ipc_cmd = SG_CMD_DIAG_DHCP_LEASES;
+		item.flow_type = FLOW_MONITOR_DHCP;
+		snprintf(item.username, sizeof(item.username),
+			 "%s", sess.username);
+		item.session_tag = sess.ipc_session_tag;
+
+		if (webd_pool_enqueue(&item) != 0) {
+			reply_json(c, 503, "{\"error\":\"Server busy\"}");
+			return -1;
+		}
+		return 0;
 	}
 
 	/* ── /api/diagnose/... ───────────────────────────────────────── */

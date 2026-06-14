@@ -88,9 +88,9 @@ typedef enum {
 	SG_CMD_SESSION_TAG_DEL = 401, /* Release session tag (logout)    */
 
 	/* Config revision management (5xx) — CLI sends these, mgmtd not yet implemented */
-	SG_CMD_COMMIT        = 500,   /* Record config revision (stub)   */
-	SG_CMD_REVISIONS     = 501,   /* List revisions (stub)           */
-	SG_CMD_ROLLBACK      = 502,   /* Rollback to revision (stub)     */
+	SG_CMD_COMMIT        = 500,   /* Snapshot config as a revision   */
+	SG_CMD_REVISIONS     = 501,   /* List config revisions           */
+	SG_CMD_ROLLBACK      = 502,   /* Restore + re-apply a revision   */
 
 	/* System operations (6xx) */
 	SG_CMD_SYS_POWEROFF  = 600,
@@ -109,13 +109,16 @@ typedef enum {
 	SG_CMD_SHOW_CONFIG   = 613,   /* Reserved: not yet implemented   */
 	SG_CMD_SHOW_STATS    = 614,
 	SG_CMD_SYS_FACTORY_RESET = 615, /* Factory reset to defaults         */
+	SG_CMD_SYS_EXEC      = 616,   /* Run a system binary as root (execvp, no shell) */
+	SG_CMD_SYS_LIST      = 617,   /* List runnable binaries in PATH (for `execute system ?`) */
 	SG_CMD_WHOAMI        = 620,   /* Get caller's profile+permissions */
 
 	/* Firewall/routing diagnostics (63x) */
 	SG_CMD_DIAG_FW_IPTABLES  = 630,  /* Show iptables rules (filter/nat) */
-	SG_CMD_DIAG_FW_POLICY    = 631,  /* Show INPUT chain policy+rules    */
+	SG_CMD_DIAG_FW_POLICY    = 631,  /* Show FORWARD chain rules         */
 	SG_CMD_DIAG_FW_CONNTRACK = 632,  /* Show conntrack entries            */
 	SG_CMD_DIAG_ROUTES       = 633,  /* Show IPv4+IPv6 routing tables     */
+	SG_CMD_DIAG_FW_IPSET     = 634,  /* Dump an FQDN object's ipset       */
 
 	/* System diagnostics (64x) — served by mgmtd_diag.c */
 	SG_CMD_DIAG_CPU          = 640,  /* CPU jiffies + thermal readings     */
@@ -130,11 +133,15 @@ typedef enum {
 	SG_CMD_DISK_SMART        = 649,  /* eMMC wear/health (life_time etc)   */
 
 	/* Show data (65x) */
-	SG_CMD_SHOW_SESSIONS     = 650,  /* /proc/stargazer/sessions contents  */
+	SG_CMD_SHOW_SESSIONS     = 650,  /* Active conntrack flows (normalized) */
 	SG_CMD_SHOW_BOOT_CONFIG  = 651,  /* modules + sysctl config files      */
 	SG_CMD_DIAG_NTP          = 652,  /* NTP status: server, pid, time      */
 	SG_CMD_DIAG_BUSYBOX_LIST = 653,  /* Enumerate busybox applet symlinks  */
-
+	/* 654 reserved — do not reuse                                          */
+	SG_CMD_SESSION_CLEAR     = 655,  /* Flush conntrack table (via netlink) */
+	SG_CMD_SESSION_STATS     = 656,  /* conntrack flow count + pkt_forward  */
+	/* 657, 658 reserved — do not reuse                                     */
+	SG_CMD_SESSION_ML        = 659,  /* Per-flow ML features (CTA_ML dump)  */
 	/* Debug state (66x) */
 	SG_CMD_DEBUG_STATE_GET   = 660,  /* Read debug conf key=value pairs    */
 	SG_CMD_DEBUG_STATE_SET   = 661,  /* Atomic write debug conf            */
@@ -147,12 +154,36 @@ typedef enum {
 	SG_CMD_LOG_SYSTEM        = 671,  /* Read dmesg output                  */
 	SG_CMD_LOG_CLEAR_AUDIT   = 672,  /* Truncate audit log                 */
 	SG_CMD_LOG_MGMTD        = 673,  /* Read mgmtd daemon log              */
+	SG_CMD_DIAG_STARGAZER_LOG = 674, /* Filtered stargazer init messages   */
+	SG_CMD_DIAG_STORAGE      = 675,  /* Storage mount status and health    */
+	SG_CMD_DIAG_DHCP_CLIENT  = 676,  /* DHCP client status for all/one iface */
+	SG_CMD_DIAG_DHCP_LEASES  = 677,  /* Active leases from all DHCP server pools */
 
 	/* DNS/DHCP — Member A (7xx): SG_CMD_DNS_* 700-749, SG_CMD_DHCP_* 750-799 */
 	/* NAT — Member B (8xx): SG_CMD_NAT_* 800-849 */
 
 	/* Firmware upload via IPC (webd → mgmtd) */
 	SG_CMD_UPGRADE_UPLOAD    = 680,  /* Receive firmware data via IPC   */
+	SG_CMD_UPGRADE_FROM_FILE = 681,  /* Install pre-uploaded firmware file */
+
+	/* DHCP lease events (udhcpc script → mgmtd) */
+	SG_CMD_DHCP_LEASE_EVENT  = 682,  /* payload: iface=<name> action=bound|renew|deconfig */
+
+	/* SSL inspection: trả CA cert (PEM) cho client tải về cài */
+	SG_CMD_SSL_CACERT        = 683,
+
+	/* IPS daemon status + alert log */
+	SG_CMD_IPS_STATUS        = 684,   /* trạng thái ipsd + counters   */
+	SG_CMD_IPS_ALERTS        = 685,   /* N dòng cuối ips-alert.log    */
+	SG_CMD_IPS_SIGNATURES    = 686,   /* catalog signature repo (JSON) */
+	SG_CMD_IPS_REBUILD       = 687,   /* recompile active.rules + reload (ips-update.sh) */
+	SG_CMD_IPS_UPDATE_NOW    = 688,   /* tải ruleset (security_ips-ruleset) + rebuild + reload */
+	SG_CMD_IPS_ALERTS_JSON       = 689,   /* parse ips-alert.log → JSON array */
+	SG_CMD_IPS_RULESETS_RELOAD   = 690,   /* scan custom dir for .xml → upsert DB entries */
+	SG_CMD_IPS_UPDATE_LOG        = 691,   /* tail ips-update.log → payload */
+	SG_CMD_IPS_ALERTS_CLEAR      = 692,   /* truncate ips-alert.log (root) */
+	SG_CMD_IPS_SCORES            = 693,   /* per-flow ML scores (ipsd dump loop) */
+	SG_CMD_SSL_DIAG              = 694,   /* SSL inspection diagnostics (debug) */
 
 	/* Keepalive / ping (9xx) */
 	SG_CMD_PING          = 900,
@@ -265,12 +296,16 @@ static inline int sg_cmd_audit_skip(sg_cmd_t cmd)
 	case SG_CMD_HISTORY_LOAD:
 	case SG_CMD_LOG_AUDIT:
 	case SG_CMD_LOG_SYSTEM:
+	case SG_CMD_SYS_LIST:        /* read-only binary enumeration, fires on `?` */
 	case SG_CMD_LOG_MGMTD:
+	case SG_CMD_DIAG_STARGAZER_LOG:
+	case SG_CMD_DIAG_STORAGE:
 	case SG_CMD_DISK_LIST:
 	case SG_CMD_DISK_INFO:
 	case SG_CMD_DISK_SMART:
 	case SG_CMD_SUPERVISOR_TEST:
 	case SG_CMD_DIAG_NTP:
+	case SG_CMD_DHCP_LEASE_EVENT:  /* internal: udhcpc → mgmtd, no audit needed */
 		return 1;
 	default:
 		return 0;

@@ -23,17 +23,22 @@
 #include "webd_sandbox.h"
 #include "stargazer_ipc.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
+#include <net/if.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-#include <unistd.h>
+#include <sys/ioctl.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
 
 #define WEBD_WWW_DIR       "/usr/share/stargazer/www"
 #define WEBD_READY_FIFO    "/run/webd-ready"
@@ -169,9 +174,17 @@ static int bind_listeners(void)
 			continue;
 		}
 
-		/* Extract IP and allowaccess */
-		char ip[64] = "", allowaccess[256] = "";
+		/* Extract mode, IP, and allowaccess */
+		char mode[16] = "", ip[64] = "", allowaccess[256] = "";
 		const char *p;
+		if ((p = strstr(iface_resp.payload, "mode=")) != NULL) {
+			const char *nl = strchr(p + 5, '\n');
+			size_t len = nl ? (size_t)(nl - p - 5) : strlen(p + 5);
+			if (len < sizeof(mode)) {
+				memcpy(mode, p + 5, len);
+				mode[len] = '\0';
+			}
+		}
 		if ((p = strstr(iface_resp.payload, "ip=")) != NULL) {
 			const char *nl = strchr(p + 3, '\n');
 			size_t len = nl ? (size_t)(nl - p - 3) : strlen(p + 3);
@@ -193,6 +206,28 @@ static int bind_listeners(void)
 		/* Strip CIDR prefix from IP (e.g. "192.168.1.1/24" → "192.168.1.1") */
 		char *slash = strchr(ip, '/');
 		if (slash) *slash = '\0';
+
+		/* DHCP interfaces have no static IP in the config DB.
+		 * Query the kernel for the live address via ioctl so we bind
+		 * to the correct interface rather than 0.0.0.0. */
+		if (!ip[0] || strcmp(mode, "dhcp") == 0) {
+			struct ifreq ifr;
+			int s = socket(AF_INET, SOCK_DGRAM, 0);
+			if (s >= 0) {
+				memset(&ifr, 0, sizeof(ifr));
+				snprintf(ifr.ifr_name, sizeof(ifr.ifr_name),
+					 "%s", iface);
+				if (ioctl(s, SIOCGIFADDR, &ifr) == 0) {
+					struct sockaddr_in *sa =
+						(struct sockaddr_in *)&ifr.ifr_addr;
+					snprintf(ip, sizeof(ip), "%s",
+						 inet_ntoa(sa->sin_addr));
+				} else {
+					ip[0] = '\0'; /* DHCP lease not yet assigned */
+				}
+				close(s);
+			}
+		}
 
 		if (!ip[0]) continue;
 
@@ -281,6 +316,7 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
 			/* Strict CSP — all resources self-hosted, no external
 			 * CDN. NGFW must be air-gapped. */
 			snprintf(static_hdrs, sizeof(static_hdrs),
+				"Cache-Control: no-cache\r\n"
 				"X-Content-Type-Options: nosniff\r\n"
 				"X-Frame-Options: DENY\r\n"
 				"Content-Security-Policy: default-src 'self' 'unsafe-inline'; "

@@ -114,7 +114,7 @@ SRC_WATCH := $(shell find $(PROJECT_ROOT)/src -name '*.c' -o -name '*.h' -o -nam
 # Main targets
 # =============================================================================
 
-.PHONY: all kernel modules busybox musl-toolchain dash iptables logind mgmtd cli tools uboot bpi-r4-bootloader rootfs iso nand-fit nand-image image firmware test-build test test-run lanvm clean help
+.PHONY: all kernel modules busybox musl-toolchain dash iptables logind mgmtd cli tools uboot bpi-r4-bootloader rootfs iso nand-fit nand-image image firmware firmware-keygen firmware-pubkey-header test-build test test-run lanvm clean help
 
 all: image
 
@@ -124,7 +124,7 @@ all: image
 
 kernel: $(KERNEL_IMAGE)
 
-$(KERNEL_IMAGE): | kernel-source kernel-config
+$(KERNEL_IMAGE): $(KERNEL_DIR)/.config | kernel-source
 	@echo "[1/5] Building kernel..."
 	$(MAKE) -C $(KERNEL_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) olddefconfig
 	$(MAKE) -C $(KERNEL_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) -j$$(nproc) Image dtbs modules
@@ -149,11 +149,17 @@ kernel-source:
 		exit 1; \
 	fi
 
-kernel-config:
+# File target: produces $(KERNEL_DIR)/.config. kernel.img depends on it, so a
+# manual .config edit (newer mtime) triggers a kernel rebuild. The guard keeps
+# an existing .config intact — only a missing one is regenerated from defconfig
+# (so hand edits are never wiped by defconfig).
+$(KERNEL_DIR)/.config: | kernel-source
 	@if [ ! -f "$(KERNEL_DIR)/.config" ]; then \
 		echo "Configuring kernel for BPI-R4 (MT7988A)..."; \
 		$(MAKE) -C $(KERNEL_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) mt7988a_bpi-r4_defconfig; \
-		$(KERNEL_DIR)/scripts/config --file $(KERNEL_DIR)/.config \
+	fi
+	@echo "Enforcing Stargazer kernel options (idempotent)..."
+	@$(KERNEL_DIR)/scripts/config --file $(KERNEL_DIR)/.config \
 			--enable NETFILTER \
 			--enable NF_CONNTRACK \
 			--enable NF_NAT \
@@ -177,9 +183,14 @@ kernel-config:
 			--enable NETFILTER_XT_MATCH_STATE \
 			--enable NETFILTER_XT_MATCH_LIMIT \
 			--enable NETFILTER_XT_TARGET_LOG \
+			--enable NETFILTER_XT_TARGET_REDIRECT \
 			--enable NETFILTER_XT_TARGET_CHECKSUM \
 			--enable NETFILTER_XT_MARK \
 			--enable NETFILTER_XT_CONNMARK \
+			--enable NETFILTER_NETLINK_QUEUE \
+			--enable NETFILTER_XT_TARGET_NFQUEUE \
+			--enable NETFILTER_XT_MATCH_CONNBYTES \
+			--enable NETFILTER_NETLINK_GLUE_CT \
 			--enable NF_LOG_IPV4 \
 			--enable NF_REJECT_IPV4 \
 			--enable NF_LOG_IPV6 \
@@ -189,12 +200,18 @@ kernel-config:
 			--module NF_NAT_TFTP \
 			--module NF_FLOW_TABLE \
 			--module NF_FLOW_TABLE_INET \
+			--disable IP_NF_TARGET_SYNPROXY \
+			--disable IP6_NF_TARGET_SYNPROXY \
+			--disable NFT_SYNPROXY \
+			--disable NET_ACT_CT \
 			--enable VIRTIO --enable VIRTIO_PCI --enable VIRTIO_NET \
 			--enable VIRTIO_BLK --enable VIRTIO_MMIO \
 			--enable MODULES --enable MODULE_UNLOAD \
-			--enable EXT4_FS --enable SQUASHFS; \
-		$(MAKE) -C $(KERNEL_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) olddefconfig; \
-	fi
+			--enable EXT4_FS --enable SQUASHFS \
+			--enable IP_SET --enable IP_SET_HASH_IP --enable NETFILTER_XT_SET \
+			--enable SERIAL_AMBA_PL011 --enable SERIAL_AMBA_PL011_CONSOLE \
+			--enable PCI_HOST_GENERIC --enable RTC_DRV_PL031 --enable HW_RANDOM_VIRTIO
+	@$(MAKE) -C $(KERNEL_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) olddefconfig
 
 # =============================================================================
 # 2. Modules
@@ -202,10 +219,10 @@ kernel-config:
 
 modules: $(BUILD_DIR)/modules/$(MODULE_NAME).ko
 
-$(BUILD_DIR)/modules/$(MODULE_NAME).ko: $(KERNEL_IMAGE) $(SRC_WATCH)
+$(BUILD_DIR)/modules/$(MODULE_NAME).ko &: $(KERNEL_IMAGE) $(SRC_WATCH)
 	@echo "[2/5] Building modules..."
 	$(MAKE) -C $(KERNEL_DIR) M=$(MODULE_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) \
-		KCFLAGS='-DPKT_FWD_VERSION="\"$(VERSION)\"" -DSESS_VERSION="\"$(VERSION)\""' \
+		KCFLAGS='-DPKT_FWD_VERSION="\"$(VERSION)\""' \
 		modules KBUILD_MODPOST_WARN=1
 	@mkdir -p $(BUILD_DIR)/modules
 	cp $(MODULE_DIR)/*.ko $(BUILD_DIR)/modules/
@@ -214,6 +231,23 @@ $(BUILD_DIR)/modules/$(MODULE_NAME).ko: $(KERNEL_IMAGE) $(SRC_WATCH)
 		[ -f $(KERNEL_DIR)/net/netfilter/$$m ] && \
 		cp $(KERNEL_DIR)/net/netfilter/$$m $(BUILD_DIR)/modules/ || true; \
 	done
+	# Copy NFQUEUE + connbytes modules (required for IPS userspace inspection)
+	@for m in nfnetlink_queue.ko xt_NFQUEUE.ko xt_connbytes.ko; do \
+		f=$$(find $(KERNEL_DIR) -name "$$m" 2>/dev/null | head -1); \
+		[ -n "$$f" ] && cp "$$f" $(BUILD_DIR)/modules/ && \
+			echo "[modules] copied $$m" || true; \
+	done
+	# Copy ip_set modules (required for FQDN address objects and -m set matching)
+	@for m in ip_set.ko ip_set_hash_ip.ko xt_set.ko; do \
+		f=$$(find $(KERNEL_DIR) -name "$$m" 2>/dev/null | head -1); \
+		[ -n "$$f" ] && cp "$$f" $(BUILD_DIR)/modules/ && \
+			echo "[modules] copied $$m" || true; \
+	done
+	# Copy af_packet.ko only if built as a module (CONFIG_PACKET=m). When
+	# PACKET=y (built-in) the .ko does not exist and AF_PACKET is always
+	# present for udhcpc — skipping the copy is not an error.
+	@[ -f $(KERNEL_DIR)/net/packet/af_packet.ko ] && \
+		cp $(KERNEL_DIR)/net/packet/af_packet.ko $(BUILD_DIR)/modules/ || true
 	@echo "[2/5] Module ready: $@"
 
 # =============================================================================
@@ -222,7 +256,7 @@ $(BUILD_DIR)/modules/$(MODULE_NAME).ko: $(KERNEL_IMAGE) $(SRC_WATCH)
 
 busybox: $(BUSYBOX_BIN) $(BUSYBOX_LINKS)
 
-$(BUSYBOX_BIN):
+$(BUSYBOX_BIN): $(BUSYBOX_CONFIG_FRAGMENT)
 	@echo "[3/5] Building BusyBox..."
 	@if [ ! -d "$(BUSYBOX_DIR)" ]; then \
 		mkdir -p "$(BUSYBOX_CACHE_DIR)"; \
@@ -259,7 +293,7 @@ $(BUSYBOX_BIN):
 	cp $(BUSYBOX_DIR)/busybox $(BUSYBOX_BIN)
 	@echo "[3/5] BusyBox ready: $(BUSYBOX_BIN)"
 
-$(BUSYBOX_LINKS):
+$(BUSYBOX_LINKS): $(BUSYBOX_CONFIG_FRAGMENT)
 	@if [ ! -d "$(BUSYBOX_DIR)" ]; then \
 		mkdir -p "$(BUSYBOX_CACHE_DIR)"; \
 		echo "Cloning BusyBox source..."; \
@@ -396,7 +430,8 @@ $(BUILD_DIR)/mgmtd/stargazer-mgmtd $(BUILD_DIR)/mgmtd/stargazer-ipc-cli: $(MUSL_
 	@mkdir -p $(BUILD_DIR)/mgmtd
 	$(MAKE) -C $(MGMTD_DIR) \
 		CROSS_COMPILE=$(MUSL_CROSS) \
-		BUILD_DIR=$(BUILD_DIR)/mgmtd
+		BUILD_DIR=$(BUILD_DIR)/mgmtd \
+		VERSION=$(VERSION)
 	@echo "[3f/5] mgmtd + IPC client ready."
 
 # =============================================================================
@@ -527,7 +562,7 @@ $(ATF_MTK_DIR)/.stamp:
 
 rootfs: $(ROOTFS_DIR)/.stamp
 
-$(ROOTFS_DIR)/.stamp: modules busybox dash iptables logind mgmtd cli webd tools
+$(ROOTFS_DIR)/.stamp: modules busybox dash iptables logind mgmtd cli webd ipsd tools
 	@echo "[4/5] Creating rootfs..."
 	@rm -rf $(ROOTFS_DIR)
 	@mkdir -p $(ROOTFS_DIR)
@@ -579,6 +614,33 @@ $(ROOTFS_DIR)/.stamp: modules busybox dash iptables logind mgmtd cli webd tools
 	# Install web daemon + static web UI files
 	cp $(BUILD_DIR)/webd/stargazer-webd $(ROOTFS_DIR)/sbin/stargazer-webd
 	@chmod +x $(ROOTFS_DIR)/sbin/stargazer-webd
+
+	# Install IPS daemon + signature repository (Phase B) — mgmtd supervise ipsd
+	# (ipsd_sync fork+exec); thiếu binary này thì IPS không bao giờ chạy và bật
+	# IPS trên policy sẽ làm NFQUEUE fail-closed (treo traffic).
+	cp $(IPSD_BIN) $(ROOTFS_DIR)/sbin/stargazer-ipsd
+	@chmod +x $(ROOTFS_DIR)/sbin/stargazer-ipsd
+	@# SSL inspection daemon (chỉ cài nếu đã build — cần OpenSSL cross). Guard
+	@# để firmware không vỡ khi ssld chưa build (SSL inspection off-by-default).
+	@if [ -f $(SSLD_BIN) ]; then \
+	    cp $(SSLD_BIN) $(ROOTFS_DIR)/sbin/stargazer-ssld; \
+	    chmod +x $(ROOTFS_DIR)/sbin/stargazer-ssld; \
+	    echo "[rootfs] stargazer-ssld đã cài"; \
+	else echo "[rootfs] stargazer-ssld chưa build — bỏ qua (SSL inspection off)"; fi
+	@mkdir -p $(ROOTFS_DIR)/etc/stargazer/ssl
+	@# Trust store (root CA bundle) cho ssld verify cert server thật (untrusted
+	@# detection). Thiếu nó → mọi cert bị coi untrusted. Lấy bundle Mozilla host.
+	@mkdir -p $(ROOTFS_DIR)/etc/ssl/certs
+	@if [ -f /etc/ssl/certs/ca-certificates.crt ]; then \
+	    cp /etc/ssl/certs/ca-certificates.crt $(ROOTFS_DIR)/etc/ssl/certs/; \
+	    echo "[rootfs] CA bundle (trust store) đã cài"; \
+	else echo "[rootfs] CẢNH BÁO: host không có ca-certificates.crt — ssld verify sẽ coi mọi cert untrusted"; fi
+	@mkdir -p $(ROOTFS_DIR)/etc/stargazer/ips/repo
+	@mkdir -p $(ROOTFS_DIR)/etc/stargazer/ips/profiles
+	@mkdir -p $(ROOTFS_DIR)/etc/stargazer/ips/rules
+	@touch    $(ROOTFS_DIR)/etc/stargazer/ips/rules/active.rules
+	@mkdir -p $(ROOTFS_DIR)/etc/stargazer/logs
+
 	@mkdir -p $(ROOTFS_DIR)/usr/share/stargazer/www
 	cp -r $(PROJECT_ROOT)/src/userspace/webui/www/* $(ROOTFS_DIR)/usr/share/stargazer/www/
 	@find $(ROOTFS_DIR)/usr/share/stargazer/www -type f \( -name '*.html' -o -name '*.js' \) \
@@ -619,6 +681,12 @@ $(ROOTFS_DIR)/.stamp: modules busybox dash iptables logind mgmtd cli webd tools
 	@cp $(USERSPACE_DIR)/etc/init.d/* $(ROOTFS_DIR)/etc/init.d/
 	@chmod +x $(ROOTFS_DIR)/etc/init.d/*
 
+	# Crontab (crond đọc /var/spool/cron/crontabs) — IPS signature auto-update
+	# + xoay ips-alert.log. crond được /etc/init.d/stargazer khởi động.
+	@mkdir -p $(ROOTFS_DIR)/var/spool/cron/crontabs
+	@cp $(USERSPACE_DIR)/var/spool/cron/crontabs/root \
+	    $(ROOTFS_DIR)/var/spool/cron/crontabs/root
+
 	# Copy init script with version substitution
 	@cp $(USERSPACE_DIR)/init $(ROOTFS_DIR)/init.tmp
 	@sed -i 's/@VERSION@/$(VERSION)/g' $(ROOTFS_DIR)/init.tmp
@@ -642,8 +710,25 @@ $(ROOTFS_DIR)/.stamp: modules busybox dash iptables logind mgmtd cli webd tools
 	# Create stargazer config directory (mgmtd seeds defaults on first boot)
 	@mkdir -p $(ROOTFS_DIR)/etc/stargazer
 
+	# Architecture guard: every ELF in the rootfs MUST be aarch64. A host
+	# (x86) binary leaking into the image — e.g. a stray cp or a build-tree
+	# contamination — would silently brick the device (login exec fails with
+	# "Exec format error"). Fail the build loudly instead of shipping it.
+	@bad=$$(find $(ROOTFS_DIR) -type f | while read -r f; do \
+		d=$$(file -b "$$f" 2>/dev/null); \
+		case "$$d" in \
+			*ELF*aarch64*) ;; \
+			*ELF*) echo "$$f [$$d]" ;; \
+		esac; \
+	done); \
+	if [ -n "$$bad" ]; then \
+		echo "[ERROR] non-aarch64 ELF binaries in rootfs:"; \
+		echo "$$bad"; \
+		exit 1; \
+	fi
+
 	@touch $@
-	@echo "[4/5] Rootfs ready: $(ROOTFS_DIR)"
+	@echo "[4/5] Rootfs ready: $(ROOTFS_DIR) (all ELF binaries verified aarch64)"
 
 # =============================================================================
 # 5. ISO Image
@@ -659,8 +744,8 @@ $(ISO_FILE): $(ROOTFS_DIR)/.stamp
 	cp $(KERNEL_IMAGE) $(BUILD_DIR)/iso/boot/kernel
 	@if [ -f "$(KERNEL_DTB)" ]; then cp $(KERNEL_DTB) $(BUILD_DIR)/iso/boot/; fi
 
-	# Create initramfs from rootfs
-	cd $(ROOTFS_DIR) && find . | sort | cpio -o -H newc 2>/dev/null | gzip -n -9 > $(BUILD_DIR)/iso/boot/initramfs.gz
+	# Create initramfs from rootfs (fakeroot injects static /dev nodes without root)
+	cd $(ROOTFS_DIR) && fakeroot sh -c 'mknod -m 600 dev/console c 5 1; mknod -m 666 dev/null c 1 3; find . | sort | cpio -o -H newc 2>/dev/null' | gzip -n -9 > $(BUILD_DIR)/iso/boot/initramfs.gz
 
 	# Create ISO (for UEFI boot on BPI-R4)
 	@if command -v xorriso >/dev/null 2>&1; then \
@@ -701,13 +786,13 @@ NAND_FIT := $(BUILD_DIR)/stargazer-nand.itb
 nand-fit: rootfs
 	@echo "[5/5] Building NAND FIT image..."
 	@mkdir -p $(BUILD_DIR)/image/fit-nand
-	cd $(ROOTFS_DIR) && find . | sort | cpio -o -H newc 2>/dev/null | gzip -n -9 > $(BUILD_DIR)/image/fit-nand/initramfs.gz
+	cd $(ROOTFS_DIR) && fakeroot sh -c 'mknod -m 600 dev/console c 5 1; mknod -m 666 dev/null c 1 3; find . | sort | cpio -o -H newc 2>/dev/null' | gzip -n -9 > $(BUILD_DIR)/image/fit-nand/initramfs.gz
 	lzma -z -k -f $(KERNEL_IMAGE) -c > $(BUILD_DIR)/image/fit-nand/Image.lzma
 	# Use pre-merged DTB (base + eMMC overlay) so eMMC is accessible for sgdata
 	cp $(KERNEL_DTB) $(BUILD_DIR)/image/fit-nand/bpi-r4.dtb
 	# Clear stale bootargs (root=/dev/fit0 etc.) — U-Boot sets args at runtime
 	fdtput -t s $(BUILD_DIR)/image/fit-nand/bpi-r4.dtb /chosen bootargs \
-		"console=ttyS0,115200n1 earlycon=uart8250,mmio32,0x11000000"
+		"console=ttyS0,115200n1 earlycon=uart8250,mmio32,0x11000000 fw_devlink=off clk_ignore_unused"
 	# Fix SPI-NAND partition table to match MTK SDK layout.
 	# The stock DTB has UBI starting at 0x200000 (OpenWrt layout) which overlaps
 	# the FIP area at 0x580000. UBI's wear leveling erases the FIP, killing boot.
@@ -811,13 +896,13 @@ image: rootfs bpi-r4-bootloader
 
 	# Build FIT image (kernel + DTB + initramfs in single .itb)
 	# MTK U-Boot reads the "firmware" partition as a raw FIT image
-	cd $(ROOTFS_DIR) && find . | sort | cpio -o -H newc 2>/dev/null | gzip -n -9 > $(BUILD_DIR)/image/fit/initramfs.gz
+	cd $(ROOTFS_DIR) && fakeroot sh -c 'mknod -m 600 dev/console c 5 1; mknod -m 666 dev/null c 1 3; find . | sort | cpio -o -H newc 2>/dev/null' | gzip -n -9 > $(BUILD_DIR)/image/fit/initramfs.gz
 	lzma -z -k -f $(KERNEL_IMAGE) -c > $(BUILD_DIR)/image/fit/Image.lzma
 	cp $(KERNEL_DIR)/arch/$(ARCH)/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dtb $(BUILD_DIR)/image/fit/bpi-r4.dtb
 	# Clear hardcoded bootargs from base DTB (root=/dev/fit0, ubi.block etc.)
 	# U-Boot sets bootargs at runtime; stale DTB args conflict with initramfs boot
 	fdtput -t s $(BUILD_DIR)/image/fit/bpi-r4.dtb /chosen bootargs \
-		"console=ttyS0,115200n1 earlycon=uart8250,mmio32,0x11000000"
+		"console=ttyS0,115200n1 earlycon=uart8250,mmio32,0x11000000 fw_devlink=off clk_ignore_unused"
 	# Pre-merge eMMC overlay into base DTB (U-Boot lacks CONFIG_OF_LIBFDT_OVERLAY)
 	@if [ -f "$(KERNEL_DIR)/arch/$(ARCH)/boot/dts/mediatek/mt7988a-bananapi-bpi-r4-emmc.dtbo" ]; then \
 		echo "  Merging eMMC overlay into base DTB..."; \
@@ -890,23 +975,62 @@ image: rootfs bpi-r4-bootloader
 	@echo "   dd if=bl2_emmc.img of=/dev/mmcblk0boot0"
 	@echo "   dd if=$(notdir $(IMG_FILE)) of=/dev/mmcblk0 bs=4M"
 	@echo "   sync && reboot -f"
+	@_blk=$$(( ($$(stat -c %s $(IMG_FILE)) + 511) / 512 )); \
+	 printf " Flash from U-Boot (load full image to 0x50000000 first):\n"; \
+	 printf "   mmc write 0x50000000 0x0 0x%X   (=%d blocks, the WHOLE image)\n" $$_blk $$_blk
 	@echo "============================================"
 
 # =============================================================================
 # Firmware upgrade package (for in-place upgrades on running devices)
 # =============================================================================
 
-FW_PKG := $(BUILD_DIR)/stargazer-fw-$(VERSION).tar.gz
+FW_PKG       := $(BUILD_DIR)/stargazer-fw-$(VERSION).tar.gz
+FW_SIGN_KEY  := keys/firmware-signing.pem
+FW_PUBKEY_HDR := $(USERSPACE_DIR)/mgmtd/firmware_pubkey.h
+
+# Generate the Ed25519 firmware-signing keypair (run ONCE per project).
+# The private key stays in keys/ (gitignored); the public key is written into
+# the committed header that mgmtd compiles in. Re-run to rotate the key.
+firmware-keygen:
+	@mkdir -p keys
+	@if [ -f $(FW_SIGN_KEY) ]; then \
+		echo "ERROR: $(FW_SIGN_KEY) already exists — refusing to overwrite."; \
+		echo "       Delete it manually to rotate the firmware-signing key."; \
+		exit 1; \
+	fi
+	openssl genpkey -algorithm ed25519 -out $(FW_SIGN_KEY)
+	@chmod 600 $(FW_SIGN_KEY)
+	@$(MAKE) firmware-pubkey-header
+	@echo "Generated $(FW_SIGN_KEY) (KEEP SECRET) and $(FW_PUBKEY_HDR)."
+
+# (Re)generate the compiled-in public-key header from the private key.
+firmware-pubkey-header:
+	@[ -f $(FW_SIGN_KEY) ] || { echo "ERROR: $(FW_SIGN_KEY) missing — run 'make firmware-keygen'"; exit 1; }
+	@_hex=$$(openssl pkey -in $(FW_SIGN_KEY) -pubout -outform DER 2>/dev/null | tail -c 32 | od -An -tx1 -v | tr -d ' \n'); \
+	if [ $${#_hex} -ne 64 ]; then \
+		echo "ERROR: could not extract a 32-byte Ed25519 public key from $(FW_SIGN_KEY) (got $${#_hex} hex chars)"; \
+		exit 1; \
+	fi; \
+	{ echo "/* Auto-generated by 'make firmware-keygen' — DO NOT EDIT. */"; \
+	  echo "/* Ed25519 firmware-signing public key (32 bytes). */"; \
+	  echo "#ifndef FIRMWARE_PUBKEY_H"; \
+	  echo "#define FIRMWARE_PUBKEY_H"; \
+	  echo "static const unsigned char firmware_pubkey[32] = {"; \
+	  echo "$$_hex" | sed -E 's/(..)/0x\1, /g' | fold -sw 60 | sed 's/^/\t/; s/ *$$//'; \
+	  echo "};"; \
+	  echo "#endif"; } > $(FW_PUBKEY_HDR)
+	@echo "Wrote $(FW_PUBKEY_HDR)"
 
 firmware: rootfs
+	@[ -f $(FW_SIGN_KEY) ] || { echo "ERROR: no firmware-signing key ($(FW_SIGN_KEY)). Run 'make firmware-keygen' once."; exit 1; }
 	@echo "Building firmware upgrade package..."
 	@mkdir -p $(BUILD_DIR)/firmware $(BUILD_DIR)/firmware/fit
 	# Build FIT image (same as image target)
-	cd $(ROOTFS_DIR) && find . | sort | cpio -o -H newc 2>/dev/null | gzip -n -9 > $(BUILD_DIR)/firmware/fit/initramfs.gz
+	cd $(ROOTFS_DIR) && fakeroot sh -c 'mknod -m 600 dev/console c 5 1; mknod -m 666 dev/null c 1 3; find . | sort | cpio -o -H newc 2>/dev/null' | gzip -n -9 > $(BUILD_DIR)/firmware/fit/initramfs.gz
 	lzma -z -k -f $(KERNEL_IMAGE) -c > $(BUILD_DIR)/firmware/fit/Image.lzma
 	cp $(KERNEL_DIR)/arch/$(ARCH)/boot/dts/mediatek/mt7988a-bananapi-bpi-r4.dtb $(BUILD_DIR)/firmware/fit/bpi-r4.dtb
 	fdtput -t s $(BUILD_DIR)/firmware/fit/bpi-r4.dtb /chosen bootargs \
-		"console=ttyS0,115200n1 earlycon=uart8250,mmio32,0x11000000"
+		"console=ttyS0,115200n1 earlycon=uart8250,mmio32,0x11000000 fw_devlink=off clk_ignore_unused"
 	# Pre-merge eMMC overlay into base DTB
 	@if [ -f "$(KERNEL_DIR)/arch/$(ARCH)/boot/dts/mediatek/mt7988a-bananapi-bpi-r4-emmc.dtbo" ]; then \
 		fdtoverlay -i $(BUILD_DIR)/firmware/fit/bpi-r4.dtb \
@@ -929,8 +1053,15 @@ firmware: rootfs
 	printf 'version=%s\nbuild_date=%s\nfit_sha256=%s\n' \
 		"$(VERSION)" "$$(date -u +%Y-%m-%dT%H:%M:%S)" "$$FSHA" \
 		> $(BUILD_DIR)/firmware/manifest.txt
-	@# Package into tar.gz
-	cd $(BUILD_DIR)/firmware && tar -czf $(FW_PKG) manifest.txt stargazer.itb
+	@# Ed25519-sign the MANIFEST (detached 64-byte signature). The manifest
+	@# carries the version and the FIT's sha256, so signing it authenticates
+	@# both the version (for the device's anti-rollback check) and — via the
+	@# device's sha256(itb)==fit_sha256 check — the FIT image itself.
+	openssl pkeyutl -sign -inkey $(FW_SIGN_KEY) -rawin \
+		-in $(BUILD_DIR)/firmware/manifest.txt \
+		-out $(BUILD_DIR)/firmware/firmware.sig
+	@# Package into tar.gz (manifest + FIT + signature)
+	cd $(BUILD_DIR)/firmware && tar -czf $(FW_PKG) manifest.txt stargazer.itb firmware.sig
 	@# Clean staging
 	@rm -rf $(BUILD_DIR)/firmware
 	@echo ""
@@ -948,7 +1079,132 @@ firmware: rootfs
 # Test in QEMU
 # =============================================================================
 
-test-build: modules busybox dash iptables logind mgmtd cli webd tools uboot
+IPSD_DIR       := $(PROJECT_ROOT)/src/userspace/ipsd
+# Nguồn "core" (file nhỏ, compile nhanh). predict.c (model tl2cgen 6 MB / 108k
+# dòng) tách riêng → cache thành predict.o, chỉ build lại khi model đổi.
+IPSD_CORE_SRCS := $(IPSD_DIR)/main.c $(IPSD_DIR)/nfq.c $(IPSD_DIR)/ctdump.c \
+                  $(IPSD_DIR)/feature.c $(IPSD_DIR)/flow_rule.c \
+                  $(IPSD_DIR)/sig_rule.c $(IPSD_DIR)/sig_reload.c \
+                  $(IPSD_DIR)/ac.c $(IPSD_DIR)/reass.c \
+                  $(IPSD_DIR)/proto_buf.c $(IPSD_DIR)/tls_clienthello.c \
+                  $(IPSD_DIR)/engine.c $(IPSD_DIR)/fusion.c \
+                  $(IPSD_DIR)/ml_scan.c \
+                  $(IPSD_DIR)/insp_ipc.c \
+                  $(IPSD_DIR)/ips_model.c
+IPSD_PREDICT_C := $(IPSD_DIR)/model/predict.c
+IPSD_PREDICT_O := $(BUILD_DIR)/ipsd/predict.o
+IPSD_BIN       := $(BUILD_DIR)/ipsd/stargazer-ipsd
+
+# P4 — libpcre2 static (cross musl) để bật regex (HAVE_PCRE). JIT off (ReDoS).
+PCRE2_VERSION  := 10.44
+PCRE2_URL      := https://github.com/PCRE2Project/pcre2/releases/download/pcre2-$(PCRE2_VERSION)/pcre2-$(PCRE2_VERSION).tar.gz
+PCRE2_DIR      := $(BUSYBOX_CACHE_DIR)/pcre2-$(PCRE2_VERSION)
+PCRE2_PREFIX   := $(BUILD_DIR)/ipsd/pcre2-prefix
+PCRE2_LIB      := $(PCRE2_PREFIX)/lib/libpcre2-8.a
+
+ipsd: $(IPSD_BIN)
+
+# Build libpcre2-8.a static cho aarch64-musl (JIT off → interpreter tôn trọng
+# match-limit, không treo). Chỉ build khi có MUSL_CC.
+$(PCRE2_LIB): $(MUSL_CC)
+	@mkdir -p $(BUSYBOX_CACHE_DIR) $(BUILD_DIR)/ipsd
+	@if [ ! -d "$(PCRE2_DIR)" ]; then \
+	    echo "[ipsd] Downloading pcre2 $(PCRE2_VERSION)..."; \
+	    curl -fSL "$(PCRE2_URL)" -o "$(BUSYBOX_CACHE_DIR)/pcre2.tar.gz"; \
+	    tar -xzf "$(BUSYBOX_CACHE_DIR)/pcre2.tar.gz" -C "$(BUSYBOX_CACHE_DIR)"; \
+	    rm -f "$(BUSYBOX_CACHE_DIR)/pcre2.tar.gz"; \
+	fi
+	@echo "[ipsd] Cross-compiling libpcre2-8 (musl static, JIT off)..."
+	cd $(PCRE2_DIR) && ./configure --host=aarch64-linux-musl CC=$(MUSL_CC) \
+	    CFLAGS="-Os" LDFLAGS="-static" --enable-static --disable-shared \
+	    --disable-jit --prefix=$(PCRE2_PREFIX) >/dev/null && \
+	$(MAKE) -j$$(nproc) >/dev/null && $(MAKE) install >/dev/null
+	@echo "[ipsd] libpcre2: $(PCRE2_LIB)"
+
+# ── SSL inspection (stargazer-ssld): OpenSSL aarch64-musl static + daemon ──
+SSLD_DIR        := $(USERSPACE_DIR)/ssld
+SSLD_BIN        := $(BUILD_DIR)/ssld/stargazer-ssld
+OPENSSL_VERSION := 3.0.15
+OPENSSL_URL     := https://github.com/openssl/openssl/releases/download/openssl-$(OPENSSL_VERSION)/openssl-$(OPENSSL_VERSION).tar.gz
+OPENSSL_DIR     := $(BUSYBOX_CACHE_DIR)/openssl-$(OPENSSL_VERSION)
+OPENSSL_PREFIX  := $(BUILD_DIR)/ssld/openssl-prefix
+OPENSSL_LIB     := $(OPENSSL_PREFIX)/lib/libssl.a
+OPENSSL_CROSS   := $(abspath $(MUSL_CROSS))
+
+SSLD_SRCS := $(SSLD_DIR)/main.c $(SSLD_DIR)/conn.c $(SSLD_DIR)/relay.c \
+             $(SSLD_DIR)/origdst.c $(SSLD_DIR)/ca.c $(SSLD_DIR)/certcache.c \
+             $(SSLD_DIR)/bump.c \
+             $(IPSD_DIR)/tls_clienthello.c $(IPSD_DIR)/tls_policy.c \
+             $(IPSD_DIR)/sig_rule.c $(IPSD_DIR)/ac.c
+
+.PHONY: ssld openssl-cross
+openssl-cross: $(OPENSSL_LIB)
+ssld: $(SSLD_BIN)
+
+# OpenSSL static cho aarch64-musl (no-shared/tests/async/engine — gọn + nhanh).
+# build_libs + install_dev: chỉ thư viện + header, bỏ apps (tiết kiệm thời gian).
+$(OPENSSL_LIB): $(MUSL_CC)
+	@mkdir -p $(BUSYBOX_CACHE_DIR) $(BUILD_DIR)/ssld
+	@if [ ! -d "$(OPENSSL_DIR)" ]; then \
+	    echo "[ssld] Downloading openssl $(OPENSSL_VERSION)..."; \
+	    curl -fSL "$(OPENSSL_URL)" -o "$(BUSYBOX_CACHE_DIR)/openssl.tar.gz"; \
+	    tar -xzf "$(BUSYBOX_CACHE_DIR)/openssl.tar.gz" -C "$(BUSYBOX_CACHE_DIR)"; \
+	    rm -f "$(BUSYBOX_CACHE_DIR)/openssl.tar.gz"; \
+	fi
+	@echo "[ssld] Cross-compiling OpenSSL $(OPENSSL_VERSION) (aarch64-musl static — vài phút)..."
+	cd $(OPENSSL_DIR) && ./Configure linux-aarch64 \
+	    --cross-compile-prefix=$(OPENSSL_CROSS) \
+	    no-shared no-tests no-async no-engine \
+	    --prefix=$(abspath $(OPENSSL_PREFIX)) >/dev/null && \
+	$(MAKE) -j$$(nproc) build_libs >/dev/null && \
+	$(MAKE) install_dev >/dev/null
+	@echo "[ssld] OpenSSL static: $(OPENSSL_LIB)"
+
+$(SSLD_BIN): $(SSLD_SRCS) $(OPENSSL_LIB)
+	@mkdir -p $(BUILD_DIR)/ssld
+	@echo "[ssld] Cross-compiling stargazer-ssld (ARM64 + OpenSSL static)..."
+	$(MUSL_CC) -static -O2 -Wall -Wextra -std=c11 \
+	    -I$(SSLD_DIR) -I$(IPSD_DIR) -I$(OPENSSL_PREFIX)/include \
+	    -o $@ $(SSLD_SRCS) \
+	    $(OPENSSL_PREFIX)/lib/libssl.a $(OPENSSL_PREFIX)/lib/libcrypto.a \
+	    -lpthread
+	@echo "[ssld] binary: $(SSLD_BIN)"
+
+$(IPSD_BIN): $(IPSD_CORE_SRCS) $(IPSD_PREDICT_C)
+	@mkdir -p $(BUILD_DIR)/ipsd
+	@echo "[ipsd] Cross-compiling stargazer-ipsd (ARM64)..."
+	@# Dùng musl nếu có, ngược lại dùng aarch64-linux-gnu-gcc (đủ cho QEMU test)
+	$(eval IPSD_CC := $(shell \
+	    if [ -x "$(MUSL_CC)" ]; then echo "$(MUSL_CC) -static"; \
+	    elif command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then \
+	        echo "aarch64-linux-gnu-gcc"; \
+	    else echo ""; fi))
+	@if [ -z "$(IPSD_CC)" ]; then \
+	    echo "ERROR: no ARM64 cross-compiler found"; \
+	    echo "Run: make musl-toolchain   OR   sudo apt install gcc-aarch64-linux-gnu"; \
+	    exit 1; fi
+	@# P4: build libpcre2 (chỉ với musl) → bật HAVE_PCRE. Fallback gnu → không pcre.
+	@if [ -x "$(MUSL_CC)" ] && [ ! -f "$(PCRE2_LIB)" ]; then \
+	    $(MAKE) $(PCRE2_LIB); fi
+	$(eval IPSD_PCRE_CFLAGS := $(shell [ -f "$(PCRE2_LIB)" ] && echo "-DHAVE_PCRE -I$(PCRE2_PREFIX)/include"))
+	$(eval IPSD_PCRE_LIB := $(shell [ -f "$(PCRE2_LIB)" ] && echo "$(PCRE2_LIB)"))
+	@# predict.o: cache; chỉ recompile khi predict.c mới hơn (-w tắt warning
+	@# code generate). Lần đầu mất vài phút, các lần sau bỏ qua bước này.
+	@if [ ! -f $(IPSD_PREDICT_O) ] || \
+	    [ $(IPSD_PREDICT_C) -nt $(IPSD_PREDICT_O) ]; then \
+	    echo "[ipsd] compiling predict.o (model ML 6MB — lần đầu/đổi model, vài phút)..."; \
+	    $(IPSD_CC) -O2 -w -c $(IPSD_PREDICT_C) -o $(IPSD_PREDICT_O); \
+	else \
+	    echo "[ipsd] predict.o cached — bỏ qua compile model"; \
+	fi
+	$(IPSD_CC) -O2 -Wall -std=c11 \
+	    -I$(IPSD_DIR) $(IPSD_PCRE_CFLAGS) \
+	    $(IPSD_CORE_SRCS) $(IPSD_PREDICT_O) $(IPSD_PCRE_LIB) \
+	    -lpthread -lm \
+	    -o $(IPSD_BIN)
+	@echo "[ipsd] Built: $(IPSD_BIN)$(if $(IPSD_PCRE_LIB), (HAVE_PCRE),)"
+
+test-build: modules busybox dash iptables logind mgmtd cli webd tools uboot ipsd
 	@echo "Building test initramfs..."
 	@mkdir -p $(BUILD_DIR)/test
 
@@ -1059,6 +1315,11 @@ test-build: modules busybox dash iptables logind mgmtd cli webd tools uboot
 	@cp $(USERSPACE_DIR)/usr/libexec/stargazer/* $(BUILD_DIR)/test/initramfs/usr/libexec/stargazer/
 	@chmod +x $(BUILD_DIR)/test/initramfs/usr/libexec/stargazer/*
 
+	# Crontab cho IPS signature auto-update (crond đọc /var/spool/cron/crontabs)
+	@mkdir -p $(BUILD_DIR)/test/initramfs/var/spool/cron/crontabs
+	@cp $(USERSPACE_DIR)/var/spool/cron/crontabs/root \
+	    $(BUILD_DIR)/test/initramfs/var/spool/cron/crontabs/root 2>/dev/null || true
+
 	# Install udhcpc default script (for DHCP network configuration)
 	@mkdir -p $(BUILD_DIR)/test/initramfs/usr/share/udhcpc
 	@cp $(USERSPACE_DIR)/usr/share/udhcpc/default.script $(BUILD_DIR)/test/initramfs/usr/share/udhcpc/
@@ -1066,6 +1327,20 @@ test-build: modules busybox dash iptables logind mgmtd cli webd tools uboot
 
 	# Create stargazer config directory (mgmtd seeds defaults on first boot)
 	@mkdir -p $(BUILD_DIR)/test/initramfs/etc/stargazer
+
+	# Install IPS daemon + signature repository (Phase B)
+	cp $(IPSD_BIN) $(BUILD_DIR)/test/initramfs/sbin/stargazer-ipsd
+	@chmod +x $(BUILD_DIR)/test/initramfs/sbin/stargazer-ipsd
+	@# Repo theo category: repo/<cat>.rules. profiles/ giữ ruleset compile
+	@# per-profile. rules/active.rules là bản ipsd nạp (mgmtd compile lúc boot).
+	@mkdir -p $(BUILD_DIR)/test/initramfs/etc/stargazer/ips/repo
+	@mkdir -p $(BUILD_DIR)/test/initramfs/etc/stargazer/ips/profiles
+	@mkdir -p $(BUILD_DIR)/test/initramfs/etc/stargazer/ips/rules
+	@# repo/ và rules/ được tạo rỗng; ipsd sẽ không nạp gì cho tới khi
+	@# user download ruleset qua web UI (Download tab → Update Rules).
+	@touch $(BUILD_DIR)/test/initramfs/etc/stargazer/ips/rules/active.rules
+	@mkdir -p $(BUILD_DIR)/test/initramfs/etc/stargazer/logs
+	@echo "[ipsd] IPS daemon + signature repo installed in initramfs"
 
 	# Pack initramfs
 	cd $(BUILD_DIR)/test/initramfs && find . | sort | cpio -o -H newc 2>/dev/null | gzip -n -9 > $(BUILD_DIR)/test/initramfs.gz
@@ -1099,7 +1374,7 @@ test-build: modules busybox dash iptables logind mgmtd cli webd tools uboot
 		$(BUILD_DIR)/test/boot-fs.img 64M 2>/dev/null
 	@# Wrap filesystem in a partitioned image (1MB MBR + 64MB partition)
 	dd if=/dev/zero of=$(BUILD_DIR)/test/boot.img bs=1M count=65 2>/dev/null
-	printf 'start=2048, type=linux\n' | sfdisk $(BUILD_DIR)/test/boot.img >/dev/null 2>&1
+	printf 'start=2048, type=linux, bootable\n' | sfdisk $(BUILD_DIR)/test/boot.img >/dev/null 2>&1
 	dd if=$(BUILD_DIR)/test/boot-fs.img of=$(BUILD_DIR)/test/boot.img \
 		bs=512 seek=2048 conv=notrunc 2>/dev/null
 	@rm -f $(BUILD_DIR)/test/boot-fs.img
@@ -1108,6 +1383,26 @@ test-build: modules busybox dash iptables logind mgmtd cli webd tools uboot
 
 	# TFTP directory for QEMU built-in TFTP server (firmware testing)
 	@mkdir -p $(BUILD_DIR)/test/tftp
+	# Copy kernel and initramfs for TFTP boot (fallback when virtio partition fails)
+	cp $(KERNEL_IMAGE) $(BUILD_DIR)/test/tftp/kernel
+	cp $(BUILD_DIR)/test/initramfs.gz $(BUILD_DIR)/test/tftp/initramfs.gz
+	# Wrap initramfs in U-Boot image format
+	mkimage -A arm64 -T ramdisk -C gzip -n "Stargazer Initramfs" \
+		-d $(BUILD_DIR)/test/tftp/initramfs.gz \
+		$(BUILD_DIR)/test/tftp/initramfs.uimg >/dev/null
+	# Create U-Boot boot script
+	@echo '# U-Boot TFTP boot script' > $(BUILD_DIR)/test/tftp/boot.cmd
+	@echo 'echo "=== Stargazer TFTP Boot ==="' >> $(BUILD_DIR)/test/tftp/boot.cmd
+	@echo 'setenv serverip 10.0.1.1' >> $(BUILD_DIR)/test/tftp/boot.cmd
+	@echo 'setenv ipaddr 10.0.1.15' >> $(BUILD_DIR)/test/tftp/boot.cmd
+	@echo 'tftp $${kernel_addr_r} kernel' >> $(BUILD_DIR)/test/tftp/boot.cmd
+	@echo 'tftp $${ramdisk_addr_r} initramfs.uimg' >> $(BUILD_DIR)/test/tftp/boot.cmd
+	@echo 'setenv bootargs "console=ttyAMA0 root=/dev/ram0 rw"' >> $(BUILD_DIR)/test/tftp/boot.cmd
+	@echo 'booti $${kernel_addr_r} $${ramdisk_addr_r} $${fdt_addr}' >> $(BUILD_DIR)/test/tftp/boot.cmd
+	mkimage -A arm64 -T script -C none -n "Stargazer TFTP Boot" \
+		-d $(BUILD_DIR)/test/tftp/boot.cmd \
+		$(BUILD_DIR)/test/tftp/boot.scr.uimg >/dev/null
+	@echo "TFTP boot files created: $(BUILD_DIR)/test/tftp/"
 
 test: test-build
 	@$(MAKE) --no-print-directory test-run
@@ -1129,13 +1424,18 @@ test-run:
 	fi
 	# Run QEMU — U-Boot loads kernel+initramfs from boot.img (virtio0)
 	# Drive order: vda=boot, vdb=sgdata, vdc=sglogs
+	# Note: ARM virt machine uses virtio-mmio, not virtio-pci
+	# bootindex=0 on boot drive tells U-Boot/firmware to boot from it
 	qemu-system-aarch64 \
 		-machine virt -cpu cortex-a72 -smp 4 -m 2G \
 		-bios $(UBOOT_BIN) \
-		-drive file=$(BUILD_DIR)/test/boot.img,format=raw,if=virtio \
-		-drive file=$(BUILD_DIR)/test/data.img,format=raw,if=virtio \
-		-drive file=$(BUILD_DIR)/test/logs.img,format=raw,if=virtio \
-		-netdev user,id=net0,hostfwd=tcp::2222-:22,net=10.0.1.0/24,host=10.0.1.1,tftp=$(BUILD_DIR)/test/tftp \
+		-drive file=$(BUILD_DIR)/test/boot.img,format=raw,if=none,id=hd0 \
+		-device virtio-blk-device,drive=hd0,bootindex=0 \
+		-drive file=$(BUILD_DIR)/test/data.img,format=raw,if=none,id=hd1 \
+		-device virtio-blk-device,drive=hd1 \
+		-drive file=$(BUILD_DIR)/test/logs.img,format=raw,if=none,id=hd2 \
+		-device virtio-blk-device,drive=hd2 \
+		-netdev user,id=net0,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:80,net=10.0.1.0/24,host=10.0.1.1,tftp=$(BUILD_DIR)/test/tftp \
 		-device virtio-net-device,netdev=net0 \
 		-nographic
 

@@ -22,6 +22,7 @@
 #define _GNU_SOURCE
 
 #include "cli_readline.h"
+#include "cli_ipc.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -60,6 +61,7 @@ static char hist[CLI_MAX_HIST][CLI_MAX_LINE];
 static int nhist = 0;
 
 static struct termios orig_termios;
+static int have_orig = 0;	/* orig_termios captured? (else don't restore) */
 static int raw_mode = 0;
 static int tty_fd = -1;
 
@@ -134,6 +136,7 @@ static int enable_raw(void)
 		return -1;
 	if (tcgetattr(tty_fd, &orig_termios) != 0)
 		return -1;
+	have_orig = 1;
 
 	t = orig_termios;
 	t.c_iflag &= ~(unsigned)(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
@@ -264,6 +267,12 @@ int cli_term_init(void)
 	 * Without this, stale keystrokes echo into the first prompt. */
 	tcflush(tty_fd, TCIFLUSH);
 
+	/* Capture the true original termios now so cli_term_cleanup() can
+	 * always restore a real setting — even if the process exits before
+	 * enable_raw() ever ran (sandbox failure, early WHOAMI exit). */
+	if (tcgetattr(tty_fd, &orig_termios) == 0)
+		have_orig = 1;
+
 	current_comps.count = 0;
 	stack_depth = 0;
 	return 0;
@@ -271,9 +280,12 @@ int cli_term_init(void)
 
 void cli_term_cleanup(void)
 {
-	/* Restore true original terminal settings (with ECHO) on exit */
+	/* Restore true original terminal settings (with ECHO) on exit —
+	 * but only if we actually captured them, else we'd apply a zeroed
+	 * termios and leave the parent shell in a degraded state. */
 	if (tty_fd >= 0) {
-		tcsetattr(tty_fd, TCSANOW, &orig_termios);
+		if (have_orig)
+			tcsetattr(tty_fd, TCSANOW, &orig_termios);
 		close(tty_fd);
 		tty_fd = -1;
 	}
@@ -748,6 +760,38 @@ static int tab_find_matches(const char *buf,
 
 /* ── ? help ───────────────────────────────────────────────────────────── */
 
+/*
+ * show_system_binaries — fetch the runnable-binary list from mgmtd and write
+ * it to the tty. Called by show_help() when the operator presses '?' at the
+ * `execute system` context (those binaries are not in the static command
+ * table, so this is the only way to enumerate them). The IPC lives here in
+ * the same layer that already does history IPC; readline stays unaware of the
+ * wire protocol beyond calling cli_ipc helpers. Newlines from mgmtd are
+ * rewritten to CR-LF because the terminal is in raw mode during readline.
+ */
+static void show_system_binaries(void)
+{
+	struct ipc_response resp = {0};
+	if (ipc_send_str(SG_CMD_SYS_LIST, "", &resp) != 0 ||
+	    resp.status != SG_OK || !resp.payload) {
+		ipc_resp_free(&resp);
+		return;
+	}
+
+	const char *p = resp.payload;
+	while (*p) {
+		const char *nl = strchr(p, '\n');
+		size_t len = nl ? (size_t)(nl - p) : strlen(p);
+		if (len)
+			tty_write(tty_fd, p, len);
+		tty_write(tty_fd, "\r\n", 2);
+		if (!nl)
+			break;
+		p = nl + 1;
+	}
+	ipc_resp_free(&resp);
+}
+
 static void show_help(const char *buf)
 {
 	int trailing_space = (buf[0] != '\0' && buf[strlen(buf) - 1] == ' ');
@@ -864,6 +908,23 @@ static void show_help(const char *buf)
 		tty_write(tty_fd, line, strlen(line));
 	}
 
+	/*
+	 * Dynamic listing: at the `execute system` context the runnable
+	 * binaries (ls, df, iptables, ...) are not registered commands, so the
+	 * static loop above only showed the management subcommands. Append the
+	 * live binary list from mgmtd. Triggers when the line (trailing spaces
+	 * trimmed) is exactly "execute system".
+	 */
+	{
+		char norm[CLI_MAX_LINE];
+		snprintf(norm, sizeof(norm), "%s", buf);
+		size_t nl = strlen(norm);
+		while (nl > 0 && norm[nl - 1] == ' ')
+			norm[--nl] = '\0';
+		if (strcmp(norm, "execute system") == 0)
+			show_system_binaries();
+	}
+
 	if (nseen == 0) {
 		if (buf[0] != '\0' && exact_desc[0] == '\0') {
 			const char *msg = "  Not a command.\r\n";
@@ -895,8 +956,6 @@ static void hist_add(const char *line)
 }
 
 /* ── IPC-based history (works inside sandbox) ─────────────────────────── */
-
-#include "cli_ipc.h"
 
 void cli_hist_load_ipc(void)
 {
@@ -932,24 +991,34 @@ void cli_hist_save_ipc(const char *username)
 	if (nhist == 0 || !username || !username[0])
 		return;
 
-	/* Build payload: "user=<username>\n<line1>\n<line2>\n..." */
-	char payload[CLI_MAX_LINE * CLI_MAX_HIST + 256];
+	/* Build payload: "user=<username>\n<line1>\n<line2>\n..."
+	 * Capped at SG_PAYLOAD_MAX — the IPC layer rejects larger messages.
+	 * Heap-allocated to avoid a 51 KB stack frame. */
+	char *payload = malloc(SG_PAYLOAD_MAX);
+	if (!payload)
+		return;
+
 	size_t pos = 0;
 
-	int n = snprintf(payload, sizeof(payload), "user=%s\n", username);
-	if (n > 0)
+	int n = snprintf(payload, SG_PAYLOAD_MAX, "user=%s\n", username);
+	/* snprintf returns the untruncated length; clamp so an over-long
+	 * username cannot push pos past the buffer for the loop below
+	 * (same guard the per-line append already applies). */
+	if (n > 0 && (size_t)n < SG_PAYLOAD_MAX)
 		pos = (size_t)n;
 
 	for (int i = 0; i < nhist; i++) {
-		n = snprintf(payload + pos, sizeof(payload) - pos,
+		n = snprintf(payload + pos, SG_PAYLOAD_MAX - pos,
 			     "%s\n", hist[i]);
-		if (n > 0 && (size_t)n < sizeof(payload) - pos)
+		if (n > 0 && (size_t)n < SG_PAYLOAD_MAX - pos)
 			pos += (size_t)n;
 	}
 
 	struct ipc_response resp = {0};
-	ipc_send(SG_CMD_HISTORY_SAVE, payload, pos, &resp);
+	if (ipc_send(SG_CMD_HISTORY_SAVE, payload, pos, &resp) < 0)
+		fprintf(stderr, "cli: history save failed (IPC error)\n");
 	ipc_resp_free(&resp);
+	free(payload);
 }
 
 /* ── Abbreviation resolution ──────────────────────────────────────────── */
@@ -1172,9 +1241,13 @@ const char *cli_readline(const char *prompt)
 		}
 		int rfd = tty_fd;
 		char ch;
-		int bpos = 0;
+		/* Continue after any paste fragment already seeded into buf
+		 * above (pos/cursor) rather than overwriting it from 0. */
+		int bpos = (pos > 0 && pos < CLI_MAX_LINE - 1) ? pos : 0;
 
 		tty_write(tty_fd, prompt, strlen(prompt));
+		if (bpos > 0)
+			tty_write(tty_fd, buf, (size_t)bpos);
 		while (bpos < CLI_MAX_LINE - 1) {
 			if (read(rfd, &ch, 1) <= 0)
 				break;
@@ -1351,7 +1424,16 @@ const char *cli_readline(const char *prompt)
 
 		case 27: { /* ESC sequence */
 			char seq[2];
+			/* A lone Escape press sends only 0x1b. With VMIN=1 a
+			 * blocking read() would hang until the next keystroke,
+			 * appearing frozen. Poll briefly for the CSI/SS3
+			 * continuation; if none arrives, treat ESC as a no-op. */
+			struct pollfd epf = { .fd = tty_fd, .events = POLLIN };
+			if (poll(&epf, 1, 50) <= 0 || !(epf.revents & POLLIN))
+				break;
 			if (read(tty_fd, &seq[0], 1) <= 0)
+				break;
+			if (poll(&epf, 1, 50) <= 0 || !(epf.revents & POLLIN))
 				break;
 			if (read(tty_fd, &seq[1], 1) <= 0)
 				break;

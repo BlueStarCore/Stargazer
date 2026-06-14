@@ -7,12 +7,15 @@
 # topology:
 #
 #   Internet <-> Host (masquerade) <-> br-wan (10.0.1.0/24) <-> Stargazer VM
-#                                      10.0.1.1                  eth0 (WAN)
-#                                                                eth1 (LAN)
-#                                                         br-lan (192.168.99.0/24)
-#                                                           192.168.99.99 (mgmt)
-#                                                                192.168.99.100
-#                                                                LAN VM
+#                                      10.0.1.1                  eth1 WAN (10.0.1.2)
+#
+#   Ubuntu host (192.168.99.1) <-> br-lan (192.168.99.0/24) <-> Stargazer VM
+#   [web UI at 192.168.99.99]                                    eth0 LAN (192.168.99.99)
+#                                               tap-lan-vm ───> LAN VM (192.168.99.100)
+#
+#   br-wan = attack-simulation side: packets enter eth1, traverse FORWARD
+#   chain + IPS, then exit eth0 toward br-lan targets.
+#   br-lan = management side: Ubuntu host accesses web UI directly (no WAN hop).
 #
 # Usage:  sudo ./scripts/test_net_setup.sh up
 #         sudo ./scripts/test_net_setup.sh down
@@ -27,6 +30,7 @@ TAP_SG_LAN="tap-sg-lan"
 TAP_LAN_VM="tap-lan-vm"
 
 WAN_IP="10.0.1.1/24"
+LAN_HOST_IP="192.168.99.1/24"
 TAPS=("$TAP_SG_WAN" "$TAP_SG_LAN" "$TAP_LAN_VM")
 
 # Resolve the real user (works under sudo)
@@ -36,7 +40,7 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 
 # Auto-detect the host's internet-facing interface
 detect_wan_iface() {
-    ip route get 8.8.8.8 2>/dev/null | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1
+    ip route get 8.8.8.8 2>/dev/null | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -n 1
 }
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -81,10 +85,16 @@ do_up() {
     create_bridge "$BR_WAN"
     create_bridge "$BR_LAN"
 
-    # Assign IP to br-wan (host side of the WAN subnet)
+    # Assign IP to br-wan (host side of the WAN/attack subnet)
     if ! ip addr show "$BR_WAN" | grep -q "${WAN_IP%/*}"; then
         ip addr add "$WAN_IP" dev "$BR_WAN"
         echo "  assigned $WAN_IP to $BR_WAN"
+    fi
+
+    # Assign IP to br-lan (host accesses Stargazer web UI directly on this segment)
+    if ! ip addr show "$BR_LAN" | grep -q "${LAN_HOST_IP%/*}"; then
+        ip addr add "$LAN_HOST_IP" dev "$BR_LAN"
+        echo "  assigned $LAN_HOST_IP to $BR_LAN"
     fi
 
     echo "Creating TAP interfaces..."
@@ -92,27 +102,12 @@ do_up() {
     create_tap "$TAP_SG_LAN" "$BR_LAN"
     create_tap "$TAP_LAN_VM" "$BR_LAN"
 
-    echo "Setting up routes..."
-    # Host needs a route to the LAN subnet via Stargazer's WAN IP.
-    # Use "via $gw dev $br" so the kernel installs the route even while
-    # br-wan is still linkdown (no QEMU connected yet).
-    if ! ip route show 192.168.99.0/24 2>/dev/null | grep -q "192.168.99.0/24"; then
-        ip route add 192.168.99.0/24 via 10.0.1.2 dev "$BR_WAN"
-        echo "  added route 192.168.99.0/24 via 10.0.1.2 dev $BR_WAN"
-    fi
-
     echo "Setting up NAT (masquerade)..."
-    # Masquerade WAN subnet to the internet
+    # Masquerade WAN subnet to the internet (Stargazer eth1 at 10.0.1.2 uses
+    # the host as its default gateway for upstream connectivity)
     if ! iptables -t nat -C POSTROUTING -s 10.0.1.0/24 -o "$wan_iface" -j MASQUERADE 2>/dev/null; then
         iptables -t nat -A POSTROUTING -s 10.0.1.0/24 -o "$wan_iface" -j MASQUERADE
         echo "  added MASQUERADE rule (10.0.1.0/24)"
-    fi
-    # Masquerade LAN subnet to the internet (packets forwarded by Stargazer
-    # arrive at the host with their original 192.168.99.x source since
-    # Stargazer has no iptables — the host must NAT them)
-    if ! iptables -t nat -C POSTROUTING -s 192.168.99.0/24 -o "$wan_iface" -j MASQUERADE 2>/dev/null; then
-        iptables -t nat -A POSTROUTING -s 192.168.99.0/24 -o "$wan_iface" -j MASQUERADE
-        echo "  added MASQUERADE rule (192.168.99.0/24)"
     fi
 
     # Allow forwarding for br-wan traffic
@@ -142,13 +137,12 @@ do_down() {
     local wan_iface
     wan_iface=$(detect_wan_iface) || true
 
-    echo "Removing routes..."
-    ip route del 192.168.99.0/24 2>/dev/null && echo "  removed route 192.168.99.0/24" || true
+    echo "Removing IPs..."
+    ip addr del "$LAN_HOST_IP" dev "$BR_LAN" 2>/dev/null && echo "  removed $LAN_HOST_IP from $BR_LAN" || true
 
     echo "Removing iptables rules..."
     if [[ -n "$wan_iface" ]]; then
         iptables -t nat -D POSTROUTING -s 10.0.1.0/24 -o "$wan_iface" -j MASQUERADE 2>/dev/null && echo "  removed MASQUERADE (10.0.1.0/24)" || true
-        iptables -t nat -D POSTROUTING -s 192.168.99.0/24 -o "$wan_iface" -j MASQUERADE 2>/dev/null && echo "  removed MASQUERADE (192.168.99.0/24)" || true
         iptables -D FORWARD -i "$BR_WAN" -o "$wan_iface" -j ACCEPT 2>/dev/null && echo "  removed FORWARD (out)" || true
         iptables -D FORWARD -i "$wan_iface" -o "$BR_WAN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null && echo "  removed FORWARD (in)" || true
     fi

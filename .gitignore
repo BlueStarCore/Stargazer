@@ -40,8 +40,25 @@ docs/*.pdf
 .env
 
 # Cache
-.cache
+.cache/
 *.tmp
 
 # AI conversation exchange
 ai-conversation/
+
+# Local code-intelligence index (codegraph MCP)
+.codegraph/
+
+# ML training / pcap-tooling artifacts (không phải mã nguồn, dung lượng lớn)
+CICFlowMeter/
+Machine Learning/
+*.pcap
+error_screenshot.png
+
+# Pentest / lab artifacts (không phải mã nguồn — tái tạo được, đừng commit)
+hulk/
+hydra.restore
+*.restore
+rockyou*.txt
+stargazer-ca.crt
+*.crt

@@ -15,6 +15,7 @@
 #include "cli_configure.h"
 #include "cli_diagnose.h"
 #include "cli_diagnose_sys.h"
+#include "cli_diagnose_bootlog.h"
 #include "cli_debug.h"
 #include "cli_show.h"
 #include "cli_ipc.h"
@@ -202,15 +203,20 @@ static int cmd_fw_upgrade(const char *args, const char *permissions)
 		return 0;
 	}
 
-	/* Confirm with admin */
+	/* Confirm with admin — switch to canonical echo mode so keystrokes are
+	 * visible (terminal is in raw/no-echo mode between readline calls). */
 	printf("  WARNING: This will download firmware, install it, and reboot the device.\n");
 	printf("  Carefully read change logs before proceeding.\n");
 	printf("  Do you want to continue? [y/N] ");
 	fflush(stdout);
 
+	cli_term_echo_on();
 	char confirm[16] = {0};
-	if (!fgets(confirm, sizeof(confirm), stdin) ||
-	    (confirm[0] != 'y' && confirm[0] != 'Y')) {
+	int cancelled = (!fgets(confirm, sizeof(confirm), stdin) ||
+			 (confirm[0] != 'y' && confirm[0] != 'Y'));
+	cli_term_echo_off();
+
+	if (cancelled) {
 		printf("  Firmware upgrade cancelled.\n");
 		return 0;
 	}
@@ -247,9 +253,20 @@ static int cmd_fw_upgrade(const char *args, const char *permissions)
 		if (ipc_stream_interrupted()) {
 			if (have_inline)
 				printf("\n");
-			/* Send cancel to mgmtd so the child process stops */
+			/* Send cancel to mgmtd so the child process stops.
+			 * Check the send return: ipc_send zero-fills cr and
+			 * SG_OK==0, so cr.status alone cannot distinguish a real
+			 * OK from a failed connection. */
 			struct ipc_response cr;
-			ipc_send_str(SG_CMD_UPGRADE_CANCEL, "", &cr);
+			if (ipc_send_str(SG_CMD_UPGRADE_CANCEL, "", &cr) != 0) {
+				printf("  Could not deliver cancel to mgmtd; "
+				       "upgrade may still be running.\n");
+				ipc_resp_free(&cr);
+				ipc_clear_interrupt();
+				have_inline = 0;
+				usleep(500000);
+				continue;
+			}
 			if (cr.status != SG_OK) {
 				/* Cancel rejected (e.g. past point of no return) */
 				printf("  %s\n",
@@ -554,6 +571,7 @@ static int cmd_diag_top(const char *args, const char *permissions)
 		if (*p) {
 			interval = atoi(p);
 			if (interval < 1) interval = 1;
+			if (interval > 3600) interval = 3600;	/* avoid *1000 int overflow */
 			/* Skip to next arg */
 			while (*p && *p != ' ') p++;
 			while (*p == ' ') p++;
@@ -726,6 +744,383 @@ static int cmd_diag_disk_smart(const char *args, const char *permissions)
 	return 0;
 }
 
+/* ── Session diagnostic handler ──────────────────────────────────────── */
+
+/*
+ * Stateful session filter (FortiOS-style): declared once with
+ *   execute diagnose session filter <field> <value> [<field> <value> ...]
+ * then reused by `clear` and `list`/`status`. It lives for the CLI session and
+ * is reset with `filter clear`. A field's value is empty when unset. Values are
+ * only structurally checked here (each field at most once, known fields only);
+ * the daemon validates the content (valid proto/IPv4) when the filter is used,
+ * so the single source of truth for what's valid stays server-side.
+ */
+#define SESS_F_LEN 64
+static struct sess_filter {
+	char proto[SESS_F_LEN];
+	char src[SESS_F_LEN];
+	char dst[SESS_F_LEN];
+	char policy[SESS_F_LEN];
+	char iif[SESS_F_LEN];
+	char oif[SESS_F_LEN];
+} g_sess_filter;
+
+/* Serialize the active filter into a key=value payload. Returns 1 if any field
+ * is set, 0 if the filter is empty, -1 if the buffer is too small. */
+static int sess_filter_build(char *buf, size_t sz)
+{
+	const struct { const char *k; const char *v; } fields[] = {
+		{ "proto",  g_sess_filter.proto },
+		{ "src",    g_sess_filter.src },
+		{ "dst",    g_sess_filter.dst },
+		{ "policy", g_sess_filter.policy },
+		{ "iif",    g_sess_filter.iif },
+		{ "oif",    g_sess_filter.oif },
+	};
+	size_t off = 0;
+	int any = 0;
+
+	if (sz == 0)
+		return -1;
+	buf[0] = '\0';
+	for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+		if (!fields[i].v[0])
+			continue;
+		int n = snprintf(buf + off, sz - off, "%s=%s\n",
+				 fields[i].k, fields[i].v);
+		if (n < 0 || (size_t)n >= sz - off)
+			return -1;
+		off += (size_t)n;
+		any = 1;
+	}
+	return any;
+}
+
+/* Print the active filter (or "(none)"). */
+static void sess_filter_show(void)
+{
+	const struct { const char *label; const char *v; } fields[] = {
+		{ "proto ", g_sess_filter.proto },
+		{ "src   ", g_sess_filter.src },
+		{ "dst   ", g_sess_filter.dst },
+		{ "policy", g_sess_filter.policy },
+		{ "iif   ", g_sess_filter.iif },
+		{ "oif   ", g_sess_filter.oif },
+	};
+	int any = 0;
+
+	printf("  Session filter:\n");
+	for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+		if (fields[i].v[0]) {
+			printf("    %s : %s\n", fields[i].label, fields[i].v);
+			any = 1;
+		}
+	}
+	if (!any)
+		printf("    (none)\n");
+}
+
+/*
+ * Parse `filter <field> <value> ...` into the active filter. Builds into a
+ * staging copy first so a bad term leaves the existing filter untouched
+ * (all-or-nothing). Each field may appear at most once per invocation; a
+ * repeated or unknown field, or a field missing its value, is an error. A field
+ * accumulates onto / overrides whatever was set before. Returns 0 always (it
+ * prints its own diagnostics).
+ */
+static int cmd_diag_session_filter(const char *rest)
+{
+	while (*rest == ' ')
+		rest++;
+
+	/* No args → show the current filter. */
+	if (!*rest) {
+		sess_filter_show();
+		return 0;
+	}
+
+	/* `filter clear` / `filter clean` → reset to empty. */
+	if (strcmp(rest, "clear") == 0 || strcmp(rest, "clean") == 0) {
+		memset(&g_sess_filter, 0, sizeof(g_sess_filter));
+		printf("  Session filter cleared.\n");
+		return 0;
+	}
+
+	struct sess_filter stage = g_sess_filter;
+	int seen_proto = 0, seen_src = 0, seen_dst = 0,
+	    seen_policy = 0, seen_iif = 0, seen_oif = 0;
+	const char *p = rest;
+
+	while (*p) {
+		while (*p == ' ')
+			p++;
+		if (!*p)
+			break;
+
+		/* field token */
+		const char *ft = p;
+		while (*p && *p != ' ')
+			p++;
+		size_t fl = (size_t)(p - ft);
+		char field[16];
+		if (fl >= sizeof(field)) {
+			printf("  Error: unknown filter field '%.*s'.\n",
+			       (int)fl, ft);
+			return 0;
+		}
+		memcpy(field, ft, fl);
+		field[fl] = '\0';
+
+		/* value token */
+		while (*p == ' ')
+			p++;
+		if (!*p) {
+			printf("  Error: missing value for '%s'.\n", field);
+			return 0;
+		}
+		const char *vt = p;
+		while (*p && *p != ' ')
+			p++;
+		size_t vl = (size_t)(p - vt);
+
+		int *seen = NULL;
+		char *slot = NULL;
+		if (strcmp(field, "proto") == 0)       { seen = &seen_proto;  slot = stage.proto; }
+		else if (strcmp(field, "src") == 0)    { seen = &seen_src;    slot = stage.src; }
+		else if (strcmp(field, "dst") == 0)    { seen = &seen_dst;    slot = stage.dst; }
+		else if (strcmp(field, "policy") == 0) { seen = &seen_policy; slot = stage.policy; }
+		else if (strcmp(field, "iif") == 0)    { seen = &seen_iif;    slot = stage.iif; }
+		else if (strcmp(field, "oif") == 0)    { seen = &seen_oif;    slot = stage.oif; }
+		else {
+			printf("  Error: unknown filter field '%s'.\n", field);
+			printf("  Valid fields: proto src dst policy iif oif\n");
+			return 0;
+		}
+		if (*seen) {
+			printf("  Error: '%s' specified more than once.\n", field);
+			return 0;
+		}
+		if (vl >= SESS_F_LEN) {
+			printf("  Error: value for '%s' too long.\n", field);
+			return 0;
+		}
+		memcpy(slot, vt, vl);
+		slot[vl] = '\0';
+		*seen = 1;
+	}
+
+	g_sess_filter = stage;	/* commit */
+	sess_filter_show();
+	return 0;
+}
+
+static int cmd_diag_session(const char *args, const char *permissions)
+{
+	(void)permissions;
+
+	const char *sub = args;
+	while (sub && *sub == ' ')
+		sub++;
+	if (!sub)
+		sub = "";
+
+	/* Split off the first subcommand word; `rest` is the remaining args. */
+	char word[16] = "";
+	const char *rest = sub;
+	{
+		const char *e = rest;
+		while (*e && *e != ' ')
+			e++;
+		size_t wl = (size_t)(e - rest);
+		if (wl >= sizeof(word))
+			wl = sizeof(word) - 1;
+		memcpy(word, rest, wl);
+		word[wl] = '\0';
+		while (*e == ' ')
+			e++;
+		rest = e;
+	}
+
+	/* ── filter: declare/show/clear the reusable session filter ──── */
+	if (strcmp(word, "filter") == 0)
+		return cmd_diag_session_filter(rest);
+
+	/* ── status/list: live connection table, narrowed by the filter ── */
+	if (!*word || strcmp(word, "status") == 0 || strcmp(word, "list") == 0) {
+		if (*rest) {
+			printf("  Error: '%s' takes no arguments.\n",
+			       *word ? word : "status");
+			printf("  Set criteria with: execute diagnose session "
+			       "filter <field> <value> ...\n");
+			return 0;
+		}
+		char payload[SG_PAYLOAD_MAX];
+		int any = sess_filter_build(payload, sizeof(payload));
+		if (any < 0) {
+			printf("  Error: filter too long.\n");
+			return 0;
+		}
+		struct ipc_response resp = {0};
+		int rc = ipc_send_str(SG_CMD_SHOW_SESSIONS,
+				      any ? payload : "", &resp);
+		if (rc != 0 || resp.status != SG_OK) {
+			print_ipc_error("Error", &resp);
+			ipc_resp_free(&resp);
+			return 0;
+		}
+		printf("  === Active Connections (conntrack) ===\n");
+		if (any)
+			printf("  (filter active)\n");
+		if (resp.payload && resp.payload[0])
+			printf("%s", resp.payload);
+		else
+			printf("  No active connections%s.\n",
+			       any ? " match the filter" : "");
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	/* ── stats: conntrack flow count + pkt_forward counters ─────── */
+	if (strcmp(word, "stats") == 0) {
+		struct ipc_response resp = {0};
+		int rc = ipc_send_str(SG_CMD_SESSION_STATS, "", &resp);
+		if (rc != 0 || resp.status != SG_OK) {
+			print_ipc_error("Error", &resp);
+			ipc_resp_free(&resp);
+			return 0;
+		}
+		const char *p = resp.payload ? resp.payload : "";
+		long long active = 0, forwarded = 0, dropped = 0, anomaly_dropped = 0;
+		int ct_ok = 0, pkt_fwd_loaded = 0;
+		const char *kv;
+		kv = strstr(p, "conntrack_available=");
+		if (kv) ct_ok            = (int)strtol(kv + 20, NULL, 10);
+		kv = strstr(p, "pkt_forward_loaded=");
+		if (kv) pkt_fwd_loaded   = (int)strtol(kv + 19, NULL, 10);
+		kv = strstr(p, "active=");
+		if (kv) active           = strtoll(kv + 7, NULL, 10);
+		kv = strstr(p, "forwarded=");
+		if (kv) forwarded        = strtoll(kv + 10, NULL, 10);
+		kv = strstr(p, "\ndropped=");
+		if (kv) dropped          = strtoll(kv + 9, NULL, 10);
+		kv = strstr(p, "anomaly_dropped=");
+		if (kv) anomaly_dropped  = strtoll(kv + 16, NULL, 10);
+
+		printf("  === Session Statistics ===\n");
+		printf("  conntrack      : %s\n", ct_ok          ? C_GREEN "available" C_NC : C_RED "unavailable" C_NC);
+		printf("  pkt_forward.ko : %s\n", pkt_fwd_loaded ? C_GREEN "loaded" C_NC : C_RED "not loaded" C_NC);
+		printf("  Active flows   : %lld\n", active);
+		if (pkt_fwd_loaded) {
+			printf("  Forwarded      : %lld\n", forwarded);
+			printf("  Dropped        : %lld\n", dropped);
+			printf("  L3/L4 anomaly  : %lld\n", anomaly_dropped);
+		}
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	/* ── clear: drop sessions matching the active filter (all if none) ── */
+	if (strcmp(word, "clear") == 0) {
+		if (*rest) {
+			printf("  Error: 'clear' takes no arguments.\n");
+			printf("  Set criteria first with: execute diagnose "
+			       "session filter <field> <value> ...\n");
+			return 0;
+		}
+		char payload[SG_PAYLOAD_MAX];
+		int any = sess_filter_build(payload, sizeof(payload));
+		if (any < 0) {
+			printf("  Error: filter too long.\n");
+			return 0;
+		}
+
+		if (any) {
+			printf("  This will drop sessions matching the active "
+			       "filter:\n");
+			sess_filter_show();
+		} else {
+			printf("  WARNING: no filter set — this drops ALL "
+			       "active sessions.\n");
+			printf("  Existing connections will be interrupted.\n");
+		}
+		printf("  Continue? [y/N] ");
+		fflush(stdout);
+		cli_term_echo_on();
+		char confirm[8] = {0};
+		if (!fgets(confirm, sizeof(confirm), stdin) ||
+		    (confirm[0] != 'y' && confirm[0] != 'Y')) {
+			cli_term_echo_off();
+			printf("  Cancelled.\n");
+			return 0;
+		}
+		cli_term_echo_off();
+
+		struct ipc_response resp = {0};
+		int rc = ipc_send_str(SG_CMD_SESSION_CLEAR,
+				      any ? payload : "", &resp);
+		if (rc != 0 || resp.status != SG_OK) {
+			print_ipc_error("Error", &resp);
+			ipc_resp_free(&resp);
+			return 0;
+		}
+		const char *p = resp.payload ? resp.payload : "";
+		const char *kv;
+		if (!any) {
+			long long flushed = 0;
+			kv = strstr(p, "flushed=");
+			if (kv) flushed = strtoll(kv + 8, NULL, 10);
+			printf("  Flushed %lld session(s).\n", flushed);
+		} else {
+			long long matched = 0, deleted = 0, failed = 0;
+			int complete = 1;
+			kv = strstr(p, "matched=");
+			if (kv) matched = strtoll(kv + 8, NULL, 10);
+			kv = strstr(p, "deleted=");
+			if (kv) deleted = strtoll(kv + 8, NULL, 10);
+			kv = strstr(p, "failed=");
+			if (kv) failed  = strtoll(kv + 7, NULL, 10);
+			kv = strstr(p, "dump_complete=");
+			if (kv) complete = (int)strtol(kv + 14, NULL, 10);
+			printf("  Matched %lld, cleared %lld session(s).\n",
+			       matched, deleted);
+			if (failed > 0)
+				printf("  %lld could not be cleared (ended "
+				       "already or kernel error).\n", failed);
+			if (!complete)
+				printf("  WARNING: conntrack dump did not "
+				       "complete; some sessions may not have "
+				       "been examined.\n");
+		}
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	/* ── ml: per-flow ML features (conntrack CTA_ML) ─────────────── */
+	if (strcmp(word, "ml") == 0) {
+		struct ipc_response resp = {0};
+		int rc = ipc_send_str(SG_CMD_SESSION_ML, "", &resp);
+		if (rc != 0 || resp.status != SG_OK) {
+			print_ipc_error("Error", &resp);
+			ipc_resp_free(&resp);
+			return 0;
+		}
+		printf("  === Per-flow ML Features ===\n");
+		if (resp.payload && resp.payload[0])
+			printf("%s", resp.payload);
+		else
+			printf("  No flows with features.\n");
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	printf("  Unknown subcommand: %s\n", word);
+	printf("  Usage: execute diagnose session "
+	       "[status|list|stats|clear|ml|filter]\n");
+	printf("  Filter: execute diagnose session filter "
+	       "[proto|src|dst|policy|iif|oif] <value> ... | clear\n");
+	return 0;
+}
+
 /* ── Selftest suite table ─────────────────────────────────────────────── */
 
 /*
@@ -796,6 +1191,11 @@ static int st_run_busybox(int mode, diag_result_t *out)
 	return cli_diagnose_test_busybox(mode, out);
 }
 
+static int st_run_session(int mode, diag_result_t *out)
+{
+	return cli_diagnose_test_session(mode, out);
+}
+
 static const struct {
 	const char  *name;
 	st_runner_t  run;
@@ -811,6 +1211,7 @@ static const struct {
 	{ "supervisor",  st_run_supervisor },
 	{ "webd",        st_run_webd },
 	{ "busybox",     st_run_busybox },
+	{ "session",     st_run_session },
 	{ NULL,          NULL }
 };
 
@@ -991,6 +1392,339 @@ static int cmd_diag_nat_policy(const char *args, const char *permissions)
 	return 0;
 }
 
+static int cmd_diag_fw_ipset(const char *args, const char *permissions)
+{
+	(void)permissions;
+
+	const char *p = args ? args : "";
+	while (*p == ' ')
+		p++;
+	if (!*p) {
+		printf("  Usage: execute diagnose firewall ipset <address-object>\n");
+		return 0;
+	}
+
+	char payload[SG_PAYLOAD_MAX];
+	snprintf(payload, sizeof(payload), "name=%s\n", p);
+
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_DIAG_FW_IPSET, payload, &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+
+	if (resp.status != SG_OK) {
+		print_ipc_error("Failed", &resp);
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	if (resp.payload && resp.payload_len > 0)
+		printf("%s", resp.payload);
+
+	ipc_resp_free(&resp);
+	return 0;
+}
+
+static int cmd_diag_ips_status(const char *args, const char *permissions)
+{
+	(void)args; (void)permissions;
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_IPS_STATUS, "", &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+	if (resp.status != SG_OK) {
+		print_ipc_error("Failed", &resp);
+	} else if (resp.payload && resp.payload_len > 0) {
+		printf("%s", resp.payload);
+	}
+	ipc_resp_free(&resp);
+	return 0;
+}
+
+static int cmd_diag_ips_alerts(const char *args, const char *permissions)
+{
+	(void)permissions;
+	char payload[64] = "";
+	if (args && args[0])
+		snprintf(payload, sizeof(payload), "lines=%s\n", args);
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_IPS_ALERTS, payload, &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+	if (resp.status != SG_OK)
+		print_ipc_error("Failed", &resp);
+	else if (resp.payload && resp.payload_len > 0)
+		printf("%s", resp.payload);
+	ipc_resp_free(&resp);
+	return 0;
+}
+
+static int cmd_diag_ips_scores(const char *args, const char *permissions)
+{
+	(void)permissions;
+	char payload[64] = "";
+	if (args && args[0])
+		snprintf(payload, sizeof(payload), "lines=%s\n", args);
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_IPS_SCORES, payload, &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+	if (resp.status != SG_OK)
+		print_ipc_error("Failed", &resp);
+	else if (resp.payload && resp.payload_len > 0)
+		printf("%s", resp.payload);
+	ipc_resp_free(&resp);
+	return 0;
+}
+
+static int cmd_diag_ssl(const char *args, const char *permissions)
+{
+	(void)args; (void)permissions;
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_SSL_DIAG, "", &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+	if (resp.status != SG_OK)
+		print_ipc_error("Failed", &resp);
+	else if (resp.payload && resp.payload_len > 0)
+		printf("%s", resp.payload);
+	ipc_resp_free(&resp);
+	return 0;
+}
+
+static int cmd_diag_ips_alerts_clear(const char *args, const char *permissions)
+{
+	(void)args; (void)permissions;
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_IPS_ALERTS_CLEAR, "", &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+	if (resp.status != SG_OK)
+		print_ipc_error("Clear failed", &resp);
+	else
+		printf("  IPS alert log cleared.\n");
+	ipc_resp_free(&resp);
+	return 0;
+}
+
+static int cmd_ips_reload(const char *args, const char *permissions)
+{
+	(void)args; (void)permissions;
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_IPS_REBUILD, "", &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+	if (resp.status != SG_OK)
+		print_ipc_error("IPS reload failed", &resp);
+	else if (resp.payload && resp.payload_len > 0)
+		printf("%s\n", resp.payload);
+	else
+		printf("IPS service reloaded.\n");
+	ipc_resp_free(&resp);
+	return 0;
+}
+
+static int cmd_ips_update_now(const char *args, const char *permissions)
+{
+	(void)args; (void)permissions;
+	printf("Downloading enabled rulesets — this may take a moment...\n");
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_IPS_UPDATE_NOW, "", &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+	if (resp.status != SG_OK)
+		print_ipc_error("IPS update failed", &resp);
+	else if (resp.payload && resp.payload_len > 0)
+		printf("%s", resp.payload);
+	else
+		printf("Update complete.\n");
+	ipc_resp_free(&resp);
+	return 0;
+}
+
+static int cmd_show_ips_profiles(const char *args, const char *permissions)
+{
+	(void)args; (void)permissions;
+
+	/* List all IPS profiles */
+	struct ipc_response lresp;
+	if (ipc_send_str(SG_CMD_CFG_LIST, "security_ips-profile", &lresp) != 0 ||
+	    lresp.status != SG_OK || !lresp.payload || !lresp.payload[0]) {
+		ipc_resp_free(&lresp);
+		printf("  No IPS profiles configured.\n");
+		return 0;
+	}
+
+	/* Walk each profile ID */
+	char *ids = lresp.payload;
+	char *id = ids;
+	while (id && *id) {
+		char *nl = strchr(id, '\n');
+		if (nl) *nl = '\0';
+		if (!*id) { if (nl) id = nl + 1; else break; continue; }
+
+		/* Fetch profile fields */
+		char sec[256];
+		snprintf(sec, sizeof(sec), "security_ips-profile:%s", id);
+		struct ipc_response gresp;
+		if (ipc_send_str(SG_CMD_CFG_GET, sec, &gresp) == 0 &&
+		    gresp.status == SG_OK && gresp.payload) {
+			char status[32]  = "enable";
+			char comment[128] = "";
+			sg_kv_get(gresp.payload, "status",  status,  sizeof(status));
+			sg_kv_get(gresp.payload, "comment", comment, sizeof(comment));
+			printf("  %-20s  %-8s  %s\n", id, status,
+			       comment[0] ? comment : "(no comment)");
+		}
+		ipc_resp_free(&gresp);
+
+		/* Fetch filters for this profile */
+		struct ipc_response fresp;
+		if (ipc_send_str(SG_CMD_CFG_LIST, "security_ips-filter", &fresp) == 0 &&
+		    fresp.status == SG_OK && fresp.payload && fresp.payload[0]) {
+			char *fid = fresp.payload;
+			int first = 1;
+			while (fid && *fid) {
+				char *fnl = strchr(fid, '\n');
+				if (fnl) *fnl = '\0';
+				if (!*fid) { if (fnl) fid = fnl + 1; else break; continue; }
+
+				char fsec[256];
+				snprintf(fsec, sizeof(fsec), "security_ips-filter:%s", fid);
+				struct ipc_response fgresp;
+				if (ipc_send_str(SG_CMD_CFG_GET, fsec, &fgresp) == 0 &&
+				    fgresp.status == SG_OK && fgresp.payload) {
+					char fp[64] = "", ftype[32] = "", fval[128] = "", faction[32] = "default";
+					sg_kv_get(fgresp.payload, "profile", fp,      sizeof(fp));
+					sg_kv_get(fgresp.payload, "type",    ftype,   sizeof(ftype));
+					sg_kv_get(fgresp.payload, "value",   fval,    sizeof(fval));
+					sg_kv_get(fgresp.payload, "action",  faction, sizeof(faction));
+					if (strcmp(fp, id) == 0) {
+						if (first) { printf("    Filters:\n"); first = 0; }
+						printf("      %-10s  %-40s  %s\n", ftype, fval, faction);
+					}
+				}
+				ipc_resp_free(&fgresp);
+				if (fnl) fid = fnl + 1; else break;
+			}
+		}
+		ipc_resp_free(&fresp);
+
+		if (nl) id = nl + 1; else break;
+	}
+	ipc_resp_free(&lresp);
+	return 0;
+}
+
+static int cmd_show_ips_filters(const char *args, const char *permissions)
+{
+	(void)permissions;
+
+	if (!args || !args[0]) {
+		printf("  Usage: show ips filter <profile-name>\n");
+		return 0;
+	}
+
+	/* Validate profile exists */
+	char sec[256];
+	snprintf(sec, sizeof(sec), "security_ips-profile:%s", args);
+	struct ipc_response gresp;
+	if (ipc_send_str(SG_CMD_CFG_GET, sec, &gresp) != 0 ||
+	    gresp.status != SG_OK) {
+		ipc_resp_free(&gresp);
+		printf("  Profile '%s' not found.\n", args);
+		return 0;
+	}
+	ipc_resp_free(&gresp);
+
+	/* List all filters, show ones for this profile */
+	struct ipc_response lresp;
+	if (ipc_send_str(SG_CMD_CFG_LIST, "security_ips-filter", &lresp) != 0 ||
+	    lresp.status != SG_OK || !lresp.payload || !lresp.payload[0]) {
+		ipc_resp_free(&lresp);
+		printf("  No filters for profile '%s'.\n", args);
+		return 0;
+	}
+
+	int found = 0;
+	char *fid = lresp.payload;
+	while (fid && *fid) {
+		char *nl = strchr(fid, '\n');
+		if (nl) *nl = '\0';
+		if (!*fid) { if (nl) fid = nl + 1; else break; continue; }
+
+		char fsec[256];
+		snprintf(fsec, sizeof(fsec), "security_ips-filter:%s", fid);
+		struct ipc_response fgresp;
+		if (ipc_send_str(SG_CMD_CFG_GET, fsec, &fgresp) == 0 &&
+		    fgresp.status == SG_OK && fgresp.payload) {
+			char fp[64] = "", ftype[32] = "", fval[128] = "", faction[32] = "default", fstatus[16] = "enable";
+			sg_kv_get(fgresp.payload, "profile", fp,      sizeof(fp));
+			sg_kv_get(fgresp.payload, "type",    ftype,   sizeof(ftype));
+			sg_kv_get(fgresp.payload, "value",   fval,    sizeof(fval));
+			sg_kv_get(fgresp.payload, "action",  faction, sizeof(faction));
+			sg_kv_get(fgresp.payload, "status",  fstatus, sizeof(fstatus));
+			if (strcmp(fp, args) == 0) {
+				if (!found) printf("  Filters for profile '%s':\n", args);
+				printf("    %-10s  %-40s  action=%-8s  %s\n",
+				       ftype, fval, faction, fstatus);
+				found++;
+			}
+		}
+		ipc_resp_free(&fgresp);
+		if (nl) fid = nl + 1; else break;
+	}
+	ipc_resp_free(&lresp);
+
+	if (!found)
+		printf("  No filters for profile '%s'.\n", args);
+	return 0;
+}
+
+static int cmd_ssl_cacert(const char *args, const char *permissions)
+{
+	(void)args;
+	(void)permissions;
+
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_SSL_CACERT, "", &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+	if (resp.status != SG_OK) {
+		print_ipc_error("Failed", &resp);
+		ipc_resp_free(&resp);
+		return 0;
+	}
+	/* In nguyên PEM ra stdout — admin copy/scp về cài vào client trust store.
+	 * Output rỗng = CA chưa sinh (chưa bật profile deep nào) — gợi ý rõ. */
+	if (resp.payload && resp.payload_len > 0)
+		printf("%s", resp.payload);
+	else
+		printf("  CA chưa tồn tại — tạo SSL inspection profile chế độ "
+		       "deep rồi gán vào firewall policy để stargazer-ssld sinh "
+		       "CA tự động.\n");
+	ipc_resp_free(&resp);
+	return 0;
+}
+
 static int cmd_diag_fw_conntrack(const char *args, const char *permissions)
 {
 	(void)args;
@@ -1043,10 +1777,74 @@ static int cmd_diag_routes(const char *args, const char *permissions)
 	return 0;
 }
 
+static int cmd_diag_dhcp_client(const char *args, const char *permissions)
+{
+	(void)permissions;
+
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_DIAG_DHCP_CLIENT, args ? args : "", &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+
+	if (resp.status != SG_OK) {
+		print_ipc_error("Failed", &resp);
+		ipc_resp_free(&resp);
+		return 0;
+	}
+
+	if (resp.payload && resp.payload_len > 0)
+		printf("%s", resp.payload);
+
+	ipc_resp_free(&resp);
+	return 0;
+}
+
 static void print_chunk(const char *data, size_t len)
 {
 	fwrite(data, 1, len, stdout);
 	fflush(stdout);
+}
+
+static int cmd_system(const char *args, const char *permissions)
+{
+	(void)permissions;
+
+	/*
+	 * `execute system` is also the parent node of the management
+	 * subcommands (shutdown / reboot / factory-*). Those longer paths are
+	 * routed to their own handlers by cmd_dispatch's longest-prefix match,
+	 * so this handler only ever runs for a free-form binary invocation or
+	 * for the bare `execute system` with no trailing words.
+	 */
+	if (!args || !*args) {
+		printf("  Usage: execute system <binary> [args...]\n");
+		printf("         Runs a system binary directly as root.\n");
+		printf("  Example: execute system df -h\n");
+		printf("  Management subcommands: shutdown | reboot |"
+		       " factory-reboot | factory-shutdown\n");
+		return 0;
+	}
+
+	/*
+	 * Forward the command line verbatim as a single value. A CLI line never
+	 * contains a newline, so one key=value line carries it intact; mgmtd
+	 * tokenizes on whitespace and execvp()s the result.
+	 */
+	char payload[SG_PAYLOAD_MAX];
+	int n = snprintf(payload, sizeof(payload), "cmd=%s\n", args);
+	if (n < 0 || (size_t)n >= sizeof(payload)) {
+		printf("  Error: command line too long.\n");
+		return 0;
+	}
+
+	int st = ipc_send_stream(SG_CMD_SYS_EXEC, payload, print_chunk);
+	if (st < 0)
+		printf("  Error: could not contact management daemon.\n");
+	else if (st != SG_OK)
+		printf("  Command failed: %s\n", sg_status_str((sg_status_t)st));
+	return 0;
 }
 
 static int cmd_ping(const char *args, const char *permissions)

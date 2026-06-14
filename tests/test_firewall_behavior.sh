@@ -224,7 +224,7 @@ printf "\n${B}${C}=== Phase 5: Firewall rule ordering and replay ===${N}\n"
 FW_APPLY2="$SRCBASE/src/userspace/mgmtd/mgmtd_apply_firewall.c"
 
 # Rules are appended (-A FORWARD), not inserted at front
-if grep -q '"-A", "FORWARD"' "$FW_APPLY2" 2>/dev/null; then
+if grep -q '"-A FORWARD"' "$FW_APPLY2" 2>/dev/null; then
     pass "Firewall policies use -A FORWARD (append order = policy priority order)"
 else
     fail "Cannot verify FORWARD rule append mode"

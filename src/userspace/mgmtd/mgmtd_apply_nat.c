@@ -10,10 +10,10 @@
  * Disabled entries are skipped.
  *
  * SNAT (overload):
- *   -A POSTROUTING [-s srcaddr] [-d dstaddr] -o <srcintf> -j MASQUERADE
+ *   -A POSTROUTING [-s srcaddr] [-d dstaddr] -o <dstintf> -j MASQUERADE
  *
  * DNAT:
- *   -A PREROUTING [-s srcaddr] [-d dstaddr] [-i dstintf]
+ *   -A PREROUTING [-s srcaddr] [-d dstaddr] [-i srcintf]
  *       [-p proto [--dport port]] -j DNAT --to-destination ip[:port]
  *
  * protocol=tcp+udp generates two separate rules (one per protocol),
@@ -38,34 +38,72 @@ static int is_any_or_all(const char *val)
 }
 
 /*
+ * nat_addr_is_fqdn_obj — true if `val` names a fqdn-type firewall_address.
+ *
+ * NAT needs a fixed IP/subnet; an fqdn object is an ipset of rotating DNS
+ * answers, which has no meaning as a NAT source/destination. The apply
+ * path already skips such a rule fail-closed, but that is silent — reject
+ * it here (config time) so the user is told instead of finding a dead
+ * port-forward later. Keywords and raw CIDRs are never fqdn objects.
+ */
+static int nat_addr_is_fqdn_obj(const char *val)
+{
+	if (is_any_or_all(val) || sg_is_cidr(val))
+		return 0;
+	char *data = sg_db_get("firewall_address", val);
+	if (!data)
+		return 0;	/* missing/dangling ref reported elsewhere */
+	char atype[VALBUFSZ];
+	extract_val(data, "type", atype, sizeof(atype));
+	free(data);
+	return strcmp(atype, "fqdn") == 0;
+}
+
+/*
  * Append optional -s/-d flags.  Same pattern as firewall rebuild
  * (mgmtd_apply_firewall.c): skip "any"/"all", validate CIDR before use.
  */
-static void append_addr_match(struct dynbuf *buf,
-			      const char *flag,
-			      const char *addr)
+/* Returns 0 if the flag was appended (or match-all, no flag needed).
+ * Returns -1 if the address object was not found (dangling ref) —
+ * caller must discard the entire rule, fail-closed. */
+static int append_addr_match(struct dynbuf *buf,
+			     const char *flag,
+			     const char *addr)
 {
 	char resolved[VALBUFSZ];
 	const char *cidr = resolve_address(addr, resolved,
 					   sizeof(resolved));
-	if (cidr && strcmp(cidr, "SKIP") != 0)
+	if (cidr && strcmp(cidr, "SKIP") == 0) {
+		mgmt_log("ERROR", "append_addr_match: '%s' not found, skipping rule",
+			 addr);
+		return -1;
+	}
+	if (cidr)
 		dbuf_printf(buf, " %s %s", flag, cidr);
+	return 0;
 }
 
 /*
  * Emit one DNAT rule line for a single protocol.
  * Called once for tcp/udp, twice for tcp+udp.
+ *
+ * Returns 0 on success, -1 if an address object was not found.
+ * On -1 the partial rule is rolled back so the buffer stays clean.
  */
 /* srcintf = incoming interface for DNAT (PREROUTING -i) */
-static void emit_dnat_rule(struct dynbuf *buf,
-			   const char *srcaddr, const char *dstaddr,
-			   const char *srcintf, const char *proto,
-			   const char *dstport,
-			   const char *mapped_ip, const char *mapped_port)
+static int emit_dnat_rule(struct dynbuf *buf,
+			  const char *srcaddr, const char *dstaddr,
+			  const char *srcintf, const char *proto,
+			  const char *dstport,
+			  const char *mapped_ip, const char *mapped_port)
 {
+	size_t rule_start = buf->used;
+
 	dbuf_printf(buf, "-A PREROUTING");
-	append_addr_match(buf, "-s", srcaddr);
-	append_addr_match(buf, "-d", dstaddr);
+	if (append_addr_match(buf, "-s", srcaddr) < 0)
+		goto skip;
+	if (append_addr_match(buf, "-d", dstaddr) < 0)
+		goto skip;
 	if (!is_any_or_all(srcintf))
 		dbuf_printf(buf, " -i %s", srcintf);
 	if (proto) {
@@ -73,12 +111,21 @@ static void emit_dnat_rule(struct dynbuf *buf,
 		if (dstport[0])
 			dbuf_printf(buf, " --dport %s", dstport);
 	}
-	if (mapped_port[0])
+	/* Port translation only with a protocol: for proto=all (1:1 NAT) a
+	 * ":port" target is invalid and would abort the whole nat rebuild, so
+	 * emit a plain destination even if mapped_port is set on a stray
+	 * entry. validate_nat rejects this combination at config time. */
+	if (proto && mapped_port[0])
 		dbuf_printf(buf, " -j DNAT --to-destination %s:%s\n",
 			    mapped_ip, mapped_port);
 	else
 		dbuf_printf(buf, " -j DNAT --to-destination %s\n",
 			    mapped_ip);
+	return 0;
+
+skip:
+	buf->used = rule_start; /* roll back partial -A PREROUTING write */
+	return -1;
 }
 
 /* ── Rebuild ─────────────────────────────────────────────────────────────── */
@@ -138,9 +185,13 @@ sg_status_t rebuild_nat_chains(char *result, size_t rsize)
 			 * srcintf not usable in POSTROUTING (-i ignored) */
 			if (strcmp(nattype, "snat") == 0 &&
 			    !is_any_or_all(dstintf)) {
+				size_t snat_start = buf.used;
 				dbuf_printf(&buf, "-A POSTROUTING");
-				append_addr_match(&buf, "-s", srcaddr);
-				append_addr_match(&buf, "-d", dstaddr);
+				if (append_addr_match(&buf, "-s", srcaddr) < 0 ||
+				    append_addr_match(&buf, "-d", dstaddr) < 0) {
+					buf.used = snat_start; /* roll back partial write */
+					continue;
+				}
 				dbuf_printf(&buf, " -o %s", dstintf);
 				dbuf_printf(&buf, " -j MASQUERADE\n");
 				snat_count++;
@@ -152,36 +203,42 @@ sg_status_t rebuild_nat_chains(char *result, size_t rsize)
 			if (strcmp(nattype, "dnat") == 0 && mapped_ip[0]) {
 				if (strcmp(protocol, "tcp+udp") == 0) {
 					/* Two separate rules (OpenWrt pattern) */
-					emit_dnat_rule(&buf, srcaddr, dstaddr,
-						       srcintf, "tcp",
-						       dstport,
-						       mapped_ip, mapped_port);
-					emit_dnat_rule(&buf, srcaddr, dstaddr,
-						       srcintf, "udp",
-						       dstport,
-						       mapped_ip, mapped_port);
-					dnat_count += 2;
+					if (emit_dnat_rule(&buf, srcaddr, dstaddr,
+							   srcintf, "tcp",
+							   dstport,
+							   mapped_ip, mapped_port) == 0)
+						dnat_count++;
+					if (emit_dnat_rule(&buf, srcaddr, dstaddr,
+							   srcintf, "udp",
+							   dstport,
+							   mapped_ip, mapped_port) == 0)
+						dnat_count++;
 				} else if (strcmp(protocol, "all") == 0) {
 					/* No -p flag, match all protocols
 					 * (1:1 NAT — dstport ignored) */
-					emit_dnat_rule(&buf, srcaddr, dstaddr,
-						       srcintf, NULL,
-						       dstport,
-						       mapped_ip, mapped_port);
-					dnat_count++;
+					if (emit_dnat_rule(&buf, srcaddr, dstaddr,
+							   srcintf, NULL,
+							   dstport,
+							   mapped_ip, mapped_port) == 0)
+						dnat_count++;
 				} else {
 					/* tcp or udp */
-					emit_dnat_rule(&buf, srcaddr, dstaddr,
-						       srcintf, protocol,
-						       dstport,
-						       mapped_ip, mapped_port);
-					dnat_count++;
+					if (emit_dnat_rule(&buf, srcaddr, dstaddr,
+							   srcintf, protocol,
+							   dstport,
+							   mapped_ip, mapped_port) == 0)
+						dnat_count++;
 				}
 				continue;
 			}
 		}
 		free(list);
 	}
+
+	/* SSL inspection: REDIRECT forwarded HTTPS into stargazer-ssld.
+	 * Emitted into the same *nat restore so the table stays atomic.
+	 * No-op if no accept policy binds an enabled ssl-inspection-profile. */
+	emit_ssl_steering(&buf);
 
 	dbuf_append(&buf, "COMMIT\n", 7);
 
@@ -206,6 +263,10 @@ sg_status_t rebuild_nat_chains(char *result, size_t rsize)
 
 	free(out);
 	free(buf.data);
+
+	/* Steering đã apply → đồng bộ lifecycle ssld (start/stop/restart theo
+	 * security_ssl-inspection-profile). Đặt SAU restore để ssld nghe ngay khi có rule. */
+	ssld_sync();
 
 	snprintf(result, rsize, "NAT chains rebuilt (%d SNAT, %d DNAT)",
 		 snat_count, dnat_count);
@@ -251,6 +312,20 @@ sg_status_t validate_nat(const char *id, const char *data,
 		snprintf(result, rsize, "Invalid dstaddr '%s'", dstaddr);
 		return SG_ERR_INVALID_VAL;
 	}
+	if (nat_addr_is_fqdn_obj(srcaddr)) {
+		snprintf(result, rsize,
+			 "NAT cannot use fqdn address object '%s' — use an "
+			 "IP/subnet (fqdn objects are for firewall policy)",
+			 srcaddr);
+		return SG_ERR_INVALID_VAL;
+	}
+	if (nat_addr_is_fqdn_obj(dstaddr)) {
+		snprintf(result, rsize,
+			 "NAT cannot use fqdn address object '%s' — use an "
+			 "IP/subnet (fqdn objects are for firewall policy)",
+			 dstaddr);
+		return SG_ERR_INVALID_VAL;
+	}
 	if (mapped_ip[0] && !sg_is_ipv4(mapped_ip)) {
 		snprintf(result, rsize, "Invalid mapped-ip '%s'", mapped_ip);
 		return SG_ERR_INVALID_VAL;
@@ -268,6 +343,15 @@ sg_status_t validate_nat(const char *id, const char *data,
 	if (dstport[0] && protocol[0] && strcmp(protocol, "all") == 0) {
 		snprintf(result, rsize,
 			 "dstport requires protocol tcp, udp, or tcp+udp");
+		return SG_ERR_INVALID_VAL;
+	}
+	/* Cross-field: port translation needs a protocol. protocol=all with a
+	 * mapped-port would emit "--to-destination IP:PORT" without -p, which
+	 * iptables rejects — failing the whole atomic nat rebuild. Reject it
+	 * here (and emit_dnat_rule drops the port for proto=all defensively). */
+	if (mapped_port[0] && protocol[0] && strcmp(protocol, "all") == 0) {
+		snprintf(result, rsize,
+			 "mapped-port requires protocol tcp, udp, or tcp+udp");
 		return SG_ERR_INVALID_VAL;
 	}
 

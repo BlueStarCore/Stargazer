@@ -11,6 +11,7 @@
 #include "sg_validate.h"
 
 #include <ctype.h>
+#include <net/if.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,11 +28,17 @@ static const sg_type_info_t type_table[] = {
 	{ "network_dns",            CFG_SINGLE, "configure", "Configure DNS settings"              },
 	{ "network_dhcp-server",    CFG_TABLE,  "configure", "Configure DHCP server pools"         },
 	{ "system_settings",        CFG_SINGLE, "configure", "System general settings"              },
+	{ "system_session-ttl",    CFG_SINGLE, "configure", "Session idle timeout settings"        },
 	{ "system_interface",       CFG_TABLE,  "configure", "Configure network interfaces"        },
 	{ "system_ntp",             CFG_SINGLE, "configure", "Configure NTP time sync"             },
 	{ "firewall_policy",        CFG_TABLE,  "configure", "Configure firewall policies"         },
 	{ "firewall_address",       CFG_TABLE,  "configure", "Configure address objects"           },
 	{ "firewall_service",       CFG_TABLE,  "configure", "Configure service objects"           },
+	{ "security_ips",           CFG_SINGLE, "configure", "Configure IPS (signature + ML inspection)" },
+	{ "security_ips-profile",   CFG_TABLE,  "configure", "Configure IPS profiles (signature sets)" },
+	{ "security_ips-filter",    CFG_TABLE,  "configure", "Configure IPS profile filters (category/signature + action, FortiGate-style)" },
+	{ "security_ips-ruleset",   CFG_TABLE,  "configure", "Configure IPS ruleset sources (URL entries for download)" },
+	{ "security_ssl-inspection-profile", CFG_TABLE, "configure", "Configure SSL inspection profiles (FortiGate-style)" },
 	{ "system_password-policy", CFG_SINGLE, "admin",     "Configure global password policy"    },
 	{ "system_admin-profile",   CFG_TABLE,  "admin",     "Configure admin permission profiles" },
 	{ "system_admin",           CFG_TABLE,  "admin",     "Configure admin accounts"            },
@@ -40,6 +47,11 @@ static const sg_type_info_t type_table[] = {
 
 /* ── Unified field table ─────────────────────────────────────────────────── */
 
+/* field_entry.flags bits */
+#define SG_FLD_HIDDEN  0x1u   /* internal field: valid for the config engine but
+			       * never shown in `show`/export and not user-settable
+			       * (e.g. cmkid, auto-assigned and reconcile-backfilled) */
+
 struct field_entry {
 	const char *type;
 	const char *key;
@@ -47,104 +59,195 @@ struct field_entry {
 	int         optional;   /* 0 = required, 1 = optional */
 	const char *defval;     /* default value, or NULL */
 	const char *desc;       /* human-readable help text */
+	unsigned    flags;      /* SG_FLD_* bitmask (0 = normal user field) */
 };
 
 static const struct field_entry field_table[] = {
 	/* network_route_static */
-	{ "network_route_static", "dst",      "cidr",                0, NULL,     "Destination network"          },
-	{ "network_route_static", "gateway",  "ipv4",                0, NULL,     "Next-hop gateway address"     },
-	{ "network_route_static", "device",   "ref-iface:system_interface", 0, NULL, "Outgoing interface"          },
-	{ "network_route_static", "distance", "uint:1:255",          0, "10",     "Administrative distance"      },
-	{ "network_route_static", "status",   "enum:enable,disable", 0, "enable", "Enable or disable this route" },
-	{ "network_route_static", "comment",  "string",              1, NULL,     "Optional description"         },
+	{ "network_route_static", "dst",      "cidr",                0, NULL,     "Destination network", 0 },
+	{ "network_route_static", "gateway",  "ipv4",                0, NULL,     "Next-hop gateway address", 0 },
+	{ "network_route_static", "device",   "ref-iface:system_interface", 0, NULL, "Outgoing interface", 0 },
+	{ "network_route_static", "distance", "uint:1:255",          0, "10",     "Administrative distance", 0 },
+	{ "network_route_static", "status",   "enum:enable,disable", 0, "enable", "Enable or disable this route", 0 },
+	{ "network_route_static", "comment",  "string",              1, NULL,     "Optional description", 0 },
 
 	/* network_nat */
-	{ "network_nat", "type",        "enum:snat,dnat",        0, NULL,     "NAT type"                    },
-	{ "network_nat", "srcintf",     "ref-iface-or:system_interface:any", 0, NULL, "Source interface"            },
-	{ "network_nat", "dstintf",     "ref-iface-or:system_interface:any", 1, NULL, "Destination interface"       },
-	{ "network_nat", "protocol",    "enum:tcp,udp,tcp+udp,all", 0, "all", "Protocol (tcp, udp, tcp+udp, or all)" },
-	{ "network_nat", "srcaddr",     "ref-or-cidr:firewall_address:all,any", 0, NULL, "Source address object or subnet" },
-	{ "network_nat", "dstaddr",     "ref-or-cidr:firewall_address:all,any", 0, NULL, "Destination address object or subnet" },
-	{ "network_nat", "dstport",     "uint:1:65535",          1, NULL,     "Destination port"             },
-	{ "network_nat", "mapped-ip",   "ipv4",                  1, NULL,     "Translated IP address"        },
-	{ "network_nat", "mapped-port", "uint:1:65535",          1, NULL,     "Translated port"              },
-	{ "network_nat", "status",      "enum:enable,disable",   0, "enable", "Enable or disable this rule"  },
-	{ "network_nat", "sequence",    "uint:1:9999",           1, NULL,     "Priority (higher = checked first)" },
+	{ "network_nat", "type",        "enum:snat,dnat",        0, NULL,     "NAT type", 0 },
+	{ "network_nat", "srcintf",     "ref-iface-or:system_interface:any", 0, NULL, "Source interface", 0 },
+	{ "network_nat", "dstintf",     "ref-iface-or:system_interface:any", 1, NULL, "Destination interface", 0 },
+	{ "network_nat", "protocol",    "enum:tcp,udp,tcp+udp,all", 0, "all", "Protocol (tcp, udp, tcp+udp, or all)", 0 },
+	{ "network_nat", "srcaddr",     "ref-or-cidr:firewall_address:all,any", 0, NULL, "Source address object or subnet", 0 },
+	{ "network_nat", "dstaddr",     "ref-or-cidr:firewall_address:all,any", 0, NULL, "Destination address object or subnet", 0 },
+	{ "network_nat", "dstport",     "uint:1:65535",          1, NULL,     "Destination port", 0 },
+	{ "network_nat", "mapped-ip",   "ipv4",                  1, NULL,     "Translated IP address", 0 },
+	{ "network_nat", "mapped-port", "uint:1:65535",          1, NULL,     "Translated port", 0 },
+	{ "network_nat", "status",      "enum:enable,disable",   0, "enable", "Enable or disable this rule", 0 },
+	{ "network_nat", "sequence",    "uint:1:9999",           1, NULL,     "Priority (higher = checked first)", 0 },
+
+	/* security_ips (CFG_SINGLE) — IPS signature/ML inspection.
+	 * Off by default; when on, mgmtd đẩy gói NEW lên stargazer-ipsd qua NFQUEUE. */
+	{ "security_ips", "status",     "enum:enable,disable", 0, "disable", "Enable IPS inspection", 0 },
+	{ "security_ips", "mode",       "enum:detect,prevent", 0, "prevent", "detect = chỉ alert; prevent = chặn", 0 },
+	{ "security_ips", "queue-num",  "uint:0:65535",        0, "0",       "NFQUEUE number nối với ipsd", 0 },
+	{ "security_ips", "snapshot-n", "uint:1:64",           0, "8",       "Số gói đầu mỗi flow đưa vào NFQUEUE (fallback khi kernel thiếu connbytes mode bytes)", 0 },
+	{ "security_ips", "snapshot-bytes", "uint:1024:262144", 0, "16384",  "Cửa sổ soi mỗi flow (byte, 2 chiều) — connbytes-mode bytes (P1 reassembly)", 0 },
+	/* Phase 4: HTTPS-deep soi qua IPC engine stateful của ipsd. */
+	{ "security_ips", "ipc-inspect",  "enum:enable,disable", 0, "enable", "Phase 4: ssld đẩy HTTPS đã giải mã qua IPC tới engine stateful ipsd (disable = soi per-chunk)", 0 },
+	{ "security_ips", "ipc-failmode", "enum:open,closed",    0, "open",   "Phase 4: IPC lỗi → open=fallback soi per-chunk; closed=chặn flow (fail-closed)", 0 },
+	{ "security_ips", "ml-https",     "enum:enable,disable", 0, "disable", "Phase 4 Pha 2: ML cho HTTPS đã giải mã — bật hook kernel LOCAL_IN (ml_account_local). Mặc định disable (opt-in).", 0 },
+	{ "security_ips", "auto-update","enum:disable,daily,weekly", 0, "disable", "Tự cập nhật signature theo lịch (cron)", 0 },
+	{ "security_ips", "update-url", "string",              1, NULL,      "URL nguồn ruleset (ET Open) cho auto-update", 0 },
+	{ "security_ips", "cron-enabled","enum:enable,disable", 0, "disable", "Enable scheduled auto-update", 0 },
+	{ "security_ips", "cron-minutes","string",              1, "0",       "Cron minutes field (0-59, *)", 0 },
+	{ "security_ips", "cron-hours",  "string",              1, "0",       "Cron hours field (0-23, *)", 0 },
+	{ "security_ips", "cron-dom",    "string",              1, "*",       "Cron day-of-month (1-31, *)", 0 },
+	{ "security_ips", "cron-months", "string",              1, "*",       "Cron months (1-12, *)", 0 },
+	{ "security_ips", "cron-dow",    "string",              1, "*",       "Cron days-of-week (0=Sun..6=Sat, *)", 0 },
+	{ "security_ips", "cron-desc",   "string",              1, NULL,      "Schedule description", 0 },
+
+	/* security_ips-profile (CFG_TABLE) — nhiều profile, mỗi profile chọn
+	 * tập signature (categories). Policy trỏ tới profile qua field
+	 * ips-profile (ref-or:security_ips-profile:none). */
+	{ "security_ips-profile", "name",         "safe-id",             0, NULL,     "Profile name", 0 },
+	{ "security_ips-profile", "status",       "enum:enable,disable", 0, "enable", "Enable this profile", 0 },
+	{ "security_ips-profile", "categories",   "string",              1, "all",    "Legacy fallback khi không có filter (comma list, 'all')", 0 },
+	{ "security_ips-profile", "comment",      "string",              1, NULL,     "Optional description", 0 },
+
+	/* security_ips-filter (CFG_TABLE, FortiGate IPS sensor) — mỗi entry là một
+	 * mục của một profile: chọn theo category hoặc signature (SID), kèm ACTION
+	 * per-entry (P7). status = có soi entry không; action = khi match làm gì.
+	 * Nhiều entry/profile (lọc theo field `profile`). */
+	{ "security_ips-filter", "profile", "ref:security_ips-profile",        0, NULL,      "Profile chứa filter này", 0 },
+	{ "security_ips-filter", "type",    "enum:category,signature",         0, "category", "category = nhóm luật; signature = SID cụ thể", 0 },
+	{ "security_ips-filter", "value",   "string",                          0, NULL,      "Tên category hoặc SID", 0 },
+	{ "security_ips-filter", "action",  "enum:default,block,alert,pass",   0, "default", "default=giữ action gốc rule; block=drop; alert=cảnh báo; pass=bỏ rule khỏi profile", 0 },
+	{ "security_ips-filter", "status",  "enum:enable,disable",             0, "enable",  "Enable filter này (có soi không)", 0 },
+
+	/* security_ips-ruleset (CFG_TABLE) — nguồn ruleset để tải về.
+	 * Mỗi entry là một URL (ET Open, SSL BL, custom). Cron và "Update Now"
+	 * iterate qua các entry enabled để chạy ips-update.sh. */
+	{ "security_ips-ruleset", "name",           "safe-id",             0, NULL,      "Ruleset name (e.g. et-botcc)", 0 },
+	{ "security_ips-ruleset", "description",   "string",              1, NULL,      "Human-readable ruleset description", 0 },
+	{ "security_ips-ruleset", "url",           "string",              0, NULL,      "HTTP/HTTPS URL của file .rules", 0 },
+	{ "security_ips-ruleset", "enabled",       "enum:enable,disable", 0, "disable", "Tải ruleset này khi update", 0 },
+	{ "security_ips-ruleset", "builtin",       "enum:yes,no",         0, "no",      "Entry mặc định (không xoá được)", SG_FLD_HIDDEN },
+	{ "security_ips-ruleset", "last-downloaded","string",             1, NULL,      "Timestamp of last successful download", SG_FLD_HIDDEN },
+
+	/* security_ssl-inspection-profile (CFG_TABLE) — profile FortiGate-style.
+	 * srcintf/ports/listen-port KHÔNG ở đây: srcintf/ports lấy từ policy gắn
+	 * profile; listen-port mgmtd tự gán theo index để mỗi profile 1 ssld. */
+	{ "security_ssl-inspection-profile", "name",                  "safe-id",               0, NULL,          "Profile name", 0 },
+	{ "security_ssl-inspection-profile", "status",                "enum:enable,disable",   0, "enable",      "Enable this profile", 0 },
+	{ "security_ssl-inspection-profile", "inspection-mode",       "enum:certificate,deep", 0, "certificate", "certificate=SNI/cert only; deep=MITM decrypt", 0 },
+	{ "security_ssl-inspection-profile", "no-sni",                "enum:bump,splice",      0, "bump",        "Action for TLS without SNI", 0 },
+	{ "security_ssl-inspection-profile", "untrusted-server-cert", "enum:allow,block",      0, "block",       "Untrusted server cert → allow/block", 0 },
+	{ "security_ssl-inspection-profile", "unsupported",           "enum:allow,block",      0, "allow",       "Unsupported (cert-pinning/cipher) → allow/block", 0 },
+	{ "security_ssl-inspection-profile", "exempt",                "string",                1, NULL,          "Exempt SNI domains (comma list)", 0 },
+	{ "security_ssl-inspection-profile", "comment",               "string",                1, NULL,          "Optional description", 0 },
 
 	/* system_interface */
-	{ "system_interface", "mode",        "enum:static,dhcp", 0, "static", "Addressing mode"              },
-	{ "system_interface", "ip",          "cidr",             1, "0.0.0.0/0", "Interface IP address and mask"  },
-	{ "system_interface", "status",      "enum:up,down",     0, "up",   "Administrative state"           },
-	{ "system_interface", "mtu",         "uint:576:65535",   0, "1500", "Maximum transmission unit"      },
-	{ "system_interface", "allowaccess", "access-services",  1, NULL,   "Allowed management services"    },
-	{ "system_interface", "description", "string",           1, NULL,   "Interface description"          },
+	{ "system_interface", "mode",        "enum:static,dhcp", 0, "static", "Addressing mode", 0 },
+	{ "system_interface", "ip",          "cidr",             1, "0.0.0.0/0", "Interface IP address and mask", 0 },
+	{ "system_interface", "status",      "enum:up,down",     0, "up",   "Administrative state", 0 },
+	{ "system_interface", "mtu",         "uint:576:65535",   0, "1500", "Maximum transmission unit", 0 },
+	{ "system_interface", "allowaccess", "access-services",  1, NULL,   "Allowed management services", 0 },
+	{ "system_interface", "description", "string",           1, NULL,   "Interface description", 0 },
 
 	/* system_settings */
-	{ "system_settings", "hostname",   "safe-id",             0, "stargazer", "System hostname"      },
-	{ "system_settings", "ip-forward", "enum:enable,disable", 0, "enable",    "IPv4 packet forwarding" },
-	{ "system_settings", "timezone",   "tz-token",            0, "UTC",       "System timezone"      },
+	{ "system_settings", "hostname",   "safe-id",             0, "stargazer", "System hostname", 0 },
+	{ "system_settings", "ip-forward", "enum:enable,disable", 0, "enable",    "IPv4 packet forwarding", 0 },
+	{ "system_settings", "timezone",   "tz-token",            0, "UTC",       "System timezone", 0 },
+	{ "system_settings", "fqdn-ttl",   "uint:60:86400",       0, "3600",      "FQDN object resolved-IP lifetime in ipsets (seconds)", 0 },
 
 	/* network_dns — always on, no status field */
-	{ "network_dns", "primary",   "ipv4", 0, "1.1.1.1", "Primary DNS server"   },
-	{ "network_dns", "secondary", "ipv4", 1, "8.8.8.8", "Secondary DNS server" },
+	{ "network_dns", "primary",   "ipv4", 0, "1.1.1.1", "Primary DNS server", 0 },
+	{ "network_dns", "secondary", "ipv4", 1, "8.8.8.8", "Secondary DNS server", 0 },
 
 	/* network_dhcp-server */
-	{ "network_dhcp-server", "interface",   "ref-iface:system_interface", 0, NULL, "Interface to serve DHCP"     },
-	{ "network_dhcp-server", "start-ip",    "ipv4",                0, NULL,     "Pool start address"           },
-	{ "network_dhcp-server", "end-ip",      "ipv4",                0, NULL,     "Pool end address"             },
-	{ "network_dhcp-server", "netmask",     "ipv4",                0, NULL,     "Subnet mask for clients"      },
-	{ "network_dhcp-server", "gateway",     "ipv4",                1, NULL,     "Default gateway for clients"  },
-	{ "network_dhcp-server", "dns-server",  "ipv4",                1, NULL,     "DNS server for clients"       },
-	{ "network_dhcp-server", "domain-name", "safe-id",             1, NULL,     "Domain name for clients"      },
-	{ "network_dhcp-server", "lease-time",  "uint:60:604800",      0, "86400",  "Lease time in seconds"        },
-	{ "network_dhcp-server", "status",      "enum:enable,disable", 0, "enable", "Enable or disable this pool"  },
+	{ "network_dhcp-server", "interface",   "ref-iface:system_interface", 0, NULL, "Interface to serve DHCP", 0 },
+	{ "network_dhcp-server", "start-ip",    "ipv4",                0, NULL,     "Pool start address", 0 },
+	{ "network_dhcp-server", "end-ip",      "ipv4",                0, NULL,     "Pool end address", 0 },
+	{ "network_dhcp-server", "netmask",     "ipv4",                0, NULL,     "Subnet mask for clients", 0 },
+	{ "network_dhcp-server", "gateway",     "ipv4",                1, NULL,     "Default gateway for clients", 0 },
+	{ "network_dhcp-server", "dns-server",  "ipv4",                1, NULL,     "DNS server for clients", 0 },
+	{ "network_dhcp-server", "domain-name", "safe-id",             1, NULL,     "Domain name for clients", 0 },
+	{ "network_dhcp-server", "lease-time",  "uint:60:604800",      0, "86400",  "Lease time in seconds", 0 },
+	{ "network_dhcp-server", "status",      "enum:enable,disable", 0, "enable", "Enable or disable this pool", 0 },
 
 	/* system_ntp — always on, no status field */
-	{ "system_ntp", "server", "safe-id", 0, "pool.ntp.org", "NTP server address or hostname" },
+	{ "system_ntp", "server", "safe-id", 0, "pool.ntp.org", "NTP server address or hostname", 0 },
+
+	/* system_session-ttl — global session idle timeouts (nf_conntrack) */
+	{ "system_session-ttl", "tcp-syn-sent",    "uint:10:600",   0, "120",  "TCP SYN_SENT half-open timeout (seconds)", 0 },
+	{ "system_session-ttl", "tcp-syn-recv",    "uint:5:300",    0, "60",   "TCP SYN_RECV timeout (seconds)", 0 },
+	{ "system_session-ttl", "tcp-established", "uint:60:86400", 0, "3600", "TCP ESTABLISHED idle timeout (seconds)", 0 },
+	{ "system_session-ttl", "tcp-fin-wait",    "uint:10:600",   0, "120",  "TCP FIN_WAIT timeout (seconds)", 0 },
+	{ "system_session-ttl", "tcp-close-wait",  "uint:5:300",    0, "60",   "TCP CLOSE_WAIT timeout (seconds)", 0 },
+	{ "system_session-ttl", "tcp-last-ack",    "uint:5:120",    0, "30",   "TCP LAST_ACK timeout (seconds)", 0 },
+	{ "system_session-ttl", "tcp-time-wait",   "uint:10:600",   0, "120",  "TCP TIME_WAIT timeout (seconds)", 0 },
+	{ "system_session-ttl", "tcp-close",       "uint:1:60",     0, "10",   "TCP CLOSE (RST) cleanup timeout (seconds)", 0 },
+	{ "system_session-ttl", "udp",             "uint:10:3600",  0, "180",  "UDP session idle timeout (seconds)", 0 },
+	{ "system_session-ttl", "icmp",            "uint:5:300",    0, "60",   "ICMP session idle timeout (seconds)", 0 },
+	{ "system_session-ttl", "other",           "uint:10:3600",  0, "300",  "Other protocol timeout — GRE, ESP, etc. (seconds)", 0 },
 
 	/* firewall_policy */
-	{ "firewall_policy", "name",     "safe-id",                         0, NULL,     "Policy name"                },
-	{ "firewall_policy", "srcintf",  "ref-iface-or:system_interface:any", 0, "any",   "Source interface"           },
-	{ "firewall_policy", "dstintf",  "ref-iface-or:system_interface:any", 0, "any",   "Destination interface"      },
-	{ "firewall_policy", "srcaddr",  "ref:firewall_address",            0, "all",    "Source address object"      },
-	{ "firewall_policy", "dstaddr",  "ref:firewall_address",            0, "all",    "Destination address object" },
-	{ "firewall_policy", "action",   "enum:accept,deny,drop",           0, "deny",   "Matching traffic action"    },
-	{ "firewall_policy", "service",  "ref:firewall_service",            0, "all",    "Service object"             },
-	{ "firewall_policy", "schedule", "safe-id-or:all,any",              0, "all",    "Schedule object"            },
-	{ "firewall_policy", "status",   "enum:enable,disable",             0, "enable", "Enable or disable this policy" },
-	{ "firewall_policy", "comment",  "string",                          1, NULL,     "Optional description"       },
-	{ "firewall_policy", "sequence", "uint:1:9999",                     1, NULL,     "Priority (higher = checked first)" },
+	{ "firewall_policy", "name",     "safe-id",                         0, NULL,     "Policy name", 0 },
+	{ "firewall_policy", "srcintf",  "ref-iface-or:system_interface:any", 0, "any",   "Source interface", 0 },
+	{ "firewall_policy", "dstintf",  "ref-iface-or:system_interface:any", 0, "any",   "Destination interface", 0 },
+	{ "firewall_policy", "srcaddr",  "ref:firewall_address",            0, "all",    "Source address object", 0 },
+	{ "firewall_policy", "dstaddr",  "ref:firewall_address",            0, "all",    "Destination address object", 0 },
+	{ "firewall_policy", "action",   "enum:accept,deny,drop",           0, "deny",   "Matching traffic action", 0 },
+	{ "firewall_policy", "service",  "ref:firewall_service",            0, "all",    "Service object", 0 },
+	{ "firewall_policy", "schedule", "safe-id-or:all,any",              0, "all",    "Schedule object", 0 },
+	{ "firewall_policy", "status",   "enum:enable,disable",             0, "enable", "Enable or disable this policy", 0 },
+	{ "firewall_policy", "comment",  "string",                          1, NULL,     "Optional description", 0 },
+	{ "firewall_policy", "sequence", "uint:1:9999",                     1, NULL,     "Priority (higher = checked first)", 0 },
+	{ "firewall_policy", "cmkid",    "uint:1:16777215",                 1, NULL,     "Connmark id stamped on permitted flows (internal)", SG_FLD_HIDDEN },
+	/* IPS: KHÔNG có "none". Tắt = ips-profile UNSET (không liên kết profile nào);
+	 * bật = ips-profile = một profile thật (web toggle on → mặc định "default",
+	 * user tự chọn khác; CLI `set ips-profile <name>` để bật, `unset ips-profile`
+	 * để tắt). ips-status là field NỘI BỘ (toggle), tự đồng bộ theo ips-profile —
+	 * ẩn khỏi CLI. ips-profile optional, không default → policy mới mặc định off. */
+	{ "firewall_policy", "ips-status",  "enum:enable,disable", 1, NULL, "Enable IPS inspection (internal toggle)", 0 },
+	{ "firewall_policy", "ips-profile", "ref:security_ips-profile", 1, NULL, "IPS security profile (accept-only policies)", 0 },
+	/* ssl-profile: mặc định built-in "no-inspection" (không giải mã). Chỉ có
+	 * nghĩa khi action=accept. */
+	{ "firewall_policy", "ssl-profile", "ref-or:security_ssl-inspection-profile:no-inspection", 0, "no-inspection", "SSL inspection profile (accept-only policies)", 0 },
 
-	/* firewall_address */
-	{ "firewall_address", "name",    "safe-id",                  0, NULL,     "Address object name"  },
-	{ "firewall_address", "subnet",  "cidr",                     0, NULL,     "Network address and mask" },
-	{ "firewall_address", "type",    "enum:ipmask,iprange,fqdn", 0, "ipmask", "Address type"         },
-	{ "firewall_address", "comment", "string",                   1, NULL,     "Optional description" },
+	/* firewall_address
+	 * subnet/fqdn are registry-optional: which one is required depends on
+	 * type (ipmask → subnet, fqdn → fqdn). The cross-field rule lives in
+	 * sg_check_entry_semantics(), enforced on every full-entry save. */
+	{ "firewall_address", "name",    "safe-id",          0, NULL,     "Address object name", 0 },
+	{ "firewall_address", "subnet",  "cidr",             1, NULL,     "Network address and mask (type ipmask)", 0 },
+	{ "firewall_address", "fqdn",    "fqdn",             1, NULL,     "Fully qualified domain name (type fqdn)", 0 },
+	{ "firewall_address", "type",    "enum:ipmask,fqdn", 0, "ipmask", "Address type", 0 },
+	{ "firewall_address", "comment", "string",           1, NULL,     "Optional description", 0 },
 
 	/* firewall_service */
-	{ "firewall_service", "name",       "safe-id",           0, NULL,  "Service object name"  },
-	{ "firewall_service", "protocol",   "enum:tcp,udp,icmp,all", 0, "tcp", "IP protocol"          },
-	{ "firewall_service", "port-range", "port-or-range",         1, NULL,  "Port or port range"   },
-	{ "firewall_service", "comment",    "string",            1, NULL,  "Optional description" },
+	{ "firewall_service", "name",       "safe-id",           0, NULL,  "Service object name", 0 },
+	{ "firewall_service", "protocol",   "enum:tcp,udp,icmp,all", 0, "tcp", "IP protocol", 0 },
+	{ "firewall_service", "port-range", "port-or-range",         1, NULL,  "Port or port range", 0 },
+	{ "firewall_service", "comment",    "string",            1, NULL,  "Optional description", 0 },
 
 	/* system_password-policy */
-	{ "system_password-policy", "min-length",    "uint:0:128", 0, "8", "Minimum password length"      },
-	{ "system_password-policy", "min-uppercase", "uint:0:128", 0, "0", "Required uppercase characters" },
-	{ "system_password-policy", "min-lowercase", "uint:0:128", 0, "0", "Required lowercase characters" },
-	{ "system_password-policy", "min-digit",     "uint:0:128", 0, "0", "Required digit characters"    },
-	{ "system_password-policy", "min-special",   "uint:0:128", 0, "0", "Required special characters"  },
+	{ "system_password-policy", "min-length",    "uint:0:128", 0, "8", "Minimum password length", 0 },
+	{ "system_password-policy", "min-uppercase", "uint:0:128", 0, "0", "Required uppercase characters", 0 },
+	{ "system_password-policy", "min-lowercase", "uint:0:128", 0, "0", "Required lowercase characters", 0 },
+	{ "system_password-policy", "min-digit",     "uint:0:128", 0, "0", "Required digit characters", 0 },
+	{ "system_password-policy", "min-special",   "uint:0:128", 0, "0", "Required special characters", 0 },
 
 	/* system_admin-profile */
-	{ "system_admin-profile", "permissions", "permissions-csv", 0, NULL, "Granted permissions"  },
-	{ "system_admin-profile", "description", "string",          1, NULL, "Profile description"  },
+	{ "system_admin-profile", "permissions", "permissions-csv", 0, NULL, "Granted permissions", 0 },
+	{ "system_admin-profile", "description", "string",          1, NULL, "Profile description", 0 },
 
 	/* system_admin */
-	{ "system_admin", "profile",                  "ref:system_admin-profile", 0, NULL,     "Admin permission profile"            },
-	{ "system_admin", "password",                 "password-interactive",     1, NULL,     "Account password"                    },
-	{ "system_admin", "enforce-change-password",  "enum:enable,disable",     0, "enable", "Force password change on first login" },
-	{ "system_admin", "enforce-password-policy",  "enum:enable,disable",     0, "enable", "Apply password policy rules"         },
+	{ "system_admin", "profile",                  "ref:system_admin-profile", 0, NULL,     "Admin permission profile", 0 },
+	{ "system_admin", "password",                 "password-interactive",     1, NULL,     "Account password", 0 },
+	{ "system_admin", "enforce-change-password",  "enum:enable,disable",     0, "enable", "Force password change on first login", 0 },
+	{ "system_admin", "enforce-password-policy",  "enum:enable,disable",     0, "enable", "Apply password policy rules", 0 },
 
-	{ NULL, NULL, NULL, 0, NULL, NULL }
+	{ NULL, NULL, NULL, 0, NULL, NULL, 0 }
 };
 
 /* ── Key=Value utility functions ────────────────────────────────────────── */
@@ -308,10 +411,69 @@ sg_is_cidr(const char *s)
 	return sg_is_uint_range(slash + 1, 0, 32);
 }
 
+/*
+ * sg_is_fqdn — strict RFC-1123 hostname for FQDN address objects.
+ *
+ * Rules: dot-separated labels of [A-Za-z0-9-], no leading/trailing hyphen,
+ * label 1-63 chars, total ≤253, at least one dot, and the last label is not
+ * all-digits (rejects bare IPv4 like "8.8.8.8" — that belongs in subnet).
+ *
+ * Wildcards ("*.facebook.com") are rejected deliberately: matching a
+ * wildcard requires observing DNS responses (DNS snooping), which the
+ * refresh engine cannot do — accepting one here would create an object
+ * that silently never matches.
+ */
+int
+sg_is_fqdn(const char *s)
+{
+	if (!s || !*s)
+		return 0;
+	if (strlen(s) > SG_NET_TARGET_MAX)
+		return 0;
+
+	int label_len = 0, dots = 0, last_label_digits = 1;
+
+	for (const char *p = s; *p; p++) {
+		if (*p == '.') {
+			if (label_len == 0 || p[-1] == '-')
+				return 0;        /* empty label / trailing '-' */
+			if (p[1] == '\0')
+				return 0;        /* trailing dot */
+			dots++;
+			label_len = 0;
+			last_label_digits = 1;
+			continue;
+		}
+		if (*p == '-') {
+			if (label_len == 0)
+				return 0;        /* leading '-' in label */
+			last_label_digits = 0;
+		} else if (isdigit((unsigned char)*p)) {
+			/* digits allowed; tracked for the all-digit TLD check */
+		} else if (isalpha((unsigned char)*p)) {
+			last_label_digits = 0;
+		} else {
+			return 0;                /* '*', '_', etc. */
+		}
+		if (++label_len > 63)
+			return 0;
+	}
+
+	if (label_len == 0 || s[strlen(s) - 1] == '-')
+		return 0;
+	if (dots == 0)
+		return 0;                        /* require qualified name */
+	if (last_label_digits)
+		return 0;                        /* numeric TLD → looks like an IP */
+	return 1;
+}
+
 int
 sg_is_iface_name(const char *s)
 {
 	if (!s || !*s)
+		return 0;
+	if (strlen(s) >= IF_NAMESIZE)   /* IF_NAMESIZE = 16, same as kernel IFNAMSIZ */
 		return 0;
 	for (const char *p = s; *p; p++) {
 		if (isalnum((unsigned char)*p))
@@ -608,6 +770,24 @@ sg_reg_is_valid_key(const char *type_name, const char *key)
 	return 0;
 }
 
+/*
+ * Is this an internal (SG_FLD_HIDDEN) field?  Such keys are valid for the
+ * config engine (auto-assigned / backfilled internally) but must not be
+ * shown in `show`/export or set/unset by a user.  Returns 0 for unknown keys.
+ */
+int
+sg_reg_is_hidden_key(const char *type_name, const char *key)
+{
+	if (!type_name || !key)
+		return 0;
+	for (const struct field_entry *f = field_table; f->type; f++) {
+		if (strcmp(f->type, type_name) == 0 &&
+		    strcmp(f->key, key) == 0)
+			return (f->flags & SG_FLD_HIDDEN) ? 1 : 0;
+	}
+	return 0;
+}
+
 int
 sg_reg_is_optional(const char *type_name, const char *key)
 {
@@ -688,10 +868,10 @@ sg_reg_all_keys_defaults(const char *type_name)
 	for (const struct field_entry *f = field_table; f->type; f++) {
 		if (strcmp(f->type, type_name) != 0)
 			continue;
-		/* Skip internal-only keys */
-		if (strcmp(f->key, "builtin") == 0 ||
-		    strcmp(f->key, "password") == 0 ||
-		    strcmp(f->key, "password-hash") == 0)
+		/* Skip internal-only keys: SG_FLD_HIDDEN fields and the
+		 * interactive "password" field are never emitted as defaults. */
+		if ((f->flags & SG_FLD_HIDDEN) ||
+		    strcmp(f->key, "password") == 0)
 			continue;
 		const char *v = f->defval ? f->defval : "";
 		int n = snprintf(buf + pos, sizeof(buf) - pos,
@@ -726,8 +906,9 @@ sg_reg_value_rule(const char *type_name, const char *key)
 		return "CIDR (A.B.C.D/len)";
 	if (strcmp(kind, "ipv4") == 0)
 		return "IPv4";
-	if (strcmp(kind, "iface") == 0)
-		return "interface name";
+	if (strcmp(kind, "fqdn") == 0)
+		return "FQDN (e.g. www.example.com — no wildcard)";
+	/* (no bare "iface" kind: interface fields use "ref-iface[-or]:...") */
 	if (strcmp(kind, "safe-id") == 0)
 		return "safe identifier [A-Za-z0-9_.-]";
 	if (strcmp(kind, "tz-token") == 0)
@@ -955,9 +1136,8 @@ sg_reg_validate_value(const char *type_name, const char *key, const char *val)
 	if (strcmp(kind, "ipv4") == 0)
 		return sg_is_ipv4(val);
 
-	/* iface */
-	if (strcmp(kind, "iface") == 0)
-		return sg_is_iface_name(val);
+	/* (no bare "iface" kind — interface fields route through the
+	 * "ref-iface"/"ref-iface-or:" branches below, not here.) */
 
 	/* uint:min:max */
 	if (strncmp(kind, "uint:", 5) == 0) {
@@ -974,6 +1154,10 @@ sg_reg_validate_value(const char *type_name, const char *key, const char *val)
 	/* cidr-or:a,b */
 	if (strncmp(kind, "cidr-or:", 8) == 0)
 		return sg_match_csv_option(kind + 8, val) || sg_is_cidr(val);
+
+	/* fqdn */
+	if (strcmp(kind, "fqdn") == 0)
+		return sg_is_fqdn(val);
 
 	/* safe-id */
 	if (strcmp(kind, "safe-id") == 0)
@@ -1303,4 +1487,67 @@ sg_reg_scrub_value(const char *type, const char *key, const char *val,
 		out[dlen] = '\0';
 	}
 	return 1;
+}
+
+/* ── Cross-field entry semantics ─────────────────────────────────────────── */
+
+/*
+ * sg_check_entry_semantics — type-conditional rules that single-field
+ * validation cannot express.  Operates on a FULL entry in "key=val\n"
+ * form (CFG_SET payload / serialized CLI buffer) — never on partial data.
+ *
+ * firewall_address: the value field must match the type —
+ *   type=ipmask → subnet required, fqdn forbidden
+ *   type=fqdn   → fqdn required, subnet forbidden
+ *
+ * Returns 0 if consistent; -1 with a message in errbuf otherwise.
+ */
+int
+sg_check_entry_semantics(const char *type_name, const char *data,
+			 char *errbuf, size_t errsz)
+{
+	if (errbuf && errsz > 0)
+		errbuf[0] = '\0';
+	if (!type_name || !data)
+		return 0;
+
+	if (strcmp(type_name, "firewall_address") == 0) {
+		char atype[32];
+
+		sg_kv_get(data, "type", atype, sizeof(atype));
+		if (!atype[0])  /* default applied on save */
+			snprintf(atype, sizeof(atype), "%s",
+				 sg_reg_field_default(type_name, "type"));
+
+		int has_subnet = sg_kv_has_key(data, "subnet");
+		int has_fqdn   = sg_kv_has_key(data, "fqdn");
+
+		if (strcmp(atype, "fqdn") == 0) {
+			if (!has_fqdn) {
+				snprintf(errbuf, errsz,
+					 "type fqdn requires 'fqdn' to be set");
+				return -1;
+			}
+			if (has_subnet) {
+				snprintf(errbuf, errsz,
+					 "'subnet' is not valid for type fqdn"
+					 " (unset it or use type ipmask)");
+				return -1;
+			}
+		} else {  /* ipmask */
+			if (!has_subnet) {
+				snprintf(errbuf, errsz,
+					 "type ipmask requires 'subnet' to be set");
+				return -1;
+			}
+			if (has_fqdn) {
+				snprintf(errbuf, errsz,
+					 "'fqdn' is not valid for type ipmask"
+					 " (unset it or use type fqdn)");
+				return -1;
+			}
+		}
+	}
+
+	return 0;
 }

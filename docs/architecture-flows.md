@@ -236,6 +236,9 @@ flowchart TD
 
 ## 6. Packet Processing Flow
 
+Priority order at NF_INET_FORWARD: pkt_forward.ko (−399) → iptables FORWARD (0).
+Sessions are created and SESS_BLOCKED is enforced before firewall policy rules run.
+
 ```mermaid
 flowchart TD
     PKT_IN["Packet arrives<br/>on interface"]
@@ -250,7 +253,7 @@ flowchart TD
 
     ROUTING{"Routing decision:<br/>dest = local IP?"}
     ROUTING -->|"Yes (to firewall)"| INPUT_CHAIN
-    ROUTING -->|"No (forward)"| FORWARD_CHAIN
+    ROUTING -->|"No (forward)"| PKT_FWD_MOD
 
     subgraph INPUT_CHAIN["INPUT chain (filter)"]
         INPUT_POLICY["Policy: DROP"]
@@ -265,24 +268,44 @@ flowchart TD
         IN_DHCP -->|No| IN_DROP["DROP<br/>(policy)"]
     end
 
-    subgraph FORWARD_CHAIN["FORWARD chain (filter)"]
-        FWD_POLICY["Policy: DROP"]
-        FWD_POLICY --> FWD_EST{"ESTABLISHED<br/>RELATED?"}
+    subgraph PKT_FWD_MOD["pkt_forward.ko — NF_INET_FORWARD priority −399"]
+        direction TB
+        MOD_IPV4{"Valid IPv4<br/>header?"}
+        MOD_IPV4 -->|No| MOD_DROP_IP["NF_DROP"]
+        MOD_IPV4 -->|Yes| MOD_KEY["Extract 5-tuple<br/>src/dst IP:port + proto"]
+        MOD_KEY -->|"L4 error"| MOD_DROP_KEY["NF_DROP"]
+        MOD_KEY -->|OK| MOD_LOOKUP{"Lookup<br/>session"}
+        MOD_LOOKUP -->|"TCP non-SYN"| MOD_BIDIR["Bidirectional lookup only<br/>(never creates)"]
+        MOD_LOOKUP -->|"ICMP error"| MOD_ICMP["Look up parent session<br/>via embedded header"]
+        MOD_LOOKUP -->|"TCP SYN / UDP / other ICMP"| MOD_CREATE["Lookup or create<br/>new session"]
+        MOD_BIDIR -->|"No match + asymmetric mode"| MOD_CREATE
+        MOD_BIDIR -->|"No match"| MOD_DROP_NOSESS["NF_DROP<br/>mid-stream, no session"]
+        MOD_BIDIR -->|"Found"| MOD_BLOCKED
+        MOD_ICMP -->|"No parent"| MOD_CREATE
+        MOD_ICMP -->|"Found parent"| MOD_BLOCKED
+        MOD_CREATE -->|"Table full / OOM"| MOD_DROP_NOSESS
+        MOD_CREATE -->|OK| MOD_BLOCKED
+        MOD_BLOCKED{"SESS_BLOCKED<br/>flag?"}
+        MOD_BLOCKED -->|Yes| MOD_DROP_BLK["NF_DROP<br/>pkts_blocked++"]
+        MOD_BLOCKED -->|No| MOD_TCP{"TCP?"}
+        MOD_TCP -->|Yes| MOD_STATE["Validate TCP state machine<br/>RST sequence, SYN injection"]
+        MOD_STATE -->|"Invalid"| MOD_DROP_STATE["NF_DROP"]
+        MOD_STATE -->|OK| MOD_UPDATE
+        MOD_TCP -->|No| MOD_UPDATE["Update session stats<br/>pkts, bytes, IAT, LRU touch"]
+        MOD_UPDATE --> MOD_ACCEPT["NF_ACCEPT<br/>pkts_forwarded++"]
+    end
+
+    subgraph FORWARD_CHAIN["iptables FORWARD chain — priority 0"]
+        MOD_ACCEPT --> FWD_EST{"ESTABLISHED<br/>RELATED?"}
         FWD_EST -->|Yes| FWD_ACCEPT_EST["ACCEPT"]
         FWD_EST -->|No| FWD_RULES{"Firewall policy<br/>rules (by sequence)"}
         FWD_RULES -->|Match ACCEPT| FWD_ACCEPT["ACCEPT"]
         FWD_RULES -->|Match DROP/DENY| FWD_DROP_RULE["DROP"]
-        FWD_RULES -->|No match| FWD_DROP["DROP<br/>(policy)"]
-    end
-
-    subgraph PKT_FWD_MOD["pkt_forward.ko<br/>(NF_INET_FORWARD)"]
-        FWD_ACCEPT --> MOD_CHECK{"Valid IPv4<br/>header?"}
-        MOD_CHECK -->|Yes| MOD_ACCEPT["NF_ACCEPT<br/>pkts_forwarded++"]
-        MOD_CHECK -->|No| MOD_DROP["NF_DROP<br/>pkts_dropped++"]
+        FWD_RULES -->|No match| FWD_DROP["DROP (policy)"]
     end
 
     subgraph POSTROUTING["POSTROUTING (nat table)"]
-        MOD_ACCEPT --> SNAT_CHECK{"SNAT rules<br/>match?"}
+        FWD_ACCEPT --> SNAT_CHECK{"SNAT rules<br/>match?"}
         SNAT_CHECK -->|Yes| SNAT_APPLY["Rewrite src IP<br/>-j MASQUERADE"]
         SNAT_CHECK -->|No| NO_SNAT["Pass through"]
         SNAT_APPLY --> PKT_OUT
@@ -520,7 +543,7 @@ flowchart TD
 | 19 | No QoS/traffic shaping | No bandwidth/priority rules |
 | 20 | Password change doesn't invalidate sessions | Old tokens remain valid |
 | 21 | Unused IPC commands | OSPF/RIP/BGP enums defined but not implemented |
-| 22 | session.c not wired into pkt_forward.ko | Session tracking infrastructure exists but unused |
+| 22 | ~~session.c not wired into pkt_forward.ko~~ | Fixed — pkt_forward.ko performs full session tracking |
 
 ### Recommended Priority for Next Sprint
 
@@ -529,4 +552,106 @@ flowchart TD
 3. Fix #15 (server-side ref existence check) — data integrity
 4. Fix #7 (CSRF) + #8 (getrandom) — web security
 5. Implement #11 (config rollback) — operational safety
-6. Wire session.c into pkt_forward.ko (#22) — data plane advancement
+6. ~~Wire session.c into pkt_forward.ko (#22)~~ — Done
+
+---
+
+## 13. Session Tracking — Lifecycle
+
+```mermaid
+flowchart TD
+    subgraph CREATE["Session Creation"]
+        direction TB
+        NEW_PKT["First packet for this flow<br/>(TCP SYN / UDP / ICMP)"]
+        NEW_PKT --> HASH["Hash the 5-tuple<br/>using Jenkins hash + random seed"]
+        HASH --> BUCKET["Look in hash bucket<br/>for matching entry"]
+        BUCKET -->|"Found (race)"| RETURN_EXISTING["Return existing session<br/>(another CPU won the race)"]
+        BUCKET -->|"Not found"| ALLOC["Allocate session struct<br/>kzalloc — zero all fields"]
+        ALLOC --> INIT["Initialise:<br/>copy 5-tuple key<br/>set flags = SESS_ACTIVE<br/>assign unique ID<br/>set expiry time"]
+        INIT --> INSERT["Insert into hash table<br/>Link at LRU tail<br/>(most-recently-used position)"]
+        INSERT --> RETURN_NEW["Return new session"]
+    end
+
+    subgraph LOOKUP["Session Lookup (existing packet)"]
+        direction TB
+        EXIST_PKT["Subsequent packet"]
+        EXIST_PKT --> HASH2["Hash 5-tuple"]
+        HASH2 --> SCAN["Scan bucket for key match"]
+        SCAN -->|"No match"| TRY_REV["Try reversed 5-tuple<br/>(reply direction)"]
+        TRY_REV -->|"No match"| NOT_FOUND["Return NULL<br/>→ NF_DROP"]
+        TRY_REV -->|"Match"| CHECK_EXP2
+        SCAN -->|"Match"| CHECK_EXP2{"Session expired?<br/>compare now vs expires_at"}
+        CHECK_EXP2 -->|"Yes"| INLINE_EVICT["Remove from hash + LRU<br/>Schedule free (RCU)<br/>Return NULL → NF_DROP"]
+        CHECK_EXP2 -->|"No"| RETURN_SESS["Return session pointer<br/>(valid within RCU read lock)"]
+    end
+
+    subgraph UPDATE["Per-Packet Update"]
+        direction TB
+        GOT_SESS["Session pointer received"]
+        GOT_SESS --> STATS["Update stats under per-session lock:<br/>pkts++, bytes += len<br/>record inter-arrival time<br/>accumulate TCP flags"]
+        STATS --> LRU_CHK{"Session still<br/>in LRU?"}
+        LRU_CHK -->|"No (just evicted)"| SKIP_LRU["Skip — avoids<br/>re-inserting freed session"]
+        LRU_CHK -->|"Yes"| LRU_TOUCH["Move to LRU tail<br/>(refresh activity time)"]
+    end
+
+    subgraph EXPIRY["Session Expiry (two paths)"]
+        direction TB
+        GC["GC Reaper (1 Hz)<br/>Periodic incremental scan"]
+        INLINE["Inline expiry<br/>Found during lookup<br/>but expires_at already past"]
+        GC --> REMOVE["Remove from hash table<br/>Remove from LRU list<br/>Decrement active counter<br/>Increment expired counter"]
+        INLINE --> REMOVE
+        REMOVE --> RCU_FREE["Schedule kfree via RCU<br/>Safe: existing readers<br/>finish before memory freed"]
+    end
+```
+
+---
+
+## 14. GC Reaper Flow
+
+```mermaid
+flowchart TD
+    TICK["1 Hz timer fires"]
+
+    TICK --> READ_ACTIVE["Read current active session count"]
+
+    subgraph HYSTERESIS["Hysteresis — prevents oscillation"]
+        READ_ACTIVE --> H1{"count ≥<br/>adaptive_start?"}
+        H1 -->|Yes| AGG_ON["Switch to aggressive mode<br/>256 buckets/tick<br/>full scan in ~4 s"]
+        H1 -->|No| H2{"count < 85% of<br/>adaptive_start?"}
+        H2 -->|Yes| AGG_OFF["Switch to normal mode<br/>64 buckets/tick<br/>full scan in ~16 s"]
+        H2 -->|No| KEEP_MODE["Keep current mode<br/>(hysteresis band)"]
+    end
+
+    AGG_ON --> ACQUIRE
+    AGG_OFF --> ACQUIRE
+    KEEP_MODE --> ACQUIRE
+
+    ACQUIRE["Acquire table lock + LRU lock"]
+
+    subgraph PHASE1["Phase 1 — Incremental bucket scan"]
+        ACQUIRE --> SCAN["Scan gc_idx … gc_idx + window<br/>(64 or 256 buckets)"]
+        SCAN --> NEXT1{"Next session<br/>in bucket?"}
+        NEXT1 -->|No more| ADV["Advance cursor gc_idx<br/>wrap to 0 after bucket 1023"]
+        NEXT1 -->|Yes| PF1["Compute adaptive timeout:<br/>scales down linearly as<br/>table fills toward adaptive_end<br/>→ 0 when table critically full"]
+        PF1 --> IDLE1{"idle time ≥<br/>adaptive timeout?"}
+        IDLE1 -->|No| NEXT1
+        IDLE1 -->|Yes| EVICT1["Remove from hash<br/>Remove from LRU<br/>count-- / expired++<br/>Schedule free (RCU)"]
+        EVICT1 --> NEXT1
+    end
+
+    subgraph PHASE2["Phase 2 — LRU head sweep (aggressive mode only)"]
+        ADV --> P2_CHECK{"Aggressive<br/>mode?"}
+        P2_CHECK -->|No| RELEASE
+        P2_CHECK -->|Yes| LRU_SCAN["Walk LRU head (oldest sessions)<br/>up to 32 candidates"]
+        LRU_SCAN --> NEXT2{"Next candidate?"}
+        NEXT2 -->|"None or limit"| RELEASE
+        NEXT2 -->|Yes| PF2["Compute adaptive timeout"]
+        PF2 --> IDLE2{"idle time ≥<br/>adaptive timeout?"}
+        IDLE2 -->|No| NEXT2
+        IDLE2 -->|Yes| EVICT2["Remove from hash<br/>Remove from LRU<br/>count-- / expired++<br/>Schedule free (RCU)"]
+        EVICT2 --> NEXT2
+    end
+
+    RELEASE["Release LRU lock + table lock"]
+    RELEASE --> RESCHEDULE["Schedule next tick in 1 s"]
+```

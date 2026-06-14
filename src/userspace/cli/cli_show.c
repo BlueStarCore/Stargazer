@@ -60,10 +60,10 @@ void show_sessions(void)
 	struct ipc_response resp = {0};
 	if (ipc_send_str(SG_CMD_SHOW_SESSIONS, "", &resp) == 0 &&
 	    resp.status == SG_OK && resp.payload && resp.payload[0]) {
-		printf("  === Active Sessions ===\n");
+		printf("  === Active Connections (conntrack) ===\n");
 		printf("%s", resp.payload);
 	} else {
-		printf("  Session tracking not available (module not loaded)\n");
+		printf("  Connection tracking not available\n");
 	}
 	ipc_resp_free(&resp);
 }
@@ -132,6 +132,7 @@ static void show_entry_keys(const char *type, const char *payload,
 
 		/* Skip internal keys */
 		if (strcmp(key, "builtin") == 0 ||
+		    strcmp(key, "system") == 0 ||
 		    strcmp(key, "password-hash") == 0) {
 			if (!knl) break;
 			kp = knl + 1;
@@ -145,6 +146,19 @@ static void show_entry_keys(const char *type, const char *payload,
 		/* Use default if not in DB */
 		if (!val[0] && defval[0])
 			snprintf(val, sizeof(val), "%s", defval);
+
+		/* ip is meaningless for dhcp interfaces — the lease address
+		 * lives in the kernel, not the config DB */
+		if (strcmp(key, "ip") == 0 &&
+		    strcmp(type, "system_interface") == 0) {
+			char iface_mode[32] = "";
+			sg_kv_get(payload, "mode", iface_mode, sizeof(iface_mode));
+			if (strcmp(iface_mode, "dhcp") == 0) {
+				if (!knl) break;
+				kp = knl + 1;
+				continue;
+			}
+		}
 
 		/* Mask passwords */
 		if (strcmp(key, "password") == 0) {
@@ -200,6 +214,29 @@ void show_configure(void)
 				char *nl = strchr(id, '\n');
 				if (nl) *nl = '\0';
 				if (!*id) { if (nl) id = nl + 1; else break; continue; }
+
+				/* Skip system-managed entries (DSA master interfaces) */
+				if (strcmp(type, "system_interface") == 0) {
+					char section[512];
+					snprintf(section, sizeof(section),
+						 "%s:%s", type, id);
+					struct ipc_response chk;
+					int is_sys = 0;
+					if (ipc_send_str(SG_CMD_CFG_GET, section,
+							 &chk) == 0 &&
+					    chk.status == SG_OK && chk.payload) {
+						char sval[8] = "";
+						sg_kv_get(chk.payload, "system",
+							  sval, sizeof(sval));
+						is_sys = (strcmp(sval, "yes") == 0);
+					}
+					ipc_resp_free(&chk);
+					if (is_sys) {
+						if (!nl) break;
+						id = nl + 1;
+						continue;
+					}
+				}
 
 				printf("  edit \"%s\"\n", id);
 

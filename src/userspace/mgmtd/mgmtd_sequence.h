@@ -37,10 +37,12 @@ int seq_type_is_orderable(const char *type);
 int seq_auto_assign(const char *type, char *data, size_t data_sz);
 
 /*
- * Check if any entry (excluding exclude_id) has the given sequence.
- * Returns 1 if collision exists, 0 if the slot is free.
+ * Auto-assign a stable connmark id: cmkid = max(existing) + 1.
+ * Appends "cmkid=N\n" to data buffer if no "cmkid=" key exists.
+ * Used by firewall_policy so live flows can be stamped with the owning
+ * policy and re-evaluated on policy change. Returns 0 / -1 (buffer too small).
  */
-int seq_has_collision(const char *type, int seq, const char *exclude_id);
+int cmkid_auto_assign(const char *type, char *data, size_t data_sz);
 
 /*
  * Rotate sequences in the affected range when moving an entry.
@@ -60,5 +62,12 @@ int seq_rotate(const char *type, int old_seq, int new_seq,
  * Returns 0 if no entries have a sequence key.
  */
 int seq_get_max(const char *type);
+
+/*
+ * Shift all non-builtin entries with sequence >= target_seq up by 1
+ * to make room for a new entry being inserted at target_seq.
+ * Skips exclude_id.  Returns number of entries shifted.
+ */
+int seq_insert_at(const char *type, int target_seq, const char *exclude_id);
 
 #endif /* MGMTD_SEQUENCE_H */
