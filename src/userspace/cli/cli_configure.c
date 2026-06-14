@@ -105,20 +105,38 @@ static void kv_parse(struct kv_buf *b, const char *data)
 
 		if (llen > 0) {
 			const char *eq = memchr(p, '=', llen);
-			if (eq && b->count < KV_MAX_ENTRIES) {
+			if (eq) {
 				size_t klen = (size_t)(eq - p);
 				size_t vlen = llen - klen - 1;
 				if (klen > 0 && klen < KV_MAX_KEY) {
-					memcpy(b->entries[b->count].key, p, klen);
-					b->entries[b->count].key[klen] = '\0';
+					char k[KV_MAX_KEY];
+					memcpy(k, p, klen);
+					k[klen] = '\0';
 					if (vlen >= KV_MAX_VAL)
 						vlen = KV_MAX_VAL - 1;
-					memcpy(b->entries[b->count].val, eq + 1, vlen);
-					b->entries[b->count].val[vlen] = '\0';
-					b->count++;
+					/* Overwrite a duplicate key (mirror kv_set):
+					 * a repeated line must not reach the DB as a
+					 * second (type,id,key) row — that aborts the
+					 * whole write with a PK violation. */
+					int slot = -1;
+					for (int i = 0; i < b->count; i++) {
+						if (strcmp(b->entries[i].key, k) == 0) {
+							slot = i;
+							break;
+						}
+					}
+					if (slot < 0) {
+						if (b->count >= KV_MAX_ENTRIES)
+							goto next_line;
+						slot = b->count++;
+						memcpy(b->entries[slot].key, k, klen + 1);
+					}
+					memcpy(b->entries[slot].val, eq + 1, vlen);
+					b->entries[slot].val[vlen] = '\0';
 				}
 			}
 		}
+next_line:
 		if (!eol)
 			break;
 		p = eol + 1;
@@ -523,9 +541,9 @@ static void register_value_completions(const char *key, const char *kind)
 	/* Other kinds (cidr, ipv4, uint, safe-id, tz-token, etc.) — no value completions */
 }
 
-/* firewall_policy: IPS coi như TẮT nếu ips-status=disable; hoặc (legacy chưa có
- * ips-status) ips-profile rỗng/none. Dùng để ẩn ips-profile khỏi `show` khi tắt
- * (tắt = không liên kết profile nào). */
+/* firewall_policy: IPS is considered OFF if ips-status=disable; or (legacy with
+ * no ips-status) ips-profile is empty/none. Used to hide ips-profile from `show`
+ * when off (off = not linked to any profile). */
 static int policy_ips_off(const char *ips_status, const char *ips_profile)
 {
 	if (ips_status && *ips_status)
@@ -534,9 +552,9 @@ static int policy_ips_off(const char *ips_status, const char *ips_profile)
 		strcmp(ips_profile, "none") == 0);
 }
 
-/* Register set commands for a config type. `action` = giá trị action hiện tại
- * của entry (NULL nếu không liên quan) → ẩn gợi ý ssl-profile/ips-profile/
- * ips-status trên firewall_policy deny/drop (chỉ hợp lệ cho accept). */
+/* Register set commands for a config type. `action` = the entry's current action
+ * value (NULL if not relevant) → hide ssl-profile/ips-profile/ips-status hints on
+ * firewall_policy deny/drop (only valid for accept). */
 static void register_set_cmds(const char *type_name, const char *action)
 {
 	int policy_deny = type_name &&
@@ -563,8 +581,8 @@ static void register_set_cmds(const char *type_name, const char *action)
 		char saved = *end;
 		*end = '\0';
 
-		/* ips-status: field nội bộ (tự đồng bộ từ ips-profile) → KHÔNG hint.
-		 * ssl-profile/ips-profile: chỉ accept → ẩn gợi ý trên deny/drop. */
+		/* ips-status: internal field (auto-synced from ips-profile) → NO hint.
+		 * ssl-profile/ips-profile: accept only → hide hints on deny/drop. */
 		int is_policy = type_name &&
 			strcmp(type_name, "firewall_policy") == 0;
 		if ((is_policy && strcmp(tok, "ips-status") == 0) ||
@@ -611,7 +629,7 @@ static void register_unset_get_cmds(const char *type_name)
 		char saved = *end;
 		*end = '\0';
 
-		/* ips-status: field nội bộ → không gợi ý unset/get trên policy. */
+		/* ips-status: internal field → no unset/get hint on policy. */
 		if (type_name && strcmp(type_name, "firewall_policy") == 0 &&
 		    strcmp(tok, "ips-status") == 0) {
 			*end = saved;
@@ -925,26 +943,26 @@ static int context_entry(const char *type_name, const char *label,
 				       " and cannot be set\n", key);
 				continue;
 			}
-			/* ips-status là field NỘI BỘ — tự bật/tắt theo ips-profile.
-			 * Không cho set tay (dùng: set ips-profile <name> để bật,
-			 * set ips-profile none để tắt). */
+			/* ips-status is an INTERNAL field — auto on/off based on ips-profile.
+			 * No manual set allowed (use: set ips-profile <name> to enable,
+			 * set ips-profile none to disable). */
 			if (strcmp(type_name, "firewall_policy") == 0 &&
 			    strcmp(key, "ips-status") == 0) {
 				printf("  Error: invalid key 'ips-status' for %s\n",
 				       type_name);
 				continue;
 			}
-			/* Security profiles (ssl/ips) chỉ hợp lệ trên ACCEPT policy.
-			 * DENY/DROP drop gói ở L4, không inspect L7 → chặn ngay lúc
-			 * set (khớp validation backend + web ẩn dropdown). */
+			/* Security profiles (ssl/ips) are only valid on ACCEPT policy.
+			 * DENY/DROP drop packets at L4, no L7 inspection → reject at
+			 * set time (matches backend validation + web hides dropdown). */
 			if (strcmp(type_name, "firewall_policy") == 0 &&
 			    (strcmp(key, "ssl-profile") == 0 ||
 			     strcmp(key, "ips-profile") == 0)) {
 				const char *act = kv_get(&data, "action");
 				if (act && (strcmp(act, "deny") == 0 ||
 					    strcmp(act, "drop") == 0)) {
-					printf("  Error: '%s' chỉ đặt được khi "
-					       "action=accept (policy này action=%s)\n",
+					printf("  Error: '%s' can only be set when "
+					       "action=accept (this policy has action=%s)\n",
 					       key, act);
 					continue;
 				}
@@ -994,9 +1012,9 @@ static int context_entry(const char *type_name, const char *label,
 				fprintf(stderr,
 					"[CFG-DBG] set: %s=%s"
 					" (valid)\n", key, val);
-			/* Tiện dụng: trên policy, set ips-profile (luôn là profile thật)
-			 * → tự bật toggle nội bộ ips-status=enable. Tắt = unset ips-profile
-			 * (xử lý ở nhánh unset). Web reload thấy switch gạt theo. */
+			/* Convenience: on a policy, set ips-profile (always a real profile)
+			 * → auto-enable the internal toggle ips-status=enable. Disable = unset
+			 * ips-profile (handled in the unset branch). Web reload sees the switch. */
 			if (strcmp(type_name, "firewall_policy") == 0 &&
 			    strcmp(key, "ips-profile") == 0) {
 				kv_set(&data, "ips-status", "enable");
@@ -1018,8 +1036,8 @@ static int context_entry(const char *type_name, const char *label,
 				       " and cannot be unset\n", key);
 				continue;
 			}
-			/* ips-status nội bộ — không cho unset tay (dùng unset
-			 * ips-profile để tắt IPS). */
+			/* ips-status is internal — no manual unset (use unset
+			 * ips-profile to disable IPS). */
 			if (strcmp(type_name, "firewall_policy") == 0 &&
 			    strcmp(key, "ips-status") == 0) {
 				printf("  Error: invalid key 'ips-status' for %s\n",
@@ -1032,7 +1050,7 @@ static int context_entry(const char *type_name, const char *label,
 				data.modified = 1;
 			}
 			kv_unset(&data, key);
-			/* unset ips-profile = tắt IPS → gỡ luôn toggle nội bộ. */
+			/* unset ips-profile = disable IPS → also remove the internal toggle. */
 			if (strcmp(type_name, "firewall_policy") == 0 &&
 			    strcmp(key, "ips-profile") == 0)
 				kv_unset(&data, "ips-status");
@@ -1075,13 +1093,13 @@ static int context_entry(const char *type_name, const char *label,
 					if (strcmp(data.entries[i].key,
 						   "builtin") == 0)
 						continue;
-					/* ips-status: field nội bộ — không show. */
+					/* ips-status: internal field — do not show. */
 					if (strcmp(type_name, "firewall_policy") == 0 &&
 					    strcmp(data.entries[i].key,
 						   "ips-status") == 0)
 						continue;
-					/* IPS tắt → không hiện ips-profile (không
-					 * liên kết profile nào). */
+					/* IPS off → do not show ips-profile (not
+					 * linked to any profile). */
 					if (p_off && strcmp(data.entries[i].key,
 							    "ips-profile") == 0)
 						continue;
@@ -1383,7 +1401,7 @@ static int context_table(const char *type_name, const char *label)
 							printf("    edit"
 							       " \"%s\"\n",
 							       id);
-							/* IPS tắt → ẩn ips-profile (xem entry show). */
+							/* IPS off → hide ips-profile (see entry show). */
 							struct kv_buf tkv;
 							kv_init(&tkv);
 							kv_parse(&tkv, dr.payload);
@@ -1413,14 +1431,14 @@ static int context_table(const char *type_name, const char *label)
 											if (eol) p++;
 											continue;
 										}
-										/* ips-status nội bộ → ẩn. */
+										/* ips-status internal → hide. */
 										if (klen == 10 &&
 										    strncmp(p, "ips-status", 10) == 0) {
 											p += llen;
 											if (eol) p++;
 											continue;
 										}
-										/* IPS tắt → ẩn ips-profile. */
+										/* IPS off → hide ips-profile. */
 										if (p_off && klen == 11 &&
 										    strncmp(p, "ips-profile", 11) == 0) {
 											p += llen;
@@ -1584,7 +1602,7 @@ static int context_table(const char *type_name, const char *label)
 					       " deleted.\n", arg);
 				} else if (dresp.status == SG_ERR_IN_USE &&
 					   dresp.extra[0]) {
-					/* FortiGate-style: đang được tham chiếu. */
+					/* FortiGate-style: currently referenced. */
 					printf("  %s\n  Command fail.\n",
 					       dresp.extra);
 				} else {
@@ -1608,7 +1626,7 @@ static int context_table(const char *type_name, const char *label)
 					printf("  Entry %s deleted.\n", arg);
 				} else if (dresp.status == SG_ERR_IN_USE &&
 					   dresp.extra[0]) {
-					/* FortiGate-style: đang được tham chiếu. */
+					/* FortiGate-style: currently referenced. */
 					printf("  %s\n  Command fail.\n",
 					       dresp.extra);
 				} else {
@@ -1758,9 +1776,9 @@ static int context_single(const char *type_name, const char *label)
 				fprintf(stderr,
 					"[CFG-DBG] set: %s=%s"
 					" (valid)\n", key, val);
-			/* Tiện dụng: trên policy, set ips-profile (luôn là profile thật)
-			 * → tự bật toggle nội bộ ips-status=enable. Tắt = unset ips-profile
-			 * (xử lý ở nhánh unset). Web reload thấy switch gạt theo. */
+			/* Convenience: on a policy, set ips-profile (always a real profile)
+			 * → auto-enable the internal toggle ips-status=enable. Disable = unset
+			 * ips-profile (handled in the unset branch). Web reload sees the switch. */
 			if (strcmp(type_name, "firewall_policy") == 0 &&
 			    strcmp(key, "ips-profile") == 0) {
 				kv_set(&data, "ips-status", "enable");

@@ -99,14 +99,14 @@ harden_perms() {
 }
 
 start_crond() {
-    # crond chạy IPS signature auto-update + xoay ips-alert.log
-    # (/var/spool/cron/crontabs/root). Không có crond → cả hai job không chạy.
+    # crond runs the IPS signature auto-update + rotates ips-alert.log
+    # (/var/spool/cron/crontabs/root). No crond → neither job runs.
     command -v crond >/dev/null 2>&1 || {
         log "WARNING: crond not found — IPS auto-update + log rotation disabled"
         return 0
     }
-    # killall trước: busybox không có pidof/pgrep để dò instance cũ; xoá sạch
-    # rồi start lại đảm bảo đúng MỘT crond (an toàn cho cả start lẫn restart).
+    # killall first: busybox has no pidof/pgrep to detect a stale instance; clearing
+    # it out then starting again guarantees exactly ONE crond (safe for both start and restart).
     killall crond 2>/dev/null
     log "Starting crond..."
     crond -b -c /var/spool/cron/crontabs 2>/dev/null && log "crond OK" || log "crond FAIL"

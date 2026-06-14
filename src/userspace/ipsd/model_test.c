@@ -1,12 +1,13 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * model_test.c - smoke test cho wrapper ML, chạy trên HOST.
+ * model_test.c - smoke test for the ML wrapper, runs on the HOST.
  *
  *   gcc -O2 -Wall -Wextra -o /tmp/model_test ips_model.c model/predict.c model_test.c -lm
  *
- * Không khẳng định "flow này phải bị chặn" (đó là việc của fusion + threshold);
- * chỉ kiểm wrapper chạy đúng KỸ THUẬT: số feature khớp, điểm ∈ [0,1], tất định,
- * và model có PHẢN HỒI (hai input khác nhau cho điểm khác nhau).
+ * Does not assert "this flow must be blocked" (that is the job of fusion +
+ * threshold); only checks the wrapper works TECHNICALLY correctly: feature
+ * count matches, score ∈ [0,1], deterministic, and the model is RESPONSIVE
+ * (two different inputs give different scores).
  */
 #include "ips_model.h"
 #include "model/predict.h"
@@ -23,7 +24,7 @@ static void check(int cond, const char *name)
 
 int main(void)
 {
-	/* vector T1 của feature_test (một flow "có thật") */
+	/* vector T1 from feature_test (a "real" flow) */
 	double v1[FEAT_COUNT] = { //web attack sample
       1372180.71,   /* [0] Flow IAT Std */
       4,            /* [1] Flow IAT Min */
@@ -40,7 +41,7 @@ int main(void)
       1,            /* [12] Down/Up Ratio */
       29200,        /* [13] Init_Win_fwd */
   };
-	/* vector khác hẳn: DDoS */
+	/* a completely different vector: DDoS */
 	double v2[14] = {	
       21700000,       /* [0] Flow IAT Std */
       19,             /* [1] Flow IAT Min */
@@ -75,7 +76,7 @@ int main(void)
   };
 
 	printf("model: get_num_feature()=%d\n", get_num_feature());
-	check(get_num_feature() == FEAT_COUNT, "model dùng đúng 14 feature");
+	check(get_num_feature() == FEAT_COUNT, "model uses exactly 14 features");
 
 	double s1 = ips_score(v1);
 	double s2 = ips_score(v2);
@@ -86,13 +87,13 @@ int main(void)
 	check(s2 >= 0.0 && s2 <= 1.0, "score(v2) ∈ [0,1]");
 	check(sz >= 0.0 && sz <= 1.0, "score(zero) ∈ [0,1]");
 
-	/* tất định: gọi lại cùng input ra cùng điểm */
-	check(ips_score(v1) == s1, "tất định (cùng input → cùng điểm)");
+	/* deterministic: re-running the same input yields the same score */
+	check(ips_score(v1) == s1, "deterministic (same input → same score)");
 
-	/* model phản hồi: ít nhất hai trong ba vector cho điểm khác nhau */
-	check(!(s1 == s2 && s2 == sz), "model phản hồi khác nhau theo input");
+	/* model responsive: at least two of the three vectors give different scores */
+	check(!(s1 == s2 && s2 == sz), "model responds differently to different input");
 
-	printf("\n%s (%d test thất bại)\n",
-	       g_failed ? "=== CÓ LỖI ===" : "=== TẤT CẢ PASS ===", g_failed);
+	printf("\n%s (%d test(s) failed)\n",
+	       g_failed ? "=== FAILURES ===" : "=== ALL PASS ===", g_failed);
 	return g_failed ? 1 : 0;
 }

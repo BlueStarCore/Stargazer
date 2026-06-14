@@ -1963,8 +1963,9 @@ static void flow_ips_alerts(work_item_t *item)
 	webd_ipc_resp_free(&resp);
 }
 
-/* GET /api/ips/alerts-json — mgmtd trả SẴN JSON array [{...}]. Gửi nguyên văn,
- * KHÔNG qua flow_simple/kv_to_json (nó tưởng payload là key=value → băm nát). */
+/* GET /api/ips/alerts-json — mgmtd returns a READY JSON array [{...}]. Send it
+ * verbatim, NOT through flow_simple/kv_to_json (which assumes payload is
+ * key=value → would mangle it). */
 static void flow_ips_alerts_json(work_item_t *item)
 {
 	webd_ipc_response_t resp;
@@ -1996,8 +1997,8 @@ static void flow_ips_alerts_json(work_item_t *item)
 	webd_ipc_resp_free(&resp);
 }
 
-/* GET /api/ips/signatures — catalog signature (mgmtd trả sẵn JSON object
- * {items,truncated}). payload mang "q=<từ khoá>" để lọc server-side. */
+/* GET /api/ips/signatures — signature catalog (mgmtd returns a ready JSON object
+ * {items,truncated}). payload carries "q=<keyword>" for server-side filtering. */
 static void flow_ips_signatures(work_item_t *item)
 {
 	webd_ipc_response_t resp;
@@ -2013,10 +2014,35 @@ static void flow_ips_signatures(work_item_t *item)
 		webd_ipc_resp_free(&resp);
 		return;
 	}
-	/* payload đã là JSON object → gửi nguyên (item->payload do dispatcher free) */
+	/* payload is already a JSON object → send verbatim (item->payload freed by dispatcher) */
 	const char *body = resp.payload ? resp.payload : "{\"items\":[],\"truncated\":0}";
 	char *out = strdup(body);
 	send_result(item->conn_id, 200, out, out ? strlen(out) : 0);
+	webd_ipc_resp_free(&resp);
+}
+
+static void flow_session_clear(work_item_t *item)
+{
+	/* SG_CMD_SESSION_CLEAR with a filter or tuples= batch payload. A
+	 * dedicated handler (not flow_simple): flow_simple sniffs an entry id
+	 * from the first ':' in the payload, which would mangle the ':' inside
+	 * a src/dst ip:port. The mgmtd reply is flat key=value
+	 * (mode/matched/deleted/failed/dump_complete) → kv_to_json verbatim. */
+	webd_ipc_response_t resp;
+	if (webd_ipc_send(item->ipc_cmd, item->username,
+			  item->session_tag, item->payload, &resp) != 0) {
+		char *json = json_error("Backend unavailable", NULL);
+		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
+		return;
+	}
+	if (resp.status != SG_OK) {
+		/* 403 admin / 400 bad filter — surface mgmtd's reason verbatim. */
+		send_ipc_error(item->conn_id, resp.status, resp.extra);
+		webd_ipc_resp_free(&resp);
+		return;
+	}
+	char *json = kv_to_json(resp.payload ? resp.payload : "", NULL);
+	send_result(item->conn_id, 200, json, json ? strlen(json) : 0);
 	webd_ipc_resp_free(&resp);
 }
 
@@ -2198,6 +2224,7 @@ static void *worker_fn(void *arg)
 		switch (item.flow_type) {
 		case FLOW_MONITOR_DHCP:     flow_monitor_dhcp(&item);     break;
 		case FLOW_MONITOR_SESSIONS: flow_monitor_sessions(&item); break;
+		case FLOW_SESSION_CLEAR:    flow_session_clear(&item);    break;
 		case FLOW_IPS_STATUS:       flow_ips_status(&item);       break;
 		case FLOW_IPS_ALERTS:       flow_ips_alerts(&item);       break;
 		case FLOW_IPS_SIGS:         flow_ips_signatures(&item);   break;

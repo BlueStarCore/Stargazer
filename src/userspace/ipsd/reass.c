@@ -1,22 +1,24 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * reass.c - Ráp dòng TCP 2 chiều + feed streaming Aho-Corasick (xem reass.h).
+ * reass.c - Bidirectional TCP stream reassembly + streaming Aho-Corasick feed
+ * (see reass.h).
  *
- * Mỗi chiều: một cửa sổ tuyến tính [base_seq, base_seq+cap) + bitmap byte đã
- * nhận. Segment được đặt theo offset = seq - base_seq (wrap-safe). Vùng LIÊN
- * TỤC từ 0 (next_off) lớn tới đâu thì feed phần mới vào AC tới đó (streaming,
- * giữ node state). "A buffer is always checked": mọi ghi clamp vào [0,cap).
+ * Each direction: a linear window [base_seq, base_seq+cap) + a received-byte
+ * bitmap. A segment is placed at offset = seq - base_seq (wrap-safe). However
+ * far the CONTIGUOUS region from 0 (next_off) reaches, the new part is fed into
+ * AC up to there (streaming, keeping node state). "A buffer is always checked":
+ * every write is clamped to [0,cap).
  */
 #include "reass.h"
 
 #include <stdlib.h>
 #include <string.h>
 
-/* Telemetry: tổng byte đã feed vào AC (main.c đọc qua extern để chẩn đoán
- * "ac_raw=0" — phân biệt reass không feed vs AC không trúng). */
+/* Telemetry: total bytes fed into AC (main.c reads it via extern to diagnose
+ * "ac_raw=0" — distinguishing reass not feeding vs AC not hitting). */
 unsigned long g_reass_fed;
 
-/* ---- bitmap byte-đã-nhận ------------------------------------------------- */
+/* ---- received-byte bitmap ------------------------------------------------ */
 static inline int bit_get(const uint8_t *bm, uint32_t i)
 {
 	return (bm[i >> 3] >> (i & 7)) & 1;
@@ -30,7 +32,7 @@ static inline void bit_clear(uint8_t *bm, uint32_t i)
 	bm[i >> 3] &= (uint8_t)~(1u << (i & 7));
 }
 
-/* ---- trampoline để chèn `dir` vào callback người dùng -------------------- */
+/* ---- trampoline to inject `dir` into the user callback ------------------- */
 struct feed_ctx {
 	reass_match_cb cb;
 	void          *ctx;
@@ -54,7 +56,7 @@ int reass_flow_init(struct reass_flow *rf, const struct ac_automaton *ac,
 	for (int i = 0; i < 2; i++) {
 		struct reass_dir *d = &rf->dir[i];
 		d->cap        = cap;
-		d->scan_limit = cap;            /* mặc định: soi tới hết cửa sổ */
+		d->scan_limit = cap;            /* default: inspect the whole window */
 		d->ac_state   = 0;
 		d->buf      = malloc(cap);
 		d->filled   = calloc(((size_t)cap + 7) / 8, 1);
@@ -86,33 +88,33 @@ int reass_segment(struct reass_flow *rf, int dir, uint32_t seq,
 		d->have_base = 1;
 	}
 
-	/* offset trong cửa sổ (wrap-safe). */
+	/* offset within the window (wrap-safe). */
 	int64_t soff = (int32_t)(seq - d->base_seq);
 	const uint8_t *p = data;
 	uint32_t l = len;
 
-	/* Segment bắt đầu TRƯỚC base (retransmit cũ) → clip phần đầu. */
+	/* Segment starts BEFORE base (old retransmit) → clip the head. */
 	if (soff < 0) {
 		uint64_t skip = (uint64_t)(-soff);
 		if (skip >= l)
-			return REASS_OK;            /* toàn bộ trước base → bỏ */
+			return REASS_OK;            /* entirely before base → drop */
 		p   += skip;
 		l   -= (uint32_t)skip;
 		soff = 0;
 	}
 
-	/* Ngoài cửa sổ K. */
+	/* Outside the K window. */
 	if ((uint64_t)soff >= d->cap) {
-		/* Còn lỗ trống trong cửa sổ mà data đã vượt K quá xa → bất thường. */
+		/* A gap remains in the window yet data has run far past K → anomaly. */
 		if (d->next_off < d->cap &&
 		    (uint64_t)soff - d->next_off > REASS_GAP_LIMIT) {
 			rf->failed = 1;
 			return REASS_FAILCLOSED;
 		}
-		return REASS_OK;                    /* phần sau K → offload */
+		return REASS_OK;                    /* part beyond K → offload */
 	}
 
-	/* Ghi byte chưa có (first-wins: byte đến trước thắng). */
+	/* Write missing bytes (first-wins: the byte that arrives first wins). */
 	uint32_t base = (uint32_t)soff;
 	uint32_t end  = base + l;
 	if (end > d->cap)
@@ -126,26 +128,26 @@ int reass_segment(struct reass_flow *rf, int dir, uint32_t seq,
 	if (end > d->max_off)
 		d->max_off = end;
 
-	/* Mở rộng vùng liên tục [0,next_off). */
+	/* Extend the contiguous region [0,next_off). */
 	while (d->next_off < d->cap && bit_get(d->filled, d->next_off))
 		d->next_off++;
 
-	/* Feed phần LIÊN TỤC MỚI vào AC (streaming, giữ node state) — CHỈ tới
-	 * scan_limit (P1: bỏ qua thân quá budget, không tốn AC). */
+	/* Feed the NEW CONTIGUOUS part into AC (streaming, keeping node state) —
+	 * ONLY up to scan_limit (P1: skip body past budget, no AC cost). */
 	uint32_t feed_to = (d->next_off < d->scan_limit) ? d->next_off
 							 : d->scan_limit;
 	if (rf->ac && feed_to > d->scanned) {
 		struct feed_ctx fctx = { cb, ctx, dir };
-		g_reass_fed += (feed_to - d->scanned);   /* telemetry: byte feed vào AC */
+		g_reass_fed += (feed_to - d->scanned);   /* telemetry: bytes fed into AC */
 		ac_search_stream(rf->ac, &d->ac_state,
 				 d->buf + d->scanned,
 				 feed_to - d->scanned,
-				 d->scanned,            /* stream_off (trong dòng) */
+				 d->scanned,            /* stream_off (within the stream) */
 				 feed_trampoline, &fctx);
 		d->scanned = feed_to;
 	}
 
-	/* Lỗ trống quá hạn: còn trống trong cửa sổ nhưng data chất sau quá nhiều. */
+	/* Over-limit gap: space remains in the window but too much data piled up after it. */
 	if (d->next_off < d->cap &&
 	    d->max_off - d->next_off > REASS_GAP_LIMIT) {
 		rf->failed = 1;
@@ -162,9 +164,9 @@ void reass_flow_rebind(struct reass_flow *rf, const struct ac_automaton *ac,
 	rf->ac = ac;
 	for (int dir = 0; dir < 2; dir++) {
 		struct reass_dir *d = &rf->dir[dir];
-		d->ac_state   = 0;      /* node index cũ vô nghĩa với automaton mới */
+		d->ac_state   = 0;      /* old node index meaningless under the new automaton */
 		d->scanned    = 0;
-		d->scan_limit = d->cap; /* re-scan toàn bộ cửa sổ với ruleset mới */
+		d->scan_limit = d->cap; /* re-scan the whole window with the new ruleset */
 		if (ac && d->buf && d->next_off > 0) {
 			struct feed_ctx fctx = { cb, ctx, dir };
 			ac_search_stream(ac, &d->ac_state, d->buf, d->next_off,
@@ -183,13 +185,13 @@ void reass_consume(struct reass_flow *rf, int dir, uint32_t n, int reset_ac,
 	if (!d->buf)
 		return;
 	if (n > d->next_off)
-		n = d->next_off;            /* chỉ bỏ phần liên tục đã có */
+		n = d->next_off;            /* only drop the contiguous part already present */
 
 	if (n > 0) {
 		uint32_t keep = (d->max_off > n) ? d->max_off - n : 0;
 		if (keep > 0)
 			memmove(d->buf, d->buf + n, keep);
-		/* trượt bitmap xuống n bit */
+		/* slide the bitmap down by n bits */
 		for (uint32_t o = 0; o < keep; o++) {
 			if (bit_get(d->filled, o + n)) bit_set(d->filled, o);
 			else                           bit_clear(d->filled, o);
@@ -207,7 +209,7 @@ void reass_consume(struct reass_flow *rf, int dir, uint32_t n, int reset_ac,
 	if (reset_ac) {
 		d->ac_state   = 0;
 		d->scanned    = 0;
-		d->scan_limit = d->cap;     /* transaction mới: soi tự do tới khi đặt budget */
+		d->scan_limit = d->cap;     /* new transaction: scan freely until a budget is set */
 		if (rf->ac && d->next_off > 0) {
 			struct feed_ctx fctx = { cb, ctx, dir };
 			ac_search_stream(rf->ac, &d->ac_state, d->buf,
@@ -226,7 +228,7 @@ void reass_set_scan_limit(struct reass_flow *rf, int dir, uint32_t limit,
 	if (limit > d->cap) limit = d->cap;
 	d->scan_limit = limit;
 
-	/* Nâng limit → soi nốt phần đã đệm trong giới hạn mới. */
+	/* Raising the limit → scan the remaining buffered part within the new limit. */
 	uint32_t feed_to = (d->next_off < d->scan_limit) ? d->next_off
 							 : d->scan_limit;
 	if (rf->ac && feed_to > d->scanned) {

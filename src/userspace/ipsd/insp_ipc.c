@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * insp_ipc.c — Phase 4 server: nhận plaintext HTTPS từ ssld, soi bằng CHÍNH
- * engine stateful của ipsd (reass + AC streaming + verify + flowbits), trả
- * verdict. Mỗi kết nối ssld = 1 handler thread sở hữu virtual-flow riêng;
- * rdlock(ruleset) khi soi (dùng chung an toàn với NFQUEUE — verify read-only).
+ * insp_ipc.c — Phase 4 server: receive HTTPS plaintext from ssld, inspect with
+ * ipsd's OWN stateful engine (reass + AC streaming + verify + flowbits), return
+ * a verdict. Each ssld connection = 1 handler thread owning its own virtual flow;
+ * rdlock(ruleset) during inspection (safely shared with NFQUEUE — verify read-only).
  *
- * ADDITIVE: KHÔNG sửa process_packet / main loop NFQUEUE / CTA_ML.
+ * ADDITIVE: does NOT modify process_packet / NFQUEUE main loop / CTA_ML.
  */
 #define _GNU_SOURCE
 #include "insp_ipc.h"
@@ -13,7 +13,7 @@
 #include "sig_rule.h"
 #include "reass.h"
 #include "proto_buf.h"
-#include "ctdump.h"      /* Phase 2: query CTA_ML của leg */
+#include "ctdump.h"      /* Phase 2: query the leg's CTA_ML */
 #include "ips_model.h"   /* ips_score */
 #include "fusion.h"      /* ips_fuse, struct ips_decision */
 #include "engine.h"      /* struct ips_config */
@@ -31,33 +31,33 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
-/* Telemetry (Phase 4) — không đụng số liệu cũ. */
+/* Telemetry (Phase 4) — does not touch the old counters. */
 #define INSP_STAT_PATH "/run/stargazer-ipsd-insp.stat"
 static _Atomic unsigned long g_conns_total, g_conns_open, g_chunks,
 			     g_sig_hits, g_blocked, g_ml_hits;
 
-/* Phase 2 — config ML (mode/threshold) từ main; con trỏ tới g_cfg (ổn định). */
+/* Phase 2 — ML config (mode/threshold) from main; pointer to g_cfg (stable). */
 static const struct ips_config *g_ips_cfg;
 
-/* Ngưỡng checkpoint ML (khớp main.c). */
+/* ML checkpoint thresholds (match main.c). */
 #define INSP_ML_PKTS   24u
 #define INSP_ML_BYTES  14000ULL
 
-/* Virtual flow của một kết nối HTTPS (sở hữu bởi handler thread). */
+/* Virtual flow of an HTTPS connection (owned by the handler thread). */
 struct insp_conn {
 	struct reass_flow    rf;
 	struct flowbit_state fb;
-	struct flow_ctx      fc;        /* proto/dport/prof_id cố định theo OPEN  */
+	struct flow_ctx      fc;        /* proto/dport/prof_id fixed at OPEN       */
 	uint32_t             next_off[2];
 	int                  rf_inited;
 	char                 sni[256];
-	/* Phase 2 — leg client→ssld (host order) cho ML; ml_done: chấm 1 lần/conn. */
+	/* Phase 2 — leg client→ssld (host order) for ML; ml_done: scored once per conn. */
 	uint32_t             leg_cli_ip, leg_fw_ip;   /* host order */
 	uint16_t             leg_cli_port, leg_fw_port;
 	uint8_t              ml_done;
 };
 
-/* Bối cảnh truyền vào reass callback — y hệt l2_on_match của main.c. */
+/* Context passed into the reass callback — identical to main.c's l2_on_match. */
 struct insp_match {
 	const struct sig_ruleset *rs;
 	struct reass_flow        *rf;
@@ -68,8 +68,8 @@ struct insp_match {
 	struct match_buffers      bufs;
 };
 
-/* AC fast-pattern khớp trên dòng đã ráp → verify đầy đủ + flowbits (read-only
- * ruleset). Sao y main.c:l2_on_match. */
+/* AC fast-pattern match on the reassembled stream → full verify + flowbits (read-only
+ * ruleset). Copy of main.c:l2_on_match. */
 static int insp_on_match(int rule_id, uint64_t end_off, int dir, void *ctx)
 {
 	(void)end_off;
@@ -82,22 +82,22 @@ static int insp_on_match(int rule_id, uint64_t end_off, int dir, void *ctx)
 	bufs_extract(&m->bufs, buf, (int)clen);
 	m->fc.bufs = &m->bufs;
 	if (!sig_verify(m->rs, rule_id, buf, (int)clen, &m->fc))
-		return 0;               /* AC prefilter hit nhưng verify trượt */
+		return 0;               /* AC prefilter hit but verify failed */
 	const struct sig_rule *r = &m->rs->rules[rule_id];
 	sig_flowbits_apply(r, m->fb);
 	if (r->fb_noalert)
-		return 0;               /* chỉ set cờ, không verdict */
-	int action = r->action;
+		return 0;               /* only set flags, no verdict */
+	int action = sig_eff_action(r, m->fc.prof_id);   /* per-profile action */
 	if (r->fidelity == SIG_FID_ALERT)
 		action = SIG_ALERT;     /* fidelity cap */
 	if (action > m->best_action) {
 		m->best_action = action;
 		m->best_idx = rule_id;
 	}
-	return (m->best_action == SIG_DROP);   /* DROP → dừng sớm */
+	return (m->best_action == SIG_DROP);   /* DROP → stop early */
 }
 
-/* Soi 1 chunk DATA, trả verdict qua *vb (đã điền). */
+/* Inspect one DATA chunk, return verdict via *vb (filled in). */
 static void insp_handle_data(struct insp_conn *c, struct sig_reload *sr,
 			     int dir01, uint32_t chunk_id,
 			     const uint8_t *plain, uint32_t len,
@@ -126,7 +126,7 @@ static void insp_handle_data(struct insp_conn *c, struct sig_reload *sr,
 			c->rf_inited = 1;
 		memset(&c->fb, 0, sizeof(c->fb));
 	} else if (c->rf.ac != &rs->ac) {
-		/* ruleset reload giữa chừng → rebind + re-scan dòng đã ráp */
+		/* ruleset reloaded mid-stream → rebind + re-scan reassembled stream */
 		memset(&c->fb, 0, sizeof(c->fb));
 		reass_flow_rebind(&c->rf, &rs->ac, insp_on_match, &mm);
 	}
@@ -150,10 +150,10 @@ static void insp_handle_data(struct insp_conn *c, struct sig_reload *sr,
 	if (vb->action != INSP_PASS) atomic_fetch_add(&g_sig_hits, 1);
 	if (vb->action == INSP_DROP) atomic_fetch_add(&g_blocked, 1);
 
-	/* Phase 2 — ML cho HTTPS: KHÔNG match signature + chưa chấm + có leg →
-	 * đọc CTA_ML của leg client→ssld (do kernel LOCAL_IN hook tích lũy khi
-	 * ml-https bật) → ips_score → ips_fuse. Gọi NGOÀI rdlock (netlink I/O).
-	 * Tuple không khớp / CTA_ML rỗng → ml_valid=0 → bỏ qua (degrade sạch). */
+	/* Phase 2 — ML for HTTPS: NO signature match + not yet scored + has leg →
+	 * read CTA_ML of the client→ssld leg (accumulated by the kernel LOCAL_IN hook
+	 * when ml-https is enabled) → ips_score → ips_fuse. Called OUTSIDE rdlock (netlink I/O).
+	 * Tuple mismatch / empty CTA_ML → ml_valid=0 → skip (clean degrade). */
 	if (vb->action == INSP_PASS && g_ips_cfg && !c->ml_done &&
 	    c->leg_cli_ip && c->leg_fw_ip) {
 		struct ctdump_result ctr;
@@ -190,7 +190,7 @@ static void insp_handle_data(struct insp_conn *c, struct sig_reload *sr,
 
 struct conn_arg { int fd; struct sig_reload *sr; };
 
-/* Một handler thread cho một kết nối ssld. */
+/* One handler thread for one ssld connection. */
 static void *insp_conn_thread(void *arg)
 {
 	struct conn_arg *a = arg;
@@ -227,10 +227,10 @@ static void *insp_conn_thread(void *arg)
 			c.fc.proto       = SIG_PROTO_TCP;
 			c.fc.dport       = o->srv_port;
 			c.fc.prof_id     = o->profile_id;
-			c.fc.established = 1;   /* leg proxy đã established */
+			c.fc.established = 1;   /* proxy leg already established */
 			o->sni[sizeof(o->sni) - 1] = '\0';
 			snprintf(c.sni, sizeof(c.sni), "%s", o->sni);
-			/* leg → host order cho ctdump_query (ip getpeername = net order). */
+			/* leg → host order for ctdump_query (getpeername ip = net order). */
 			c.leg_cli_ip   = ntohl(o->leg_cli_ip);
 			c.leg_fw_ip    = ntohl(o->leg_fw_ip);
 			c.leg_cli_port = o->leg_cli_port;
@@ -274,7 +274,7 @@ static void *insp_conn_thread(void *arg)
 	return NULL;
 }
 
-/* Ghi telemetry định kỳ ra INSP_STAT_PATH (không đụng số liệu cũ). */
+/* Periodically write telemetry to INSP_STAT_PATH (does not touch old counters). */
 static void *insp_stat_thread(void *arg)
 {
 	(void)arg;
@@ -295,7 +295,7 @@ static void *insp_stat_thread(void *arg)
 	return NULL;
 }
 
-/* Acceptor thread: listen SEQPACKET, mỗi kết nối → 1 handler thread. */
+/* Acceptor thread: listen SEQPACKET, each connection → 1 handler thread. */
 static void *insp_accept_thread(void *arg)
 {
 	struct sig_reload *sr = arg;
@@ -321,7 +321,7 @@ static void *insp_accept_thread(void *arg)
 		unlink(INSP_SOCK_PATH);
 		return NULL;
 	}
-	fprintf(stderr, "insp_ipc: server lắng nghe %s\n", INSP_SOCK_PATH);
+	fprintf(stderr, "insp_ipc: server listening on %s\n", INSP_SOCK_PATH);
 
 	for (;;) {
 		int cfd = accept(lfd, NULL, NULL);
@@ -350,16 +350,16 @@ int insp_ipc_start(struct sig_reload *sr, const struct ips_config *cfg)
 {
 	if (!sr)
 		return -1;
-	g_ips_cfg = cfg;        /* Phase 2: dùng cho ML fuse (NULL → không chấm ML) */
+	g_ips_cfg = cfg;        /* Phase 2: used for ML fuse (NULL → no ML scoring) */
 	pthread_t th;
 	if (pthread_create(&th, NULL, insp_accept_thread, sr) != 0) {
-		fprintf(stderr, "insp_ipc: không tạo được acceptor thread: %m\n");
+		fprintf(stderr, "insp_ipc: failed to create acceptor thread: %m\n");
 		return -1;
 	}
 	pthread_detach(th);
 
 	pthread_t st;
 	if (pthread_create(&st, NULL, insp_stat_thread, NULL) == 0)
-		pthread_detach(st);   /* telemetry — không bắt buộc */
+		pthread_detach(st);   /* telemetry — not mandatory */
 	return 0;
 }

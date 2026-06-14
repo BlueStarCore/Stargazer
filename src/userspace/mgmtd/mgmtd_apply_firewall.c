@@ -229,10 +229,10 @@ static int connmark_supported(void)
 /*
  * connbytes_supported — probe xt_connbytes availability (cached).
  *
- * xt_connbytes cần CONFIG_NETFILTER_XT_MATCH_CONNBYTES=y/m + module load.
- * Nếu không có: NFQUEUE rule fallback về --ctstate NEW (chỉ gói SYN, giống
- * cách cũ). Fallback ít hiệu quả hơn (không thấy payload data packets) nhưng
- * pipeline ML + L1 vẫn chạy, không crash.
+ * xt_connbytes needs CONFIG_NETFILTER_XT_MATCH_CONNBYTES=y/m + module load.
+ * If unavailable: the NFQUEUE rule falls back to --ctstate NEW (SYN packets
+ * only, the old behaviour). The fallback is less effective (it never sees
+ * payload data packets) but the ML + L1 pipeline still runs and does not crash.
  */
 static int connbytes_supported(void)
 {
@@ -256,17 +256,18 @@ static int connbytes_supported(void)
 
 	mgmt_log("INFO", "xt_connbytes(mode bytes) %s; IPS NFQUEUE rule uses %s",
 		 cached ? "available" : "unavailable",
-		 cached ? "connbytes byte-window 2 chiều (P1)"
+		 cached ? "bidirectional connbytes byte-window (P1)"
 			: "--ctstate NEW (SYN-only fallback)");
 	return cached;
 }
 
 /*
- * mark_target_supported — probe xt_MARK (cached). Per-policy IPS scoping đặt skb
- * mark = profile-id trước NFQUEUE để ipsd lọc signature theo profile của flow.
- * Thiếu CONFIG_NETFILTER_XT_TARGET_MARK → KHÔNG emit MARK (iptables-restore là
- * nguyên tử: một rule lỗi làm hỏng CẢ chain) → ipsd nhận prof_id=0 → soi MỌI
- * rule (fail-safe = hành vi global cũ). Scoping suy biến mềm, không gãy IPS.
+ * mark_target_supported — probe xt_MARK (cached). Per-policy IPS scoping sets the
+ * skb mark = profile-id before NFQUEUE so ipsd filters signatures by the flow's
+ * profile. Without CONFIG_NETFILTER_XT_TARGET_MARK → do NOT emit MARK
+ * (iptables-restore is atomic: one bad rule breaks the WHOLE chain) → ipsd gets
+ * prof_id=0 → inspects against ALL rules (fail-safe = the old global behaviour).
+ * Scoping degrades gracefully and does not break IPS.
  */
 static int mark_target_supported(void)
 {
@@ -287,8 +288,8 @@ static int mark_target_supported(void)
 
 	mgmt_log("INFO", "xt_MARK %s; per-policy IPS scoping %s",
 		 cached ? "available" : "unavailable",
-		 cached ? "BẬT (skb mark = profile-id)"
-			: "TẮT → ipsd soi global (fail-safe)");
+		 cached ? "ON (skb mark = profile-id)"
+			: "OFF → ipsd inspects globally (fail-safe)");
 	return cached;
 }
 
@@ -316,19 +317,19 @@ static int mark_target_supported(void)
 #define SG_CMK_PID_SHIFT   8
 #define SG_CMK_STAMP_MASK  0xFFFFFF01u   /* policy_id field + DIRTY bit */
 
-/* IPS connmark bits — PHẢI khớp src/userspace/ipsd/nfq.h. */
-#define SG_CMK_IPS_BLOCK     0x00000002u   /* flow ipsd kết án → mọi gói DROP   */
-#define SG_CMK_IPS_INSPECTED 0x00000004u   /* đã có verdict → khỏi queue lại    */
+/* IPS connmark bits — MUST match src/userspace/ipsd/nfq.h. */
+#define SG_CMK_IPS_BLOCK     0x00000002u   /* flow convicted by ipsd → DROP all packets */
+#define SG_CMK_IPS_INSPECTED 0x00000004u   /* verdict reached → skip re-queueing        */
 
-/* Bản đồ bit: IPS dùng bit 1-2, KHÔNG được chồng DIRTY (bit0) hay
- * policy_id (bit 8-31). Assert lúc biên dịch. */
+/* Bit map: IPS uses bits 1-2, must NOT overlap DIRTY (bit 0) or
+ * policy_id (bits 8-31). Asserted at compile time. */
 _Static_assert((SG_CMK_IPS_BLOCK | SG_CMK_IPS_INSPECTED) ==
 	       0x00000006u, "IPS bits must be 1-2");
 _Static_assert(((SG_CMK_IPS_BLOCK | SG_CMK_IPS_INSPECTED) &
 		(SG_CMK_DIRTY | 0xFFFFFF00u)) == 0,
 	       "IPS bits overlap DIRTY/policy_id");
 
-/* Validate config security_ips cho CFG_SET (không đụng kernel). */
+/* Validate config security_ips for CFG_SET (no kernel changes). */
 sg_status_t validate_ips(const char *id, const char *data,
 			 char *result, size_t rsize)
 {
@@ -339,34 +340,35 @@ sg_status_t validate_ips(const char *id, const char *data,
 	extract_val(data, "queue-num", queue,  sizeof(queue));
 
 	if (status[0] && strcmp(status, "enable") && strcmp(status, "disable")) {
-		snprintf(result, rsize, "status phải là enable/disable");
+		snprintf(result, rsize, "status must be enable/disable");
 		return SG_ERR_INVALID_VAL;
 	}
 	if (mode[0] && strcmp(mode, "detect") && strcmp(mode, "prevent")) {
-		snprintf(result, rsize, "mode phải là detect/prevent");
+		snprintf(result, rsize, "mode must be detect/prevent");
 		return SG_ERR_INVALID_VAL;
 	}
 	if (queue[0]) {
 		for (const char *p = queue; *p; p++)
 			if (*p < '0' || *p > '9') {
-				snprintf(result, rsize, "queue-num phải là số");
+				snprintf(result, rsize, "queue-num must be a number");
 				return SG_ERR_INVALID_VAL;
 			}
 		int v = atoi(queue);
 		if (v < 0 || v > 65535) {
-			snprintf(result, rsize, "queue-num ngoài [0,65535]");
+			snprintf(result, rsize, "queue-num out of range [0,65535]");
 			return SG_ERR_INVALID_VAL;
 		}
 	}
-	snprintf(result, rsize, "IPS config hợp lệ");
+	snprintf(result, rsize, "IPS config valid");
 	return SG_OK;
 }
 
 /*
- * ips_profile_active — policy có IPS không?
- * Trả 1 nếu `name` trỏ tới một security_ips-profile tồn tại + status=enable
- * (không phải "none"/rỗng). Profile không tồn tại / disable → 0 (fail-safe:
- * không soi, không emit NFQUEUE). Thay cho check literal "default" cũ.
+ * ips_profile_active — does the policy have IPS?
+ * Returns 1 if `name` points to an existing security_ips-profile with
+ * status=enable (not "none"/empty). Nonexistent / disabled profile → 0
+ * (fail-safe: no inspection, no NFQUEUE emitted). Replaces the old literal
+ * "default" check.
  */
 static int ips_profile_active(const char *name)
 {
@@ -376,19 +378,19 @@ static int ips_profile_active(const char *name)
 	int ok = st && strcmp(st, "enable") == 0;
 	if (st && !ok)
 		mgmt_log("INFO", "ips_profile_active: profile '%s' disabled — "
-			 "policy không soi IPS", name);
+			 "policy will not run IPS", name);
 	free(st);
 	if (!st)
-		mgmt_log("WARN", "ips_profile_active: profile '%s' không tồn tại "
-			 "— policy không soi IPS", name);
+		mgmt_log("WARN", "ips_profile_active: profile '%s' does not exist "
+			 "— policy will not run IPS", name);
 	return ok;
 }
 
 /*
- * ips_policy_on — policy có bật IPS không, theo toggle ips-status.
- * Tương thích ngược: status="disable" → tắt rõ ràng; "enable" → theo profile;
- * RỖNG (policy cũ chưa có ips-status) → fallback logic cũ (theo profile, tức
- * profile != none/disabled). Nhờ vậy KHÔNG cần migrate DB.
+ * ips_policy_on — does the policy enable IPS, per the ips-status toggle.
+ * Backward compatible: status="disable" → explicitly off; "enable" → per profile;
+ * EMPTY (old policy without ips-status) → old fallback logic (per profile, i.e.
+ * profile != none/disabled). This means NO DB migration is needed.
  */
 int ips_policy_on(const char *status, const char *profile)
 {
@@ -398,8 +400,8 @@ int ips_policy_on(const char *status, const char *profile)
 }
 
 /*
- * Đọc trạng thái IPS: trả 1 nếu security_ips status=enable, điền *queue.
- * Steering chỉ phát khi bật (off-by-default, fail-safe).
+ * Read IPS state: returns 1 if security_ips status=enable, fills *queue.
+ * Steering is only emitted when enabled (off-by-default, fail-safe).
  */
 static int ips_enabled(int *queue, int *snapshot_n, int *snapshot_bytes)
 {
@@ -445,25 +447,25 @@ static int ips_enabled(int *queue, int *snapshot_n, int *snapshot_bytes)
 }
 
 /*
- * ipsd_sync — đồng bộ lifecycle stargazer-ipsd với trạng thái NFQUEUE.
+ * ipsd_sync — synchronise the stargazer-ipsd lifecycle with the NFQUEUE state.
  *
- * Dùng supervisor_start() / supervisor_stop() của mgmtd — đây là cùng cơ
- * chế quản lý webd/udhcpc: fork()+exec() trong spawn_child(), SIGTERM để
- * stop với waitpid(WNOHANG) poll 3s rồi SIGKILL, SIGCHLD+reap_children()
- * trong main loop xử lý zombie và restart khi crash.
+ * Uses mgmtd's supervisor_start() / supervisor_stop() — the same mechanism that
+ * manages webd/udhcpc: fork()+exec() in spawn_child(), SIGTERM to stop with a
+ * waitpid(WNOHANG) poll over 3s then SIGKILL, and SIGCHLD+reap_children() in the
+ * main loop to handle zombies and restart on crash.
  *
- * `active=1` + ipsd chưa chạy  → supervisor_start() → fork()+exec() ipsd.
- * `active=0` + ipsd đang chạy  → supervisor_stop() → SIGTERM → reap.
- * Trạng thái khớp              → không làm gì (ngăn restart không cần).
+ * `active=1` + ipsd not running → supervisor_start() → fork()+exec() ipsd.
+ * `active=0` + ipsd running      → supervisor_stop() → SIGTERM → reap.
+ * State already matches          → do nothing (avoids needless restarts).
  *
- * Fail-safe: binary/ruleset thiếu → log cảnh báo, không start.
+ * Fail-safe: missing binary/ruleset → log a warning, do not start.
  */
 #define IPSD_CHILD_NAME "stargazer-ipsd"
 #define IPSD_BIN        "/sbin/stargazer-ipsd"
 #define IPSD_RULES      "/etc/stargazer/ips/rules/active.rules"
-#define IPSD_MODE_FILE  "/run/stargazer-ipsd.mode"  /* mode ipsd đang chạy */
+#define IPSD_MODE_FILE  "/run/stargazer-ipsd.mode"  /* mode of the running ipsd */
 
-/* Mode hiệu lực từ DB: "detect" nếu DB=detect, ngược lại "prevent". */
+/* Effective mode from DB: "detect" if DB=detect, otherwise "prevent". */
 static const char *ips_mode_str(void)
 {
 	char *m = sg_db_get_val("security_ips", "0", "mode");
@@ -476,10 +478,11 @@ static void ipsd_sync(int active, int queue_num)
 {
 	int running = (supervisor_get_pid(IPSD_CHILD_NAME) > 0);
 
-	/* Mode đặt qua cờ CLI lúc start → đổi mode trong DB cần RESTART ipsd.
-	 * So mode DB với mode ipsd đang chạy (lưu /run/...mode); khác nhau → stop
-	 * để nhánh start bên dưới khởi động lại với cờ mới NGAY trong apply này
-	 * (không cần reboot/toggle thủ công). */
+	/* Mode is set via a CLI flag at start → changing the mode in the DB
+	 * requires a RESTART of ipsd. Compare the DB mode with the running ipsd's
+	 * mode (stored in /run/...mode); if they differ → stop so the start branch
+	 * below relaunches with the new flag RIGHT in this apply (no manual
+	 * reboot/toggle needed). */
 	if (active && running) {
 		const char *want = ips_mode_str();
 		char cur[16] = "";
@@ -487,32 +490,33 @@ static void ipsd_sync(int active, int queue_num)
 		if (mf) { if (!fgets(cur, sizeof(cur), mf)) cur[0] = '\0'; fclose(mf); }
 		char *nl = strchr(cur, '\n'); if (nl) *nl = '\0';
 		if (strcmp(cur, want) != 0) {
-			mgmt_log("INFO", "ipsd_sync: mode %s→%s — restart ipsd",
+			mgmt_log("INFO", "ipsd_sync: mode %s→%s — restarting ipsd",
 				 cur[0] ? cur : "?", want);
 			supervisor_stop(IPSD_CHILD_NAME);
-			running = 0;   /* → nhánh start khởi động lại với mode mới */
+			running = 0;   /* → start branch relaunches with the new mode */
 		}
 	}
 
 	if (active && !running) {
-		/* Kiểm tra binary + ruleset tồn tại trước khi fork */
+		/* Check the binary + ruleset exist before forking */
 		if (access(IPSD_BIN,   X_OK) != 0 ||
 		    access(IPSD_RULES, R_OK) != 0) {
-			mgmt_log("WARN", "ipsd_sync: %s hoặc %s không tồn tại "
-				 "— IPS không được khởi động",
+			mgmt_log("WARN", "ipsd_sync: %s or %s does not exist "
+				 "— IPS not started",
 				 IPSD_BIN, IPSD_RULES);
 			return;
 		}
 
 		char qarg[16];
 		snprintf(qarg, sizeof(qarg), "%d", queue_num);
-		/* Truyền mode qua CLI: ipsd load_config_from_mgmtd không tin cậy
-		 * (request IPC tự ráp), nên đọc mode từ DB ở đây và truyền cờ -d
-		 * (detect) trực tiếp. Default ipsd là PREVENT; -d → DETECT (alert,
-		 * không drop). Đổi mode cần restart ipsd (toggle IPS hoặc reboot). */
+		/* Pass mode via CLI: ipsd's load_config_from_mgmtd is not trusted
+		 * (it assembles its own IPC request), so read the mode from the DB
+		 * here and pass the -d (detect) flag directly. The ipsd default is
+		 * PREVENT; -d → DETECT (alert, no drop). Changing mode requires
+		 * restarting ipsd (toggle IPS or reboot). */
 		const char *mode = ips_mode_str();
 		int detect = strcmp(mode, "detect") == 0;
-		/* Ghi mode đang start để lần apply sau phát hiện đổi mode → restart. */
+		/* Record the mode being started so a later apply detects a mode change → restart. */
 		FILE *mf = fopen(IPSD_MODE_FILE, "w");
 		if (mf) { fprintf(mf, "%s\n", mode); fclose(mf); }
 		const char *argv[8];
@@ -524,24 +528,24 @@ static void ipsd_sync(int active, int queue_num)
 		argv[ai] = NULL;
 
 		/*
-		 * SRC_CONFIG: supervisor chỉ restart sau crash nếu
-		 * security_ips.default.status vẫn là "enable". Khi admin tắt
+		 * SRC_CONFIG: the supervisor only restarts after a crash if
+		 * security_ips.default.status is still "enable". When the admin disables
 		 * IPS (status=disable → rebuild_forward_chain → ipsd_sync(0))
-		 * supervisor_stop() set restart_max=0 trước → không restart.
+		 * supervisor_stop() sets restart_max=0 first → no restart.
 		 */
 		int rc = supervisor_start(IPSD_CHILD_NAME, argv,
 					  SRC_CONFIG,
 					  "security_ips", "0",
 					  "status", "enable");
 		if (rc != 0)
-			mgmt_log("ERROR", "ipsd_sync: supervisor_start thất bại");
+			mgmt_log("ERROR", "ipsd_sync: supervisor_start failed");
 
 	} else if (!active && running) {
 		supervisor_stop(IPSD_CHILD_NAME);
-		mgmt_log("INFO", "ipsd_sync: dừng ipsd "
-			 "(không còn policy nào dùng IPS profile)");
+		mgmt_log("INFO", "ipsd_sync: stopping ipsd "
+			 "(no policy uses an IPS profile anymore)");
 	}
-	/* active == running: không làm gì */
+	/* active == running: do nothing */
 }
 
 sg_status_t rebuild_forward_chain(char *result, size_t rsize)
@@ -566,20 +570,23 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 		const char *inv = "-A FORWARD -m conntrack --ctstate INVALID -j DROP\n";
 		dbuf_append(&buf, inv, strlen(inv));
 
-		/* [IPS] flow đã bị ipsd kết án → DROP mọi gói, TRƯỚC fast-path
-		 * accept (để gói ESTABLISHED của flow xấu vẫn bị chặn). */
+		/* [IPS] flow already convicted by ipsd → DROP all packets, BEFORE
+		 * the fast-path accept (so ESTABLISHED packets of a bad flow are
+		 * still blocked). */
 		if (ips_on)
 			dbuf_printf(&buf,
 				"-A FORWARD -m connmark --mark 0x%x/0x%x -j DROP\n",
 				SG_CMK_IPS_BLOCK, SG_CMK_IPS_BLOCK);
 
 		/*
-		 * [IPS] Cửa sổ soi: khi IPS bật + connbytes có sẵn, fast-path
-		 * ESTABLISHED chỉ được áp dụng cho flow ĐÃ VƯỢT K byte. Trong K byte
-		 * đầu, gói ESTABLISHED (request/response data) KHÔNG fast-path mà rơi
-		 * xuống NFQUEUE per-policy để ipsd soi payload. Không có gate này thì
-		 * fast-path accept thẳng mọi gói data ESTABLISHED → ipsd chỉ thấy SYN
-		 * (NEW), content signature KHÔNG BAO GIỜ match (tcp_payload=0).
+		 * [IPS] Inspection window: when IPS is on + connbytes is available,
+		 * the ESTABLISHED fast-path only applies to flows that have ALREADY
+		 * EXCEEDED K bytes. Within the first K bytes, ESTABLISHED packets
+		 * (request/response data) do NOT fast-path but fall through to the
+		 * per-policy NFQUEUE so ipsd can inspect the payload. Without this
+		 * gate the fast-path accepts every ESTABLISHED data packet outright →
+		 * ipsd only sees the SYN (NEW) and content signatures NEVER match
+		 * (tcp_payload=0).
 		 */
 		char cbw[160] = "";
 		if (ips_on && connbytes_supported())
@@ -601,9 +608,9 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 				"-A FORWARD -m conntrack"
 				" --ctstate ESTABLISHED,RELATED%s -j ACCEPT\n", cbw);
 
-		/* IPS NFQUEUE: đặt per-policy (FortiGate-style), KHÔNG global ở đây.
-		 * Chỉ policy accept có ips-profile != none (profile enable) mới emit NFQUEUE,
-		 * ngay trước rule ACCEPT của policy đó trong vòng lặp bên dưới. */
+		/* IPS NFQUEUE: emitted per-policy (FortiGate-style), NOT globally here.
+		 * Only an accept policy with ips-profile != none (profile enabled) emits
+		 * NFQUEUE, right before that policy's ACCEPT rule in the loop below. */
 	}
 
 	/* Read all policies ordered by sequence DESC (highest first) */
@@ -765,26 +772,30 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 				 */
 				if (strcmp(target, "ACCEPT") == 0) {
 					/*
-					 * ACCEPT policy có thể emit 1-3 rule dùng chung
-					 * match prefix. Lưu prefix ONCE vào saved_pfx, rồi
-					 * sau mỗi sub-rule APPEND lại saved_pfx để tạo prefix
-					 * cho rule tiếp theo — KHÔNG truncate buf.used (làm
-					 * thế sẽ xóa mất rule vừa emit).
+					 * An ACCEPT policy may emit 1-3 rules sharing a
+					 * common match prefix. Save the prefix ONCE into
+					 * saved_pfx, then after each sub-rule re-APPEND
+					 * saved_pfx to form the prefix for the next rule —
+					 * do NOT truncate buf.used (that would erase the
+					 * rule just emitted).
 					 *
-					 * Thứ tự (FortiGate-style, theo ips-profile):
+					 * Order (FortiGate-style, per ips-profile):
 					 *   [IPS]  <match> connbytes 0:K bytes both → NFQUEUE
-					 *          ipsd ráp dòng + soi K byte đầu (2 chiều)
-					 *          mỗi flow (P1). NF_ACCEPT; NF_DROP+BLOCK khi
-					 *          phát hiện. `! INSPECTED` để ipsd offload sớm.
+					 *          ipsd reassembles the stream + inspects the
+					 *          first K bytes (both directions) of each flow
+					 *          (P1). NF_ACCEPT; NF_DROP+BLOCK on detection.
+					 *          `! INSPECTED` lets ipsd offload early.
 					 *   [CMK]  <match> → CONNMARK (stamp policy_id)
 					 *          <match> → ACCEPT
 					 *
-					 * connbytes-mode bytes --connbytes-dir both: đếm BYTE
-					 * cả 2 chiều. Vượt K → rule không match → flow đi thẳng
-					 * (đã soi đủ cửa sổ). Đóng né cắt-segment/đổi-chiều/MSS
-					 * nhỏ. Không --queue-bypass: ipsd chết → fail-closed.
-					 * Fallback (kernel thiếu connbytes mode bytes): ctstate
-					 * NEW (SYN-only) — pipeline vẫn chạy, ít hiệu quả hơn.
+					 * connbytes-mode bytes --connbytes-dir both: counts
+					 * BYTES in both directions. Past K → rule no longer
+					 * matches → flow goes straight through (already
+					 * inspected the full window). Closes segment-splitting/
+					 * direction-flipping/small-MSS evasion. No
+					 * --queue-bypass: ipsd dies → fail-closed. Fallback
+					 * (kernel lacks connbytes mode bytes): ctstate NEW
+					 * (SYN-only) — pipeline still runs, less effective.
 					 */
 					size_t pfx_len = buf.used - rule_start;
 					char saved_pfx[256];
@@ -797,20 +808,22 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 					if (pfx_ok && ips_on &&
 					    ips_policy_on(ips_status, ips_profile)) {
 
-						/* [MARK] Mang IPS profile-id xuống ipsd qua
-						 * skb mark (NFQA_MARK) → per-policy scoping:
-						 * ipsd chỉ áp signature của profile này cho
-						 * flow. Dùng skb mark thay connmark vì kernel
-						 * thiết bị thiếu glue_ct (NFQA_CT không tin
-						 * cậy). low byte = bit+1 (0 = none). MARK không
-						 * terminating → gói chạy tiếp xuống NFQUEUE đã
-						 * mang mark. Đặt prefix-thuần (mọi gói của flow
-						 * trong cửa sổ K được mark). */
-						int pbit = ips_profile_bit(ips_profile);
-						if (pbit >= 0 && mark_target_supported()) {
+						/* [MARK] Carry the IPS profile-id down to
+						 * ipsd via the skb mark (NFQA_MARK) →
+						 * per-policy scoping: ipsd applies only this
+						 * profile's signatures to the flow. Uses the skb
+						 * mark instead of connmark because the device
+						 * kernel lacks glue_ct (NFQA_CT is unreliable).
+						 * low byte = bit+1 (0 = none). MARK is non-
+						 * terminating → the packet continues down to the
+						 * NFQUEUE already carrying the mark. Set on the
+						 * bare prefix (every packet of the flow within the
+						 * K-byte window gets marked). */
+						int pid = ips_profid(ips_profile);
+						if (pid >= 1 && mark_target_supported()) {
 							dbuf_printf(&buf,
 							    " -j MARK --set-xmark"
-							    " 0x%x/0xff\n", pbit + 1);
+							    " 0x%x/0xff\n", pid);
 							dbuf_append(&buf, saved_pfx,
 								    pfx_len);
 							rule_count++;
@@ -831,7 +844,7 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 							    SG_CMK_IPS_INSPECTED,
 							    ips_q);
 						} else {
-							/* Fallback: chỉ ném gói NEW vào IPS */
+							/* Fallback: only feed NEW packets to IPS */
 							dbuf_printf(&buf,
 							    " -m conntrack"
 							    " --ctstate NEW"
@@ -906,13 +919,15 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 	fqdn_refresh_kick();
 
 	/*
-	 * IPS daemon lifecycle: start ipsd nếu có NFQUEUE rules trong chain vừa
-	 * rebuild, stop nếu không có. mgmtd là người duy nhất quản lý ipsd —
-	 * init không start ipsd trực tiếp (đúng như webd được mgmtd supervise).
+	 * IPS daemon lifecycle: start ipsd if there are NFQUEUE rules in the
+	 * just-rebuilt chain, stop it if there are none. mgmtd is the sole manager
+	 * of ipsd — init does not start ipsd directly (just as webd is supervised
+	 * by mgmtd).
 	 *
-	 * "nfqueue_active" = ips_on VÀ có ít nhất một policy accept + ips-profile.
-	 * Cách đếm đơn giản: đọc lại DB thay vì truyền counter qua — rebuild đã
-	 * đọc DB một lần rồi, đọc lại là idempotent và giữ hàm đơn giản.
+	 * "nfqueue_active" = ips_on AND at least one accept policy + ips-profile.
+	 * Simple counting approach: re-read the DB rather than threading a counter
+	 * through — rebuild already read the DB once, re-reading is idempotent and
+	 * keeps the function simple.
 	 */
 	{
 		int nfqueue_active = 0;
@@ -943,11 +958,12 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 			}
 		}
 		/*
-		 * Dựng active.rules TRƯỚC ipsd_sync. Ở boot, reconcile chạy
-		 * rebuild_forward_chain trước khi active.rules được dựng → ipsd_sync
-		 * thấy thiếu active.rules → KHÔNG start ipsd (dù profile đã gắn).
-		 * Build ở đây (chỉ khi có policy dùng IPS) đảm bảo file tồn tại đúng
-		 * lúc ipsd_sync kiểm tra → ipsd khởi động được ngay từ boot đầu.
+		 * Build active.rules BEFORE ipsd_sync. At boot, reconcile runs
+		 * rebuild_forward_chain before active.rules is built → ipsd_sync sees
+		 * active.rules missing → does NOT start ipsd (even though a profile is
+		 * attached). Building it here (only when a policy uses IPS) ensures the
+		 * file exists exactly when ipsd_sync checks → ipsd can start from the
+		 * very first boot.
 		 */
 		if (nfqueue_active) {
 			char rb[256];
@@ -1024,9 +1040,9 @@ sg_status_t validate_firewall_policy(const char *id, const char *data,
 		return SG_ERR_INVALID_VAL;
 	}
 
-	/* IPS profile chỉ hợp lệ trên ACCEPT policy — DENY/DROP drop gói ở L4,
-	 * không có payload để inspect. Giống FortiGate: security profile tab ẩn
-	 * hoàn toàn trên DENY policy. */
+	/* IPS profile is only valid on an ACCEPT policy — DENY/DROP drop packets
+	 * at L4, leaving no payload to inspect. Like FortiGate: the security
+	 * profile tab is hidden entirely on a DENY policy. */
 	{
 		char ips_profile[VALBUFSZ];
 		extract_val(data, "ips-profile", ips_profile, sizeof(ips_profile));
@@ -1036,24 +1052,25 @@ sg_status_t validate_firewall_policy(const char *id, const char *data,
 		    strcmp(ips_profile, "none") != 0 &&
 		    strcmp(ips_profile, "default") != 0) {
 			snprintf(result, rsize,
-				 "ips-profile không thể đặt trên policy '%s' "
-				 "(chỉ hợp lệ cho action=accept)",
+				 "ips-profile cannot be set on policy '%s' "
+				 "(only valid for action=accept)",
 				 action);
 			return SG_ERR_INVALID_VAL;
 		}
-		/* ips-status (toggle) cũng chỉ bật được trên ACCEPT. */
+		/* ips-status (toggle) can also only be enabled on ACCEPT. */
 		char ips_status[VALBUFSZ];
 		extract_val(data, "ips-status", ips_status, sizeof(ips_status));
 		if (!is_accept && strcmp(ips_status, "enable") == 0) {
 			snprintf(result, rsize,
-				 "ips không thể bật trên policy '%s' "
-				 "(chỉ hợp lệ cho action=accept)", action);
+				 "ips cannot be enabled on policy '%s' "
+				 "(only valid for action=accept)", action);
 			return SG_ERR_INVALID_VAL;
 		}
 	}
 
-	/* SSL inspection cũng chỉ hợp lệ trên ACCEPT — DENY/DROP drop gói ở L4,
-	 * không có TLS để giải mã. Built-in "no-inspection" = tắt nên luôn cho phép. */
+	/* SSL inspection is also only valid on ACCEPT — DENY/DROP drop packets at
+	 * L4, leaving no TLS to decrypt. The built-in "no-inspection" = off, so it
+	 * is always allowed. */
 	{
 		char ssl_profile[VALBUFSZ];
 		extract_val(data, "ssl-profile", ssl_profile, sizeof(ssl_profile));
@@ -1062,8 +1079,8 @@ sg_status_t validate_firewall_policy(const char *id, const char *data,
 		if (!is_accept && ssl_profile[0] &&
 		    strcmp(ssl_profile, "no-inspection") != 0) {
 			snprintf(result, rsize,
-				 "ssl-profile không thể đặt trên policy '%s' "
-				 "(chỉ hợp lệ cho action=accept)",
+				 "ssl-profile cannot be set on policy '%s' "
+				 "(only valid for action=accept)",
 				 action);
 			return SG_ERR_INVALID_VAL;
 		}

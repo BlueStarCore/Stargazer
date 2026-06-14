@@ -1,14 +1,15 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * relay_test.c - test bơm byte hai chiều bằng socketpair.
+ * relay_test.c - test the bidirectional byte pump with socketpairs.
  *
- * Sơ đồ: dựng hai socketpair mô phỏng hai kết nối, cho relay_pump nối hai đầu
- * trong (proxy), rồi điều khiển hai đầu ngoài (client/upstream) từ main thread.
+ * Layout: build two socketpairs simulating two connections, let relay_pump join
+ * the two inner ends (proxy), then drive the two outer ends (client/upstream)
+ * from the main thread.
  *
  *   client_ext ── client_int ──[relay_pump (thread)]── up_int ── up_ext
  *
- * Ghi vào client_ext phải hiện ra ở up_ext, và ngược lại. Đóng một đầu phải
- * lan FIN sang đầu kia (half-close). Chạy dưới ASan.
+ * A write to client_ext must show up at up_ext, and vice versa. Closing one end
+ * must propagate FIN to the other (half-close). Run under ASan.
  */
 #include "relay.h"
 
@@ -44,7 +45,7 @@ static void *write_thread(void *arg)
 	return NULL;
 }
 
-/* Đọc đúng n byte (lặp) — tránh đọc thiếu do phân mảnh. */
+/* Read exactly n bytes (loop) - avoid short reads due to fragmentation. */
 static int read_n(int fd, char *buf, size_t n)
 {
 	size_t off = 0;
@@ -77,8 +78,8 @@ int main(void)
 		const char *msg = "GET / HTTP/1.1\r\n";
 		relay_write_all(client_ext, msg, strlen(msg));
 		char buf[64] = {0};
-		CHECK(read_n(up_ext, buf, strlen(msg)) == 0, "đọc đủ byte ở upstream");
-		CHECK(memcmp(buf, msg, strlen(msg)) == 0, "nội dung khớp chiều ->");
+		CHECK(read_n(up_ext, buf, strlen(msg)) == 0, "read all bytes at upstream");
+		CHECK(memcmp(buf, msg, strlen(msg)) == 0, "content matches -> direction");
 	}
 
 	printf("== test 2: upstream -> client ==\n");
@@ -86,51 +87,51 @@ int main(void)
 		const char *msg = "HTTP/1.1 200 OK\r\n";
 		relay_write_all(up_ext, msg, strlen(msg));
 		char buf[64] = {0};
-		CHECK(read_n(client_ext, buf, strlen(msg)) == 0, "đọc đủ byte ở client");
-		CHECK(memcmp(buf, msg, strlen(msg)) == 0, "nội dung khớp chiều <-");
+		CHECK(read_n(client_ext, buf, strlen(msg)) == 0, "read all bytes at client");
+		CHECK(memcmp(buf, msg, strlen(msg)) == 0, "content matches <- direction");
 	}
 
-	printf("== test 3: dữ liệu lớn (vượt 1 buffer) ==\n");
+	printf("== test 3: large data (exceeds 1 buffer) ==\n");
 	{
 		size_t big = RELAY_BUF_SIZE * 3 + 123;
 		char *out = malloc(big), *in = malloc(big);
 		for (size_t i = 0; i < big; i++) out[i] = (char)(i & 0xff);
-		/* ghi trong thread riêng để tránh deadlock khi buffer đầy */
+		/* write in a separate thread to avoid deadlock when the buffer fills */
 		struct write_args wa = { client_ext, out, big };
 		pthread_t wt;
 		pthread_create(&wt, NULL, write_thread, &wa);
-		CHECK(read_n(up_ext, in, big) == 0, "đọc đủ khối lớn");
-		CHECK(memcmp(out, in, big) == 0, "khối lớn khớp nguyên vẹn");
+		CHECK(read_n(up_ext, in, big) == 0, "read the whole large block");
+		CHECK(memcmp(out, in, big) == 0, "large block matches intact");
 		pthread_join(wt, NULL);
 		free(out); free(in);
 	}
 
-	printf("== test 4: half-close lan FIN ==\n");
+	printf("== test 4: half-close propagates FIN ==\n");
 	{
-		/* đóng đầu ghi client_ext → client_int đọc EOF → pump shutdown up_int
-		 * write → up_ext đọc EOF. */
+		/* close the write end of client_ext -> client_int reads EOF -> pump
+		 * shutdown up_int write -> up_ext reads EOF. */
 		shutdown(client_ext, SHUT_WR);
 		char buf[8];
 		ssize_t r = read(up_ext, buf, sizeof(buf));
-		CHECK(r == 0, "upstream nhận EOF sau khi client half-close");
+		CHECK(r == 0, "upstream receives EOF after client half-close");
 
-		/* chiều còn lại vẫn gửi được */
+		/* the other direction can still send */
 		const char *msg = "late";
 		relay_write_all(up_ext, msg, strlen(msg));
 		char b2[8] = {0};
 		CHECK(read_n(client_ext, b2, strlen(msg)) == 0,
-		      "upstream->client vẫn chạy sau half-close");
+		      "upstream->client still works after half-close");
 	}
 
-	printf("== test 5: đóng nốt → pump kết thúc ==\n");
+	printf("== test 5: close the rest -> pump finishes ==\n");
 	{
 		shutdown(up_ext, SHUT_WR);
 		close(up_ext);
-		/* pump phải thoát; join với timeout mềm bằng cách đóng client_ext */
+		/* the pump must exit; join with a soft timeout by closing client_ext */
 		shutdown(client_ext, SHUT_RDWR);
 		close(client_ext);
 		pthread_join(th, NULL);
-		CHECK(1, "relay_pump thoát sạch khi cả hai chiều đóng");
+		CHECK(1, "relay_pump exits cleanly when both directions close");
 	}
 
 	close(client_int); close(up_int);
@@ -139,6 +140,6 @@ int main(void)
 		printf("\n== %d TEST FAIL ==\n", g_fail);
 		return 1;
 	}
-	printf("\n== TẤT CẢ relay TEST PASS ==\n");
+	printf("\n== ALL relay TESTS PASS ==\n");
 	return 0;
 }

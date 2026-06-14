@@ -386,6 +386,23 @@ static int sg_insert_ordered(sqlite3_stmt *ins,
 
 /* ── sg_db_set ───────────────────────────────────────────────────────────── */
 
+/* Last SQLite error from a failed write, captured at the failure point before
+ * the ROLLBACK resets it. Lets callers report the real reason ("attempt to
+ * write a readonly database", "UNIQUE constraint failed", …) instead of a bare
+ * "Failed to write config". */
+static char g_db_last_err[256];
+
+const char *sg_db_last_err(void)
+{
+	return g_db_last_err[0] ? g_db_last_err : "(no error recorded)";
+}
+
+static void db_capture_err(void)
+{
+	snprintf(g_db_last_err, sizeof(g_db_last_err), "%s",
+		 g_db ? sqlite3_errmsg(g_db) : "database not open");
+}
+
 int sg_db_set(const char *type, const char *id, const char *data)
 {
 	if (!g_db || !type || !id) return -1;
@@ -395,37 +412,45 @@ int sg_db_set(const char *type, const char *id, const char *data)
 	 * between sg_db_begin()/sg_db_commit() it joins that transaction and
 	 * leaves commit/rollback to the owner (returning -1 on failure). */
 	int owned = sqlite3_get_autocommit(g_db) ? 1 : 0;
-	if (owned && sqlite3_exec(g_db, "BEGIN;", NULL, NULL, NULL) != SQLITE_OK)
+	if (owned && sqlite3_exec(g_db, "BEGIN;", NULL, NULL, NULL) != SQLITE_OK) {
+		db_capture_err();
 		return -1;
+	}
 
 	/* Delete existing rows for this entry */
 	sqlite3_stmt *del;
 	const char *del_sql = "DELETE FROM config WHERE type=?1 AND id=?2;";
 	if (sqlite3_prepare_v2(g_db, del_sql, -1, &del, NULL) != SQLITE_OK) {
+		db_capture_err();
 		if (owned) sqlite3_exec(g_db, "ROLLBACK;", NULL, NULL, NULL);
 		return -1;
 	}
 	sqlite3_bind_text(del, 1, type, -1, SQLITE_STATIC);
 	sqlite3_bind_text(del, 2, id, -1, SQLITE_STATIC);
 	if (sqlite3_step(del) != SQLITE_DONE) {
+		db_capture_err();
 		sqlite3_finalize(del);
 		if (owned) sqlite3_exec(g_db, "ROLLBACK;", NULL, NULL, NULL);
 		return -1;
 	}
 	sqlite3_finalize(del);
 
-	/* Insert new rows in field_table registry order */
+	/* Insert new rows in field_table registry order. INSERT OR REPLACE so a
+	 * duplicate key within one payload is last-wins (matching the PK
+	 * semantics) instead of aborting the whole write with a constraint error. */
 	if (data && data[0]) {
 		sqlite3_stmt *ins;
 		const char *ins_sql =
-			"INSERT INTO config(type, id, key, value) "
+			"INSERT OR REPLACE INTO config(type, id, key, value) "
 			"VALUES(?1, ?2, ?3, ?4);";
 		if (sqlite3_prepare_v2(g_db, ins_sql, -1, &ins, NULL) != SQLITE_OK) {
+			db_capture_err();
 			if (owned) sqlite3_exec(g_db, "ROLLBACK;", NULL, NULL, NULL);
 			return -1;
 		}
 
 		if (sg_insert_ordered(ins, type, id, data) != 0) {
+			db_capture_err();
 			sqlite3_finalize(ins);
 			if (owned) sqlite3_exec(g_db, "ROLLBACK;", NULL, NULL, NULL);
 			return -1;
@@ -434,6 +459,7 @@ int sg_db_set(const char *type, const char *id, const char *data)
 	}
 
 	if (owned && sqlite3_exec(g_db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+		db_capture_err();
 		sqlite3_exec(g_db, "ROLLBACK;", NULL, NULL, NULL);
 		return -1;
 	}

@@ -2,14 +2,14 @@
 <!--
   Stargazer NGFW — IPS/IDS block notification page (FortiGate-style).
 
-  Trang này được stargazer-ssld phục vụ cho client khi một flow HTTPS đã giải mã
-  bị IPS chấm DROP (prevent mode). ssld thay nội dung động vào các placeholder:
-    {{URL}}         — host/URL bị chặn (SNI + path nếu có)
-    {{SIGNATURE}}   — tên/SID signature đã khớp
-    {{POLICY}}      — id policy
-    {{DESCRIPTION}} — mô tả (hiện để trống)
-  File standalone này để xem/chỉnh giao diện; bản phục vụ nhúng trong ssld phải
-  khớp markup/CSS với file này.
+  This page is served by stargazer-ssld to the client when a decrypted HTTPS flow
+  is scored DROP by IPS (prevent mode). ssld substitutes dynamic content into the placeholders:
+    {{URL}}         — blocked host/URL (SNI + path if present)
+    {{SIGNATURE}}   — matched signature name/SID
+    {{POLICY}}      — policy id
+    {{DESCRIPTION}} — description (currently left blank)
+  This standalone file is for viewing/editing the UI; the version embedded in ssld must
+  match the markup/CSS of this file.
 -->
 <html lang="en">
 <head>

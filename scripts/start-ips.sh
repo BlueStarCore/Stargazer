@@ -1,9 +1,9 @@
 #!/bin/sh
-# start-ips.sh — chạy trên Stargazer VM để bật IPS test
+# start-ips.sh — run on the Stargazer VM to enable IPS testing
 #
-# Dùng: ./start-ips.sh [detect|prevent]
+# Usage: ./start-ips.sh [detect|prevent]
 #
-# Yêu cầu: stargazer-ipsd + rules đã có trong /sbin/ và /etc/stargazer/ips/
+# Requires: stargazer-ipsd + rules already present in /sbin/ and /etc/stargazer/ips/
 
 MODE="${1:-prevent}"
 QUEUE_NUM=0
@@ -12,11 +12,11 @@ LOG="/etc/stargazer/logs/ipsd.log"
 
 echo "[IPS] Setting up iptables NFQUEUE rules..."
 
-# ---- 1. IPS enforcement rules (chèn trước chain policy) ----
-# Chặn flow bị đánh dấu BLOCK (bit 1 = 0x2)
+# ---- 1. IPS enforcement rules (insert before the policy chain) ----
+# Drop flows marked BLOCK (bit 1 = 0x2)
 iptables -I FORWARD 1 -m connmark --mark 0x2/0x2 -j DROP
 
-# Queue NEW flows chưa có verdict INSPECTED (bit 2 = 0x4)
+# Queue NEW flows without an INSPECTED verdict yet (bit 2 = 0x4)
 iptables -I FORWARD 2 \
     -m conntrack --ctstate NEW \
     -m connmark ! --mark 0x4/0x4 \
@@ -25,7 +25,7 @@ iptables -I FORWARD 2 \
 echo "[IPS] iptables rules:"
 iptables -L FORWARD -n --line-numbers | head -10
 
-# ---- 2. Khởi động ipsd ----
+# ---- 2. Start ipsd ----
 echo "[IPS] Starting stargazer-ipsd (mode=${MODE})..."
 
 EXTRA=""

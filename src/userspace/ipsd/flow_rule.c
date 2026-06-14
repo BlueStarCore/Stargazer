@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * flow_rule.c - Signature lớp 1 built-in (xem flow_rule.h).
+ * flow_rule.c - built-in layer-1 signatures (see flow_rule.h).
  *
- * Mỗi rule là một điều kiện trên flow_stats + flow_ctx.
- * Thứ tự: DROP trước ALERT; dừng ở rule DROP đầu tiên.
+ * Each rule is a condition over flow_stats + flow_ctx.
+ * Order: DROP before ALERT; stop at the first DROP rule.
  */
 #include "flow_rule.h"
 
@@ -11,7 +11,7 @@
 #include <string.h>
 #include <netinet/in.h>   /* IPPROTO_* */
 
-/* ---- ánh xạ cờ TCP -------------------------------------------------------- */
+/* ---- TCP flag mapping ----------------------------------------------------- */
 
 void flow_rule_flags_str(uint8_t flags, char *buf, size_t n)
 {
@@ -28,33 +28,33 @@ void flow_rule_flags_str(uint8_t flags, char *buf, size_t n)
 		buf[0] = '\0';
 }
 
-/* ---- bảng built-in rules -------------------------------------------------- */
+/* ---- built-in rules table ------------------------------------------------- */
 
 /*
- * Mỗi entry: kiểm tra điều kiện, nếu khớp thì điền *out và trả 0.
- * Thứ tự DROP trước ALERT quan trọng để loop dừng đúng.
+ * Each entry: test the condition, and if it matches fill *out and return 0.
+ * DROP-before-ALERT ordering matters so the loop stops correctly.
  */
 
-/* SID base cho built-in (tránh đụng ET OPEN (<3000000)) */
+/* SID base for built-ins (avoid clashing with ET OPEN (<3000000)) */
 #define BIN_SID_BASE 1000000u
 
-/* Ngưỡng SYN flood: syn_count >= N VÀ syn_count > RATIO * ack_count.
- * RFC 2827 / BCP38; threshold 10 là thực tiễn Snort dos.rules. */
+/* SYN flood threshold: syn_count >= N AND syn_count > RATIO * ack_count.
+ * RFC 2827 / BCP38; threshold 10 follows Snort dos.rules practice. */
 #define SYN_FLOOD_MIN_SYN    10u
 #define SYN_FLOOD_RATIO      10u   /* syn > 10 * ack */
 
-/* Port scan: flow rất ít gói, chỉ SYN, không hoàn tất handshake.
- * Staniford 2002: 1-3 gói/flow là dấu hiệu scan. */
+/* Port scan: flow with very few packets, SYN only, no completed handshake.
+ * Staniford 2002: 1-3 packets/flow is a scan signature. */
 #define PORT_SCAN_MAX_PKTS   3u
 
-/* URG flood ngưỡng */
+/* URG flood threshold */
 #define URG_FLOOD_MIN        20u
 
-/* ACK flood (phản xạ DDoS): nhiều ACK, không SYN (giả mạo). */
+/* ACK flood (reflection DDoS): many ACK, no SYN (spoofed). */
 #define ACK_FLOOD_MIN_ACK    50u
 
 /* Known-bad ports — Metasploit default, netcat backdoor, IRC botnet, Tor.
- * Nguồn: ET OPEN trojan.rules, malware.rules. */
+ * Source: ET OPEN trojan.rules, malware.rules. */
 static const uint16_t KNOWN_BAD_PORTS[] = {
 	4444,   /* Metasploit default */
 	31337,  /* Back Orifice */
@@ -84,11 +84,11 @@ int flow_rule_match_builtin(const struct flow_ctx *fc,
 
 	uint32_t pkts_total = fs->pkts_fwd + fs->pkts_bwd;
 
-	/* ── DROP rules (kiểm trước) ─────────────────────────────────── */
+	/* ── DROP rules (checked first) ──────────────────────────────── */
 
-	/* R1: SYN flood — TCP, syn_count >= threshold VÀ syn >> ack.
-	 * RFC 2827: SYN flood đặc trưng bởi rất nhiều SYN, hầu như không ACK.
-	 * Dùng nhân để tránh chia (an toàn với ack_count == 0). */
+	/* R1: SYN flood — TCP, syn_count >= threshold AND syn >> ack.
+	 * RFC 2827: a SYN flood is characterized by very many SYN, almost no ACK.
+	 * Use multiplication to avoid division (safe when ack_count == 0). */
 	if (fc->proto == SIG_PROTO_TCP &&
 	    fs->syn_count >= SYN_FLOOD_MIN_SYN &&
 	    fs->syn_count > SYN_FLOOD_RATIO * fs->ack_count) {
@@ -102,8 +102,8 @@ int flow_rule_match_builtin(const struct flow_ctx *fc,
 		return 0;
 	}
 
-	/* R2: Port scan — TCP, rất ít gói, chỉ SYN (không hoàn tất handshake).
-	 * Staniford 2002: ≤3 gói, có SYN, không ACK = probe chưa được trả lời. */
+	/* R2: Port scan — TCP, very few packets, SYN only (no completed handshake).
+	 * Staniford 2002: ≤3 packets, with SYN, no ACK = an unanswered probe. */
 	if (fc->proto == SIG_PROTO_TCP &&
 	    pkts_total > 0 && pkts_total <= PORT_SCAN_MAX_PKTS &&
 	    fs->syn_count >= 1 && fs->ack_count == 0) {
@@ -115,7 +115,7 @@ int flow_rule_match_builtin(const struct flow_ctx *fc,
 		return 0;
 	}
 
-	/* R3: URG flood — nhiều gói URG (DoS qua urgent pointer). */
+	/* R3: URG flood — many URG packets (DoS via urgent pointer). */
 	if (fc->proto == SIG_PROTO_TCP && fs->urg_count >= URG_FLOOD_MIN) {
 		out->sid    = BIN_SID_BASE + 3;
 		out->action = SIG_DROP;
@@ -128,7 +128,7 @@ int flow_rule_match_builtin(const struct flow_ctx *fc,
 	/* ── ALERT rules ─────────────────────────────────────────────── */
 
 	/* R4: Known-bad destination port (ET OPEN trojan/malware category).
-	 * TCP hoặc UDP. Alert thay vì Drop vì port có thể dùng hợp lệ. */
+	 * TCP or UDP. Alert rather than Drop since the port may have legitimate use. */
 	if ((fc->proto == SIG_PROTO_TCP || fc->proto == SIG_PROTO_UDP) &&
 	    is_known_bad_port(fc->dport)) {
 		out->sid    = BIN_SID_BASE + 4;
@@ -139,8 +139,8 @@ int flow_rule_match_builtin(const struct flow_ctx *fc,
 		return 0;
 	}
 
-	/* R5: ACK flood phản xạ — nhiều ACK, không SYN (giả mạo địa chỉ).
-	 * Đặc trưng của reflected amplification DDoS. */
+	/* R5: ACK flood reflection — many ACK, no SYN (spoofed addresses).
+	 * Characteristic of reflected amplification DDoS. */
 	if (fc->proto == SIG_PROTO_TCP &&
 	    fs->ack_count >= ACK_FLOOD_MIN_ACK && fs->syn_count == 0) {
 		out->sid    = BIN_SID_BASE + 5;
@@ -151,5 +151,5 @@ int flow_rule_match_builtin(const struct flow_ctx *fc,
 		return 0;
 	}
 
-	return -1;   /* lành */
+	return -1;   /* clean */
 }

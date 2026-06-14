@@ -1,21 +1,22 @@
-# Makefile HOST-TEST cho stargazer-ssld (transparent TLS-inspection proxy).
+# HOST-TEST Makefile for stargazer-ssld (transparent TLS-inspection proxy).
 #
-# SPLICE không cần TLS lib; BUMP cần OpenSSL. Bản cross-compile aarch64 cho
-# BPI-R4 do root Makefile lo (cần OpenSSL/sysroot aarch64). File này build/test
-# nhanh trên host (OpenSSL host có sẵn).
+# SPLICE needs no TLS lib; BUMP needs OpenSSL. The aarch64 cross-compile build
+# for the BPI-R4 is handled by the root Makefile (needs an aarch64
+# OpenSSL/sysroot). This file builds/tests quickly on the host (the host OpenSSL
+# is available).
 #
-#   make test         # relay + ca/certcache + bump (+tls từ ../ipsd)
-#   make ssld         # build daemon (cần root + iptables REDIRECT để chạy thật)
+#   make test         # relay + ca/certcache + bump (+tls from ../ipsd)
+#   make ssld         # build the daemon (needs root + iptables REDIRECT to run live)
 #   make clean
 #
-# Dùng chung peek-SNI + splice/bump decision + signature engine từ ../ipsd.
+# Shares peek-SNI + the splice/bump decision + the signature engine from ../ipsd.
 
 CC     ?= gcc
 CFLAGS ?= -O2 -Wall -Wextra -std=c11 -I. -I../ipsd
 SANIT  := -fsanitize=address,undefined
 BUILD  := build
 
-# module dùng chung từ ipsd
+# shared modules from ipsd
 IPSD   := ../ipsd/tls_clienthello.c ../ipsd/tls_policy.c \
           ../ipsd/sig_rule.c ../ipsd/ac.c
 
@@ -24,7 +25,7 @@ SSLD_SRCS := main.c conn.c relay.c origdst.c ca.c certcache.c bump.c $(IPSD)
 .PHONY: test relay-test ca-test bump-test ssld clean
 
 test: relay-test ca-test bump-test
-	@echo "== TẤT CẢ SSLD TEST PASS =="
+	@echo "== ALL SSLD TESTS PASS =="
 
 relay-test: $(BUILD)/relay_test
 	@echo "--- relay_test (splice byte pump) ---"
@@ -35,8 +36,8 @@ ca-test: $(BUILD)/ca_certcache_test
 	./$(BUILD)/ca_certcache_test
 
 bump-test: $(BUILD)/bump_test
-	@echo "--- bump_test (MITM end-to-end, TLS thật) ---"
-	@# OpenSSL có one-time alloc → tắt leak detection (noise, không phải bug ssld)
+	@echo "--- bump_test (MITM end-to-end, real TLS) ---"
+	@# OpenSSL has one-time allocs -> disable leak detection (noise, not an ssld bug)
 	ASAN_OPTIONS=detect_leaks=0 ./$(BUILD)/bump_test
 
 $(BUILD)/relay_test: relay.c relay.h relay_test.c | $(BUILD)
