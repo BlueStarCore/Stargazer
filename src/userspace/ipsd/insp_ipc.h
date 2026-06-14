@@ -1,16 +1,17 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * insp_ipc.h — Phase 4: kênh IPC inspection (ipsd server ⇄ ssld client).
+ * insp_ipc.h — Phase 4: inspection IPC channel (ipsd server ⇄ ssld client).
  *
- * ssld giải mã HTTPS rồi đẩy plaintext qua đây để CHÍNH engine stateful của
- * ipsd (reass + Aho-Corasick streaming + verify + flowbits) soi — thay cho việc
- * ssld tự gọi sig_match per-chunk. Bắt được pattern vắt qua nhiều TLS record.
+ * ssld decrypts HTTPS then pushes plaintext here so that ipsd's OWN stateful
+ * engine (reass + Aho-Corasick streaming + verify + flowbits) inspects it —
+ * instead of ssld calling sig_match per-chunk itself. Catches patterns spanning
+ * multiple TLS records.
  *
- * ADDITIVE + GATED: chạy trong thread riêng, KHÔNG đụng NFQUEUE main loop hay
- * struct CTA_ML. Tắt SSL inspection → ssld không chạy → server im.
+ * ADDITIVE + GATED: runs in its own thread, does NOT touch the NFQUEUE main loop
+ * or the CTA_ML struct. Disable SSL inspection → ssld does not run → server idle.
  *
- * Vận tải: AF_UNIX SOCK_SEQPACKET tại INSP_SOCK_PATH — mỗi message = 1 datagram.
- * Một socket cho mỗi kết nối proxy của ssld (handler thread sở hữu riêng flow).
+ * Transport: AF_UNIX SOCK_SEQPACKET at INSP_SOCK_PATH — each message = 1 datagram.
+ * One socket per ssld proxy connection (handler thread owns its own flow).
  */
 #ifndef SG_IPSD_INSP_IPC_H
 #define SG_IPSD_INSP_IPC_H
@@ -21,14 +22,14 @@ struct sig_reload;
 struct ips_config;
 
 #define INSP_SOCK_PATH   "/run/stargazer-ipsd-insp.sock"
-#define INSP_MAX_PLAIN   16384      /* = REASS_MAX_BYTES: chunk plaintext tối đa */
+#define INSP_MAX_PLAIN   16384      /* = REASS_MAX_BYTES: max plaintext chunk */
 
-/* loại message */
+/* message type */
 enum {
-	INSP_OPEN    = 1,   /* ssld → ipsd: bắt đầu 1 flow HTTPS */
-	INSP_DATA    = 2,   /* ssld → ipsd: 1 chunk plaintext (kèm theo sau header) */
-	INSP_CLOSE   = 3,   /* ssld → ipsd: kết thúc flow */
-	INSP_VERDICT = 128, /* ipsd → ssld: verdict cho 1 chunk */
+	INSP_OPEN    = 1,   /* ssld → ipsd: start an HTTPS flow */
+	INSP_DATA    = 2,   /* ssld → ipsd: one plaintext chunk (follows the header) */
+	INSP_CLOSE   = 3,   /* ssld → ipsd: end of flow */
+	INSP_VERDICT = 128, /* ipsd → ssld: verdict for one chunk */
 };
 
 /* verdict.action */
@@ -37,25 +38,25 @@ enum { INSP_PASS = 0, INSP_ALERT = 1, INSP_DROP = 2 };
 struct insp_hdr {
 	uint16_t type;       /* INSP_* */
 	uint16_t flags;
-	uint32_t conn_id;    /* tham chiếu (1 socket/flow nên không bắt buộc) */
+	uint32_t conn_id;    /* reference (1 socket/flow so not mandatory) */
 };
 
 struct insp_open_body {
-	uint32_t srv_ip;     /* đích thật (network order) — log */
+	uint32_t srv_ip;     /* real destination (network order) — log */
 	uint16_t srv_port;   /* → fc.dport */
-	uint8_t  profile_id; /* → fc.prof_id (0 = áp mọi rule) */
+	uint8_t  profile_id; /* → fc.prof_id (0 = apply every rule) */
 	uint8_t  _pad;
-	char     sni[256];   /* host cho log */
-	/* Phase 2 — leg client→ssld để ipsd đọc CTA_ML (ML cho HTTPS). Host order
-	 * cho cli_port/fw_port; ip network order. ssld lấy bằng getpeername (client)
-	 * + getsockname (fw, sau REDIRECT). 0 = không có (ML không chấm). */
+	char     sni[256];   /* host for log */
+	/* Phase 2 — leg client→ssld so ipsd can read CTA_ML (ML for HTTPS). Host order
+	 * for cli_port/fw_port; ip network order. ssld obtains them via getpeername (client)
+	 * + getsockname (fw, after REDIRECT). 0 = none (ML not scored). */
 	uint32_t leg_cli_ip;
 	uint32_t leg_fw_ip;
 	uint16_t leg_cli_port;
 	uint16_t leg_fw_port;
 };
 
-struct insp_data_body {       /* theo sau là `len` byte plaintext trong cùng datagram */
+struct insp_data_body {       /* followed by `len` plaintext bytes in the same datagram */
 	uint8_t  dir;        /* 0=to_server, 1=to_client */
 	uint8_t  _pad[3];
 	uint32_t chunk_id;
@@ -65,7 +66,7 @@ struct insp_data_body {       /* theo sau là `len` byte plaintext trong cùng d
 struct insp_verdict_body {
 	uint32_t chunk_id;
 	uint8_t  action;     /* INSP_PASS / INSP_ALERT / INSP_DROP */
-	uint8_t  src;        /* 0 = signature (ML để Pha 2) */
+	uint8_t  src;        /* 0 = signature (ML in Phase 2) */
 	uint8_t  _pad[2];
 	float    score;
 	uint32_t sid;
@@ -73,9 +74,9 @@ struct insp_verdict_body {
 };
 
 /*
- * Khởi động IPC inspection server (tạo acceptor thread; mỗi kết nối → 1 handler
- * thread sở hữu insp_flow riêng, rdlock(ruleset) khi soi — dùng chung an toàn
- * với NFQUEUE). Trả 0 nếu OK, -1 nếu lỗi (caller log + chạy tiếp không IPC).
+ * Start the inspection IPC server (create acceptor thread; each connection → 1 handler
+ * thread owning its own insp_flow, rdlock(ruleset) during inspection — safely shared
+ * with NFQUEUE). Returns 0 on success, -1 on error (caller logs + continues without IPC).
  */
 int insp_ipc_start(struct sig_reload *sr, const struct ips_config *cfg);
 

@@ -1,11 +1,12 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * engine.h - điều phối pipeline phát hiện hybrid (signature → ML → fusion).
+ * engine.h - orchestrates the hybrid detection pipeline (signature → ML → fusion).
  *
- * Thứ tự CỐ Ý: signature chạy TRƯỚC. Nếu signature khớp → quyết định ngay theo
- * signature và KHÔNG chạy ML (tiết kiệm inference; tấn công "đã biết" thì chặn
- * luôn, khỏi cần điểm bất thường). Chỉ khi KHÔNG có signature nào khớp mới chấm
- * ML rồi so ngưỡng. Đây là tầng ghép sig_rule + ips_model + fusion lại.
+ * INTENTIONAL ordering: signature runs FIRST. If a signature matches → decide
+ * immediately from the signature and do NOT run ML (saves inference; a "known"
+ * attack is blocked right away, no need for an anomaly score). Only when NO
+ * signature matches do we score with ML and compare against the threshold. This
+ * is the layer that ties sig_rule + ips_model + fusion together.
  */
 #ifndef SG_ENGINE_H
 #define SG_ENGINE_H
@@ -19,13 +20,13 @@
 #include "flow_rule.h"   /* flow_stats */
 
 /*
- * Đánh giá một flow/gói. Thứ tự pipeline:
- *   [L1-builtin]  flow_rule_match_builtin(fc, fs)     — anomaly (SYN-flood…), không payload
+ * Evaluate a flow/packet. Pipeline order:
+ *   [L1-builtin]  flow_rule_match_builtin(fc, fs)     — anomaly (SYN-flood…), no payload
  *   [L2]          sig_match(rs, payload, plen, fc)     — Aho-Corasick payload (signature)
  *   [ML]          ips_score(feat)                      — LightGBM
  *
- * fs == NULL → bỏ qua cả hai lớp L1 (dùng khi không có flow stats).
- * Mọi lớp đều short-circuit: khớp thì trả ngay, không chạy lớp sau.
+ * fs == NULL → skip both L1 layers (used when there are no flow stats).
+ * Every layer short-circuits: on a match it returns immediately, skipping later layers.
  */
 struct ips_decision ips_evaluate(const struct ips_config *cfg,
 				 const struct sig_ruleset *rs,
@@ -35,13 +36,15 @@ struct ips_decision ips_evaluate(const struct ips_config *cfg,
 				 const struct flow_stats *fs);
 
 /*
- * Biến thể cho P1 reassembly: lớp L2 đã được tính SẴN trên DÒNG ĐÃ GHÉP (ở
- * main.c qua reass + streaming AC) nên KHÔNG chạy sig_match per-packet.
- *   l2_ready    : 1 → dùng l2_sig_idx/l2_sig_action làm kết quả L2 (đã fidelity-
- *                 cap); 0 → hành xử như ips_evaluate (tự sig_match trên payload).
- *   l2_sig_idx  : index rule L2 khớp (trong rs->rules), -1 nếu không khớp.
- *   l2_sig_action: action ĐÃ cap của rule đó (SIG_ALERT/SIG_DROP).
- * Thứ tự vẫn L1-builtin → L1-user → L2 → ML (L1 vẫn ưu tiên trước L2).
+ * Variant for P1 reassembly: the L2 layer is ALREADY computed over the
+ * REASSEMBLED STREAM (in main.c via reass + streaming AC), so sig_match is NOT
+ * run per-packet.
+ *   l2_ready    : 1 → use l2_sig_idx/l2_sig_action as the L2 result (already
+ *                 fidelity-capped); 0 → behave like ips_evaluate (run sig_match
+ *                 on the payload).
+ *   l2_sig_idx  : index of the matched L2 rule (in rs->rules), -1 if no match.
+ *   l2_sig_action: the rule's ALREADY-capped action (SIG_ALERT/SIG_DROP).
+ * Order remains L1-builtin → L1-user → L2 → ML (L1 still takes priority over L2).
  */
 struct ips_decision ips_evaluate_full(const struct ips_config *cfg,
 				      const struct sig_ruleset *rs,

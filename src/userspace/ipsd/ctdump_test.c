@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * ctdump_test.c - test parse + convert, chạy trên HOST (không cần kernel).
+ * ctdump_test.c - test parse + convert, runs on the HOST (no kernel needed).
  *
- * Dựng buffer nlattr giả lập chứa CTA_ML + CTA_COUNTERS rồi gọi
- * ctdump_parse_response() để kiểm parser. Không cần socket netlink.
+ * Build a mock nlattr buffer containing CTA_ML + CTA_COUNTERS, then call
+ * ctdump_parse_response() to exercise the parser. No netlink socket required.
  *
  *   gcc -O2 -Wall -Wextra -std=c11 -fsanitize=address,undefined \
  *       -o /tmp/ctdump_test ctdump.c feature.c ctdump_test.c -lm
@@ -28,9 +28,9 @@ static void check(int cond, const char *name)
 	if (!cond) g_failed++;
 }
 
-/* ---- builder NLA giả lập ------------------------------------------------- */
+/* ---- mock NLA builder ---------------------------------------------------- */
 
-/* Khớp định nghĩa trong ctdump.c */
+/* Match the definitions in ctdump.c */
 #define T_CTA_ML             27
 #define T_CTA_COUNTERS_ORIG  9
 #define T_CTA_COUNTERS_REPLY 10
@@ -42,7 +42,7 @@ static char buf[4096];
 
 static void buf_reset(void) { buf_off = 0; memset(buf, 0, sizeof(buf)); }
 
-/* ghi nlattr {type, data[len]} */
+/* write nlattr {type, data[len]} */
 static void buf_nla(uint16_t type, const void *data, int len)
 {
 	struct nlattr *nla = (struct nlattr *)(buf + buf_off);
@@ -115,12 +115,12 @@ static void t1_parse_ml(void)
 	struct ctdump_result r;
 	int rc = ctdump_parse_response(buf, buf_off, &r);
 
-	check(rc == 0,               "parse trả 0");
+	check(rc == 0,               "parse returns 0");
 	check(r.ml_valid == 1,       "ml_valid = 1");
-	check(r.ml.iat_count == 4,   "iat_count khớp");
-	check(r.ml.syn_count == 1,   "syn_count khớp");
-	check(r.ml.bytes_fwd == 600, "bytes_fwd khớp");
-	check(r.acct_valid == 0,     "acct_valid = 0 (không có COUNTERS)");
+	check(r.ml.iat_count == 4,   "iat_count matches");
+	check(r.ml.syn_count == 1,   "syn_count matches");
+	check(r.ml.bytes_fwd == 600, "bytes_fwd matches");
+	check(r.acct_valid == 0,     "acct_valid = 0 (no COUNTERS)");
 }
 
 /* ---- T2: parse CTA_ML + CTA_COUNTERS ------------------------------------- */
@@ -150,10 +150,10 @@ static void t2_parse_counters(void)
 	check(r.pkts_reply == 30,     "pkts_reply = 30");
 }
 
-/* ---- T3: không có CTA_ML → ml_valid = 0 --------------------------------- */
+/* ---- T3: no CTA_ML → ml_valid = 0 --------------------------------------- */
 static void t3_no_ml(void)
 {
-	printf("T3 không có CTA_ML:\n");
+	printf("T3 no CTA_ML:\n");
 	buf_reset();
 
 	int co = buf_nest_start(T_CTA_COUNTERS_ORIG);
@@ -163,7 +163,7 @@ static void t3_no_ml(void)
 	struct ctdump_result r;
 	ctdump_parse_response(buf, buf_off, &r);
 	check(r.ml_valid == 0,  "ml_valid = 0");
-	check(r.acct_valid == 1, "acct_valid = 1 (COUNTERS có)");
+	check(r.acct_valid == 1, "acct_valid = 1 (COUNTERS present)");
 }
 
 /* ---- T4: ctdump_to_flow_stats ------------------------------------------- */
@@ -186,10 +186,10 @@ static void t4_to_flow_stats(void)
 	struct flow_stats fs;
 	ctdump_to_flow_stats(&r, &fs);
 
-	check(fs.pkts_fwd == 25,           "pkts_fwd từ ACCT = 25");
-	check(fs.pkts_bwd == 15,           "pkts_bwd từ ACCT = 15");
-	check(fs.syn_count == 2,           "syn_count khớp");
-	check(fs.tcp_flags_fwd == 0x12,    "tcp_flags_fwd khớp");
+	check(fs.pkts_fwd == 25,           "pkts_fwd from ACCT = 25");
+	check(fs.pkts_bwd == 15,           "pkts_bwd from ACCT = 15");
+	check(fs.syn_count == 2,           "syn_count matches");
+	check(fs.tcp_flags_fwd == 0x12,    "tcp_flags_fwd matches");
 }
 
 /* ---- T5: ctdump_to_features → feature_extract --------------------------- */
@@ -218,12 +218,12 @@ static void t5_to_features(void)
 	check(feat[FEAT_FWD_PKTLEN_MEAN] == 200.0, "Fwd Pkt Mean = 600/3 = 200");
 	check(feat[FEAT_BWD_PKTLEN_MEAN] > 57.0 && feat[FEAT_BWD_PKTLEN_MEAN] < 58.0,
 	      "Bwd Pkt Mean ≈ 400/7");
-	check(feat[FEAT_DOWNUP_RATIO] == 2.0,   "Down/Up = 7/3 chia nguyên = 2");
+	check(feat[FEAT_DOWNUP_RATIO] == 2.0,   "Down/Up = 7/3 integer division = 2");
 	check(feat[FEAT_INIT_WIN_FWD] == 8192.0,"Init_Win_fwd = 8192");
 	check(feat[FEAT_SYN_CNT] == 2.0,        "SYN count = 2");
 }
 
-/* ---- T6: buffer NULL / rỗng --------------------------------------------- */
+/* ---- T6: NULL / empty buffer -------------------------------------------- */
 static void t6_edge(void)
 {
 	printf("T6 edge cases:\n");
@@ -232,13 +232,13 @@ static void t6_edge(void)
 	check(ctdump_parse_response(NULL, 0, &r) == -1, "NULL → -1");
 	check(ctdump_parse_response(buf, 0, &r) == -1,   "len=0 → -1");
 
-	/* buf hợp lệ nhưng không chứa attr nào quen */
+	/* valid buf but containing no known attr */
 	buf_reset();
 	char junk[4] = {1, 2, 3, 4};
-	buf_nla(99, junk, 4);   /* attr type lạ */
+	buf_nla(99, junk, 4);   /* unknown attr type */
 	int rc = ctdump_parse_response(buf, buf_off, &r);
-	check(rc == 0,           "attr lạ → parse OK (không crash)");
-	check(r.ml_valid == 0,   "ml_valid = 0 (không có CTA_ML)");
+	check(rc == 0,           "unknown attr → parse OK (no crash)");
+	check(r.ml_valid == 0,   "ml_valid = 0 (no CTA_ML)");
 }
 
 int main(void)
@@ -250,7 +250,7 @@ int main(void)
 	t5_to_features();
 	t6_edge();
 
-	printf("\n%s (%d test thất bại)\n",
-	       g_failed ? "=== CÓ LỖI ===" : "=== TẤT CẢ PASS ===", g_failed);
+	printf("\n%s (%d tests failed)\n",
+	       g_failed ? "=== ERRORS ===" : "=== ALL PASS ===", g_failed);
 	return g_failed ? 1 : 0;
 }

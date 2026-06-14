@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * proto_buf.c - Trích sticky buffer giao thức (xem proto_buf.h).
+ * proto_buf.c - Extract protocol sticky buffers (see proto_buf.h).
  *
- * "A buffer is always checked": mọi chỉ số đọc dòng đều bounds-check; vùng
- * không xác định để NULL/0 (verify sẽ coi như không khớp → fail-safe).
+ * "A buffer is always checked": every stream-read index is bounds-checked;
+ * undefined regions are left NULL/0 (verify treats them as no-match → fail-safe).
  */
 #include "proto_buf.h"
 #include "tls_clienthello.h"
@@ -18,7 +18,7 @@ void bufs_init_raw(struct match_buffers *mb, const uint8_t *raw, int len)
 	mb->len[SIG_BUF_RAW] = (len > 0) ? len : 0;
 }
 
-/* Method hợp lệ = chữ HOA A-Z (tránh nhận nhầm nhị phân là HTTP). */
+/* Valid method = uppercase A-Z (avoids mistaking binary for HTTP). */
 static int is_http_method(const uint8_t *s, int n)
 {
 	if (n < 3 || n > 12) return 0;
@@ -41,7 +41,7 @@ void bufs_extract(struct match_buffers *mb, const uint8_t *s, int len)
 			mb->b[SIG_BUF_TLS_SNI]   = (const uint8_t *)mb->sni;
 			mb->len[SIG_BUF_TLS_SNI] = (int)strlen(mb->sni);
 		}
-		return;   /* TLS → không phải HTTP */
+		return;   /* TLS → not HTTP */
 	}
 
 	/* ---- HTTP request: METHOD SP URI SP HTTP/x CRLF headers CRLF CRLF body */
@@ -63,7 +63,7 @@ void bufs_extract(struct match_buffers *mb, const uint8_t *s, int len)
 		mb->len[SIG_BUF_HTTP_URI] = sp2 - us;
 	}
 
-	/* hết dòng request */
+	/* end of request line */
 	int eol = -1;
 	for (int i = sp2; i < len; i++)
 		if (s[i] == '\n') { eol = i; break; }
@@ -71,7 +71,7 @@ void bufs_extract(struct match_buffers *mb, const uint8_t *s, int len)
 		return;
 	int hstart = eol + 1;
 
-	/* ranh giới header/body: CRLFCRLF hoặc LFLF */
+	/* header/body boundary: CRLFCRLF or LFLF */
 	int hend = -1, bstart = -1;
 	for (int i = hstart; i < len - 1; i++) {
 		if (s[i] == '\n' && s[i + 1] == '\n') {
@@ -83,7 +83,7 @@ void bufs_extract(struct match_buffers *mb, const uint8_t *s, int len)
 		}
 	}
 	if (hend < 0) {
-		/* chưa thấy kết thúc header → header = phần còn lại */
+		/* no header terminator seen yet → header = the remainder */
 		if (len > hstart) {
 			mb->b[SIG_BUF_HTTP_HEADER]   = s + hstart;
 			mb->len[SIG_BUF_HTTP_HEADER] = len - hstart;

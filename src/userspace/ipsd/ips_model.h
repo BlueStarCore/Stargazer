@@ -1,9 +1,10 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * ips_model.h - wrapper mỏng quanh model LightGBM đã convert sang C (tl2cgen).
+ * ips_model.h - thin wrapper around the LightGBM model converted to C (tl2cgen).
  *
- * Code model nằm ở model/predict.{c,h} (SINH MÁY — không sửa tay). File này chỉ
- * bọc lại cho gọn: nhận vector 14 feature (đúng thứ tự feature.h) → trả xác suất.
+ * The model code lives in model/predict.{c,h} (MACHINE-GENERATED — do not edit by hand).
+ * This file just wraps it conveniently: takes a 14-feature vector (in feature.h order)
+ * → returns a probability.
  */
 #ifndef SG_IPS_MODEL_H
 #define SG_IPS_MODEL_H
@@ -11,8 +12,8 @@
 #include "feature.h"   /* FEAT_COUNT */
 
 /*
- * Chấm điểm anomaly cho một flow. Trả về xác suất ∈ [0,1] (model là binary
- * classifier 'binary sigmoid:1' → predict() với pred_margin=0 đã áp sigmoid).
+ * Score the anomaly for a flow. Returns a probability in [0,1] (the model is a binary
+ * classifier 'binary sigmoid:1' → predict() with pred_margin=0 has sigmoid applied).
  */
 double ips_score(const double feat[FEAT_COUNT]);
 

@@ -25,9 +25,9 @@ static void check(int cond, const char *name)
 	if (!cond) g_failed++;
 }
 
-/* ---- builder gói giả lập ------------------------------------------------- */
+/* ---- synthetic packet builders ------------------------------------------- */
 
-/* IP checksum (không cần đúng cho test parse, nhưng cho trọn vẹn) */
+/* IP checksum (not required for the parse test, but for completeness) */
 static uint16_t ip_cksum(const void *p, int len)
 {
 	const uint16_t *w = p; uint32_t s = 0;
@@ -37,7 +37,7 @@ static uint16_t ip_cksum(const void *p, int len)
 	return (uint16_t)~s;
 }
 
-/* Xây TCP SYN packet: src 1.2.3.4:12345 → dst 5.6.7.8:80, window=65535 */
+/* Build a TCP SYN packet: src 1.2.3.4:12345 → dst 5.6.7.8:80, window=65535 */
 static int build_syn(uint8_t *buf, int cap,
 		     const char *payload, int plen)
 {
@@ -65,7 +65,7 @@ static int build_syn(uint8_t *buf, int cap,
 	return total;
 }
 
-/* TCP ACK (không phải SYN) */
+/* TCP ACK (not a SYN) */
 static int build_ack(uint8_t *buf, int cap,
 		     uint16_t sport, uint16_t dport,
 		     const char *payload, int plen)
@@ -137,13 +137,13 @@ static void t1_syn(void)
 	check(pkt.sport == 12345,             "sport 12345");
 	check(pkt.dport == 80,                "dport 80");
 	check(pkt.tcp_flags == SIG_TCP_SYN,   "flags = SYN only");
-	check(pkt.init_win == 65535,          "init_win = 65535 (từ SYN)");
-	check(pkt.plen == 0,                  "payload = 0 (SYN không data)");
+	check(pkt.init_win == 65535,          "init_win = 65535 (from SYN)");
+	check(pkt.plen == 0,                  "payload = 0 (SYN has no data)");
 }
 
 static void t2_ack_payload(void)
 {
-	printf("T2 parse TCP ACK+PSH với payload:\n");
+	printf("T2 parse TCP ACK+PSH with payload:\n");
 	uint8_t buf[256]; int len;
 	const char *pl = "GET / HTTP/1.0\r\n";
 	len = build_ack(buf, sizeof(buf), 54321, 80, pl, (int)strlen(pl));
@@ -153,10 +153,10 @@ static void t2_ack_payload(void)
 
 	check((pkt.tcp_flags & SIG_TCP_ACK) && (pkt.tcp_flags & SIG_TCP_PSH),
 	      "flags ACK+PSH");
-	check(pkt.init_win == -1,             "init_win = -1 (không phải SYN)");
-	check(pkt.plen == (uint16_t)strlen(pl), "payload length đúng");
+	check(pkt.init_win == -1,             "init_win = -1 (not a SYN)");
+	check(pkt.plen == (uint16_t)strlen(pl), "payload length correct");
 	check(pkt.payload && memcmp(pkt.payload, pl, pkt.plen) == 0,
-	      "payload content đúng");
+	      "payload content correct");
 }
 
 static void t3_udp(void)
@@ -171,8 +171,8 @@ static void t3_udp(void)
 
 	check(pkt.proto == IPPROTO_UDP,   "proto UDP");
 	check(pkt.dport == 53,            "dport 53 (DNS)");
-	check(pkt.tcp_flags == 0,         "tcp_flags = 0 cho UDP");
-	check(pkt.init_win == -1,         "init_win = -1 cho UDP");
+	check(pkt.tcp_flags == 0,         "tcp_flags = 0 for UDP");
+	check(pkt.init_win == -1,         "init_win = -1 for UDP");
 	check(pkt.plen == (uint16_t)strlen(pl), "payload length UDP");
 }
 
@@ -183,8 +183,8 @@ static void t4_edge(void)
 
 	check(nfq_parse_packet(NULL, 0, &pkt) == -1, "NULL → -1");
 
-	/* header quá ngắn */
-	uint8_t short_buf[10] = {0x45, 0, 0, 20}; /* tot_len=20 nhưng buf chỉ 10B */
+	/* header too short */
+	uint8_t short_buf[10] = {0x45, 0, 0, 20}; /* tot_len=20 but buf is only 10B */
 	check(nfq_parse_packet(short_buf, 10, &pkt) == -1, "buf<ihl → -1");
 
 	/* version != 4 */
@@ -214,13 +214,13 @@ static void t6_connmark_bits(void)
 {
 	printf("T6 connmark bits:\n");
 	check((SG_CMK_IPS_BLOCK & SG_CMK_IPS_INSPECTED) == 0,
-	      "BLOCK và INSPECTED không overlap");
+	      "BLOCK and INSPECTED do not overlap");
 	check((SG_CMK_IPS_BLOCK & 0x1) == 0,
-	      "BLOCK không đụng DIRTY (bit 0)");
+	      "BLOCK does not touch DIRTY (bit 0)");
 	check((SG_CMK_IPS_INSPECTED & 0x1) == 0,
-	      "INSPECTED không đụng DIRTY (bit 0)");
+	      "INSPECTED does not touch DIRTY (bit 0)");
 	check((SG_CMK_IPS_BLOCK & ~0xFF) == 0,
-	      "BLOCK trong byte thấp (không đụng policy_id bits 8-31)");
+	      "BLOCK in the low byte (does not touch policy_id bits 8-31)");
 }
 
 int main(void)
@@ -232,7 +232,7 @@ int main(void)
 	t5_flow_ctx();
 	t6_connmark_bits();
 
-	printf("\n%s (%d test thất bại)\n",
-	       g_failed ? "=== CÓ LỖI ===" : "=== TẤT CẢ PASS ===", g_failed);
+	printf("\n%s (%d tests failed)\n",
+	       g_failed ? "=== FAILURES ===" : "=== ALL PASS ===", g_failed);
 	return g_failed ? 1 : 0;
 }
