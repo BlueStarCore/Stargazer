@@ -1,12 +1,13 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * main.c - stargazer-ssld: transparent TLS-inspection proxy cho Stargazer NGFW.
+ * main.c - stargazer-ssld: transparent TLS-inspection proxy for Stargazer NGFW.
  *
- *   iptables REDIRECT flow TLS → ssld → accept → thread/kết nối →
- *   ssld_handle_conn (peek SNI → splice/bump). BUMP: terminate + giải mã +
- *   soi plaintext bằng signature engine + mã hóa lại.
+ *   iptables REDIRECTs the TLS flow -> ssld -> accept -> thread/connection ->
+ *   ssld_handle_conn (peek SNI -> splice/bump). BUMP: terminate + decrypt +
+ *   inspect plaintext with the signature engine + re-encrypt.
  *
- * Chạy thật: cần root + rule REDIRECT (mgmtd dựng khi accept policy gán security_ssl-inspection-profile):
+ * Live run: needs root + a REDIRECT rule (mgmtd installs it when an accept policy
+ * assigns a security_ssl-inspection-profile):
  *   -t nat -A PREROUTING -i lan -p tcp --dport 443 -j REDIRECT --to-ports 8443
  */
 #define _GNU_SOURCE
@@ -55,7 +56,7 @@ static int load_bypass_file(struct tls_policy *pol, const char *path)
 {
 	FILE *f = fopen(path, "r");
 	if (!f) {
-		fprintf(stderr, "ssld: không mở được bypass file %s: %m\n", path);
+		fprintf(stderr, "ssld: cannot open bypass file %s: %m\n", path);
 		return -1;
 	}
 	char line[320];
@@ -85,7 +86,7 @@ static int make_listener(uint16_t port)
 		.sin_port = htons(port),
 	};
 	if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-		fprintf(stderr, "ssld: bind :%u thất bại: %m\n", port);
+		fprintf(stderr, "ssld: bind :%u failed: %m\n", port);
 		close(fd);
 		return -1;
 	}
@@ -99,16 +100,16 @@ static int make_listener(uint16_t port)
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-		"dùng: %s [-p port] [-b bypass_file] [-r rules] [-B] [-S] [-V]\n"
+		"usage: %s [-p port] [-b bypass_file] [-r rules] [-B] [-S] [-V]\n"
 		"      [-c ca_cert] [-k ca_key]\n"
-		"  -p <port>  cổng nghe REDIRECT (mặc định %d)\n"
-		"  -b <file>  bypass list (domain | *.domain mỗi dòng)\n"
-		"  -r <file>  ruleset signature để soi plaintext bump\n"
-		"  -B         flow không SNI → SPLICE (mặc định BUMP)\n"
-		"  -S         splice-only (TẮT bump — không giải mã)\n"
-		"  -V         verify cert server thật (fail-closed nếu lỗi)\n"
-		"  -c <file>  CA cert (mặc định %s)\n"
-		"  -k <file>  CA key  (mặc định %s)\n",
+		"  -p <port>  REDIRECT listen port (default %d)\n"
+		"  -b <file>  bypass list (domain | *.domain per line)\n"
+		"  -r <file>  signature ruleset for inspecting bumped plaintext\n"
+		"  -B         flow with no SNI -> SPLICE (default BUMP)\n"
+		"  -S         splice-only (DISABLE bump - no decryption)\n"
+		"  -V         verify the real server cert (fail-closed on error)\n"
+		"  -c <file>  CA cert (default %s)\n"
+		"  -k <file>  CA key  (default %s)\n",
 		prog, DEFAULT_PORT, DEFAULT_CACERT, DEFAULT_CAKEY);
 }
 
@@ -129,8 +130,8 @@ int main(int argc, char **argv)
 		case 'B': no_sni_splice = 1; break;
 		case 'S': splice_only = 1; break;
 		case 'V': verify_upstream = 1; break;
-		case 'Q': no_ipc = 1; break;          /* P4: tắt IPC, soi per-chunk */
-		case 'F': ipc_failclosed = 1; break;  /* P4: IPC lỗi → chặn flow */
+		case 'Q': no_ipc = 1; break;          /* P4: disable IPC, inspect per-chunk */
+		case 'F': ipc_failclosed = 1; break;  /* P4: IPC error -> block flow */
 		case 'c': ca_cert = optarg; break;
 		case 'k': ca_key = optarg; break;
 		case 'h': default: usage(argv[0]); return (opt == 'h') ? 0 : 1;
@@ -144,10 +145,10 @@ int main(int argc, char **argv)
 	if (bypass_file) {
 		int n = load_bypass_file(&pol, bypass_file);
 		if (n >= 0)
-			fprintf(stderr, "ssld: nạp %d bypass pattern\n", n);
+			fprintf(stderr, "ssld: loaded %d bypass pattern(s)\n", n);
 	}
 
-	/* CA + certcache (cho bump) */
+	/* CA + certcache (for bump) */
 	struct ca_ctx ca;
 	struct certcache *cc = NULL;
 	int bump_ready = 0;
@@ -155,13 +156,13 @@ int main(int argc, char **argv)
 		if (ca_load_or_create(&ca, ca_cert, ca_key) == 0 &&
 		    (cc = certcache_new(&ca, CERTCACHE_MAX)) != NULL) {
 			bump_ready = 1;
-			fprintf(stderr, "ssld: CA sẵn sàng (%s) — BUMP bật\n", ca_cert);
+			fprintf(stderr, "ssld: CA ready (%s) - BUMP enabled\n", ca_cert);
 		} else {
-			fprintf(stderr, "ssld: CA lỗi — chạy SPLICE-only\n");
+			fprintf(stderr, "ssld: CA error - running SPLICE-only\n");
 		}
 	}
 
-	/* ruleset signature (tùy chọn) */
+	/* signature ruleset (optional) */
 	struct sig_ruleset rs;
 	struct sig_ruleset *rules = NULL;
 	if (rules_file && bump_ready) {
@@ -170,10 +171,10 @@ int main(int argc, char **argv)
 		int added = sig_load_file(&rs, rules_file, &ls);
 		if (added >= 0 && sig_build(&rs) == 0) {
 			rules = &rs;
-			fprintf(stderr, "ssld: nạp %d rule (soi plaintext bump)\n",
+			fprintf(stderr, "ssld: loaded %d rule(s) (inspect bumped plaintext)\n",
 				added);
 		} else {
-			fprintf(stderr, "ssld: nạp rules %s lỗi — bump không soi\n",
+			fprintf(stderr, "ssld: loading rules %s failed - bump will not inspect\n",
 				rules_file);
 			sig_ruleset_free(&rs);
 		}
@@ -198,7 +199,7 @@ int main(int argc, char **argv)
 	int lfd = make_listener(port);
 	if (lfd < 0)
 		goto cleanup;
-	fprintf(stderr, "ssld: nghe :%u mode=%s verify_upstream=%d\n",
+	fprintf(stderr, "ssld: listening :%u mode=%s verify_upstream=%d\n",
 		port, bump_ready ? "BUMP+splice" : "splice-only", verify_upstream);
 
 	while (!g_stop) {
@@ -222,7 +223,7 @@ int main(int argc, char **argv)
 		pthread_detach(th);
 	}
 
-	fprintf(stderr, "ssld: dừng — total=%lu splice=%lu bump=%lu error=%lu\n",
+	fprintf(stderr, "ssld: stopping - total=%lu splice=%lu bump=%lu error=%lu\n",
 		g_stats.n_total, g_stats.n_splice,
 		g_stats.n_bump, g_stats.n_error);
 	close(lfd);

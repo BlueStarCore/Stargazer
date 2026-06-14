@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * relay.c - Bơm byte hai chiều (xem relay.h).
+ * relay.c - Bidirectional byte pump (see relay.h).
  */
 #include "relay.h"
 
@@ -27,7 +27,8 @@ int relay_write_all(int fd, const void *buf, size_t len)
 	return 0;
 }
 
-/* Đọc từ `from`, ghi hết sang `to`. Trả 1 nếu còn mở, 0 nếu EOF, -1 nếu lỗi. */
+/* Read from `from`, write it all to `to`. Returns 1 if still open, 0 on EOF, -1
+ * on error. */
 static int pump_one(int from, int to)
 {
 	char buf[RELAY_BUF_SIZE];
@@ -40,13 +41,13 @@ static int pump_one(int from, int to)
 	if (n == 0)
 		return 0;                       /* EOF */
 	if (errno == EINTR)
-		return 1;                       /* thử lại vòng sau */
-	return -1;                              /* lỗi đọc */
+		return 1;                       /* retry next round */
+	return -1;                              /* read error */
 }
 
 int relay_pump(int a, int b)
 {
-	int a_open = 1, b_open = 1;              /* chiều ĐỌC còn mở? */
+	int a_open = 1, b_open = 1;              /* is the READ direction still open? */
 	struct pollfd pfd[2];
 
 	while (a_open || b_open) {
@@ -70,9 +71,9 @@ int relay_pump(int a, int b)
 			if (s <= 0) {
 				a_open = 0;
 				if (s == 0)
-					shutdown(b, SHUT_WR);  /* truyền FIN */
+					shutdown(b, SHUT_WR);  /* propagate FIN */
 				else
-					b_open = 0;            /* lỗi → bỏ cả hai */
+					b_open = 0;            /* error -> drop both */
 			}
 		}
 
