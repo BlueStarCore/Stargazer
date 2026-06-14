@@ -39,6 +39,27 @@ X("execute system shutdown",                "Shut down the system",             
 X("execute system reboot",                  "Reboot the system",                       "admin",           0,  cmd_sys_reboot)
 X("execute system factory-reboot",         "Factory reset and reboot",                "admin",           0,  cmd_sys_factory_reboot)
 X("execute system factory-shutdown",       "Factory reset and shutdown",              "admin",           0,  cmd_sys_factory_shutdown)
+X("execute system ssl-ca-cert",             "Print SSL-inspection CA cert (PEM) to install on clients", "configure,admin", 0, cmd_ssl_cacert)
+X("execute diagnose ips",                   "IPS engine diagnostics",                                   "admin",           0, NULL)
+X("execute diagnose ips status",            "IPS daemon status and configuration",                      "admin",           0, cmd_diag_ips_status)
+X("execute diagnose ips alerts",            "Show recent IPS alert log entries",                        "admin",           1, cmd_diag_ips_alerts)
+X("execute diagnose ips alerts-clear",      "Clear (truncate) the IPS alert log",                       "admin",           0, cmd_diag_ips_alerts_clear)
+X("execute diagnose ips scores",            "Per-flow ML scores (behavioral scoring loop)",             "admin",           1, cmd_diag_ips_scores)
+X("execute diagnose ssl",                   "SSL inspection diagnostics (ssld, CA, steering)",          "admin",           0, cmd_diag_ssl)
+X("execute ips",                            "IPS operations",                                           "admin",           0, NULL)
+X("execute ips reload",                     "Reload IPS ruleset and hot-reload daemon (no traffic drop)","admin",           0, cmd_ips_reload)
+X("execute ips update-now",                 "Download enabled rulesets and rebuild active signatures",  "admin",           0, cmd_ips_update_now)
+X("show ips profile",                       "List IPS profiles and their signature filters",            "monitor",         0, cmd_show_ips_profiles)
+X("show ips filter",                        "Show signature filters for a specific profile",            "monitor",         1, cmd_show_ips_filters)
+/* Menu/discovery entries only (handler = NULL): they surface under
+ * `configure security` in tab/?-help, but must NOT match as dispatch handlers —
+ * a handler here would swallow the type path so cli_configure sees empty args.
+ * With NULL handler, dispatch falls through to the catch-all `configure`, which
+ * passes the full path ("security ssl-inspection-profile") to cli_configure to
+ * build the type_key and enter the context. Same pattern as `configure commit`. */
+X("configure security ips-profile",         "Create or edit IPS signature profiles",                   "configure,admin", 0, NULL)
+X("configure security ips-filter",          "Create or edit per-profile signature filters",            "configure,admin", 0, NULL)
+X("configure security ssl-inspection-profile", "Configure SSL inspection profiles (FortiGate-style)",  "configure,admin", 0, NULL)
 
 X("execute firmware",                       "Firmware management",                     "admin",           0,  NULL)
 X("execute firmware upgrade",               "Upgrade firmware from URL",               "admin",           1,  cmd_fw_upgrade)

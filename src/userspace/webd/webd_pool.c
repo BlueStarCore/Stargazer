@@ -1899,6 +1899,127 @@ static const char *kv_extract(const char *line, const char *key,
 	return dst;
 }
 
+/* GET /api/monitor/ips — IPS daemon status (key=value → JSON object). */
+static void flow_ips_status(work_item_t *item)
+{
+	webd_ipc_response_t resp;
+	if (webd_ipc_send(SG_CMD_IPS_STATUS, item->username,
+			  item->session_tag, "", &resp) != 0) {
+		char *json = json_error("Backend unavailable", NULL);
+		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
+		return;
+	}
+	if (resp.status != SG_OK) {
+		send_ipc_error(item->conn_id, resp.status, resp.extra);
+		webd_ipc_resp_free(&resp);
+		return;
+	}
+	/* resp.payload is "status=...\nmode=...\n..." → kv_to_json gives a flat object. */
+	char *json = kv_to_json(resp.payload ? resp.payload : "", NULL);
+	send_result(item->conn_id, 200, json, json ? strlen(json) : 0);
+	webd_ipc_resp_free(&resp);
+}
+
+/* GET /api/monitor/ips-alerts — recent IPS alert log lines (raw → {"output":...}). */
+static void flow_ips_alerts(work_item_t *item)
+{
+	webd_ipc_response_t resp;
+	if (webd_ipc_send(SG_CMD_IPS_ALERTS, item->username,
+			  item->session_tag,
+			  item->payload ? item->payload : "", &resp) != 0) {
+		char *json = json_error("Backend unavailable", NULL);
+		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
+		return;
+	}
+	if (resp.status != SG_OK) {
+		send_ipc_error(item->conn_id, resp.status, resp.extra);
+		webd_ipc_resp_free(&resp);
+		return;
+	}
+	/* Wrap raw log text as {"output":"..."} (same shape as flow_diagnose). */
+	size_t raw_len = resp.payload ? resp.payload_len : 0;
+	size_t esc_cap = raw_len * 2 + 64;
+	char *json = malloc(esc_cap);
+	if (json) {
+		size_t pos = 0;
+		pos += (size_t)snprintf(json + pos, esc_cap - pos, "{\"output\":\"");
+		if (resp.payload) {
+			for (size_t i = 0; i < raw_len && pos + 8 < esc_cap; i++) {
+				char ch = resp.payload[i];
+				if (ch == '"')       { json[pos++] = '\\'; json[pos++] = '"'; }
+				else if (ch == '\\') { json[pos++] = '\\'; json[pos++] = '\\'; }
+				else if (ch == '\n') { json[pos++] = '\\'; json[pos++] = 'n'; }
+				else if (ch == '\r') { json[pos++] = '\\'; json[pos++] = 'r'; }
+				else if (ch == '\t') { json[pos++] = '\\'; json[pos++] = 't'; }
+				else if ((unsigned char)ch >= 0x20) { json[pos++] = ch; }
+			}
+		}
+		pos += (size_t)snprintf(json + pos, esc_cap - pos, "\"}");
+		send_result(item->conn_id, 200, json, pos);
+	} else {
+		char *j = json_error("Out of memory", NULL);
+		send_result(item->conn_id, 500, j, j ? strlen(j) : 0);
+	}
+	webd_ipc_resp_free(&resp);
+}
+
+/* GET /api/ips/alerts-json — mgmtd trả SẴN JSON array [{...}]. Gửi nguyên văn,
+ * KHÔNG qua flow_simple/kv_to_json (nó tưởng payload là key=value → băm nát). */
+static void flow_ips_alerts_json(work_item_t *item)
+{
+	webd_ipc_response_t resp;
+	if (webd_ipc_send(SG_CMD_IPS_ALERTS_JSON, item->username,
+			  item->session_tag,
+			  item->payload ? item->payload : "", &resp) != 0) {
+		char *json = json_error("Backend unavailable", NULL);
+		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
+		return;
+	}
+	if (resp.status != SG_OK) {
+		send_ipc_error(item->conn_id, resp.status, resp.extra);
+		webd_ipc_resp_free(&resp);
+		return;
+	}
+	if (resp.payload && resp.payload_len > 0) {
+		char *body = malloc(resp.payload_len + 1);
+		if (body) {
+			memcpy(body, resp.payload, resp.payload_len);
+			body[resp.payload_len] = '\0';
+			send_result(item->conn_id, 200, body, resp.payload_len);
+		} else {
+			char *j = json_error("Out of memory", NULL);
+			send_result(item->conn_id, 500, j, j ? strlen(j) : 0);
+		}
+	} else {
+		send_result(item->conn_id, 200, strdup("[]"), 2);
+	}
+	webd_ipc_resp_free(&resp);
+}
+
+/* GET /api/ips/signatures — catalog signature (mgmtd trả sẵn JSON object
+ * {items,truncated}). payload mang "q=<từ khoá>" để lọc server-side. */
+static void flow_ips_signatures(work_item_t *item)
+{
+	webd_ipc_response_t resp;
+	const char *q = item->payload ? item->payload : "";
+	if (webd_ipc_send(SG_CMD_IPS_SIGNATURES, item->username,
+			  item->session_tag, q, &resp) != 0) {
+		char *json = json_error("Backend unavailable", NULL);
+		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
+		return;
+	}
+	if (resp.status != SG_OK) {
+		send_ipc_error(item->conn_id, resp.status, resp.extra);
+		webd_ipc_resp_free(&resp);
+		return;
+	}
+	/* payload đã là JSON object → gửi nguyên (item->payload do dispatcher free) */
+	const char *body = resp.payload ? resp.payload : "{\"items\":[],\"truncated\":0}";
+	char *out = strdup(body);
+	send_result(item->conn_id, 200, out, out ? strlen(out) : 0);
+	webd_ipc_resp_free(&resp);
+}
+
 static void flow_monitor_sessions(work_item_t *item)
 {
 	/* Call SG_CMD_SHOW_SESSIONS; parse the procfs text into JSON. */
@@ -2077,6 +2198,12 @@ static void *worker_fn(void *arg)
 		switch (item.flow_type) {
 		case FLOW_MONITOR_DHCP:     flow_monitor_dhcp(&item);     break;
 		case FLOW_MONITOR_SESSIONS: flow_monitor_sessions(&item); break;
+		case FLOW_IPS_STATUS:       flow_ips_status(&item);       break;
+		case FLOW_IPS_ALERTS:       flow_ips_alerts(&item);       break;
+		case FLOW_IPS_SIGS:         flow_ips_signatures(&item);   break;
+		case FLOW_IPS_UPDATE:       flow_diagnose(&item);         break;
+		case FLOW_IPS_ALERTS_JSON:  flow_ips_alerts_json(&item);   break;
+		case FLOW_IPS_UPDATE_LOG:   flow_diagnose(&item);         break;
 		case FLOW_LOGIN:         flow_login(&item);           break;
 		case FLOW_CONFIG_LIST:   flow_config_list(&item);     break;
 		case FLOW_CONFIG_CREATE: flow_config_create(&item);   break;

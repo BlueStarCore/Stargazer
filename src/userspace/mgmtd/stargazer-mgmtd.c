@@ -2004,22 +2004,68 @@ static int mgmtd_first_boot_seed(void)
 	 * mgmtd_reconcile_config() Phase 2 — runs every boot,
 	 * idempotent, also handles upgrade migration. */
 
-	/* ── Default interfaces ──────────────────────────────────────── */
-	/* lan3: LAN management interface — only seed if the hardware
-	 * actually exists.  On non-BPI-R4 platforms (e.g. QEMU) lan3
-	 * does not exist and mgmtd_sync_interfaces() will create entries
-	 * for whatever NICs the platform actually has. */
-	if (iface_exists("lan3")) {
-		if (sg_db_set("system_interface", "lan3",
-			      "mode=static\n"
-			      "ip=" MGMT_DEFAULT_IP "\n"
-			      "status=up\n"
-			      "mtu=1500\n"
-			      "allowaccess=ping http https\n") != 0) goto fail;
-	} else {
-		mgmt_log("INFO",
-			 "first-boot: skipping lan3 seed (hardware not present)");
-	}
+	/* Interface seeding is handled entirely by mgmtd_sync_interfaces()
+	 * which runs after the NIC wait — it assigns the management IP to
+	 * the correct first NIC on every platform (BPI-R4 lan3, QEMU eth0).
+	 * Seeding here would race with slow-probing hardware and produce
+	 * inconsistent allowaccess values depending on which path ran. */
+
+	/* ── IPS ruleset sources (builtin defaults) ──────────────────── */
+	/* Seeded non-critically: if they fail, don't block boot */
+#define ET_BASE "https://rules.emergingthreats.net/open/snort-2.9.0/rules/"
+	sg_db_set("security_ips-ruleset", "et-botcc",
+		  "description=ET open/botcc (Command-and-Control)\n"
+		  "url=" ET_BASE "emerging-botcc.rules\n"
+		  "enabled=disable\nbuiltin=yes\n");
+	sg_db_set("security_ips-ruleset", "et-botcc-portgrouped",
+		  "description=ET open/botcc.portgrouped\n"
+		  "url=" ET_BASE "emerging-botcc.portgrouped.rules\n"
+		  "enabled=disable\nbuiltin=yes\n");
+	sg_db_set("security_ips-ruleset", "et-compromised",
+		  "description=ET open/compromised (Known bad hosts)\n"
+		  "url=" ET_BASE "emerging-compromised.rules\n"
+		  "enabled=disable\nbuiltin=yes\n");
+	sg_db_set("security_ips-ruleset", "et-drop",
+		  "description=ET open/drop (Spamhaus DROP list)\n"
+		  "url=" ET_BASE "emerging-drop.rules\n"
+		  "enabled=disable\nbuiltin=yes\n");
+	sg_db_set("security_ips-ruleset", "et-dshield",
+		  "description=ET open/dshield (DShield blocklist)\n"
+		  "url=" ET_BASE "emerging-dshield.rules\n"
+		  "enabled=disable\nbuiltin=yes\n");
+	sg_db_set("security_ips-ruleset", "et-exploit",
+		  "description=ET open/exploit (Exploit kits)\n"
+		  "url=" ET_BASE "emerging-exploit.rules\n"
+		  "enabled=disable\nbuiltin=yes\n");
+	sg_db_set("security_ips-ruleset", "et-dos",
+		  "description=ET open/dos (Denial-of-Service)\n"
+		  "url=" ET_BASE "emerging-dos.rules\n"
+		  "enabled=disable\nbuiltin=yes\n");
+	sg_db_set("security_ips-ruleset", "et-trojan",
+		  "description=ET open/trojan (Trojan activity)\n"
+		  "url=" ET_BASE "emerging-trojan.rules\n"
+		  "enabled=disable\nbuiltin=yes\n");
+	sg_db_set("security_ips-ruleset", "et-scan",
+		  "description=ET open/scan (Port scan detection)\n"
+		  "url=" ET_BASE "emerging-scan.rules\n"
+		  "enabled=disable\nbuiltin=yes\n");
+	sg_db_set("security_ips-ruleset", "et-policy",
+		  "description=ET open/policy (Policy violations)\n"
+		  "url=" ET_BASE "emerging-policy.rules\n"
+		  "enabled=disable\nbuiltin=yes\n");
+	sg_db_set("security_ips-ruleset", "abuse-feodo",
+		  "description=abuse.ch/Feodo Tracker (botnet C2)\n"
+		  "url=https://feodotracker.abuse.ch/downloads/feodotracker.rules\n"
+		  "enabled=disable\nbuiltin=yes\n");
+	sg_db_set("security_ips-ruleset", "abuse-sslbl",
+		  "description=abuse.ch/SSL IP Blacklist\n"
+		  "url=https://sslbl.abuse.ch/blacklist/sslipblacklist.rules\n"
+		  "enabled=disable\nbuiltin=yes\n");
+	sg_db_set("security_ips-ruleset", "abuse-urlhaus",
+		  "description=abuse.ch/URLhaus (malware distribution)\n"
+		  "url=https://urlhaus.abuse.ch/downloads/urlhaus.rules\n"
+		  "enabled=disable\nbuiltin=yes\n");
+#undef ET_BASE
 
 	/* Verify critical tables populated before stamping flag */
 	for (size_t i = 0; i < N_CRITICAL; i++) {
@@ -2150,6 +2196,20 @@ static void mgmtd_reconcile_config(void)
 			  "builtin=yes\n"
 			  "immutable=yes\n"
 			  "comment=Match all services\n" },
+			{ "security_ips-profile", "default",
+			  "name=default\n"
+			  "status=enable\n"
+			  "categories=all\n"
+			  "builtin=yes\n"
+			  "immutable=yes\n"
+			  "comment=Default IPS profile (all signatures)\n" },
+			{ "security_ssl-inspection-profile", "no-inspection",
+			  "name=no-inspection\n"
+			  "status=enable\n"
+			  "inspection-mode=certificate\n"
+			  "builtin=yes\n"
+			  "immutable=yes\n"
+			  "comment=Built-in: no SSL inspection (read-only)\n" },
 			{ "firewall_policy", "1",
 			  "name=default-deny\n"
 			  "srcintf=any\n"
@@ -2232,6 +2292,87 @@ static void mgmtd_reconcile_config(void)
 				mgmt_log("ERROR",
 					 "reconcile: failed to overwrite %s:%s",
 					 btype, bid);
+			}
+		}
+	}
+
+	/* ── Phase 2b: seed missing built-in IPS ruleset sources ─────
+	 *
+	 * INSERT-only: never overwrites existing entries so that the user's
+	 * enabled/disabled choice survives firmware upgrades.  Runs on every
+	 * boot, so rulesets added by new firmware land even when the DB was
+	 * originally seeded by an older build (BOOT_NORMAL path). */
+	{
+#define ET_BASE "https://rules.emergingthreats.net/open/snort-2.9.0/rules/"
+		static const struct { const char *id; const char *data; } ips_rs[] = {
+			{ "et-botcc",
+			  "description=ET open/botcc (Command-and-Control)\n"
+			  "url=" ET_BASE "emerging-botcc.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "et-botcc-portgrouped",
+			  "description=ET open/botcc.portgrouped\n"
+			  "url=" ET_BASE "emerging-botcc.portgrouped.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "et-compromised",
+			  "description=ET open/compromised (Known bad hosts)\n"
+			  "url=" ET_BASE "emerging-compromised.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "et-drop",
+			  "description=ET open/drop (Spamhaus DROP list)\n"
+			  "url=" ET_BASE "emerging-drop.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "et-dshield",
+			  "description=ET open/dshield (DShield blocklist)\n"
+			  "url=" ET_BASE "emerging-dshield.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "et-exploit",
+			  "description=ET open/exploit (Exploit kits)\n"
+			  "url=" ET_BASE "emerging-exploit.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "et-dos",
+			  "description=ET open/dos (Denial-of-Service)\n"
+			  "url=" ET_BASE "emerging-dos.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "et-trojan",
+			  "description=ET open/trojan (Trojan activity)\n"
+			  "url=" ET_BASE "emerging-trojan.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "et-scan",
+			  "description=ET open/scan (Port scan detection)\n"
+			  "url=" ET_BASE "emerging-scan.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "et-policy",
+			  "description=ET open/policy (Policy violations)\n"
+			  "url=" ET_BASE "emerging-policy.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "abuse-feodo",
+			  "description=abuse.ch/Feodo Tracker (botnet C2)\n"
+			  "url=https://feodotracker.abuse.ch/downloads/feodotracker.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "abuse-sslbl",
+			  "description=abuse.ch/SSL IP Blacklist\n"
+			  "url=https://sslbl.abuse.ch/blacklist/sslipblacklist.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ "abuse-urlhaus",
+			  "description=abuse.ch/URLhaus (malware distribution)\n"
+			  "url=https://urlhaus.abuse.ch/downloads/urlhaus.rules\n"
+			  "enabled=disable\nbuiltin=yes\n" },
+			{ NULL, NULL }
+		};
+#undef ET_BASE
+		for (int i = 0; ips_rs[i].id; i++) {
+			char *existing = sg_db_get("security_ips-ruleset",
+						   ips_rs[i].id);
+			if (existing) { free(existing); continue; }
+			if (sg_db_set("security_ips-ruleset",
+				      ips_rs[i].id, ips_rs[i].data) == 0) {
+				mgmt_log("INFO", "reconcile: seeded ruleset %s",
+					 ips_rs[i].id);
+				changes++;
+			} else {
+				mgmt_log("ERROR",
+					 "reconcile: failed to seed ruleset %s",
+					 ips_rs[i].id);
 			}
 		}
 	}
@@ -2478,7 +2619,8 @@ static int read_sysfs_int(const char *path)
 	if (!f)
 		return -1;
 	int val = -1;
-	fscanf(f, "%d", &val);
+	if (fscanf(f, "%d", &val) != 1)
+		val = -1;
 	fclose(f);
 	return val;
 }
@@ -2683,7 +2825,7 @@ static void mgmtd_sync_interfaces(int is_first_boot)
 				snprintf(seed, sizeof(seed),
 					 "mode=static\n"
 					 "ip=" MGMT_DEFAULT_IP "\n"
-					 "allowaccess=ping\n"
+					 "allowaccess=ping http https\n"
 					 "status=up\n"
 					 "mtu=%d\n"
 					 "builtin=yes\n", cur_mtu);
@@ -3307,6 +3449,10 @@ static int mgmtd_replay_config(void)
 				rc == SG_OK ? "" : "FAIL ",
 				rb_result);
 			if (rc != SG_OK) fails++;
+			/* IPS Phase B: build active.rules from active profiles
+			 * after policy is loaded — ipsd loads this on start. */
+			rebuild_ips_active(rb_result, sizeof(rb_result));
+			fprintf(stderr, "[mgmtd] replay ips: %s\n", rb_result);
 			continue;
 		}
 		if (strcmp(table_types[i], "network_nat") == 0) {
@@ -4026,23 +4172,26 @@ int check_references(const char *type, const char *id,
 	sg_ref_entry_t refs[16];
 	int nrefs = sg_reg_find_referencing(type, refs, 16);
 
+	/* Đếm TỔNG số entry đang tham chiếu (gộp mọi field/type). */
+	int total = 0;
 	for (int i = 0; i < nrefs; i++) {
 		char *found = sg_db_find_referencing(refs[i].type,
 						     refs[i].key, id);
 		if (found) {
-			/* Extract first referencing entry for the message */
-			const char *nl = strchr(found, '\n');
-			size_t flen = nl ? (size_t)(nl - found) : strlen(found);
-			char first[128];
-			if (flen >= sizeof(first)) flen = sizeof(first) - 1;
-			memcpy(first, found, flen);
-			first[flen] = '\0';
-
-			snprintf(errbuf, errsz,
-				 "Referenced by %s (%s)", first, refs[i].key);
+			int cnt = 0;
+			for (const char *p = found; *p; p++)
+				if (*p == '\n') cnt++;
+			if (cnt == 0 && found[0])   /* không có '\n' cuối */
+				cnt = 1;
+			total += cnt;
 			free(found);
-			return -1;
 		}
+	}
+	if (total > 0) {
+		/* FortiGate-style. */
+		snprintf(errbuf, errsz,
+			 "The entry is used by other %d entries", total);
+		return -1;
 	}
 	return 0;
 }
@@ -4950,6 +5099,18 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			return 0;
 		}
 
+		/* Giới hạn số SSL inspection profile — mỗi profile chạy 1 ssld
+		 * riêng, nên chặn tạo quá nhiều (DoS process). Built-in
+		 * no-inspection không bị chặn (update bị immutable chặn ở trên). */
+		if (is_new_entry &&
+		    strcmp(db_type, "security_ssl-inspection-profile") == 0 &&
+		    sg_db_count(db_type) >= 8) {
+			free(existing);
+			send_error(client_fd, SG_ERR_INVALID_VAL,
+				   "Đã đạt giới hạn 8 SSL inspection profile");
+			return 0;
+		}
+
 		/* Build clean data: strip builtin=, password=, password-hash= */
 		char clean[SG_PAYLOAD_MAX];
 		size_t cpos = 0;
@@ -5277,18 +5438,62 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			}
 		}
 
+		/* security_ips-filter: persist rồi biên dịch lại ruleset IPS
+		 * (không đụng FORWARD chain — filter chỉ đổi nội dung ruleset).
+		 * Validate generic theo registry. */
+		if (strcmp(db_type, "security_ips-filter") == 0) {
+			char vr[512];
+			sg_status_t vrc = validate_cfg_data(db_type, clean,
+							    vr, sizeof(vr));
+			if (vrc != SG_OK) {
+				free(existing);
+				send_error(client_fd, vrc, vr);
+				return 0;
+			}
+			if (sg_db_set(db_type, db_id, clean) != 0) {
+				free(existing);
+				send_error(client_fd, SG_ERR_IO_FAIL,
+					   "Failed to write config");
+				return 0;
+			}
+			char ir[256];
+			rebuild_ips_active(ir, sizeof(ir));
+			free(existing);
+			send_ok(client_fd, "Config saved", NULL);
+			return 0;
+		}
+
 		/* Firewall/NAT types: persist first, then atomic rebuild.
 		 * The rebuild reads ALL entries from DB, so the new data
 		 * must be in the DB before we can generate the chain.
 		 * If rebuild fails, we rollback the DB change. */
 		if (strcmp(db_type, "firewall_policy") == 0 ||
-		    strcmp(db_type, "network_nat") == 0) {
+		    strcmp(db_type, "network_nat") == 0 ||
+		    strcmp(db_type, "security_ssl-inspection-profile") == 0 ||
+		    strcmp(db_type, "security_ips") == 0 ||
+		    strcmp(db_type, "security_ips-profile") == 0 ||
+		    strcmp(db_type, "security_ips-filter") == 0) {
 			/* Validate fields without touching the kernel */
 			char val_result[512];
 			sg_status_t val_rc;
 			if (strcmp(db_type, "firewall_policy") == 0)
 				val_rc = validate_firewall_policy(
 					db_id, clean,
+					val_result, sizeof(val_result));
+			else if (strcmp(db_type, "security_ssl-inspection-profile") == 0)
+				/* generic field validation (CFG_TABLE) */
+				val_rc = validate_cfg_data(
+					db_type, clean,
+					val_result, sizeof(val_result));
+			else if (strcmp(db_type, "security_ips") == 0)
+				val_rc = validate_ips(
+					db_id, clean,
+					val_result, sizeof(val_result));
+			else if (strcmp(db_type, "security_ips-profile") == 0 ||
+				 strcmp(db_type, "security_ips-filter") == 0)
+				/* generic field validation (CFG_TABLE) */
+				val_rc = validate_cfg_data(
+					db_type, clean,
 					val_result, sizeof(val_result));
 			else
 				val_rc = validate_nat(
@@ -5310,13 +5515,31 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 				return 0;
 			}
 
-			/* Atomic rebuild from DB */
+			/* Atomic rebuild from DB. SSL-inspection steering lives in
+			 * the *nat table (emit_ssl_steering inside rebuild_nat_chains),
+			 * so it rebuilds the NAT chains like network_nat does. */
 			char rb_result[512];
 			sg_status_t rb_rc;
-			if (strcmp(db_type, "firewall_policy") == 0)
+			if (strcmp(db_type, "firewall_policy") == 0 ||
+			    strcmp(db_type, "security_ips") == 0 ||
+			    strcmp(db_type, "security_ips-profile") == 0 ||
+			    strcmp(db_type, "security_ips-filter") == 0) {
 				rb_rc = rebuild_forward_chain(
 					rb_result, sizeof(rb_result));
-			else
+				/* A firewall policy's ssl-profile binding drives
+				 * the SSL-inspection steering (REDIRECT in *nat
+				 * PREROUTING) and the ssld lifecycle — both live
+				 * in rebuild_nat_chains (emit_ssl_steering +
+				 * ssld_sync). The FORWARD rebuild above never
+				 * touches them, so binding/unbinding an
+				 * ssl-profile on a policy would otherwise leave
+				 * steering + ssld stale (HTTPS not inspected, or
+				 * a dangling REDIRECT). Rebuild NAT too. */
+				if (rb_rc == SG_OK &&
+				    strcmp(db_type, "firewall_policy") == 0)
+					rb_rc = rebuild_nat_chains(
+						rb_result, sizeof(rb_result));
+			} else
 				rb_rc = rebuild_nat_chains(
 					rb_result, sizeof(rb_result));
 			if (rb_rc != SG_OK) {
@@ -5328,6 +5551,18 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 				free(existing);
 				send_error(client_fd, rb_rc, rb_result);
 				return 0;
+			}
+
+			/* IPS (Phase B): đổi profile/policy/ips → biên dịch lại
+			 * active.rules theo categories đang dùng + hot-reload ipsd.
+			 * Không fail-toàn-bộ nếu compile lỗi (chain đã apply OK);
+			 * chỉ log. */
+			if (strcmp(db_type, "security_ips") == 0 ||
+			    strcmp(db_type, "security_ips-profile") == 0 ||
+			    strcmp(db_type, "security_ips-filter") == 0 ||
+			    strcmp(db_type, "firewall_policy") == 0) {
+				char ips_r[256];
+				rebuild_ips_active(ips_r, sizeof(ips_r));
 			}
 			/* Re-evaluate live flows against the rebuilt chain so a
 			 * policy change applies to already-open connections.
@@ -5640,10 +5875,23 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		if (strcmp(db_type, "firewall_policy") == 0) {
 			char rb[512];
 			rebuild_forward_chain(rb, sizeof(rb));
+			/* The deleted policy may have bound an ssl-profile, whose
+			 * steering REDIRECT lives in *nat PREROUTING. Rebuild NAT
+			 * so that dangling steering is dropped + ssld re-synced;
+			 * the FORWARD rebuild above does not touch it. */
+			rebuild_nat_chains(rb, sizeof(rb));
 			/* Only the deleted policy's own flows can change verdict
 			 * (cmkid 0 here → dirty all, also safe). */
 			conntrack_reeval_after_policy_change(del_cmkid);
-		} else if (strcmp(db_type, "network_nat") == 0) {
+			char ir[256]; rebuild_ips_active(ir, sizeof(ir));
+		} else if (strcmp(db_type, "security_ips-filter") == 0 ||
+			   strcmp(db_type, "security_ips-profile") == 0) {
+			/* Xóa filter/profile → biên dịch lại ruleset IPS */
+			char ir[256]; rebuild_ips_active(ir, sizeof(ir));
+		} else if (strcmp(db_type, "network_nat") == 0 ||
+			   strcmp(db_type, "security_ssl-inspection-profile") == 0) {
+			/* Xóa SSL profile → rebuild nat (gỡ steering policy trỏ
+			 * profile đã mất) + ssld_sync (dừng ssld của profile đó). */
 			char rb[512];
 			rebuild_nat_chains(rb, sizeof(rb));
 		} else if (strcmp(db_type, "network_route_static") == 0) {
@@ -6054,6 +6302,81 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 	case SG_CMD_DHCP_LEASE_EVENT:
 		return handle_dhcp_lease_event(client_fd, user, payload, hdr);
 
+	case SG_CMD_IPS_REBUILD: {
+		/* Internal trigger (ips-update.sh sau khi cập nhật repo): biên
+		 * dịch lại active.rules theo profiles + hot-reload ipsd. Chỉ đọc
+		 * config DB sẵn có, fail-closed verify — không nhận dữ liệu ngoài. */
+		(void)user;
+		char rb[256];
+		rebuild_ips_active(rb, sizeof(rb));
+		send_ok(client_fd, NULL, rb);  /* rb vào payload → CLI/Web in được lý do */
+		return 0;
+	}
+
+	case SG_CMD_IPS_UPDATE_NOW: {
+		(void)user;
+		/*
+		 * Downloads can take a while.  Double-fork so the mgmtd MAIN loop
+		 * stays responsive (it keeps serving other IPC while the inner
+		 * child downloads).  KHÁC bản cũ: inner child GIỮ client_fd và
+		 * GỬI ĐÚNG kết quả (thành công/lỗi + lý do) về cho webd → UI hiện
+		 * toast thật, thay vì "Update started in background" rồi vứt kết
+		 * quả (khiến lỗi tải/syntax bị ẩn, người dùng không biết vì sao
+		 * custom rule không xuất hiện).
+		 *
+		 * Inner child reparent về init (không zombie); parent reap wrapper
+		 * và trả "owned"=1 để main loop không đụng client_fd (inner sở hữu).
+		 * Inner mở SQLite handle riêng — không share sqlite3* qua fork.
+		 */
+		char ids_copy[512] = "";
+		if (payload && payload[0])
+			snprintf(ids_copy, sizeof(ids_copy), "%s", payload);
+
+		pid_t mid = fork();
+		if (mid < 0) {
+			send_error(client_fd, SG_ERR_SYSTEM_FAIL, "fork failed");
+			return 0;
+		}
+		if (mid == 0) {
+			/* Wrapper — KHÔNG đóng client_fd (để inner thừa kế + trả lời) */
+			if (g_listen_fd >= 0) close(g_listen_fd);
+			pid_t inner = fork();
+			if (inner == 0) {
+				/* Inner child — reparented to init, sở hữu client_fd */
+				sg_db_close();
+				if (sg_db_open(SG_DB_PATH) != 0) {
+					send_error(client_fd, SG_ERR_SYSTEM_FAIL,
+						   "DB open failed");
+					_exit(1);
+				}
+				char rb[4096];
+				sg_status_t st = run_ips_update_now(
+					ids_copy[0] ? ids_copy : NULL,
+					rb, sizeof(rb));
+				if (st == SG_OK)
+					send_ok(client_fd, NULL, rb);
+				else
+					send_error(client_fd, st, rb);
+				sg_db_close();
+				close(client_fd);
+				_exit(0);
+			}
+			close(client_fd);   /* wrapper bỏ bản sao; chỉ inner giữ kênh */
+			_exit(0);           /* wrapper exits → inner reparented to init */
+		}
+		waitpid(mid, NULL, 0);  /* reap wrapper (<1ms) */
+		close(client_fd);       /* parent bỏ bản sao; inner sở hữu fd */
+		return 1;               /* owned → main loop KHÔNG đóng client_fd */
+	}
+
+	case SG_CMD_IPS_RULESETS_RELOAD: {
+		(void)user;
+		char rb[4096];
+		ips_rulesets_reload_custom(rb, sizeof(rb));
+		send_ok(client_fd, NULL, rb);   /* rb → payload so webd emits {"output":"..."} */
+		return 0;
+	}
+
 	case SG_CMD_SHOW_STATUS: {
 		char status_buf[512];
 		size_t spos = 0;
@@ -6414,14 +6737,15 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			return 0;
 		}
 		const char *argv[] = {
-			"iptables", "-L", "INPUT", "-n", "-v", NULL
+			"iptables", "-L", "FORWARD", "-n", "-v",
+			"--line-numbers", NULL
 		};
 		char *out = safe_exec(argv);
 		if (out && out[0])
 			send_ok(client_fd, NULL, out);
 		else
 			send_ok(client_fd, "empty",
-				"  No INPUT chain rules found.\n"
+				"  No FORWARD chain rules found.\n"
 				"  (is iptables available?)\n");
 		free(out);
 		return 0;
@@ -6630,6 +6954,34 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		return handle_diag_ram(client_fd, user, payload, hdr);
 	case SG_CMD_DIAG_DISK:
 		return handle_diag_disk(client_fd, user, payload, hdr);
+
+	case SG_CMD_SSL_CACERT:
+		return handle_ssl_cacert(client_fd, user, payload, hdr);
+
+	case SG_CMD_SSL_DIAG:
+		return handle_ssl_diag(client_fd, user, payload, hdr);
+
+	case SG_CMD_IPS_STATUS:
+		return handle_ips_status(client_fd, user, payload, hdr);
+
+	case SG_CMD_IPS_ALERTS:
+		return handle_ips_alerts(client_fd, user, payload, hdr);
+
+	case SG_CMD_IPS_ALERTS_CLEAR:
+		return handle_ips_alerts_clear(client_fd, user, payload, hdr);
+
+	case SG_CMD_IPS_SCORES:
+		return handle_ips_scores(client_fd, user, payload, hdr);
+
+	case SG_CMD_IPS_SIGNATURES:
+		return handle_ips_signatures(client_fd, user, payload, hdr);
+
+	case SG_CMD_IPS_ALERTS_JSON:
+		return handle_ips_alerts_json(client_fd, user, payload, hdr);
+
+	case SG_CMD_IPS_UPDATE_LOG:
+		return handle_ips_update_log(client_fd, user, payload, hdr);
+
 	case SG_CMD_DIAG_IFACE_STATS:
 		return handle_diag_iface_stats(client_fd, user, payload, hdr);
 	case SG_CMD_DIAG_PROCTOP:

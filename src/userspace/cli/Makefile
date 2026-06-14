@@ -37,7 +37,8 @@ SRCS := stargazer-cli.c \
 HEADERS := cli_readline.h cli_ipc.h cli_configure.h cli_cmd_table.h \
            cli_dispatch.h cli_diagnose.h cli_diagnose_sys.h cli_diagnose_bootlog.h \
            cli_show.h cli_debug.h cli_sandbox.h \
-           $(COMMON_DIR)/sg_validate.h ../mgmtd/stargazer_ipc.h
+           $(COMMON_DIR)/sg_validate.h $(COMMON_DIR)/sg_cmd_defs.h \
+           ../mgmtd/stargazer_ipc.h
 
 TARGET := $(BUILD_DIR)/stargazer-cli
 

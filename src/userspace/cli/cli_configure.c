@@ -523,9 +523,27 @@ static void register_value_completions(const char *key, const char *kind)
 	/* Other kinds (cidr, ipv4, uint, safe-id, tz-token, etc.) — no value completions */
 }
 
-/* Register set commands for a config type */
-static void register_set_cmds(const char *type_name)
+/* firewall_policy: IPS coi như TẮT nếu ips-status=disable; hoặc (legacy chưa có
+ * ips-status) ips-profile rỗng/none. Dùng để ẩn ips-profile khỏi `show` khi tắt
+ * (tắt = không liên kết profile nào). */
+static int policy_ips_off(const char *ips_status, const char *ips_profile)
 {
+	if (ips_status && *ips_status)
+		return strcmp(ips_status, "enable") != 0;
+	return (!ips_profile || !*ips_profile ||
+		strcmp(ips_profile, "none") == 0);
+}
+
+/* Register set commands for a config type. `action` = giá trị action hiện tại
+ * của entry (NULL nếu không liên quan) → ẩn gợi ý ssl-profile/ips-profile/
+ * ips-status trên firewall_policy deny/drop (chỉ hợp lệ cho accept). */
+static void register_set_cmds(const char *type_name, const char *action)
+{
+	int policy_deny = type_name &&
+		strcmp(type_name, "firewall_policy") == 0 &&
+		action && (strcmp(action, "deny") == 0 ||
+			   strcmp(action, "drop") == 0);
+
 	const char *keys = sg_reg_valid_keys(type_name);
 	if (!keys || !*keys) {
 		cli_register("set", "Set a parameter (set <key> <value>)");
@@ -544,6 +562,18 @@ static void register_set_cmds(const char *type_name)
 		while (*end && *end != ' ') end++;
 		char saved = *end;
 		*end = '\0';
+
+		/* ips-status: field nội bộ (tự đồng bộ từ ips-profile) → KHÔNG hint.
+		 * ssl-profile/ips-profile: chỉ accept → ẩn gợi ý trên deny/drop. */
+		int is_policy = type_name &&
+			strcmp(type_name, "firewall_policy") == 0;
+		if ((is_policy && strcmp(tok, "ips-status") == 0) ||
+		    (policy_deny && (strcmp(tok, "ssl-profile") == 0 ||
+				     strcmp(tok, "ips-profile") == 0))) {
+			*end = saved;
+			tok = end;
+			continue;
+		}
 
 		char regpath[CLI_MAX_LINE + 272], regdesc[CLI_MAX_LINE + 272];
 		const char *desc = sg_reg_field_desc(type_name, tok);
@@ -581,6 +611,14 @@ static void register_unset_get_cmds(const char *type_name)
 		char saved = *end;
 		*end = '\0';
 
+		/* ips-status: field nội bộ → không gợi ý unset/get trên policy. */
+		if (type_name && strcmp(type_name, "firewall_policy") == 0 &&
+		    strcmp(tok, "ips-status") == 0) {
+			*end = saved;
+			tok = end;
+			continue;
+		}
+
 		char regpath[CLI_MAX_LINE + 272], regdesc[CLI_MAX_LINE + 272];
 		snprintf(regpath, sizeof(regpath), "unset %s", tok);
 		snprintf(regdesc, sizeof(regdesc), "Unset %s", tok);
@@ -596,13 +634,13 @@ static void register_unset_get_cmds(const char *type_name)
 }
 
 /* Register entry context sub-commands */
-static void register_entry_cmds(const char *type_name)
+static void register_entry_cmds(const char *type_name, const char *action)
 {
 	cli_register("show", "Show all parameters for this entry");
 	cli_register("next", "Save entry and return to table");
 	cli_register("end", "Save entry and exit context");
 	cli_register("abort", "Discard changes and exit");
-	register_set_cmds(type_name);
+	register_set_cmds(type_name, action);
 	register_unset_get_cmds(type_name);
 }
 
@@ -625,7 +663,7 @@ static void register_single_cmds(const char *type_name)
 	cli_register("show", "Show all parameters");
 	cli_register("end", "Save and exit");
 	cli_register("abort", "Discard changes and exit");
-	register_set_cmds(type_name);
+	register_set_cmds(type_name, NULL);
 	register_unset_get_cmds(type_name);
 }
 
@@ -838,7 +876,7 @@ static int context_entry(const char *type_name, const char *label,
 	ipc_resp_free(&resp);
 
 	cli_push();
-	register_entry_cmds(type_name);
+	register_entry_cmds(type_name, kv_get(&data, "action"));
 
 	char prompt[384];
 	snprintf(prompt, sizeof(prompt), "(%s-%s) # ", label, entry_id);
@@ -887,6 +925,30 @@ static int context_entry(const char *type_name, const char *label,
 				       " and cannot be set\n", key);
 				continue;
 			}
+			/* ips-status là field NỘI BỘ — tự bật/tắt theo ips-profile.
+			 * Không cho set tay (dùng: set ips-profile <name> để bật,
+			 * set ips-profile none để tắt). */
+			if (strcmp(type_name, "firewall_policy") == 0 &&
+			    strcmp(key, "ips-status") == 0) {
+				printf("  Error: invalid key 'ips-status' for %s\n",
+				       type_name);
+				continue;
+			}
+			/* Security profiles (ssl/ips) chỉ hợp lệ trên ACCEPT policy.
+			 * DENY/DROP drop gói ở L4, không inspect L7 → chặn ngay lúc
+			 * set (khớp validation backend + web ẩn dropdown). */
+			if (strcmp(type_name, "firewall_policy") == 0 &&
+			    (strcmp(key, "ssl-profile") == 0 ||
+			     strcmp(key, "ips-profile") == 0)) {
+				const char *act = kv_get(&data, "action");
+				if (act && (strcmp(act, "deny") == 0 ||
+					    strcmp(act, "drop") == 0)) {
+					printf("  Error: '%s' chỉ đặt được khi "
+					       "action=accept (policy này action=%s)\n",
+					       key, act);
+					continue;
+				}
+			}
 			/* Password: interactive prompt */
 			if (strcmp(type_name, "system_admin") == 0 &&
 			    strcmp(key, "password") == 0) {
@@ -932,6 +994,13 @@ static int context_entry(const char *type_name, const char *label,
 				fprintf(stderr,
 					"[CFG-DBG] set: %s=%s"
 					" (valid)\n", key, val);
+			/* Tiện dụng: trên policy, set ips-profile (luôn là profile thật)
+			 * → tự bật toggle nội bộ ips-status=enable. Tắt = unset ips-profile
+			 * (xử lý ở nhánh unset). Web reload thấy switch gạt theo. */
+			if (strcmp(type_name, "firewall_policy") == 0 &&
+			    strcmp(key, "ips-profile") == 0) {
+				kv_set(&data, "ips-status", "enable");
+			}
 		} else if (strcmp(cmd, "unset") == 0) {
 			if (!key[0]) {
 				printf("  Usage: unset <key>\n");
@@ -949,12 +1018,24 @@ static int context_entry(const char *type_name, const char *label,
 				       " and cannot be unset\n", key);
 				continue;
 			}
+			/* ips-status nội bộ — không cho unset tay (dùng unset
+			 * ips-profile để tắt IPS). */
+			if (strcmp(type_name, "firewall_policy") == 0 &&
+			    strcmp(key, "ips-status") == 0) {
+				printf("  Error: invalid key 'ips-status' for %s\n",
+				       type_name);
+				continue;
+			}
 			if (strcmp(type_name, "system_admin") == 0 &&
 			    strcmp(key, "password") == 0) {
 				password_cleared = 1;
 				data.modified = 1;
 			}
 			kv_unset(&data, key);
+			/* unset ips-profile = tắt IPS → gỡ luôn toggle nội bộ. */
+			if (strcmp(type_name, "firewall_policy") == 0 &&
+			    strcmp(key, "ips-profile") == 0)
+				kv_unset(&data, "ips-status");
 			if (cfg_dbg())
 				fprintf(stderr,
 					"[CFG-DBG] unset: %s\n",
@@ -985,10 +1066,24 @@ static int context_entry(const char *type_name, const char *label,
 			if (cfg_reject_extra(key, "show"))
 				continue;
 			if (data.count > 0) {
+				int p_off = strcmp(type_name,
+						   "firewall_policy") == 0 &&
+					policy_ips_off(kv_get(&data, "ips-status"),
+						       kv_get(&data, "ips-profile"));
 				printf("    edit \"%s\"\n", entry_id);
 				for (int i = 0; i < data.count; i++) {
 					if (strcmp(data.entries[i].key,
 						   "builtin") == 0)
+						continue;
+					/* ips-status: field nội bộ — không show. */
+					if (strcmp(type_name, "firewall_policy") == 0 &&
+					    strcmp(data.entries[i].key,
+						   "ips-status") == 0)
+						continue;
+					/* IPS tắt → không hiện ips-profile (không
+					 * liên kết profile nào). */
+					if (p_off && strcmp(data.entries[i].key,
+							    "ips-profile") == 0)
 						continue;
 					if (strcmp(type_name,
 						   "system_admin") == 0 &&
@@ -1288,6 +1383,15 @@ static int context_table(const char *type_name, const char *label)
 							printf("    edit"
 							       " \"%s\"\n",
 							       id);
+							/* IPS tắt → ẩn ips-profile (xem entry show). */
+							struct kv_buf tkv;
+							kv_init(&tkv);
+							kv_parse(&tkv, dr.payload);
+							int p_off = strcmp(type_name,
+								"firewall_policy") == 0 &&
+								policy_ips_off(
+								  kv_get(&tkv, "ips-status"),
+								  kv_get(&tkv, "ips-profile"));
 							const char *p =
 								dr.payload;
 							while (*p) {
@@ -1305,6 +1409,20 @@ static int context_table(const char *type_name, const char *label)
 											(size_t)(eq - p);
 										if (klen == 7 &&
 										    strncmp(p, "builtin", 7) == 0) {
+											p += llen;
+											if (eol) p++;
+											continue;
+										}
+										/* ips-status nội bộ → ẩn. */
+										if (klen == 10 &&
+										    strncmp(p, "ips-status", 10) == 0) {
+											p += llen;
+											if (eol) p++;
+											continue;
+										}
+										/* IPS tắt → ẩn ips-profile. */
+										if (p_off && klen == 11 &&
+										    strncmp(p, "ips-profile", 11) == 0) {
 											p += llen;
 											if (eol) p++;
 											continue;
@@ -1464,6 +1582,11 @@ static int context_table(const char *type_name, const char *label)
 				    dresp.status == SG_OK) {
 					printf("  Profile '%s'"
 					       " deleted.\n", arg);
+				} else if (dresp.status == SG_ERR_IN_USE &&
+					   dresp.extra[0]) {
+					/* FortiGate-style: đang được tham chiếu. */
+					printf("  %s\n  Command fail.\n",
+					       dresp.extra);
 				} else {
 					if (dresp.extra[0])
 						printf("  Error: %s\n",
@@ -1483,6 +1606,11 @@ static int context_table(const char *type_name, const char *label)
 						 &dresp) == 0 &&
 				    dresp.status == SG_OK) {
 					printf("  Entry %s deleted.\n", arg);
+				} else if (dresp.status == SG_ERR_IN_USE &&
+					   dresp.extra[0]) {
+					/* FortiGate-style: đang được tham chiếu. */
+					printf("  %s\n  Command fail.\n",
+					       dresp.extra);
 				} else {
 					if (dresp.extra[0])
 						printf("  Error: %s\n",
@@ -1630,6 +1758,13 @@ static int context_single(const char *type_name, const char *label)
 				fprintf(stderr,
 					"[CFG-DBG] set: %s=%s"
 					" (valid)\n", key, val);
+			/* Tiện dụng: trên policy, set ips-profile (luôn là profile thật)
+			 * → tự bật toggle nội bộ ips-status=enable. Tắt = unset ips-profile
+			 * (xử lý ở nhánh unset). Web reload thấy switch gạt theo. */
+			if (strcmp(type_name, "firewall_policy") == 0 &&
+			    strcmp(key, "ips-profile") == 0) {
+				kv_set(&data, "ips-status", "enable");
+			}
 		} else if (strcmp(cmd, "unset") == 0) {
 			if (!key[0]) {
 				printf("  Usage: unset <key>\n");

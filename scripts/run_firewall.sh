@@ -50,6 +50,15 @@ fi
 
 # U-Boot boots from boot.img (virtio0), then loads kernel+initramfs from disk
 # vda=boot, vdb=sgdata (config), vdc=sglogs (logs)
+#
+# NIC order on ARM virtio-mmio: the LAST device on the cmdline gets the lowest
+# MMIO address and is probed FIRST by the kernel → becomes eth0.
+# mgmtd_sync_interfaces() assigns the management IP to the first NIC
+# alphabetically (eth0), so LAN must be declared LAST.
+#   WAN first  → guest eth1 (higher MMIO addr, probed second)
+#   LAN last   → guest eth0 (lower MMIO addr,  probed first)
+# U-Boot also uses eth0 (= LAN here) for BOOTP, which exercises the TX
+# virtqueue and prevents the TX-stall that occurs on the unused device.
 exec qemu-system-aarch64 \
     -machine virt -cpu cortex-a72 -smp 4 -m 2G \
     -bios "$UBOOT_BIN" \
@@ -58,6 +67,6 @@ exec qemu-system-aarch64 \
     -drive file="$LOGS_IMG",format=raw,if=virtio \
     -nographic \
     -netdev tap,id=wan,ifname=tap-sg-wan,script=no,downscript=no \
-    -device virtio-net-pci,netdev=wan,mac=52:54:00:12:01:02 \
+    -device virtio-net-device,netdev=wan,mac=52:54:00:12:01:02 \
     -netdev tap,id=lan,ifname=tap-sg-lan,script=no,downscript=no \
-    -device virtio-net-pci,netdev=lan,mac=52:54:00:12:02:fe
+    -device virtio-net-device,netdev=lan,mac=52:54:00:12:02:fe

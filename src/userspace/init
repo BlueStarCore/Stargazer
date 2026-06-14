@@ -345,6 +345,18 @@ if [ -x /sbin/stargazer-mgmtd ]; then
 fi
 # webd is now started by mgmtd's supervisor — no init block needed.
 
+# stargazer-ipsd lifecycle quản lý bởi mgmtd (không phải init).
+# mgmtd start ipsd khi rebuild_forward_chain emit NFQUEUE rules (security_ips=enable
+# VÀ có ít nhất 1 policy ips-profile=default), stop ipsd khi không còn rule nào.
+# Init không start ipsd trực tiếp — đúng như webd được mgmtd supervise.
+
+# crond — chạy lịch IPS signature auto-update (wrapper tự kiểm config bật/tắt).
+if command -v crond >/dev/null 2>&1; then
+	mkdir -p /var/spool/cron/crontabs
+	crond -b -c /var/spool/cron/crontabs -L /dev/null 2>/dev/null \
+		&& echo "[stargazer] crond started (IPS auto-update schedule)"
+fi
+
 # Create commands (remove busybox symlinks first to avoid "Text file busy")
 rm -f /sbin/service /sbin/poweroff /sbin/reboot /sbin/halt /sbin/shutdown
 
@@ -395,6 +407,8 @@ sleep 0.3
 # Safety net: kill any stragglers individually
 killall stargazer-cli 2>/dev/null
 killall stargazer-logind 2>/dev/null
+killall stargazer-ipsd 2>/dev/null
+killall crond 2>/dev/null
 
 # SIGTERM mgmtd — its shutdown_children() handles webd, udhcpc, udhcpd
 # (SIGUSR2 for DHCP RELEASE, SIGTERM, then SIGKILL for stragglers).

@@ -38,6 +38,7 @@ $(BUILD_DIR)/tweetnacl.o: tweetnacl.c tweetnacl.h
 MGMTD_APPLY_SRCS := mgmtd_apply_route.c mgmtd_apply_iface.c \
                      mgmtd_apply_nat.c mgmtd_apply_dns.c mgmtd_apply_dhcp.c \
                      mgmtd_apply_firewall.c mgmtd_apply_ntp.c \
+                     mgmtd_apply_ssl.c mgmtd_apply_ips.c mgmtd_ips_compile.c \
                      mgmtd_sequence.c
 
 MGMTD_SRCS := mgmtd_user.c mgmtd_firmware.c mgmtd_network.c mgmtd_diag.c \

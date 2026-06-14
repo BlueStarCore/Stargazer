@@ -87,6 +87,26 @@
                 </div>
             </div>
 
+            <!-- Security -->
+            <div class="nav-category" data-section="security">
+                <div class="nav-category-header" tabindex="0" aria-expanded="false">
+                    <span class="nav-icon" aria-hidden="true">&#9876;</span>
+                    <span class="nav-label">SECURITY</span>
+                    <span class="nav-arrow" aria-hidden="true">&#9656;</span>
+                </div>
+                <div class="nav-sub">
+                    <div class="nav-sub-item" data-page="sec-ips">
+                        <span class="sub-label">IPS SIGNATURES</span>
+                    </div>
+                    <div class="nav-sub-item" data-page="sec-ips-profiles">
+                        <span class="sub-label">IPS PROFILES</span>
+                    </div>
+                    <div class="nav-sub-item" data-page="sec-ssl">
+                        <span class="sub-label">SSL INSPECTION</span>
+                    </div>
+                </div>
+            </div>
+
             <!-- System -->
             <div class="nav-category" data-section="system">
                 <div class="nav-category-header" tabindex="0" aria-expanded="false">
@@ -109,6 +129,9 @@
                     </div>
                     <div class="nav-sub-item" data-page="sys-firmware">
                         <span class="sub-label">FIRMWARE</span>
+                    </div>
+                    <div class="nav-sub-item" data-page="sys-certificates">
+                        <span class="sub-label">CERTIFICATES</span>
                     </div>
                 </div>
             </div>
@@ -631,6 +654,9 @@
                             <div class="form-row" data-key="dstaddr"><label class="form-label">Destination</label><select class="form-input addr-select"><option value="all" selected>all</option></select></div>
                             <div class="form-row" data-key="service"><label class="form-label">Service</label><select class="form-input svc-select"><option value="all" selected>ALL</option></select></div>
                             <div class="form-row" data-key="action"><label class="form-label">Action</label><select class="form-input"><option value="accept" selected>ACCEPT</option><option value="deny">DENY</option><option value="drop">DROP</option></select></div>
+                            <div class="form-row" data-key="ips-status"><label class="form-label">IPS</label><label class="switch"><input type="checkbox" class="form-input" data-on="enable" data-off="disable"><span class="slider"></span></label></div>
+                            <div class="form-row" data-key="ips-profile"><label class="form-label">IPS Profile</label><select class="form-input ips-profile-select"><option value="default" selected>default</option></select></div>
+                            <div class="form-row" data-key="ssl-profile"><label class="form-label">SSL Inspection</label><select class="form-input ssl-profile-select"><option value="no-inspection" selected>no-inspection</option></select></div>
                             <div class="form-row" data-key="schedule"><label class="form-label">Schedule</label><input class="form-input" type="text" value="all" placeholder="all or schedule name" maxlength="64"></div>
                             <div class="form-row form-row-full form-row-wide" data-key="comment"><label class="form-label">Comment</label><input class="form-input" type="text" placeholder="Optional description" maxlength="255"></div>
                         </div>
@@ -698,6 +724,322 @@
                     <tbody>
                     </tbody>
                 </table>
+            </div>
+
+            <!-- ======== SECURITY > IPS (5-tab OPNsense-style) ======== -->
+            <div id="page-sec-ips" class="page" style="display:none">
+                <div class="page-header"><h1 class="page-title">IPS SIGNATURES</h1></div>
+
+                <!-- Tab bar -->
+                <div class="page-tab-bar">
+                    <button class="page-tab active" data-ips-tab="settings">Settings</button>
+                    <button class="page-tab" data-ips-tab="download">Download</button>
+                    <button class="page-tab" data-ips-tab="rules">Rules</button>
+                    <button class="page-tab" data-ips-tab="alerts">Alerts</button>
+                    <button class="page-tab" data-ips-tab="schedule">Schedule</button>
+                </div>
+
+                <!-- ── Tab: Settings ── -->
+                <div class="ips-tab-pane" data-ips-pane="settings">
+                    <div style="display:flex;justify-content:flex-end;margin-bottom:12px">
+                        <button class="btn" id="ips-reload-btn">Reload Service</button>
+                    </div>
+                    <div class="form-card" data-settings="security">
+                        <div class="form-section">INTRUSION PREVENTION</div>
+                        <div class="form-row" data-key="status">
+                            <label class="form-label">Status</label>
+                            <select class="form-input">
+                                <option value="disable">Disabled</option>
+                                <option value="enable">Enabled</option>
+                            </select>
+                        </div>
+                        <div class="form-row" data-key="mode">
+                            <label class="form-label">Mode</label>
+                            <select class="form-input">
+                                <option value="prevent">Prevent (block)</option>
+                                <option value="detect">Detect (alert only)</option>
+                            </select>
+                        </div>
+                        <div class="form-row" data-key="snapshot-bytes">
+                            <label class="form-label">Inspection window (bytes)</label>
+                            <input class="form-input" type="number" min="1024" max="262144" placeholder="16384">
+                        </div>
+                        <div class="form-actions"><button class="btn btn-primary">Apply</button><button class="btn">Reset</button></div>
+                    </div>
+                    <div style="margin-top:12px;display:flex;align-items:center;gap:8px">
+                        <span class="form-label" style="margin:0">Hướng dẫn áp dụng</span>
+                        <span class="sg-info" tabindex="0" role="img" aria-label="Hướng dẫn">i<span class="sg-tip">Bật IPS ở đây, sau đó gắn vào policy: Firewall &rarr; Policies &rarr; chọn policy <b>accept</b> &rarr; set <b>IPS Profile = default</b>.</span></span>
+                    </div>
+                </div>
+
+                <!-- ── Tab: Download ── -->
+                <div class="ips-tab-pane" data-ips-pane="download" style="display:none">
+                    <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+                        <input id="ips-rulesets-search" class="form-input" style="width:200px" placeholder="Search…">
+                        <button class="btn" id="ips-rulesets-reload-btn" title="Rescan /etc/stargazer/ips/custom/ for new XML files">&#8635; Reload</button>
+                        <button class="btn" id="ips-custom-add-btn" style="margin-left:auto">+ Import Custom Rules</button>
+                    </div>
+                    <div class="table-scroll">
+                        <table class="data-table" id="ips-rulesets-table">
+                            <thead><tr>
+                                <th class="th-checkbox"><input type="checkbox" id="ips-rulesets-all"></th>
+                                <th>DESCRIPTION</th>
+                                <th>LAST UPDATED</th>
+                                <th></th>
+                            </tr></thead>
+                            <tbody id="ips-rulesets-tbody"></tbody>
+                        </table>
+                    </div>
+                    <div id="ips-update-log" style="display:none;margin-top:12px">
+                        <div class="form-card">
+                            <div class="form-section">UPDATE LOG</div>
+                            <pre id="ips-update-log-content" style="white-space:pre-wrap;word-break:break-word;max-height:200px;overflow:auto;margin:0;font-size:12px"></pre>
+                        </div>
+                    </div>
+                    <div style="margin-top:12px">
+                        <button class="btn btn-primary" id="ips-update-now-btn" style="padding:8px 20px">Download &amp; Update Rules</button>
+                    </div>
+                </div>
+
+                <!-- ── Custom ruleset import modal ── -->
+                <div class="modal-overlay" id="modal-ips-custom" style="display:none" role="dialog" aria-modal="true" aria-label="Import custom ruleset">
+                    <div class="form-card" style="width:460px;max-width:95vw">
+                        <div class="form-section" style="display:flex;justify-content:space-between;align-items:center">
+                            <span class="modal-title-text">IMPORT CUSTOM RULES</span>
+                            <button class="modal-close" type="button" id="ips-custom-modal-close" aria-label="Close">&#10005;</button>
+                        </div>
+                        <div class="modal-body" style="padding:20px">
+                            <div style="display:flex;flex-direction:column;gap:14px">
+                                <div>
+                                    <label class="form-label" style="display:block;margin-bottom:4px">Description <span style="color:#e05">*</span></label>
+                                    <input type="text" id="ips-custom-desc" class="form-input" style="width:100%;box-sizing:border-box" placeholder="e.g. My Company Block List" autocomplete="off">
+                                </div>
+                                <div>
+                                    <label class="form-label" style="display:block;margin-bottom:4px">URL <span style="color:#e05">*</span></label>
+                                    <input type="text" id="ips-custom-url" class="form-input" style="width:100%;box-sizing:border-box" placeholder="https://example.com/rules/custom.rules" autocomplete="off">
+                                    <p class="form-hint" style="margin:4px 0 0;font-size:12px;color:#888">HTTP/HTTPS link to a Snort-compatible <code>.rules</code> file. Downloaded on each update.</p>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="modal-footer" style="display:flex;gap:8px;padding:12px 20px;border-top:1px solid var(--border-light)">
+                            <button class="btn btn-primary" id="ips-custom-submit">Add Ruleset</button>
+                            <button class="btn" id="ips-custom-cancel">Cancel</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ── Tab: Rules ── -->
+                <div class="ips-tab-pane" data-ips-pane="rules" style="display:none">
+                    <div class="toolbar" style="margin-bottom:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                        <input id="ips-rules-search" class="form-input" style="width:240px" placeholder="Search SID, message, source...">
+                        <select id="ips-rules-action-filter" class="form-input" style="width:140px">
+                            <option value="">All actions</option>
+                            <option value="alert">Alert</option>
+                            <option value="drop">Drop</option>
+                        </select>
+                        <span id="ips-rules-count-label" style="font-size:12px;color:#666;margin-left:auto"></span>
+                        <button class="btn" id="ips-rules-refresh" title="Refresh rules">&#8635; Refresh</button>
+                    </div>
+                    <div class="table-scroll">
+                        <table class="data-table" id="ips-rules-table">
+                            <thead><tr>
+                                <th>SID</th>
+                                <th>ACTION</th>
+                                <th>SOURCE</th>
+                                <th>CLASSTYPE</th>
+                                <th>MESSAGE</th>
+                                <th>INFO</th>
+                            </tr></thead>
+                            <tbody id="ips-rules-tbody"></tbody>
+                        </table>
+                    </div>
+                    <div class="rf-pager" id="ips-rules-pager"></div>
+                </div>
+
+                <!-- ── Tab: Alerts ── -->
+                <div class="ips-tab-pane" data-ips-pane="alerts" style="display:none">
+                    <div class="toolbar" style="margin-bottom:8px;display:flex;gap:8px;align-items:center">
+                        <button class="btn" id="ips-alerts-refresh">Refresh</button>
+                        <button class="btn" id="ips-alerts-clear" style="color:var(--color-danger)">Clear Alerts</button>
+                        <span id="ips-alerts-count" style="font-size:12px;color:#666;margin-left:8px"></span>
+                    </div>
+                    <div class="table-scroll">
+                        <table class="data-table" id="ips-alerts-table">
+                            <thead><tr>
+                                <th>TIMESTAMP</th>
+                                <th>SID</th>
+                                <th>ACTION</th>
+                                <th>PROTO</th>
+                                <th>SOURCE</th>
+                                <th>DESTINATION</th>
+                                <th>MESSAGE</th>
+                                <th></th>
+                            </tr></thead>
+                            <tbody id="ips-alerts-tbody"></tbody>
+                        </table>
+                    </div>
+                    <!-- Alert Info modal -->
+                    <div class="modal-overlay" id="ips-alert-detail-modal" style="display:none">
+                        <div class="form-card" style="max-width:560px;width:90vw" role="dialog" aria-modal="true">
+                            <div class="form-section"><span class="modal-title-text">ALERT DETAILS</span><button class="modal-close" type="button" id="ips-alert-detail-close">&#10005;</button></div>
+                            <div class="modal-body" id="ips-alert-detail-body"></div>
+                            <div class="modal-footer">
+                                <button class="btn" id="ips-alert-detail-close2">Close</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ── Tab: Schedule ── -->
+                <div class="ips-tab-pane" data-ips-pane="schedule" style="display:none">
+                    <div class="form-card" data-settings="security-schedule" data-custom-apply>
+                        <div class="form-section">SCHEDULED RULES UPDATE</div>
+                        <div class="form-row" data-key="cron-enabled">
+                            <label class="form-label">Enabled</label>
+                            <select class="form-input">
+                                <option value="disable">Disabled</option>
+                                <option value="enable">Enabled</option>
+                            </select>
+                        </div>
+                        <div class="form-row" data-key="cron-minutes">
+                            <label class="form-label">Minutes</label>
+                            <input class="form-input" type="text" placeholder="0" maxlength="64">
+                            <span style="font-size:11px;color:#888">0–59 or * (every minute)</span>
+                        </div>
+                        <div class="form-row" data-key="cron-hours">
+                            <label class="form-label">Hours</label>
+                            <input class="form-input" type="text" placeholder="0" maxlength="64">
+                            <span style="font-size:11px;color:#888">0–23 or * (every hour)</span>
+                        </div>
+                        <div class="form-row" data-key="cron-dom">
+                            <label class="form-label">Day of month</label>
+                            <input class="form-input" type="text" placeholder="*" maxlength="64">
+                            <span style="font-size:11px;color:#888">1–31 or *</span>
+                        </div>
+                        <div class="form-row" data-key="cron-months">
+                            <label class="form-label">Months</label>
+                            <input class="form-input" type="text" placeholder="*" maxlength="64">
+                            <span style="font-size:11px;color:#888">1–12 or *</span>
+                        </div>
+                        <div class="form-row" data-key="cron-dow">
+                            <label class="form-label">Days of week</label>
+                            <input class="form-input" type="text" placeholder="*" maxlength="64">
+                            <span style="font-size:11px;color:#888">0=Sun, 1=Mon … 6=Sat, or *</span>
+                        </div>
+                        <div class="form-row">
+                            <label class="form-label">Command</label>
+                            <select class="form-input" disabled>
+                                <option value="update-reload">Update and reload intrusion detection rules</option>
+                            </select>
+                        </div>
+                        <div class="form-row" data-key="cron-desc">
+                            <label class="form-label">Description</label>
+                            <input class="form-input" type="text" placeholder="Optional description" maxlength="128">
+                        </div>
+                        <div style="margin:8px 0 4px;font-size:12px;color:#666;padding:4px 0 0 0">
+                            <span id="cron-preview-label" style="font-family:monospace;background:#f0f0f0;padding:2px 8px;border-radius:3px"></span>
+                            <span style="margin-left:8px;color:#999">— resulting cron expression (min hr dom month dow)</span>
+                        </div>
+                        <div class="form-actions"><button class="btn btn-primary">Apply</button><button class="btn">Reset</button></div>
+                    </div>
+                    <div style="margin-top:10px;font-size:12px;color:#666;padding:0 4px">
+                        When the schedule fires, the system downloads all <b>Enabled</b> rulesets from the Download tab, then rebuilds and hot-reloads ipsd without dropping traffic.
+                        Default (<code>0 0 * * *</code>) runs at midnight every day.
+                    </div>
+                </div>
+            </div>
+
+            <!-- ======== SECURITY > IPS PROFILES PAGE ======== -->
+            <div id="page-sec-ips-profiles" class="page" style="display:none">
+                <div class="page-header">
+                    <h1 class="page-title">IPS PROFILES</h1>
+                    <button class="btn-create" data-toggle-form="form-ips-profile"><span class="btn-create-plus">+</span> Create Profile <span class="btn-create-caret">&#9662;</span></button>
+                </div>
+                <div class="add-form form-card" id="form-ips-profile" role="dialog" aria-modal="true" aria-label="IPS profile form">
+                    <div class="form-section"><span class="modal-title-text">NEW IPS PROFILE</span><button class="modal-close" type="button" aria-label="Close" data-toggle-form="form-ips-profile">&#10005;</button></div>
+                    <div class="modal-body">
+                        <div class="form-grid">
+                            <div class="form-row" data-key="name"><label class="form-label">Name</label><input class="form-input" type="text" placeholder="e.g. web_dmz" maxlength="64"></div>
+                            <div class="form-row" data-key="status"><label class="form-label">Status</label><select class="form-input"><option value="enable" selected>Enabled</option><option value="disable">Disabled</option></select></div>
+                            <div class="form-row form-row-full form-row-wide" data-key="comment"><label class="form-label">Comment</label><input class="form-input" type="text" placeholder="Optional description" maxlength="255"></div>
+                            <!-- categories: legacy fallback khi profile chưa có filter nào -->
+                            <input type="hidden" data-key="categories" value="all">
+                        </div>
+                        <div class="form-section" style="display:flex;align-items:center;justify-content:space-between">
+                            <span>IPS SIGNATURES AND FILTERS</span>
+                            <button type="button" class="btn-create" id="ips-add-sig"><span class="btn-create-plus">+</span> Create New</button>
+                        </div>
+                        <table class="data-table" id="ips-prof-filters">
+                            <thead><tr><th>TYPE</th><th>VALUE</th><th>ACTION</th><th>STATUS</th><th></th></tr></thead>
+                            <tbody><tr><td colspan="5" style="opacity:.6">Lưu profile rồi thêm signature/filter…</td></tr></tbody>
+                        </table>
+                    </div>
+                    <div class="modal-footer"><button class="btn btn-primary">Save</button><button class="btn" data-toggle-form="form-ips-profile">Cancel</button></div>
+                </div>
+
+                <!-- Modal: Add Signatures / Filter (kiểu FortiGate) -->
+                <div class="modal-overlay" id="ips-sig-modal" style="display:none">
+                  <div class="form-card" role="dialog" aria-modal="true" aria-label="Add signatures" style="max-width:880px;width:92%;max-height:86vh;display:flex;flex-direction:column">
+                    <div class="form-section" style="display:flex;align-items:center;justify-content:space-between">
+                        <span>ADD SIGNATURES / FILTER</span>
+                        <button type="button" class="modal-close" id="ips-sig-close">&#10005;</button>
+                    </div>
+                    <div class="modal-body" style="overflow:auto">
+                        <div class="toolbar" style="gap:8px">
+                            <button type="button" class="btn ips-tab" data-tab="signature">Signature</button>
+                            <button type="button" class="btn ips-tab" data-tab="filter">Filter (Category)</button>
+                            <span style="flex:1"></span>
+                            <span class="filter-label">Action</span>
+                            <select class="form-input" id="ips-sig-action" style="width:auto">
+                                <option value="default" selected>Default</option>
+                                <option value="block">Block</option>
+                                <option value="alert">Alert</option>
+                                <option value="pass">Pass</option>
+                            </select>
+                        </div>
+                        <!-- Signature pane -->
+                        <div id="ips-pane-signature">
+                            <div class="toolbar" style="display:flex;gap:8px;align-items:center"><div class="toolbar-search"><input type="text" id="ips-sig-search" placeholder="Search name / SID / CVE..." class="form-input"></div><span id="ips-sig-count" style="font-size:12px;color:#666;margin-left:auto"></span></div>
+                            <table class="data-table" id="ips-sig-table">
+                                <thead><tr><th class="th-checkbox"><input type="checkbox" id="ips-sig-all"></th><th>SID</th><th>NAME</th><th>CATEGORY</th><th>DEFAULT</th><th>CVE</th></tr></thead>
+                                <tbody><tr><td colspan="6">Đang tải…</td></tr></tbody>
+                            </table>
+                        </div>
+                        <!-- Filter (category) pane -->
+                        <div id="ips-pane-filter" style="display:none">
+                            <div class="form-row"><label class="form-label">Category</label><select class="form-input" id="ips-filter-cat"><option value="all">all (mọi category)</option></select></div>
+                            <p class="form-hint" style="opacity:.6;margin-top:8px">Thêm cả nhóm luật theo category, áp Action chọn ở trên cho toàn nhóm (default=giữ action gốc).</p>
+                        </div>
+                    </div>
+                    <div class="modal-footer"><button class="btn btn-primary" id="ips-sig-ok">OK</button><button class="btn" id="ips-sig-cancel">Cancel</button></div>
+                  </div>
+                </div>
+                <div class="toolbar"><div class="toolbar-search"><input type="text" placeholder="Filter profiles..." class="table-filter" data-target="tbl-ips-profile"><button class="search-btn" type="button">&#9906;</button></div></div>
+                <table class="data-table" data-entity="ipsProfiles">
+                    <thead><tr><th class="th-checkbox"><input type="checkbox" class="select-all"></th><th>NAME</th><th>CATEGORIES</th><th>STATUS</th><th>COMMENT</th></tr></thead>
+                    <tbody>
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- ======== SECURITY > IPS MONITOR PAGE ======== -->
+            <div id="page-sec-ips-monitor" class="page" style="display:none">
+                <div class="page-header"><h1 class="page-title">IPS MONITOR</h1></div>
+                <div class="form-card">
+                    <div class="form-section">STATUS</div>
+                    <div class="form-row"><label class="form-label">Daemon</label><span id="ips-stat-running" class="form-value">—</span></div>
+                    <div class="form-row"><label class="form-label">Status</label><span id="ips-stat-status" class="form-value">—</span></div>
+                    <div class="form-row"><label class="form-label">Mode</label><span id="ips-stat-mode" class="form-value">—</span></div>
+                    <div class="form-row"><label class="form-label">Inspection window</label><span id="ips-stat-snap" class="form-value">—</span></div>
+                    <div class="form-row"><label class="form-label">Rules loaded</label><span id="ips-stat-rules" class="form-value">—</span></div>
+                    <div class="form-row"><label class="form-label">Enforce coverage</label><span id="ips-stat-coverage" class="form-value">—</span></div>
+                    <div class="form-row"><label class="form-label">Total alerts</label><span id="ips-stat-alerts" class="form-value">—</span></div>
+                    <div class="form-actions"><button class="btn" id="ips-refresh">Refresh</button></div>
+                </div>
+                <div class="form-card" style="margin-top:16px">
+                    <div class="form-section">RECENT ALERTS</div>
+                    <pre id="ips-alert-log" style="white-space:pre-wrap;word-break:break-word;max-height:420px;overflow:auto;margin:0;font-size:12px">Đang tải...</pre>
+                </div>
             </div>
 
             <!-- ======== SYSTEM > SETTINGS PAGE ======== -->
@@ -784,6 +1126,49 @@
                 </table>
             </div>
 
+            <!-- ======== SECURITY > SSL INSPECTION PAGE ======== -->
+            <div id="page-sec-ssl" class="page" style="display:none">
+                <div class="page-header">
+                    <h1 class="page-title">SSL INSPECTION</h1>
+                    <button class="btn-create" data-toggle-form="form-ssl-profile"><span class="btn-create-plus">+</span> Create Profile <span class="btn-create-caret">&#9662;</span></button>
+                </div>
+
+                <div class="add-form form-card" id="form-ssl-profile" role="dialog" aria-modal="true" aria-label="SSL inspection profile form">
+                    <div class="form-section"><span class="modal-title-text">NEW SSL INSPECTION PROFILE</span><button class="modal-close" type="button" aria-label="Close" data-toggle-form="form-ssl-profile">&#10005;</button></div>
+                    <div class="modal-body">
+                        <div id="ssl-deep-warning" style="display:none;background:#fff3cd;border:1px solid #ffc107;color:#664d03;padding:12px 14px;border-radius:6px;margin-bottom:14px;line-height:1.5">
+                            <strong>⚠ This profile uses full SSL inspection (deep).</strong>
+                            <div style="margin-top:6px">End users will see <b>certificate warnings</b> unless the firewall CA certificate is installed in their browser. Export it at <b>System &rarr; Certificates</b> and install into the client trust store.</div>
+                            <div style="margin-top:6px">Domains listed under <b>Exempt</b> are spliced (not decrypted).</div>
+                        </div>
+                        <div class="form-grid">
+                            <div class="form-row" data-key="name"><label class="form-label">Name</label><input class="form-input" type="text" placeholder="e.g. deep_lan" maxlength="64"></div>
+                            <div class="form-row" data-key="status"><label class="form-label">Status</label><select class="form-input"><option value="enable" selected>Enabled</option><option value="disable">Disabled</option></select></div>
+                            <div class="form-row" data-key="inspection-mode"><label class="form-label">Inspection Mode</label><select class="form-input"><option value="certificate" selected>Certificate (SNI/cert only — no decrypt)</option><option value="deep">Deep (full MITM decrypt)</option></select></div>
+                            <div class="form-row" data-key="no-sni"><label class="form-label">TLS without SNI</label><select class="form-input"><option value="bump" selected>Bump (decrypt)</option><option value="splice">Splice (bypass)</option></select></div>
+                            <div class="form-row" data-key="untrusted-server-cert"><label class="form-label">Untrusted Server Cert</label><select class="form-input"><option value="block" selected>Block</option><option value="allow">Allow</option></select></div>
+                            <div class="form-row" data-key="unsupported"><label class="form-label">Unsupported (cert-pinning)</label><select class="form-input"><option value="allow" selected>Allow (bypass)</option><option value="block">Block</option></select></div>
+                            <div class="form-row form-row-full form-row-wide" data-key="exempt"><label class="form-label">Exempt domains (SNI)</label><input class="form-input" type="text" placeholder="*.bank.com,*.health.gov"></div>
+                            <div class="form-row form-row-full form-row-wide" data-key="comment"><label class="form-label">Comment</label><input class="form-input" type="text" placeholder="Optional description" maxlength="255"></div>
+                        </div>
+                    </div>
+                    <div class="modal-footer"><button class="btn btn-primary">Save</button><button class="btn" data-toggle-form="form-ssl-profile">Cancel</button></div>
+                </div>
+
+                <div class="toolbar"><div class="toolbar-search"><input type="text" placeholder="Filter profiles..." class="table-filter" data-target="tbl-ssl-profile"><button class="search-btn" type="button">&#9906;</button></div></div>
+                <table class="data-table" data-entity="sslProfiles">
+                    <thead><tr><th class="th-checkbox"><input type="checkbox" class="select-all"></th><th>NAME</th><th>MODE</th><th>STATUS</th><th>COMMENT</th></tr></thead>
+                    <tbody>
+                    </tbody>
+                </table>
+
+                <div class="form-card" style="margin-top:12px">
+                    <div class="form-section">DIAGNOSTICS</div>
+                    <div style="display:flex;justify-content:flex-end;margin-bottom:8px"><button class="btn" id="ssl-diag-btn">Run diagnostics</button></div>
+                    <pre id="ssl-diag-output" style="white-space:pre-wrap;font-size:12px;background:#1e1e1e;color:#ddd;padding:10px;border-radius:4px;min-height:40px;margin:0">(click "Run diagnostics" to check profiles / ssld / CA / steering)</pre>
+                </div>
+            </div>
+
             <!-- ======== SYSTEM > PASSWORD POLICY PAGE ======== -->
             <div id="page-sys-password" class="page" style="display:none">
                 <div class="page-header"><h1 class="page-title">PASSWORD POLICY</h1></div>
@@ -816,6 +1201,25 @@
                         <label class="form-label">Restart Device</label>
                         <button class="btn btn-danger" id="btn-reboot">Reboot</button>
                     </div>
+                </div>
+            </div>
+
+            <!-- ======== SYSTEM > CERTIFICATES PAGE ======== -->
+            <div id="page-sys-certificates" class="page" style="display:none">
+                <div class="page-header"><h1 class="page-title">CERTIFICATES</h1></div>
+                <div class="form-card">
+                    <div class="form-section">SSL INSPECTION CA</div>
+                    <p style="margin:0 0 10px;line-height:1.5">CA của firewall dùng để ký lại chứng chỉ khi <b>deep SSL inspection</b>. Cài CA này vào trust store của client để trình duyệt không báo lỗi chứng chỉ. CA được sinh tự động lần đầu bật deep inspection.</p>
+                    <div class="form-row"><label class="form-label">CA status</label><span id="cert-ca-status" class="form-input" style="border:none;background:none">(checking…)</span></div>
+                    <div class="form-actions">
+                        <button class="btn btn-primary" id="cert-export-btn">Show CA (PEM)</button>
+                        <button class="btn" id="cert-download-btn">Download .crt</button>
+                    </div>
+                </div>
+                <div class="form-card" style="margin-top:12px;display:none" id="cert-pem-card">
+                    <div class="form-section">CA CERTIFICATE (PEM)</div>
+                    <pre id="cert-pem" style="white-space:pre-wrap;font-size:11px;background:#1e1e1e;color:#ddd;padding:10px;border-radius:4px;margin:0"></pre>
+                    <div style="margin-top:8px;color:#888;font-size:12px">Copy nội dung trên (hoặc Download .crt) → cài vào "Trusted Root Certification Authorities" của client.</div>
                 </div>
             </div>
 

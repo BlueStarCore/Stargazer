@@ -235,6 +235,11 @@ sg_status_t rebuild_nat_chains(char *result, size_t rsize)
 		free(list);
 	}
 
+	/* SSL inspection: REDIRECT forwarded HTTPS into stargazer-ssld.
+	 * Emitted into the same *nat restore so the table stays atomic.
+	 * No-op if no accept policy binds an enabled ssl-inspection-profile. */
+	emit_ssl_steering(&buf);
+
 	dbuf_append(&buf, "COMMIT\n", 7);
 
 	/* Flush both NAT chains.  During this window, no NAT translation
@@ -258,6 +263,10 @@ sg_status_t rebuild_nat_chains(char *result, size_t rsize)
 
 	free(out);
 	free(buf.data);
+
+	/* Steering đã apply → đồng bộ lifecycle ssld (start/stop/restart theo
+	 * security_ssl-inspection-profile). Đặt SAU restore để ssld nghe ngay khi có rule. */
+	ssld_sync();
 
 	snprintf(result, rsize, "NAT chains rebuilt (%d SNAT, %d DNAT)",
 		 snat_count, dnat_count);

@@ -115,7 +115,7 @@ typedef enum {
 
 	/* Firewall/routing diagnostics (63x) */
 	SG_CMD_DIAG_FW_IPTABLES  = 630,  /* Show iptables rules (filter/nat) */
-	SG_CMD_DIAG_FW_POLICY    = 631,  /* Show INPUT chain policy+rules    */
+	SG_CMD_DIAG_FW_POLICY    = 631,  /* Show FORWARD chain rules         */
 	SG_CMD_DIAG_FW_CONNTRACK = 632,  /* Show conntrack entries            */
 	SG_CMD_DIAG_ROUTES       = 633,  /* Show IPv4+IPv6 routing tables     */
 	SG_CMD_DIAG_FW_IPSET     = 634,  /* Dump an FQDN object's ipset       */
@@ -168,6 +168,22 @@ typedef enum {
 
 	/* DHCP lease events (udhcpc script → mgmtd) */
 	SG_CMD_DHCP_LEASE_EVENT  = 682,  /* payload: iface=<name> action=bound|renew|deconfig */
+
+	/* SSL inspection: trả CA cert (PEM) cho client tải về cài */
+	SG_CMD_SSL_CACERT        = 683,
+
+	/* IPS daemon status + alert log */
+	SG_CMD_IPS_STATUS        = 684,   /* trạng thái ipsd + counters   */
+	SG_CMD_IPS_ALERTS        = 685,   /* N dòng cuối ips-alert.log    */
+	SG_CMD_IPS_SIGNATURES    = 686,   /* catalog signature repo (JSON) */
+	SG_CMD_IPS_REBUILD       = 687,   /* recompile active.rules + reload (ips-update.sh) */
+	SG_CMD_IPS_UPDATE_NOW    = 688,   /* tải ruleset (security_ips-ruleset) + rebuild + reload */
+	SG_CMD_IPS_ALERTS_JSON       = 689,   /* parse ips-alert.log → JSON array */
+	SG_CMD_IPS_RULESETS_RELOAD   = 690,   /* scan custom dir for .xml → upsert DB entries */
+	SG_CMD_IPS_UPDATE_LOG        = 691,   /* tail ips-update.log → payload */
+	SG_CMD_IPS_ALERTS_CLEAR      = 692,   /* truncate ips-alert.log (root) */
+	SG_CMD_IPS_SCORES            = 693,   /* per-flow ML scores (ipsd dump loop) */
+	SG_CMD_SSL_DIAG              = 694,   /* SSL inspection diagnostics (debug) */
 
 	/* Keepalive / ping (9xx) */
 	SG_CMD_PING          = 900,

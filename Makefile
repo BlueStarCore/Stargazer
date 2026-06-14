@@ -124,7 +124,7 @@ all: image
 
 kernel: $(KERNEL_IMAGE)
 
-$(KERNEL_IMAGE): | kernel-source kernel-config
+$(KERNEL_IMAGE): $(KERNEL_DIR)/.config | kernel-source
 	@echo "[1/5] Building kernel..."
 	$(MAKE) -C $(KERNEL_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) olddefconfig
 	$(MAKE) -C $(KERNEL_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) -j$$(nproc) Image dtbs modules
@@ -149,7 +149,11 @@ kernel-source:
 		exit 1; \
 	fi
 
-kernel-config:
+# File target: produces $(KERNEL_DIR)/.config. kernel.img depends on it, so a
+# manual .config edit (newer mtime) triggers a kernel rebuild. The guard keeps
+# an existing .config intact — only a missing one is regenerated from defconfig
+# (so hand edits are never wiped by defconfig).
+$(KERNEL_DIR)/.config: | kernel-source
 	@if [ ! -f "$(KERNEL_DIR)/.config" ]; then \
 		echo "Configuring kernel for BPI-R4 (MT7988A)..."; \
 		$(MAKE) -C $(KERNEL_DIR) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) mt7988a_bpi-r4_defconfig; \
@@ -179,9 +183,14 @@ kernel-config:
 			--enable NETFILTER_XT_MATCH_STATE \
 			--enable NETFILTER_XT_MATCH_LIMIT \
 			--enable NETFILTER_XT_TARGET_LOG \
+			--enable NETFILTER_XT_TARGET_REDIRECT \
 			--enable NETFILTER_XT_TARGET_CHECKSUM \
 			--enable NETFILTER_XT_MARK \
 			--enable NETFILTER_XT_CONNMARK \
+			--enable NETFILTER_NETLINK_QUEUE \
+			--enable NETFILTER_XT_TARGET_NFQUEUE \
+			--enable NETFILTER_XT_MATCH_CONNBYTES \
+			--enable NETFILTER_NETLINK_GLUE_CT \
 			--enable NF_LOG_IPV4 \
 			--enable NF_REJECT_IPV4 \
 			--enable NF_LOG_IPV6 \
@@ -222,6 +231,18 @@ $(BUILD_DIR)/modules/$(MODULE_NAME).ko &: $(KERNEL_IMAGE) $(SRC_WATCH)
 		[ -f $(KERNEL_DIR)/net/netfilter/$$m ] && \
 		cp $(KERNEL_DIR)/net/netfilter/$$m $(BUILD_DIR)/modules/ || true; \
 	done
+	# Copy NFQUEUE + connbytes modules (required for IPS userspace inspection)
+	@for m in nfnetlink_queue.ko xt_NFQUEUE.ko xt_connbytes.ko; do \
+		f=$$(find $(KERNEL_DIR) -name "$$m" 2>/dev/null | head -1); \
+		[ -n "$$f" ] && cp "$$f" $(BUILD_DIR)/modules/ && \
+			echo "[modules] copied $$m" || true; \
+	done
+	# Copy ip_set modules (required for FQDN address objects and -m set matching)
+	@for m in ip_set.ko ip_set_hash_ip.ko xt_set.ko; do \
+		f=$$(find $(KERNEL_DIR) -name "$$m" 2>/dev/null | head -1); \
+		[ -n "$$f" ] && cp "$$f" $(BUILD_DIR)/modules/ && \
+			echo "[modules] copied $$m" || true; \
+	done
 	# Copy af_packet.ko only if built as a module (CONFIG_PACKET=m). When
 	# PACKET=y (built-in) the .ko does not exist and AF_PACKET is always
 	# present for udhcpc — skipping the copy is not an error.
@@ -235,7 +256,7 @@ $(BUILD_DIR)/modules/$(MODULE_NAME).ko &: $(KERNEL_IMAGE) $(SRC_WATCH)
 
 busybox: $(BUSYBOX_BIN) $(BUSYBOX_LINKS)
 
-$(BUSYBOX_BIN):
+$(BUSYBOX_BIN): $(BUSYBOX_CONFIG_FRAGMENT)
 	@echo "[3/5] Building BusyBox..."
 	@if [ ! -d "$(BUSYBOX_DIR)" ]; then \
 		mkdir -p "$(BUSYBOX_CACHE_DIR)"; \
@@ -272,7 +293,7 @@ $(BUSYBOX_BIN):
 	cp $(BUSYBOX_DIR)/busybox $(BUSYBOX_BIN)
 	@echo "[3/5] BusyBox ready: $(BUSYBOX_BIN)"
 
-$(BUSYBOX_LINKS):
+$(BUSYBOX_LINKS): $(BUSYBOX_CONFIG_FRAGMENT)
 	@if [ ! -d "$(BUSYBOX_DIR)" ]; then \
 		mkdir -p "$(BUSYBOX_CACHE_DIR)"; \
 		echo "Cloning BusyBox source..."; \
@@ -541,7 +562,7 @@ $(ATF_MTK_DIR)/.stamp:
 
 rootfs: $(ROOTFS_DIR)/.stamp
 
-$(ROOTFS_DIR)/.stamp: modules busybox dash iptables logind mgmtd cli webd tools
+$(ROOTFS_DIR)/.stamp: modules busybox dash iptables logind mgmtd cli webd ipsd tools
 	@echo "[4/5] Creating rootfs..."
 	@rm -rf $(ROOTFS_DIR)
 	@mkdir -p $(ROOTFS_DIR)
@@ -593,6 +614,33 @@ $(ROOTFS_DIR)/.stamp: modules busybox dash iptables logind mgmtd cli webd tools
 	# Install web daemon + static web UI files
 	cp $(BUILD_DIR)/webd/stargazer-webd $(ROOTFS_DIR)/sbin/stargazer-webd
 	@chmod +x $(ROOTFS_DIR)/sbin/stargazer-webd
+
+	# Install IPS daemon + signature repository (Phase B) — mgmtd supervise ipsd
+	# (ipsd_sync fork+exec); thiếu binary này thì IPS không bao giờ chạy và bật
+	# IPS trên policy sẽ làm NFQUEUE fail-closed (treo traffic).
+	cp $(IPSD_BIN) $(ROOTFS_DIR)/sbin/stargazer-ipsd
+	@chmod +x $(ROOTFS_DIR)/sbin/stargazer-ipsd
+	@# SSL inspection daemon (chỉ cài nếu đã build — cần OpenSSL cross). Guard
+	@# để firmware không vỡ khi ssld chưa build (SSL inspection off-by-default).
+	@if [ -f $(SSLD_BIN) ]; then \
+	    cp $(SSLD_BIN) $(ROOTFS_DIR)/sbin/stargazer-ssld; \
+	    chmod +x $(ROOTFS_DIR)/sbin/stargazer-ssld; \
+	    echo "[rootfs] stargazer-ssld đã cài"; \
+	else echo "[rootfs] stargazer-ssld chưa build — bỏ qua (SSL inspection off)"; fi
+	@mkdir -p $(ROOTFS_DIR)/etc/stargazer/ssl
+	@# Trust store (root CA bundle) cho ssld verify cert server thật (untrusted
+	@# detection). Thiếu nó → mọi cert bị coi untrusted. Lấy bundle Mozilla host.
+	@mkdir -p $(ROOTFS_DIR)/etc/ssl/certs
+	@if [ -f /etc/ssl/certs/ca-certificates.crt ]; then \
+	    cp /etc/ssl/certs/ca-certificates.crt $(ROOTFS_DIR)/etc/ssl/certs/; \
+	    echo "[rootfs] CA bundle (trust store) đã cài"; \
+	else echo "[rootfs] CẢNH BÁO: host không có ca-certificates.crt — ssld verify sẽ coi mọi cert untrusted"; fi
+	@mkdir -p $(ROOTFS_DIR)/etc/stargazer/ips/repo
+	@mkdir -p $(ROOTFS_DIR)/etc/stargazer/ips/profiles
+	@mkdir -p $(ROOTFS_DIR)/etc/stargazer/ips/rules
+	@touch    $(ROOTFS_DIR)/etc/stargazer/ips/rules/active.rules
+	@mkdir -p $(ROOTFS_DIR)/etc/stargazer/logs
+
 	@mkdir -p $(ROOTFS_DIR)/usr/share/stargazer/www
 	cp -r $(PROJECT_ROOT)/src/userspace/webui/www/* $(ROOTFS_DIR)/usr/share/stargazer/www/
 	@find $(ROOTFS_DIR)/usr/share/stargazer/www -type f \( -name '*.html' -o -name '*.js' \) \
@@ -632,6 +680,12 @@ $(ROOTFS_DIR)/.stamp: modules busybox dash iptables logind mgmtd cli webd tools
 	@cp $(USERSPACE_DIR)/etc/sysctl.d/*.conf $(ROOTFS_DIR)/etc/sysctl.d/
 	@cp $(USERSPACE_DIR)/etc/init.d/* $(ROOTFS_DIR)/etc/init.d/
 	@chmod +x $(ROOTFS_DIR)/etc/init.d/*
+
+	# Crontab (crond đọc /var/spool/cron/crontabs) — IPS signature auto-update
+	# + xoay ips-alert.log. crond được /etc/init.d/stargazer khởi động.
+	@mkdir -p $(ROOTFS_DIR)/var/spool/cron/crontabs
+	@cp $(USERSPACE_DIR)/var/spool/cron/crontabs/root \
+	    $(ROOTFS_DIR)/var/spool/cron/crontabs/root
 
 	# Copy init script with version substitution
 	@cp $(USERSPACE_DIR)/init $(ROOTFS_DIR)/init.tmp
@@ -1025,7 +1079,132 @@ firmware: rootfs
 # Test in QEMU
 # =============================================================================
 
-test-build: modules busybox dash iptables logind mgmtd cli webd tools uboot
+IPSD_DIR       := $(PROJECT_ROOT)/src/userspace/ipsd
+# Nguồn "core" (file nhỏ, compile nhanh). predict.c (model tl2cgen 6 MB / 108k
+# dòng) tách riêng → cache thành predict.o, chỉ build lại khi model đổi.
+IPSD_CORE_SRCS := $(IPSD_DIR)/main.c $(IPSD_DIR)/nfq.c $(IPSD_DIR)/ctdump.c \
+                  $(IPSD_DIR)/feature.c $(IPSD_DIR)/flow_rule.c \
+                  $(IPSD_DIR)/sig_rule.c $(IPSD_DIR)/sig_reload.c \
+                  $(IPSD_DIR)/ac.c $(IPSD_DIR)/reass.c \
+                  $(IPSD_DIR)/proto_buf.c $(IPSD_DIR)/tls_clienthello.c \
+                  $(IPSD_DIR)/engine.c $(IPSD_DIR)/fusion.c \
+                  $(IPSD_DIR)/ml_scan.c \
+                  $(IPSD_DIR)/insp_ipc.c \
+                  $(IPSD_DIR)/ips_model.c
+IPSD_PREDICT_C := $(IPSD_DIR)/model/predict.c
+IPSD_PREDICT_O := $(BUILD_DIR)/ipsd/predict.o
+IPSD_BIN       := $(BUILD_DIR)/ipsd/stargazer-ipsd
+
+# P4 — libpcre2 static (cross musl) để bật regex (HAVE_PCRE). JIT off (ReDoS).
+PCRE2_VERSION  := 10.44
+PCRE2_URL      := https://github.com/PCRE2Project/pcre2/releases/download/pcre2-$(PCRE2_VERSION)/pcre2-$(PCRE2_VERSION).tar.gz
+PCRE2_DIR      := $(BUSYBOX_CACHE_DIR)/pcre2-$(PCRE2_VERSION)
+PCRE2_PREFIX   := $(BUILD_DIR)/ipsd/pcre2-prefix
+PCRE2_LIB      := $(PCRE2_PREFIX)/lib/libpcre2-8.a
+
+ipsd: $(IPSD_BIN)
+
+# Build libpcre2-8.a static cho aarch64-musl (JIT off → interpreter tôn trọng
+# match-limit, không treo). Chỉ build khi có MUSL_CC.
+$(PCRE2_LIB): $(MUSL_CC)
+	@mkdir -p $(BUSYBOX_CACHE_DIR) $(BUILD_DIR)/ipsd
+	@if [ ! -d "$(PCRE2_DIR)" ]; then \
+	    echo "[ipsd] Downloading pcre2 $(PCRE2_VERSION)..."; \
+	    curl -fSL "$(PCRE2_URL)" -o "$(BUSYBOX_CACHE_DIR)/pcre2.tar.gz"; \
+	    tar -xzf "$(BUSYBOX_CACHE_DIR)/pcre2.tar.gz" -C "$(BUSYBOX_CACHE_DIR)"; \
+	    rm -f "$(BUSYBOX_CACHE_DIR)/pcre2.tar.gz"; \
+	fi
+	@echo "[ipsd] Cross-compiling libpcre2-8 (musl static, JIT off)..."
+	cd $(PCRE2_DIR) && ./configure --host=aarch64-linux-musl CC=$(MUSL_CC) \
+	    CFLAGS="-Os" LDFLAGS="-static" --enable-static --disable-shared \
+	    --disable-jit --prefix=$(PCRE2_PREFIX) >/dev/null && \
+	$(MAKE) -j$$(nproc) >/dev/null && $(MAKE) install >/dev/null
+	@echo "[ipsd] libpcre2: $(PCRE2_LIB)"
+
+# ── SSL inspection (stargazer-ssld): OpenSSL aarch64-musl static + daemon ──
+SSLD_DIR        := $(USERSPACE_DIR)/ssld
+SSLD_BIN        := $(BUILD_DIR)/ssld/stargazer-ssld
+OPENSSL_VERSION := 3.0.15
+OPENSSL_URL     := https://github.com/openssl/openssl/releases/download/openssl-$(OPENSSL_VERSION)/openssl-$(OPENSSL_VERSION).tar.gz
+OPENSSL_DIR     := $(BUSYBOX_CACHE_DIR)/openssl-$(OPENSSL_VERSION)
+OPENSSL_PREFIX  := $(BUILD_DIR)/ssld/openssl-prefix
+OPENSSL_LIB     := $(OPENSSL_PREFIX)/lib/libssl.a
+OPENSSL_CROSS   := $(abspath $(MUSL_CROSS))
+
+SSLD_SRCS := $(SSLD_DIR)/main.c $(SSLD_DIR)/conn.c $(SSLD_DIR)/relay.c \
+             $(SSLD_DIR)/origdst.c $(SSLD_DIR)/ca.c $(SSLD_DIR)/certcache.c \
+             $(SSLD_DIR)/bump.c \
+             $(IPSD_DIR)/tls_clienthello.c $(IPSD_DIR)/tls_policy.c \
+             $(IPSD_DIR)/sig_rule.c $(IPSD_DIR)/ac.c
+
+.PHONY: ssld openssl-cross
+openssl-cross: $(OPENSSL_LIB)
+ssld: $(SSLD_BIN)
+
+# OpenSSL static cho aarch64-musl (no-shared/tests/async/engine — gọn + nhanh).
+# build_libs + install_dev: chỉ thư viện + header, bỏ apps (tiết kiệm thời gian).
+$(OPENSSL_LIB): $(MUSL_CC)
+	@mkdir -p $(BUSYBOX_CACHE_DIR) $(BUILD_DIR)/ssld
+	@if [ ! -d "$(OPENSSL_DIR)" ]; then \
+	    echo "[ssld] Downloading openssl $(OPENSSL_VERSION)..."; \
+	    curl -fSL "$(OPENSSL_URL)" -o "$(BUSYBOX_CACHE_DIR)/openssl.tar.gz"; \
+	    tar -xzf "$(BUSYBOX_CACHE_DIR)/openssl.tar.gz" -C "$(BUSYBOX_CACHE_DIR)"; \
+	    rm -f "$(BUSYBOX_CACHE_DIR)/openssl.tar.gz"; \
+	fi
+	@echo "[ssld] Cross-compiling OpenSSL $(OPENSSL_VERSION) (aarch64-musl static — vài phút)..."
+	cd $(OPENSSL_DIR) && ./Configure linux-aarch64 \
+	    --cross-compile-prefix=$(OPENSSL_CROSS) \
+	    no-shared no-tests no-async no-engine \
+	    --prefix=$(abspath $(OPENSSL_PREFIX)) >/dev/null && \
+	$(MAKE) -j$$(nproc) build_libs >/dev/null && \
+	$(MAKE) install_dev >/dev/null
+	@echo "[ssld] OpenSSL static: $(OPENSSL_LIB)"
+
+$(SSLD_BIN): $(SSLD_SRCS) $(OPENSSL_LIB)
+	@mkdir -p $(BUILD_DIR)/ssld
+	@echo "[ssld] Cross-compiling stargazer-ssld (ARM64 + OpenSSL static)..."
+	$(MUSL_CC) -static -O2 -Wall -Wextra -std=c11 \
+	    -I$(SSLD_DIR) -I$(IPSD_DIR) -I$(OPENSSL_PREFIX)/include \
+	    -o $@ $(SSLD_SRCS) \
+	    $(OPENSSL_PREFIX)/lib/libssl.a $(OPENSSL_PREFIX)/lib/libcrypto.a \
+	    -lpthread
+	@echo "[ssld] binary: $(SSLD_BIN)"
+
+$(IPSD_BIN): $(IPSD_CORE_SRCS) $(IPSD_PREDICT_C)
+	@mkdir -p $(BUILD_DIR)/ipsd
+	@echo "[ipsd] Cross-compiling stargazer-ipsd (ARM64)..."
+	@# Dùng musl nếu có, ngược lại dùng aarch64-linux-gnu-gcc (đủ cho QEMU test)
+	$(eval IPSD_CC := $(shell \
+	    if [ -x "$(MUSL_CC)" ]; then echo "$(MUSL_CC) -static"; \
+	    elif command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then \
+	        echo "aarch64-linux-gnu-gcc"; \
+	    else echo ""; fi))
+	@if [ -z "$(IPSD_CC)" ]; then \
+	    echo "ERROR: no ARM64 cross-compiler found"; \
+	    echo "Run: make musl-toolchain   OR   sudo apt install gcc-aarch64-linux-gnu"; \
+	    exit 1; fi
+	@# P4: build libpcre2 (chỉ với musl) → bật HAVE_PCRE. Fallback gnu → không pcre.
+	@if [ -x "$(MUSL_CC)" ] && [ ! -f "$(PCRE2_LIB)" ]; then \
+	    $(MAKE) $(PCRE2_LIB); fi
+	$(eval IPSD_PCRE_CFLAGS := $(shell [ -f "$(PCRE2_LIB)" ] && echo "-DHAVE_PCRE -I$(PCRE2_PREFIX)/include"))
+	$(eval IPSD_PCRE_LIB := $(shell [ -f "$(PCRE2_LIB)" ] && echo "$(PCRE2_LIB)"))
+	@# predict.o: cache; chỉ recompile khi predict.c mới hơn (-w tắt warning
+	@# code generate). Lần đầu mất vài phút, các lần sau bỏ qua bước này.
+	@if [ ! -f $(IPSD_PREDICT_O) ] || \
+	    [ $(IPSD_PREDICT_C) -nt $(IPSD_PREDICT_O) ]; then \
+	    echo "[ipsd] compiling predict.o (model ML 6MB — lần đầu/đổi model, vài phút)..."; \
+	    $(IPSD_CC) -O2 -w -c $(IPSD_PREDICT_C) -o $(IPSD_PREDICT_O); \
+	else \
+	    echo "[ipsd] predict.o cached — bỏ qua compile model"; \
+	fi
+	$(IPSD_CC) -O2 -Wall -std=c11 \
+	    -I$(IPSD_DIR) $(IPSD_PCRE_CFLAGS) \
+	    $(IPSD_CORE_SRCS) $(IPSD_PREDICT_O) $(IPSD_PCRE_LIB) \
+	    -lpthread -lm \
+	    -o $(IPSD_BIN)
+	@echo "[ipsd] Built: $(IPSD_BIN)$(if $(IPSD_PCRE_LIB), (HAVE_PCRE),)"
+
+test-build: modules busybox dash iptables logind mgmtd cli webd tools uboot ipsd
 	@echo "Building test initramfs..."
 	@mkdir -p $(BUILD_DIR)/test
 
@@ -1136,6 +1315,11 @@ test-build: modules busybox dash iptables logind mgmtd cli webd tools uboot
 	@cp $(USERSPACE_DIR)/usr/libexec/stargazer/* $(BUILD_DIR)/test/initramfs/usr/libexec/stargazer/
 	@chmod +x $(BUILD_DIR)/test/initramfs/usr/libexec/stargazer/*
 
+	# Crontab cho IPS signature auto-update (crond đọc /var/spool/cron/crontabs)
+	@mkdir -p $(BUILD_DIR)/test/initramfs/var/spool/cron/crontabs
+	@cp $(USERSPACE_DIR)/var/spool/cron/crontabs/root \
+	    $(BUILD_DIR)/test/initramfs/var/spool/cron/crontabs/root 2>/dev/null || true
+
 	# Install udhcpc default script (for DHCP network configuration)
 	@mkdir -p $(BUILD_DIR)/test/initramfs/usr/share/udhcpc
 	@cp $(USERSPACE_DIR)/usr/share/udhcpc/default.script $(BUILD_DIR)/test/initramfs/usr/share/udhcpc/
@@ -1143,6 +1327,20 @@ test-build: modules busybox dash iptables logind mgmtd cli webd tools uboot
 
 	# Create stargazer config directory (mgmtd seeds defaults on first boot)
 	@mkdir -p $(BUILD_DIR)/test/initramfs/etc/stargazer
+
+	# Install IPS daemon + signature repository (Phase B)
+	cp $(IPSD_BIN) $(BUILD_DIR)/test/initramfs/sbin/stargazer-ipsd
+	@chmod +x $(BUILD_DIR)/test/initramfs/sbin/stargazer-ipsd
+	@# Repo theo category: repo/<cat>.rules. profiles/ giữ ruleset compile
+	@# per-profile. rules/active.rules là bản ipsd nạp (mgmtd compile lúc boot).
+	@mkdir -p $(BUILD_DIR)/test/initramfs/etc/stargazer/ips/repo
+	@mkdir -p $(BUILD_DIR)/test/initramfs/etc/stargazer/ips/profiles
+	@mkdir -p $(BUILD_DIR)/test/initramfs/etc/stargazer/ips/rules
+	@# repo/ và rules/ được tạo rỗng; ipsd sẽ không nạp gì cho tới khi
+	@# user download ruleset qua web UI (Download tab → Update Rules).
+	@touch $(BUILD_DIR)/test/initramfs/etc/stargazer/ips/rules/active.rules
+	@mkdir -p $(BUILD_DIR)/test/initramfs/etc/stargazer/logs
+	@echo "[ipsd] IPS daemon + signature repo installed in initramfs"
 
 	# Pack initramfs
 	cd $(BUILD_DIR)/test/initramfs && find . | sort | cpio -o -H newc 2>/dev/null | gzip -n -9 > $(BUILD_DIR)/test/initramfs.gz

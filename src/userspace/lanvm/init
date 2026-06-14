@@ -51,4 +51,4 @@ echo "  ping -c 3 192.168.99.99    # Stargazer LAN"
 echo "  ping -c 3 8.8.8.8          # Internet (if forwarding enabled)"
 echo ""
 
-exec /bin/sh
+exec /bin/sh < /dev/ttyAMA0 > /dev/ttyAMA0 2>&1
