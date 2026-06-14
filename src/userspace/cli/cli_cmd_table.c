@@ -1713,14 +1713,15 @@ static int cmd_ssl_cacert(const char *args, const char *permissions)
 		ipc_resp_free(&resp);
 		return 0;
 	}
-	/* In nguyên PEM ra stdout — admin copy/scp về cài vào client trust store.
-	 * Output rỗng = CA chưa sinh (chưa bật profile deep nào) — gợi ý rõ. */
+	/* Print the raw PEM to stdout — admin copies/scps it into the client trust
+	 * store. Empty output = CA not generated yet (no deep profile enabled) — give
+	 * a clear hint. */
 	if (resp.payload && resp.payload_len > 0)
 		printf("%s", resp.payload);
 	else
-		printf("  CA chưa tồn tại — tạo SSL inspection profile chế độ "
-		       "deep rồi gán vào firewall policy để stargazer-ssld sinh "
-		       "CA tự động.\n");
+		printf("  CA does not exist yet — create an SSL inspection profile in "
+		       "deep mode and assign it to a firewall policy so stargazer-ssld "
+		       "generates the CA automatically.\n");
 	ipc_resp_free(&resp);
 	return 0;
 }

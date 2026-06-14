@@ -14,9 +14,9 @@
 #include <stddef.h>
 
 #define CLI_MAX_LINE   512
-/* ~116 cmd_table + ~20 registry type (+ ngữ cảnh entry "set <key>") > 128 →
- * trước đây tràn, cli_register drop âm thầm các type đăng ký sau (mất gợi ý
- * "configure firewall ..."). 256 cho dư. */
+/* ~116 cmd_table + ~20 registry types (+ entry context "set <key>") > 128 →
+ * previously overflowed, cli_register silently dropped the types registered
+ * afterwards (lost the "configure firewall ..." hints). 256 has plenty of room. */
 #define CLI_MAX_COMPS  256
 #define CLI_MAX_HIST   100
 #define CLI_MAX_DESC   128

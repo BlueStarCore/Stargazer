@@ -169,15 +169,15 @@ typedef enum {
 	/* DHCP lease events (udhcpc script → mgmtd) */
 	SG_CMD_DHCP_LEASE_EVENT  = 682,  /* payload: iface=<name> action=bound|renew|deconfig */
 
-	/* SSL inspection: trả CA cert (PEM) cho client tải về cài */
+	/* SSL inspection: return the CA cert (PEM) for the client to download and install */
 	SG_CMD_SSL_CACERT        = 683,
 
 	/* IPS daemon status + alert log */
-	SG_CMD_IPS_STATUS        = 684,   /* trạng thái ipsd + counters   */
-	SG_CMD_IPS_ALERTS        = 685,   /* N dòng cuối ips-alert.log    */
+	SG_CMD_IPS_STATUS        = 684,   /* ipsd status + counters       */
+	SG_CMD_IPS_ALERTS        = 685,   /* last N lines of ips-alert.log */
 	SG_CMD_IPS_SIGNATURES    = 686,   /* catalog signature repo (JSON) */
 	SG_CMD_IPS_REBUILD       = 687,   /* recompile active.rules + reload (ips-update.sh) */
-	SG_CMD_IPS_UPDATE_NOW    = 688,   /* tải ruleset (security_ips-ruleset) + rebuild + reload */
+	SG_CMD_IPS_UPDATE_NOW    = 688,   /* fetch ruleset (security_ips-ruleset) + rebuild + reload */
 	SG_CMD_IPS_ALERTS_JSON       = 689,   /* parse ips-alert.log → JSON array */
 	SG_CMD_IPS_RULESETS_RELOAD   = 690,   /* scan custom dir for .xml → upsert DB entries */
 	SG_CMD_IPS_UPDATE_LOG        = 691,   /* tail ips-update.log → payload */

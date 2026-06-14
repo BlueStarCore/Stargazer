@@ -1,13 +1,13 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * mgmtd_ips_compile.h — Biên dịch ruleset IPS theo category (Phase B).
+ * mgmtd_ips_compile.h — Compile IPS ruleset by category (Phase B).
  *
- * Kho signature global tổ chức theo category file: <repo>/<cat>.rules
- * (vd repo/scan.rules, repo/web.rules). Một profile chọn tập category qua
- * field `categories` ("all" hoặc "scan,web,malware"). Hàm compile ghép các
- * file category được chọn thành MỘT ruleset đầu ra (profile hoặc active).
+ * The global signature store is organized into per-category files: <repo>/<cat>.rules
+ * (e.g. repo/scan.rules, repo/web.rules). A profile selects a set of categories via
+ * the `categories` field ("all" or "scan,web,malware"). The compile function merges
+ * the selected category files into ONE output ruleset (per-profile or active).
  *
- * Thuần I/O (dirent/stdio) — KHÔNG phụ thuộc DB/mgmtd → host-test được.
+ * Pure I/O (dirent/stdio) — does NOT depend on DB/mgmtd → host-testable.
  */
 #ifndef MGMTD_IPS_COMPILE_H
 #define MGMTD_IPS_COMPILE_H
@@ -15,16 +15,16 @@
 #include <stddef.h>
 
 /*
- * Ghép các category đã chọn từ repo_dir vào out_path.
+ * Merge the selected categories from repo_dir into out_path.
  *
- *   repo_dir   : thư mục chứa <category>.rules
- *   categories : "all" → mọi *.rules trong repo; hoặc danh sách "a,b,c"
- *                (mỗi mục → repo_dir/<mục>.rules; thiếu file thì bỏ qua).
- *   out_path   : file ruleset đầu ra (ghi đè).
+ *   repo_dir   : directory containing <category>.rules
+ *   categories : "all" → every *.rules in the repo; or a list "a,b,c"
+ *                (each entry → repo_dir/<entry>.rules; a missing file is skipped).
+ *   out_path   : output ruleset file (overwritten).
  *
- * Trả số file category đã ghép (>=0), -1 nếu lỗi mở out_path / repo.
- * out_path luôn có header comment + nội dung các category (kể cả 0 file →
- * file rỗng hợp lệ, ipsd -C sẽ báo 0 rule).
+ * Returns the number of category files merged (>=0), -1 on failure to open out_path / repo.
+ * out_path always has a header comment + the category contents (even 0 files →
+ * a valid empty file, ipsd -C will report 0 rules).
  */
 int ips_compile_categories(const char *repo_dir, const char *categories,
 			   const char *out_path);
@@ -37,38 +37,38 @@ enum ips_filter_action { IPS_FA_DEFAULT = 0, IPS_FA_BLOCK, IPS_FA_ALERT,
 
 struct ips_filter {
 	int  type;          /* enum ips_filter_type   */
-	char value[128];    /* tên category hoặc SID  */
+	char value[128];    /* category name or SID   */
 	int  action;        /* enum ips_filter_action (P7) */
 };
 
 /*
- * Compile ruleset của một profile TỪ danh sách filter vào out_path (P7).
- * Mỗi entry mang action per-entry; khi ghi rule, REWRITE token action đầu:
- *   default → giữ action gốc của rule.   block → "drop".   alert → "alert".
- *   pass    → KHÔNG ghi rule (whitelist, loại khỏi profile).
- * Precedence (như FortiGate): signature override > category > default — sid có
- * filter type=signature thì dùng action đó, kể cả khi sid nằm trong category.
- * Rule partial-match (P0 fidelity ALERT) dù block vẫn bị ipsd kẹp ALERT lúc
- * chạy (không false-DROP).
- * Trả số dòng RULE đã ghi (>=0), -1 nếu lỗi mở out_path/repo.
+ * Compile a profile's ruleset FROM a filter list into out_path (P7).
+ * Each entry carries a per-entry action; when writing a rule, REWRITE the first action token:
+ *   default → keep the rule's original action.   block → "drop".   alert → "alert".
+ *   pass    → do NOT write the rule (whitelist, excluded from the profile).
+ * Precedence (like FortiGate): signature override > category > default — a sid with a
+ * filter type=signature uses that action, even when the sid is inside a category.
+ * A partial-match rule (P0 fidelity ALERT), even if block, is still clamped to ALERT by
+ * ipsd at runtime (no false-DROP).
+ * Returns the number of RULE lines written (>=0), -1 on failure to open out_path/repo.
  */
 int ips_compile_filters(const char *repo_dir, const struct ips_filter *filters,
 			int n_filters, const char *out_path);
 
 /*
- * Liệt kê signature trong repo dưới dạng JSON array (cho bảng "Add Signatures"
- * kiểu FortiGate). Mỗi entry: {sid,name,category,action,cve}. Parse từng rule
- * lấy action (token đầu), msg:"..." (name), sid:N;, reference:cve,...
- * Ghi vào buf (cap), trả độ dài (>=0) hoặc -1. Cắt an toàn nếu gần đầy cap.
+ * List the signatures in the repo as a JSON array (for the FortiGate-style
+ * "Add Signatures" table). Each entry: {sid,name,category,action,cve}. Parse each rule
+ * to get the action (first token), msg:"..." (name), sid:N;, reference:cve,...
+ * Write into buf (cap), return the length (>=0) or -1. Truncate safely if near the cap.
  */
 /* allowed: array of category name strings (repo filename stem, e.g. "botcc").
  * Only entries whose category appears in allowed[] are included.
  * Pass allowed=NULL / n_allowed=0 to include everything.
  *
- * query: lọc text (case-insensitive) — chỉ entry có `query` trong sid/name/
- * category/cve mới được xuất. NULL/"" = không lọc. Vì response IPC giới hạn
- * 64KB, ruleset lớn phải SEARCH server-side; *truncated được set 1 nếu còn
- * entry khớp nhưng hết chỗ (frontend báo "thu hẹp từ khoá"). */
+ * query: text filter (case-insensitive) — only entries with `query` in sid/name/
+ * category/cve are emitted. NULL/"" = no filter. Because the IPC response is limited
+ * to 64KB, a large ruleset must be SEARCHed server-side; *truncated is set to 1 if there
+ * are still matching entries but no room left (the frontend prompts "narrow the keyword"). */
 int ips_catalog_to_json(const char *repo_dir, char *buf, size_t cap,
                         const char *const *allowed, int n_allowed,
                         const char *query, int *truncated);

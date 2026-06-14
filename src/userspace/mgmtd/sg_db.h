@@ -51,6 +51,13 @@ char *sg_db_get(const char *type, const char *id);
 int sg_db_set(const char *type, const char *id, const char *data);
 
 /*
+ * Human-readable reason for the most recent sg_db_set() failure, captured at
+ * the failure point before ROLLBACK (e.g. "attempt to write a readonly
+ * database"). Returns a static string; never NULL.
+ */
+const char *sg_db_last_err(void);
+
+/*
  * Delete all rows for a (type, id) entry.
  * Returns 0 on success (even if nothing deleted), -1 on error.
  */
