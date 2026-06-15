@@ -3787,8 +3787,8 @@
         'firewall_address': 1,
         'firewall_service': 1,
         'system_admin': 1,
-        'system_admin-profile': 1,
-        'security_ips-profile': 1
+        'system_admin-profile': 1
+        /* security_ips-profile is numeric-id now (auto-assigned via nextNumericId) */
     };
     function nextNumericId() {
         var pageEl = document.getElementById('page-' + activePage);
@@ -4842,11 +4842,16 @@
             var row = profForm ? profForm.querySelector('.form-row[data-key="name"] .form-input') : null;
             return row ? row.value.trim() : '';
         }
+        /* The profile's numeric id (filters are nested children "<profid>/<seq>").
+         * Empty for a not-yet-saved new profile → only pending filters show. */
+        function curProfileId() {
+            return (profForm && profForm.dataset.editRowId) || '';
+        }
 
         function renderProfileFilters() {
             var tb = document.querySelector('#ips-prof-filters tbody');
             if (!tb) return;
-            var name = curProfileName();
+            var pid = curProfileId();
 
             function paint(dbRows) {
                 if (!dbRows.length && !pendingFilters.length) {
@@ -4855,10 +4860,12 @@
                 }
                 tb.innerHTML = '';
                 dbRows.forEach(function (e) {
+                    var typ = e.rule ? 'signature' : (e.category ? 'category' : '');
+                    var val = e.rule || e.category || '';
                     var tr = document.createElement('tr');
                     tr.innerHTML =
-                        '<td>' + (e.type || '') + '</td>' +
-                        '<td>' + (e.value || '') + '</td>' +
+                        '<td>' + typ + '</td>' +
+                        '<td>' + val + '</td>' +
                         '<td>' + (e.action || 'default') + '</td>' +
                         '<td>' + (e.status || 'enable') + '</td>' +
                         '<td><button type="button" class="btn ips-del-filter" data-id="' + (e.id || '') + '">Delete</button></td>';
@@ -4877,13 +4884,14 @@
                 });
             }
 
-            if (!name) {
+            if (!pid) {           /* new (unsaved) profile → only pending */
                 paint([]);
                 return;
             }
             api('/config/security_ips-filter').then(function (data) {
+                var prefix = pid + '/';
                 var rows = (data && data.entries ? data.entries : [])
-                    .filter(function (e) { return e.profile === name; });
+                    .filter(function (e) { return e.id && e.id.indexOf(prefix) === 0; });
                 paint(rows);
             }).catch(function () { paint([]); });
         }
@@ -5015,24 +5023,37 @@
                     method = 'PUT'; url = '/config/security_ips-profile/' + rowId;
                 } else {
                     method = 'POST'; url = '/config/security_ips-profile';
-                    payload.id = payload.name; /* NAME_AS_ID_TYPES */
+                    payload.id = nextNumericId(); /* numeric profile id 1..31 */
                 }
 
                 var toFlush = pendingFilters.slice();
+                var savedId = isEdit ? rowId : payload.id;
                 api(url, { method: method, body: payload })
                     .then(function () {
                         pendingFilters = [];
-                        var savedName = payload.name;
-                        return Promise.all(toFlush.map(function (pf) {
-                            var id = (savedName + '-' + pf.value).replace(/[^A-Za-z0-9_-]/g, '_');
-                            return api('/config/security_ips-filter', {
-                                method: 'POST',
-                                body: { id: id, profile: savedName, type: pf.type,
-                                        value: pf.value,
-                                        action: pf.action || 'default',
-                                        status: 'enable' }
+                        if (!toFlush.length) return;
+                        /* Filters are nested children "<profid>/<seq>". Continue
+                         * the sequence after the profile's existing filters so we
+                         * never clobber one (e.g. editing a profile that has 2/1). */
+                        return api('/config/security_ips-filter').then(function (data) {
+                            var prefix = savedId + '/';
+                            var maxSeq = 0;
+                            (data && data.entries ? data.entries : []).forEach(function (e) {
+                                if (e.id && e.id.indexOf(prefix) === 0) {
+                                    var s = parseInt(e.id.slice(prefix.length), 10);
+                                    if (!isNaN(s) && s > maxSeq) maxSeq = s;
+                                }
                             });
-                        }));
+                            return Promise.all(toFlush.map(function (pf, i) {
+                                var body = { id: prefix + (maxSeq + 1 + i),
+                                             action: pf.action || 'default',
+                                             status: 'enable' };
+                                if (pf.type === 'category') body.category = pf.value;
+                                else                        body.rule = pf.value;
+                                return api('/config/security_ips-filter', {
+                                    method: 'POST', body: body });
+                            }));
+                        });
                     })
                     .then(function () {
                         closeModal(false);
@@ -6087,18 +6108,16 @@
         return cachedApi('/config/security_ips-profile').then(function (data) {
             var entries = (data && data.entries) ? data.entries : [];
             document.querySelectorAll('.ips-profile-select').forEach(function (sel) {
-                var cur = sel.value || 'default';
+                /* profiles are numeric-id now; default profile id is 1 */
+                var cur = sel.value || '1';
                 sel.innerHTML = '';
-                var def = document.createElement('option');
-                def.value = 'default';
-                def.textContent = 'default';
-                sel.appendChild(def);
                 entries.forEach(function (e) {
-                    var eid = e.id || e.name || '';
-                    if (!eid || eid === 'default') return;
+                    var eid = e.id || '';
+                    if (!eid) return;
                     var opt = document.createElement('option');
-                    opt.value = eid;
-                    opt.textContent = eid;
+                    opt.value = eid;                 /* the ref is the numeric id */
+                    opt.textContent = (e.name ? e.name : ('profile ' + eid)) +
+                                      ' (' + eid + ')';
                     sel.appendChild(opt);
                 });
                 selectOption(sel, cur);

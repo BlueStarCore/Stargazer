@@ -14,6 +14,7 @@
 #include "stargazer_ipc.h"
 #include "sg_validate.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -52,11 +53,12 @@ static int rate_limit_check(void)
  */
 static int type_uses_name_as_id(const char *type)
 {
+	/* security_ips-profile is a NUMERIC-id table now (like firewall_policy):
+	 * the id is the profile id 1..31, 'name' is descriptive only. */
 	return strcmp(type, "firewall_address") == 0 ||
 	       strcmp(type, "firewall_service") == 0 ||
 	       strcmp(type, "system_admin") == 0 ||
-	       strcmp(type, "system_admin-profile") == 0 ||
-	       strcmp(type, "security_ips-profile") == 0;
+	       strcmp(type, "system_admin-profile") == 0;
 }
 
 static void reply_json(struct mg_connection *c, int status, const char *json)
@@ -243,6 +245,25 @@ static int parse_segments(struct mg_str uri, char segs[][128], int max)
 		p = slash ? slash + 1 : end;
 	}
 	return n;
+}
+
+/* In-place percent-decode (e.g. "2%2F1" → "2/1"). Path segments are split on
+ * literal '/', so a composite id like "<profid>/<seq>" must be sent encoded;
+ * decode it here before use. Decoded length is always <= input length. */
+static void url_decode_inplace(char *s)
+{
+	char *o = s;
+	for (char *p = s; *p; p++) {
+		if (p[0] == '%' && isxdigit((unsigned char)p[1]) &&
+		    isxdigit((unsigned char)p[2])) {
+			char h[3] = { p[1], p[2], 0 };
+			*o++ = (char)strtol(h, NULL, 16);
+			p += 2;
+		} else {
+			*o++ = *p;
+		}
+	}
+	*o = '\0';
 }
 
 /*
@@ -610,6 +631,11 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 	if (strcmp(segs[0], "config") == 0 && nseg >= 2) {
 		const char *type = segs[1];
 
+		/* The entry id (segs[2]) may be percent-encoded so a composite id
+		 * like "<profid>/<seq>" survives path splitting — decode it once here. */
+		if (nseg >= 3)
+			url_decode_inplace(segs[2]);
+
 		/* GET /api/config/{type} — list all entries */
 		if (nseg == 2 && mg_str_eq(hm->method, "GET")) {
 			/* Check for ?q= search param */
@@ -637,8 +663,9 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 
 		/* GET /api/config/{type}/{id} — get single entry */
 		if (nseg >= 3 && mg_str_eq(hm->method, "GET")) {
-			/* Validate entry ID to prevent injection attacks */
-			if (!sg_is_safe_id(segs[2])) {
+			/* Validate entry ID per the type's id rule (uint / safe-id /
+			 * composite profid/seq) — also prevents injection. */
+			if (!sg_reg_validate_entry_id(type, segs[2])) {
 				reply_json(c, 400,
 					   "{\"error\":\"Invalid entry ID\"}");
 				return -1;
@@ -802,8 +829,9 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 
 		/* PUT /api/config/{type}/{id} — update entry */
 		if (nseg >= 3 && mg_str_eq(hm->method, "PUT")) {
-			/* Validate entry ID to prevent injection attacks */
-			if (!sg_is_safe_id(segs[2])) {
+			/* Validate entry ID per the type's id rule (uint / safe-id /
+			 * composite profid/seq) — also prevents injection. */
+			if (!sg_reg_validate_entry_id(type, segs[2])) {
 				reply_json(c, 400,
 					   "{\"error\":\"Invalid entry ID\"}");
 				return -1;
@@ -847,8 +875,9 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 
 		/* DELETE /api/config/{type}/{id} — delete entry */
 		if (nseg >= 3 && mg_str_eq(hm->method, "DELETE")) {
-			/* Validate entry ID to prevent injection attacks */
-			if (!sg_is_safe_id(segs[2])) {
+			/* Validate entry ID per the type's id rule (uint / safe-id /
+			 * composite profid/seq) — also prevents injection. */
+			if (!sg_reg_validate_entry_id(type, segs[2])) {
 				reply_json(c, 400,
 					   "{\"error\":\"Invalid entry ID\"}");
 				return -1;
