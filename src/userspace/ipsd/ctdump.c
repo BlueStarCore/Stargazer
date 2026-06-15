@@ -56,6 +56,9 @@
 /* CTA_ML = 27 (Stargazer extension) */
 #define SG_CTA_ML              27
 
+/* CTA_MARK = 8 (be32 connmark) — carries the IPS profile id on the HTTPS path */
+#define SG_CTA_MARK            8
+
 struct sg_nfgenmsg {
 	uint8_t  nfgen_family;
 	uint8_t  version;
@@ -170,6 +173,15 @@ int ctdump_parse_response(const void *attrs_data, int attrs_len,
 			uint64_t v; memcpy(&v, pv, 8);
 			out->pkts_reply = be64toh(v);
 		}
+	}
+
+	/* ---- CTA_MARK (connmark; low bits carry the IPS profile id) ---- */
+	int mk_len = 0;
+	const void *mk = sg_nla_find(attrs_data, attrs_len, SG_CTA_MARK, &mk_len);
+	if (mk && mk_len == 4) {
+		uint32_t v; memcpy(&v, mk, 4);
+		out->mark = be32toh(v);
+		out->mark_valid = 1;
 	}
 
 	return 0;

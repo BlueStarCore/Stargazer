@@ -28,6 +28,9 @@ struct ctdump_result {
 	uint64_t pkts_orig;            /* CTA_COUNTERS_ORIG  → packets forward  */
 	uint64_t pkts_reply;           /* CTA_COUNTERS_REPLY → packets backward */
 	int      acct_valid;           /* 1 if CTA_COUNTERS is present (CONFIG_NF_CONNTRACK_ACCT) */
+
+	uint32_t mark;                 /* CTA_MARK: the flow's connmark         */
+	int      mark_valid;           /* 1 if CTA_MARK is present in the response */
 };
 
 /* ---- API ------------------------------------------------------------------ */

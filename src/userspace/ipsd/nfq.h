@@ -31,6 +31,14 @@
 #define SG_CMK_IPS_INSPECTED   0x00000004u   /* bit 2 — inspected → offload      */
 #define SG_CMK_IPS_MASK        0x00000006u   /* bit 1-2                          */
 
+/* IPS profile id carried in the connmark (bits 3-7 → 1..31). On the HTTPS /
+ * deep-inspection path the flow is REDIRECTed to ssld and never traverses the
+ * FORWARD NFQUEUE rule, so its skb mark carries no profile id. mgmtd stamps the
+ * profile id into the connmark at PREROUTING instead, and ipsd recovers it from
+ * the flow's conntrack entry (CTA_MARK) when ssld opens the inspection IPC. */
+#define SG_CMK_IPS_PROFID_SHIFT 3
+#define SG_CMK_IPS_PROFID_MASK  0x000000F8u   /* bits 3-7 — profile id 1..31      */
+
 /* ---- NFQUEUE context ------------------------------------------------------ */
 struct nfq_ctx {
 	int      fd;           /* AF_NETLINK socket */
