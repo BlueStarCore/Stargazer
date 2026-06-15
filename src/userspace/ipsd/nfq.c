@@ -22,8 +22,12 @@
 #include <linux/udp.h>
 #include <linux/icmp.h>
 
-/* CTA_MARK for NFQA_CT in the verdict */
-#define SG_CTA_MARK          8     /* matches ctdump.c */
+/* CTA_* attributes carried inside NFQA_CT in the verdict (set the conntrack mark).
+ * These are CTA_* values from nfnetlink_conntrack.h — must be in range [0,CTA_MAX]
+ * or the kernel's strict nla validation rejects the whole NFQA_CT nest (then the
+ * mark is silently never applied). */
+#define SG_CTA_MARK          8     /* CTA_MARK      — matches ctdump.c */
+#define SG_CTA_MARK_MASK     21    /* CTA_MARK_MASK — apply only the masked bits  */
 #define SG_NLA_F_NESTED      0x8000
 
 /* ---- NLA helpers (compact, internal use) ---------------------------------- */
@@ -441,9 +445,13 @@ int nfq_verdict(struct nfq_ctx *ctx, uint32_t id, int accept,
 		if (nla_put_raw(buf, &off, (int)sizeof(buf),
 				SG_CTA_MARK, &m, 4) < 0)
 			return -1;
-		/* NFQA_CT_MASK (=28) so the kernel applies the mask */
+		/* CTA_MARK_MASK (21) — inside the NFQA_CT nest — so the kernel does
+		 * ct->mark = (ct->mark & ~mask) | (mark & mask), preserving policy_id
+		 * (bits 8-31) + DIRTY (bit 0). (Was wrongly 28 > CTA_MAX → the kernel
+		 * rejected the whole NFQA_CT nest and never set the convicted bit.) */
 		uint32_t mk = htonl(connmark_mask);
-		if (nla_put_raw(buf, &off, (int)sizeof(buf), 28, &mk, 4) < 0)
+		if (nla_put_raw(buf, &off, (int)sizeof(buf),
+				SG_CTA_MARK_MASK, &mk, 4) < 0)
 			return -1;
 		nla_nest_end(buf, nest, off);
 	}

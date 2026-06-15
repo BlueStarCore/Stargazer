@@ -321,13 +321,23 @@ static int mark_target_supported(void)
 #define SG_CMK_IPS_BLOCK     0x00000002u   /* flow convicted by ipsd → DROP all packets */
 #define SG_CMK_IPS_INSPECTED 0x00000004u   /* verdict reached → skip re-queueing        */
 
-/* Bit map: IPS uses bits 1-2, must NOT overlap DIRTY (bit 0) or
+/* IPS profile id carried in the connmark (bits 3-7 → 1..31) — MUST match
+ * src/userspace/ipsd/nfq.h. Used on the HTTPS deep-inspection path: the bumped
+ * flow is REDIRECTed to ssld and never hits the FORWARD NFQUEUE MARK rule, so the
+ * profile id is stamped into the connmark at PREROUTING and ipsd recovers it from
+ * conntrack (CTA_MARK) on the inspection IPC. */
+#define SG_CMK_IPS_PROFID_SHIFT 3
+#define SG_CMK_IPS_PROFID_MASK  0x000000F8u   /* bits 3-7 — profile id 1..31      */
+
+/* Bit map: IPS uses bits 1-2 + profid bits 3-7, must NOT overlap DIRTY (bit 0) or
  * policy_id (bits 8-31). Asserted at compile time. */
 _Static_assert((SG_CMK_IPS_BLOCK | SG_CMK_IPS_INSPECTED) ==
 	       0x00000006u, "IPS bits must be 1-2");
-_Static_assert(((SG_CMK_IPS_BLOCK | SG_CMK_IPS_INSPECTED) &
+_Static_assert(((SG_CMK_IPS_BLOCK | SG_CMK_IPS_INSPECTED | SG_CMK_IPS_PROFID_MASK) &
 		(SG_CMK_DIRTY | 0xFFFFFF00u)) == 0,
 	       "IPS bits overlap DIRTY/policy_id");
+_Static_assert((31u << SG_CMK_IPS_PROFID_SHIFT) == SG_CMK_IPS_PROFID_MASK,
+	       "profid 31 must fill the profid mask");
 
 /* Validate config security_ips for CFG_SET (no kernel changes). */
 sg_status_t validate_ips(const char *id, const char *data,

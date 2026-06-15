@@ -658,6 +658,9 @@ static void register_entry_cmds(const char *type_name, const char *action)
 	cli_register("next", "Save entry and return to table");
 	cli_register("end", "Save entry and exit context");
 	cli_register("abort", "Discard changes and exit");
+	/* Nested sub-tables (e.g. `config filter` inside an IPS profile). */
+	if (sg_reg_subtable_child(type_name, "filter"))
+		cli_register("config filter", "Configure signature/category filters");
 	register_set_cmds(type_name, action);
 	register_unset_get_cmds(type_name);
 }
@@ -840,6 +843,12 @@ static int handle_password(const char *entry_id, struct kv_buf *b)
 }
 
 /* ── Entry context ────────────────────────────────────────────────────── */
+
+/* Nested sub-table (e.g. `config filter` inside a profile edit). Defined after
+ * context_table; forward-declared so context_entry can recurse into it. Returns 1
+ * if the user typed `end` (propagate exit all the way up), 0 otherwise. */
+static int context_subtable(const char *child_type, const char *label,
+			    const char *parent_id);
 
 static int context_entry(const char *type_name, const char *label,
 			 const char *entry_id, int *exit_all)
@@ -1305,6 +1314,48 @@ static int context_entry(const char *type_name, const char *label,
 			if (strcmp(cmd, "end") == 0 && exit_all)
 				*exit_all = 1;
 			break;
+		} else if (strcmp(cmd, "config") == 0) {
+			/* Nested sub-table, e.g. `config filter` inside a profile.
+			 * The child entries are keyed "<this entry_id>/<seq>", so the
+			 * parent must exist first — persist it now (its CFG_SET also
+			 * triggers any apply on the mgmtd side). */
+			const char *child = sg_reg_subtable_child(type_name, key);
+			if (!child) {
+				printf("  Unknown sub-command: \"config %s\"\n", key);
+				continue;
+			}
+			const char *miss = validate_required(type_name, &data);
+			if (miss) {
+				printf("  Error: set required field(s)%s before"
+				       " 'config %s'.\n", miss, key);
+				continue;
+			}
+			{
+				char payload[4096];
+				int hl = snprintf(payload, sizeof(payload),
+						  "%s\n", section);
+				char serial[2048];
+				kv_serialize(&data, serial, sizeof(serial));
+				if ((size_t)hl + strlen(serial) < sizeof(payload)) {
+					memcpy(payload + hl, serial,
+					       strlen(serial) + 1);
+					struct ipc_response sr;
+					if (ipc_send(SG_CMD_CFG_SET, payload,
+						     (size_t)hl + strlen(serial),
+						     &sr) == 0 &&
+					    sr.status == SG_OK)
+						data.modified = 0;
+					ipc_resp_free(&sr);
+				}
+			}
+			char sublabel[256];
+			snprintf(sublabel, sizeof(sublabel), "%s %s / %s",
+				 label, entry_id, key);
+			if (context_subtable(child, sublabel, entry_id) &&
+			    exit_all) {
+				*exit_all = 1;
+				break;
+			}
 		} else if (strcmp(cmd, "abort") == 0) {
 			if (cfg_reject_extra(key, "abort"))
 				continue;
@@ -1655,6 +1706,133 @@ static int context_table(const char *type_name, const char *label)
 			"[CFG-DBG] exit table: %s\n", type_name);
 	cli_pop();
 	return 0;
+}
+
+/* ── Nested sub-table context ─────────────────────────────────────────────
+ *
+ * A child table (e.g. `config filter`) reached from inside a parent entry edit.
+ * Child entries are keyed "<parent_id>/<seq>"; the user types `edit <seq>` and we
+ * form the composite id. `show`/`delete`/`edit` are scoped to this parent only.
+ * Returns 1 if the user typed `end` (caller propagates the exit), 0 otherwise. */
+static int context_subtable(const char *child_type, const char *label,
+			    const char *parent_id)
+{
+	cli_push();
+	register_table_cmds(child_type);
+
+	char prompt[384];
+	snprintf(prompt, sizeof(prompt), "(%s) # ", label);
+	size_t plen = strlen(parent_id);
+	int propagate_end = 0;
+
+	const char *line;
+	while ((line = cli_readline(prompt)) != NULL) {
+		char cmd[64], arg[256], extra[256], linebuf[1024];
+		snprintf(linebuf, sizeof(linebuf), "%s", line);
+		char *trimmed = trim(linebuf);
+		if (!*trimmed) continue;
+		char resolved[CLI_MAX_LINE];
+		if (cli_resolve_cmd(trimmed, resolved, sizeof(resolved)) != 0)
+			continue;
+		parse_line(resolved, cmd, sizeof(cmd), arg, sizeof(arg),
+			   extra, sizeof(extra));
+
+		if (strcmp(cmd, "show") == 0) {
+			if (cfg_reject_extra(arg, "show")) continue;
+			struct ipc_response resp;
+			int found = 0;
+			printf("config %s\n", label);
+			if (ipc_send_str(SG_CMD_CFG_LIST, child_type, &resp) == 0 &&
+			    resp.status == SG_OK && resp.payload) {
+				for (char *id = resp.payload; id && *id; ) {
+					char *nl = strchr(id, '\n');
+					if (nl) *nl = '\0';
+					/* only this parent's children "<pid>/<seq>" */
+					if (*id && strncmp(id, parent_id, plen) == 0 &&
+					    id[plen] == '/') {
+						char section[512];
+						snprintf(section, sizeof(section),
+							 "%s:%s", child_type, id);
+						struct ipc_response dr;
+						if (ipc_send_str(SG_CMD_CFG_GET,
+								 section, &dr) == 0 &&
+						    dr.status == SG_OK && dr.payload) {
+							found = 1;
+							printf("    edit %s\n",
+							       id + plen + 1);
+							for (const char *p = dr.payload;
+							     p && *p; ) {
+								const char *eol =
+									strchr(p, '\n');
+								size_t ll = eol ?
+								  (size_t)(eol - p) :
+								  strlen(p);
+								const char *eq =
+								  memchr(p, '=', ll);
+								if (eq && !(((size_t)(eq - p) == 7) &&
+								    strncmp(p, "builtin", 7) == 0))
+									printf("        set %.*s %.*s\n",
+									  (int)(eq - p), p,
+									  (int)(ll - (eq - p) - 1),
+									  eq + 1);
+								p += ll;
+								if (eol) p++;
+							}
+							printf("    next\n");
+						}
+						ipc_resp_free(&dr);
+					}
+					if (!nl) break;
+					id = nl + 1;
+				}
+			}
+			ipc_resp_free(&resp);
+			if (!found) printf("  No entries configured.\n");
+			else        printf("end\n");
+		} else if (strcmp(cmd, "edit") == 0) {
+			if (!arg[0]) { printf("  Usage: edit <seq>\n"); continue; }
+			if (cfg_reject_extra(extra, "edit")) continue;
+			int ok = 1;
+			for (const char *p = arg; *p; p++)
+				if (*p < '0' || *p > '9') ok = 0;
+			if (!ok) {
+				printf("  Error: invalid id '%s' (expected a"
+				       " number)\n", arg);
+				continue;
+			}
+			char cid[512];
+			snprintf(cid, sizeof(cid), "%s/%s", parent_id, arg);
+			int exit_all = 0;
+			context_entry(child_type, label, cid, &exit_all);
+			if (exit_all) { propagate_end = 1; break; }
+		} else if (strcmp(cmd, "delete") == 0) {
+			if (!arg[0]) { printf("  Usage: delete <seq>\n"); continue; }
+			if (cfg_reject_extra(extra, "delete")) continue;
+			char cid[512], section[600];
+			snprintf(cid, sizeof(cid), "%s/%s", parent_id, arg);
+			snprintf(section, sizeof(section), "%s:%s", child_type, cid);
+			struct ipc_response dresp;
+			if (ipc_send_str(SG_CMD_CFG_DEL, section, &dresp) == 0 &&
+			    dresp.status == SG_OK)
+				printf("  Entry %s deleted.\n", arg);
+			else
+				printf("  Error: %s\n", dresp.extra[0] ?
+				       dresp.extra : "delete failed");
+			ipc_resp_free(&dresp);
+		} else if (strcmp(cmd, "end") == 0) {
+			if (cfg_reject_extra(arg, "end")) continue;
+			propagate_end = 1;
+			break;
+		} else if (strcmp(cmd, "abort") == 0) {
+			if (cfg_reject_extra(arg, "abort")) continue;
+			break;
+		} else {
+			printf("  Unknown command: \"%s\", try '?' \n", cmd);
+		}
+	}
+
+	cli_pop();
+	return propagate_end;
 }
 
 /* ── Single context ───────────────────────────────────────────────────── */
@@ -2055,6 +2233,18 @@ int cli_configure(int argc, const char **argv)
 			fprintf(stderr,
 				"[CFG-DBG] configure: unknown"
 				" type_key=%s\n", type_key);
+		printf("  Unknown config path:");
+		for (int i = 0; i < argc; i++)
+			printf(" %s", argv[i]);
+		printf("\n  Run 'configure ?' to see available options.\n");
+		return 0;
+	}
+
+	/* A nested sub-table (e.g. security_ips-filter) is only reachable inside its
+	 * parent — it has no standalone `configure <child>` path at all. Treat it
+	 * exactly like an unknown path so it is not exposed as a top-level command. */
+	if (sg_reg_subtable_child("security_ips-profile", "filter") &&
+	    strcmp(type_key, "security_ips-filter") == 0) {
 		printf("  Unknown config path:");
 		for (int i = 0; i < argc; i++)
 			printf(" %s", argv[i]);

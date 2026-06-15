@@ -49,6 +49,14 @@
 #define SSL_CFG_SIG    "/run/stargazer-ssld.cfg"
 #define SSL_IPS_RULES  "/etc/stargazer/ips/rules/active.rules"
 
+/* IPS profile id carried in the connmark bits 3-7 — MUST match
+ * src/userspace/ipsd/nfq.h and mgmtd_apply_firewall.c. On the HTTPS deep-inspect
+ * path the flow is REDIRECTed to ssld and never hits the FORWARD MARK rule, so we
+ * stamp the profile id into the connmark in the SG_SSLD (filter INPUT) chain; ipsd
+ * recovers it from the leg's conntrack entry (CTA_MARK) on the inspection IPC. */
+#define SG_CMK_IPS_PROFID_SHIFT 3
+#define SG_CMK_IPS_PROFID_MASK  0xF8u
+
 /* Interface name safe for iptables (alnum . _ - @, reasonable length). */
 static int valid_ifname(const char *s)
 {
@@ -276,19 +284,47 @@ static void ssld_input_access_sync(void)
 
 		char portstr[16];
 		snprintf(portstr, sizeof(portstr), "%d", port);
+
+		/* Per-policy IPS scoping for the bumped flow: stamp the profile id
+		 * into the connmark (bits 3-7) so ipsd can recover it from conntrack
+		 * (this flow never traverses the FORWARD MARK rule). CONNMARK is
+		 * non-terminating → placed BEFORE the ACCEPT in the same chain, same
+		 * match. Only when the flow will actually be inspected (IPS on). */
+		char xmark[24] = "";
+		if (ips_policy_on(ipst, ipp)) {
+			int pid = ips_profid(ipp);
+			if (pid >= 1 && pid <= 31)
+				snprintf(xmark, sizeof(xmark), "0x%x/0x%x",
+					 (unsigned)pid << SG_CMK_IPS_PROFID_SHIFT,
+					 SG_CMK_IPS_PROFID_MASK);
+		}
 		if (is_any(srcintf)) {
+			if (xmark[0]) {
+				const char *cm[] = {"iptables", "-A", "SG_SSLD",
+					"-p", "tcp", "-m", "tcp", "--dport", portstr,
+					"-j", "CONNMARK", "--set-xmark", xmark, NULL};
+				ipt_exec(cm);
+			}
 			const char *a[] = {"iptables", "-A", "SG_SSLD",
 				"-p", "tcp", "-m", "tcp", "--dport", portstr,
 				"-j", "ACCEPT", NULL};
 			ipt_exec(a);
 		} else {
+			if (xmark[0]) {
+				const char *cm[] = {"iptables", "-A", "SG_SSLD",
+					"-i", srcintf, "-p", "tcp", "-m", "tcp",
+					"--dport", portstr,
+					"-j", "CONNMARK", "--set-xmark", xmark, NULL};
+				ipt_exec(cm);
+			}
 			const char *a[] = {"iptables", "-A", "SG_SSLD",
 				"-i", srcintf, "-p", "tcp", "-m", "tcp",
 				"--dport", portstr, "-j", "ACCEPT", NULL};
 			ipt_exec(a);
 		}
-		mgmt_log("INFO", "SSL input-access: policy %s -i %s tcp/%d ACCEPT",
-			 id, is_any(srcintf) ? "any" : srcintf, port);
+		mgmt_log("INFO", "SSL input-access: policy %s -i %s tcp/%d ACCEPT%s",
+			 id, is_any(srcintf) ? "any" : srcintf, port,
+			 xmark[0] ? " (+profid connmark)" : "");
 	}
 	free(list);
 }

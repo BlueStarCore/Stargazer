@@ -57,8 +57,7 @@ X("show ips filter",                        "Show signature filters for a specif
  * With NULL handler, dispatch falls through to the catch-all `configure`, which
  * passes the full path ("security ssl-inspection-profile") to cli_configure to
  * build the type_key and enter the context. Same pattern as `configure commit`. */
-X("configure security ips-profile",         "Create or edit IPS signature profiles",                   "configure,admin", 0, NULL)
-X("configure security ips-filter",          "Create or edit per-profile signature filters",            "configure,admin", 0, NULL)
+X("configure security ips-profile",         "Create or edit IPS signature profiles (filters nested via 'config filter')", "configure,admin", 0, NULL)
 X("configure security ssl-inspection-profile", "Configure SSL inspection profiles (FortiGate-style)",  "configure,admin", 0, NULL)
 
 X("execute firmware",                       "Firmware management",                     "admin",           0,  NULL)

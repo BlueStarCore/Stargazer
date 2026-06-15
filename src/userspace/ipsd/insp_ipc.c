@@ -13,7 +13,8 @@
 #include "sig_rule.h"
 #include "reass.h"
 #include "proto_buf.h"
-#include "ctdump.h"      /* Phase 2: query the leg's CTA_ML */
+#include "ctdump.h"      /* Phase 2: query the leg's CTA_ML + CTA_MARK */
+#include "nfq.h"         /* SG_CMK_IPS_PROFID_* (profile id in the connmark) */
 #include "ips_model.h"   /* ips_score */
 #include "fusion.h"      /* ips_fuse, struct ips_decision */
 #include "engine.h"      /* struct ips_config */
@@ -226,7 +227,7 @@ static void *insp_conn_thread(void *arg)
 				(buf + sizeof(struct insp_hdr));
 			c.fc.proto       = SIG_PROTO_TCP;
 			c.fc.dport       = o->srv_port;
-			c.fc.prof_id     = o->profile_id;
+			c.fc.prof_id     = o->profile_id;   /* ssld sends 0 today */
 			c.fc.established = 1;   /* proxy leg already established */
 			o->sni[sizeof(o->sni) - 1] = '\0';
 			snprintf(c.sni, sizeof(c.sni), "%s", o->sni);
@@ -235,6 +236,25 @@ static void *insp_conn_thread(void *arg)
 			c.leg_fw_ip    = ntohl(o->leg_fw_ip);
 			c.leg_cli_port = o->leg_cli_port;
 			c.leg_fw_port  = o->leg_fw_port;
+
+			/* Per-policy IPS scoping on the HTTPS path: ssld can't tag the
+			 * flow, so mgmtd stamps the IPS profile id into the connmark
+			 * (bits 3-7) at PREROUTING. Recover it from the client→ssld leg's
+			 * conntrack entry (CTA_MARK). Failure / no profid → keep ssld's
+			 * value (0 = inspect against every rule, fail-safe). */
+			if (c.leg_cli_ip && c.leg_fw_ip) {
+				struct ctdump_result ctr;
+				if (ctdump_query(c.leg_cli_ip, c.leg_fw_ip,
+						 c.leg_cli_port, c.leg_fw_port,
+						 6 /* IPPROTO_TCP */, &ctr) == 0 &&
+				    ctr.mark_valid) {
+					uint8_t pid = (uint8_t)
+					    ((ctr.mark & SG_CMK_IPS_PROFID_MASK)
+					     >> SG_CMK_IPS_PROFID_SHIFT);
+					if (pid >= 1 && pid <= 31)
+						c.fc.prof_id = pid;
+				}
+			}
 
 		} else if (h->type == INSP_DATA) {
 			if ((size_t)n < sizeof(struct insp_hdr) +

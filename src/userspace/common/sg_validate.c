@@ -105,24 +105,23 @@ static const struct field_entry field_table[] = {
 	{ "security_ips", "cron-dow",    "string",              1, "*",       "Cron days-of-week (0=Sun..6=Sat, *)", 0 },
 	{ "security_ips", "cron-desc",   "string",              1, NULL,      "Schedule description", 0 },
 
-	/* security_ips-profile (CFG_TABLE) — multiple profiles, each selecting
-	 * a set of signatures (categories). A policy points to a profile via the
-	 * ips-profile field (ref-or:security_ips-profile:none). */
-	{ "security_ips-profile", "name",         "safe-id",             0, NULL,     "Profile name", 0 },
+	/* security_ips-profile (CFG_TABLE) — NUMERIC-id table (like firewall_policy):
+	 * the entry id IS the profile id 1..31, drives the scope bit and the on-disk
+	 * map filename <id>.rules. `name` is a descriptive label only. A policy points
+	 * to a profile via the ips-profile ref (now a numeric id). */
+	{ "security_ips-profile", "name",         "safe-id",             1, NULL,     "Profile label (descriptive)", 0 },
 	{ "security_ips-profile", "status",       "enum:enable,disable", 0, "enable", "Enable this profile", 0 },
 	{ "security_ips-profile", "categories",   "string",              1, "all",    "Legacy fallback when no filter is set (comma list, 'all')", 0 },
-	{ "security_ips-profile", "profid",       "uint:1:31",           1, NULL,     "Stable profile id 1..31 (internal; drives the scope bit + profile map filename)", SG_FLD_HIDDEN },
 	{ "security_ips-profile", "comment",      "string",              1, NULL,     "Optional description", 0 },
 
-	/* security_ips-filter (CFG_TABLE, FortiGate IPS sensor) — each entry is one
-	 * item of a profile: selected by category or signature (SID), with a
-	 * per-entry ACTION (P7). status = whether the entry is inspected; action = what
-	 * to do on match. Multiple entries per profile (filtered by the `profile` field). */
-	{ "security_ips-filter", "profile", "ref:security_ips-profile",        0, NULL,      "Profile that contains this filter", 0 },
-	{ "security_ips-filter", "type",    "enum:category,signature",         0, "category", "category = rule group; signature = specific SID", 0 },
-	{ "security_ips-filter", "value",   "string",                          0, NULL,      "Category name or SID", 0 },
-	{ "security_ips-filter", "action",  "enum:default,block,alert,pass",   0, "default", "default=keep rule's original action; block=drop; alert=warn; pass=remove rule from profile", 0 },
-	{ "security_ips-filter", "status",  "enum:enable,disable",             0, "enable",  "Enable this filter (whether it is inspected)", 0 },
+	/* security_ips-filter (FortiGate IPS sensor entry) — NESTED sub-table of
+	 * security_ips-profile. The entry id is "<profid>/<seq>" (the profile id is the
+	 * prefix → no profile ref field). Each entry selects ONE signature (rule=SID) or
+	 * ONE category, with a per-entry ACTION. status = whether it is inspected. */
+	{ "security_ips-filter", "rule",     "uint:1:2147483647",            1, NULL,      "Signature SID (set exactly one of rule|category)", 0 },
+	{ "security_ips-filter", "category", "string",                       1, NULL,      "Category name (set exactly one of rule|category)", 0 },
+	{ "security_ips-filter", "action",   "enum:default,block,alert,pass", 0, "default", "default=keep rule's original action; block=drop; alert=warn; pass=remove rule from profile", 0 },
+	{ "security_ips-filter", "status",   "enum:enable,disable",          0, "enable",  "Enable this filter (whether it is inspected)", 0 },
 
 	/* security_ips-ruleset (CFG_TABLE) — ruleset sources to download.
 	 * Each entry is a URL (ET Open, SSL BL, custom). Cron and "Update Now"
@@ -1096,9 +1095,49 @@ sg_reg_field_desc(const char *type_name, const char *key)
 const char *
 sg_reg_entry_id_kind(const char *type_name)
 {
-	if (type_name && strcmp(type_name, "firewall_policy") == 0)
+	/* Numeric-id tables: the entry id IS the object id (firewall_policy uses it
+	 * for the connmark; security_ips-profile uses it as the profile id 1..31 +
+	 * the on-disk map filename <id>.rules). All others are name-keyed. */
+	if (type_name && (strcmp(type_name, "firewall_policy") == 0 ||
+			  strcmp(type_name, "security_ips-profile") == 0))
 		return "uint";
+	/* security_ips-filter is a nested child of a profile: "<profid>/<seq>". */
+	if (type_name && strcmp(type_name, "security_ips-filter") == 0)
+		return "profid/seq";
 	return "safe-id";
+}
+
+/* Nested sub-tables: inside `config <parent_type> / edit <id>`, the verb
+ * `config <subcmd>` enters the child table. Returns the child type, or NULL. */
+const char *
+sg_reg_subtable_child(const char *parent_type, const char *subcmd)
+{
+	static const struct {
+		const char *parent, *subcmd, *child;
+	} sub[] = {
+		{ "security_ips-profile", "filter", "security_ips-filter" },
+		{ NULL, NULL, NULL }
+	};
+	if (!parent_type || !subcmd)
+		return NULL;
+	for (int i = 0; sub[i].parent; i++)
+		if (strcmp(sub[i].parent, parent_type) == 0 &&
+		    strcmp(sub[i].subcmd, subcmd) == 0)
+			return sub[i].child;
+	return NULL;
+}
+
+/* Reverse lookup: if `child_type` is a nested sub-table, return "<parent_type>
+ * <subcmd>" guidance (how to reach it), else NULL. Used to block standalone
+ * `configure <child>` — a child is only reachable nested inside its parent. */
+const char *
+sg_reg_subtable_path(const char *child_type)
+{
+	if (!child_type)
+		return NULL;
+	if (strcmp(child_type, "security_ips-filter") == 0)
+		return "config security ips-profile / edit <id> / config filter";
+	return NULL;
 }
 
 const char *
@@ -1385,6 +1424,18 @@ sg_reg_validate_entry_id(const char *type_name, const char *id)
 				return 0;
 		}
 		return 1;
+	}
+	if (strcmp(kind, "profid/seq") == 0) {
+		/* Composite "<profid 1..31>/<seq>" — both all-digits, one slash.
+		 * The profile id is the prefix (a nested filter has no profile ref). */
+		const char *slash = strchr(id, '/');
+		if (!slash || slash == id || !slash[1])
+			return 0;
+		for (const char *p = id; *p; p++)
+			if (p != slash && !isdigit((unsigned char)*p))
+				return 0;
+		int pid = atoi(id);
+		return (pid >= 1 && pid <= 31);
 	}
 	/* safe-id */
 	return sg_is_safe_id(id);
