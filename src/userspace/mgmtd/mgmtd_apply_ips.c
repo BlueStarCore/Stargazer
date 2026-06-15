@@ -62,12 +62,6 @@ static int files_equal(const char *a, const char *b)
 	return eq;
 }
 
-static int parse_filter_type(const char *s)
-{
-	return (s && strcmp(s, "signature") == 0) ? IPS_FT_SIGNATURE
-						  : IPS_FT_CATEGORY;
-}
-
 /* P7 — action per-entry (FortiGate). */
 static int parse_filter_action(const char *s)
 {
@@ -79,32 +73,43 @@ static int parse_filter_action(const char *s)
 }
 
 /*
- * Gather the filters (status=enable) belonging to `profile` into out[]. Returns
- * the filter count. Each entry carries type/value + per-entry action (P7).
+ * Gather the enabled filters belonging to a profile into out[]. Filters are nested
+ * children keyed "<profid>/<seq>", so we select by id prefix (no profile field).
+ * Each child sets either `rule` (a SID → signature) or `category`, plus a per-entry
+ * action. `profid` is the profile's numeric id. Returns the filter count.
  */
-static int gather_filters(const char *profile, struct ips_filter *out, int max)
+static int gather_filters(const char *profid, struct ips_filter *out, int max)
 {
 	char *list = sg_db_list("security_ips-filter");
 	if (!list)
 		return 0;
+	char pfx[24];
+	int plen = snprintf(pfx, sizeof(pfx), "%s/", profid);   /* "<profid>/" */
 	int n = 0;
 	char *sp = NULL;
 	for (char *id = strtok_r(list, "\n", &sp); id && n < max;
 	     id = strtok_r(NULL, "\n", &sp)) {
-		char *pf  = sg_db_get_val("security_ips-filter", id, "profile");
+		if (strncmp(id, pfx, (size_t)plen) != 0)
+			continue;                              /* not our child */
 		char *st  = sg_db_get_val("security_ips-filter", id, "status");
-		char *ty  = sg_db_get_val("security_ips-filter", id, "type");
-		char *va  = sg_db_get_val("security_ips-filter", id, "value");
+		char *ru  = sg_db_get_val("security_ips-filter", id, "rule");
+		char *ca  = sg_db_get_val("security_ips-filter", id, "category");
 		char *ac  = sg_db_get_val("security_ips-filter", id, "action");
 
-		if (pf && strcmp(pf, profile) == 0 &&
-		    (!st || strcmp(st, "disable") != 0) && va && va[0]) {
-			out[n].type   = parse_filter_type(ty);
-			out[n].action = parse_filter_action(ac);
-			snprintf(out[n].value, sizeof(out[n].value), "%s", va);
-			n++;
+		if ((!st || strcmp(st, "disable") != 0)) {
+			if (ru && ru[0]) {              /* signature (SID) */
+				out[n].type   = IPS_FT_SIGNATURE;
+				out[n].action = parse_filter_action(ac);
+				snprintf(out[n].value, sizeof(out[n].value), "%s", ru);
+				n++;
+			} else if (ca && ca[0]) {       /* category */
+				out[n].type   = IPS_FT_CATEGORY;
+				out[n].action = parse_filter_action(ac);
+				snprintf(out[n].value, sizeof(out[n].value), "%s", ca);
+				n++;
+			}
 		}
-		free(pf); free(st); free(ty); free(va); free(ac);
+		free(st); free(ru); free(ca); free(ac);
 	}
 	free(list);
 	return n;
@@ -232,39 +237,16 @@ static void ips_write_update_conf(void)
 	fclose(f);
 }
 
-int ips_profid(const char *name)
+/* The profile id IS the entry id (numeric-id table, like firewall_policy). It
+ * drives the scope bit, the iptables MARK/connmark, and the map filename
+ * <id>.rules. `id` is the profile's entry id (or a ref to it). Returns 1..31, or
+ * -1 if not a valid profile id. */
+int ips_profid(const char *id)
 {
-	if (!name || !*name)
+	if (!id || !*id)
 		return -1;
-	char *v = sg_db_get_val("security_ips-profile", name, "profid");
-	int id = v ? atoi(v) : 0;
-	free(v);
-	if (id >= 1 && id <= 31)
-		return id;
-
-	/* Assign the lowest free id 1..31 and persist it (stable thereafter). */
-	char used[32] = {0};
-	char *list = sg_db_list("security_ips-profile");
-	if (list) {
-		char *sp = NULL;
-		for (char *p = strtok_r(list, "\n", &sp); p;
-		     p = strtok_r(NULL, "\n", &sp)) {
-			char *pv = sg_db_get_val("security_ips-profile", p, "profid");
-			int pid = pv ? atoi(pv) : 0;
-			free(pv);
-			if (pid >= 1 && pid <= 31) used[pid] = 1;
-		}
-		free(list);
-	}
-	int n = -1;
-	for (int i = 1; i <= 31; i++)
-		if (!used[i]) { n = i; break; }
-	if (n < 0)
-		return -1;                          /* all 31 ids taken */
-	char buf[8];
-	snprintf(buf, sizeof(buf), "%d", n);
-	sg_db_set_val("security_ips-profile", name, "profid", buf);
-	return n;
+	int n = atoi(id);
+	return (n >= 1 && n <= 31) ? n : -1;
 }
 
 /* Build profiles/<profid>.rules = "sid action" for one profile. Reuses
@@ -322,22 +304,23 @@ static void profile_sig(const char *name, char *out, size_t cap)
 
 	char *fl = sg_db_list("security_ips-filter");
 	if (fl) {
+		char pfx[24];
+		int plen = snprintf(pfx, sizeof(pfx), "%s/", name);  /* "<profid>/" */
 		char *sp = NULL;
 		for (char *id = strtok_r(fl, "\n", &sp); id;
 		     id = strtok_r(NULL, "\n", &sp)) {
-			char *pf = sg_db_get_val("security_ips-filter", id, "profile");
-			if (pf && strcmp(pf, name) == 0) {
-				char *ty = sg_db_get_val("security_ips-filter", id, "type");
-				char *va = sg_db_get_val("security_ips-filter", id, "value");
-				char *ac = sg_db_get_val("security_ips-filter", id, "action");
-				char *stt = sg_db_get_val("security_ips-filter", id, "status");
-				SIG_MIX(ty ? ty : "");  SIG_MIX(":");
-				SIG_MIX(va ? va : "");  SIG_MIX(":");
-				SIG_MIX(ac ? ac : "");  SIG_MIX(":");
-				SIG_MIX(stt ? stt : ""); SIG_MIX(";");
-				free(ty); free(va); free(ac); free(stt);
-			}
-			free(pf);
+			if (strncmp(id, pfx, (size_t)plen) != 0)
+				continue;                       /* not our child */
+			char *ru = sg_db_get_val("security_ips-filter", id, "rule");
+			char *ca = sg_db_get_val("security_ips-filter", id, "category");
+			char *ac = sg_db_get_val("security_ips-filter", id, "action");
+			char *stt = sg_db_get_val("security_ips-filter", id, "status");
+			SIG_MIX(id);            SIG_MIX(":");   /* seq makes it order-stable */
+			SIG_MIX(ru ? ru : "");  SIG_MIX(":");
+			SIG_MIX(ca ? ca : "");  SIG_MIX(":");
+			SIG_MIX(ac ? ac : "");  SIG_MIX(":");
+			SIG_MIX(stt ? stt : ""); SIG_MIX(";");
+			free(ru); free(ca); free(ac); free(stt);
 		}
 		free(fl);
 	}

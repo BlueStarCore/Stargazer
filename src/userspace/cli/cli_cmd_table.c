@@ -1587,9 +1587,12 @@ static int cmd_show_ips_profiles(const char *args, const char *permissions)
 		    gresp.status == SG_OK && gresp.payload) {
 			char status[32]  = "enable";
 			char comment[128] = "";
+			char name[64]    = "";
 			sg_kv_get(gresp.payload, "status",  status,  sizeof(status));
 			sg_kv_get(gresp.payload, "comment", comment, sizeof(comment));
-			printf("  %-20s  %-8s  %s\n", id, status,
+			sg_kv_get(gresp.payload, "name",    name,    sizeof(name));
+			printf("  id %-4s  %-16s  %-8s  %s\n", id,
+			       name[0] ? name : "-", status,
 			       comment[0] ? comment : "(no comment)");
 		}
 		ipc_resp_free(&gresp);

@@ -2187,8 +2187,44 @@ sg_status_t validate_cfg_data(const char *type, const char *data,
  * Phase 2: Seed/repair built-in immutable      (force-overwrite on conflict)
  * Phase 3: Backfill missing keys               (new fields added)
  * Phase 4: Backfill sequence numbers           (firewall_policy, network_nat)
+ * Phase 4c: Migrate name-keyed IPS profiles    (→ numeric ids + rewrite refs)
  * Phase 5: Purge stale types                   (types removed from registry)
  */
+
+/* Rewrite every <type>.<field> that equals oldval → newval. Used to fix up
+ * references after an IPS profile's id changes from a name to a number. */
+static int migrate_rewrite_ref(const char *type, const char *field,
+			       const char *oldval, const char *newval)
+{
+	char *list = sg_db_list(type);
+	if (!list)
+		return 0;
+	int n = 0;
+	char *sp = NULL;
+	for (char *id = strtok_r(list, "\n", &sp); id;
+	     id = strtok_r(NULL, "\n", &sp)) {
+		char *v = sg_db_get_val(type, id, field);
+		if (v && strcmp(v, oldval) == 0) {
+			sg_db_set_val(type, id, field, newval);
+			n++;
+		}
+		free(v);
+	}
+	free(list);
+	return n;
+}
+
+/* 1 if s is a non-empty all-digits string. */
+static int is_numeric_id(const char *s)
+{
+	if (!s || !*s)
+		return 0;
+	for (const char *p = s; *p; p++)
+		if (*p < '0' || *p > '9')
+			return 0;
+	return 1;
+}
+
 static void mgmtd_reconcile_config(void)
 {
 	const sg_type_info_t *types = sg_reg_types();
@@ -2245,7 +2281,7 @@ static void mgmtd_reconcile_config(void)
 			  "builtin=yes\n"
 			  "immutable=yes\n"
 			  "comment=Match all services\n" },
-			{ "security_ips-profile", "default",
+			{ "security_ips-profile", "1",
 			  "name=default\n"
 			  "status=enable\n"
 			  "categories=all\n"
@@ -2570,6 +2606,90 @@ static void mgmtd_reconcile_config(void)
 					 "firewall_policy:%s cmkid=%d",
 					 tok, next_cmkid);
 				next_cmkid++;
+				changes++;
+			}
+			free(list);
+		}
+	}
+
+	/* ── Phase 4c: migrate name-keyed IPS profiles → numeric ids ──
+	 *
+	 * security_ips-profile became a NUMERIC-id table (the entry id IS the
+	 * profile id 1..31 == the on-disk map filename <id>.rules). Upgraded DBs
+	 * have name-keyed rows ("default", "test1", …). Map each non-numeric id to
+	 * a number (old "default" folds into the seeded id 1; others take the lowest
+	 * free 2..31), move the row, and rewrite every reference
+	 * (firewall_policy.ips-profile, security_ips-filter.profile). Idempotent:
+	 * numeric ids are skipped → no-op on fresh / already-migrated DBs. Runs
+	 * AFTER Phase 2 seeded security_ips-profile:1, so default folds cleanly. */
+	{
+		char *list = sg_db_list("security_ips-profile");
+		if (list) {
+			char used[32] = {0};
+			char *l2 = strdup(list);
+			if (l2) {
+				char *sp = NULL;
+				for (char *t = strtok_r(l2, "\n", &sp); t;
+				     t = strtok_r(NULL, "\n", &sp)) {
+					int n = atoi(t);
+					if (is_numeric_id(t) && n >= 1 && n <= 31)
+						used[n] = 1;
+				}
+				free(l2);
+			}
+			char *sp = NULL;
+			for (char *id = strtok_r(list, "\n", &sp); id;
+			     id = strtok_r(NULL, "\n", &sp)) {
+				if (is_numeric_id(id))
+					continue;          /* already migrated */
+				int newid = -1;
+				if (strcmp(id, "default") == 0) {
+					newid = 1;         /* fold into seeded default */
+				} else {
+					for (int i = 2; i <= 31; i++)
+						if (!used[i]) { newid = i; break; }
+					if (newid < 0)
+						for (int i = 1; i <= 31; i++)
+							if (!used[i]) { newid = i; break; }
+				}
+				if (newid < 0) {
+					mgmt_log("ERROR", "reconcile: no free IPS "
+						 "profid for '%s' — dropping", id);
+					sg_db_del("security_ips-profile", id);
+					changes++;
+					continue;
+				}
+				char nid[8];
+				snprintf(nid, sizeof(nid), "%d", newid);
+				/* Move the row only if the target id is not already
+				 * populated (default→1 keeps the seeded built-in). */
+				char *targ = sg_db_get("security_ips-profile", nid);
+				if (!targ) {
+					char *data = sg_db_get("security_ips-profile", id);
+					if (data) {
+						sg_db_set("security_ips-profile", nid, data);
+						free(data);
+					}
+					/* Preserve a label: name-keyed rows may have had no
+					 * explicit `name` field (the id WAS the name). */
+					char *nm = sg_db_get_val("security_ips-profile",
+								 nid, "name");
+					int have_name = nm && nm[0];
+					free(nm);
+					if (!have_name)
+						sg_db_set_val("security_ips-profile",
+							      nid, "name", id);
+				}
+				free(targ);
+				sg_db_del("security_ips-profile", id);
+				used[newid] = 1;
+				int r1 = migrate_rewrite_ref("firewall_policy",
+							     "ips-profile", id, nid);
+				int r2 = migrate_rewrite_ref("security_ips-filter",
+							     "profile", id, nid);
+				mgmt_log("INFO", "reconcile: migrated IPS profile "
+					 "'%s' → id %s (%d policy + %d filter refs)",
+					 id, nid, r1, r2);
 				changes++;
 			}
 			free(list);
@@ -5082,6 +5202,36 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			return 0;
 		}
 
+		/* IPS profile id is the profile's scope bit (1..31) and its map
+		 * filename — bound it to that range (the connmark mask is 5 bits). */
+		if (strcmp(db_type, "security_ips-profile") == 0) {
+			int pid = atoi(db_id);
+			if (pid < 1 || pid > 31) {
+				send_error(client_fd, SG_ERR_INVALID_ARG,
+					   "IPS profile id must be 1..31");
+				return 0;
+			}
+		}
+
+		/* IPS filter is a nested child "<profid>/<seq>": the parent profile
+		 * must exist. (The rule|category XOR is checked below, after the
+		 * existing row is loaded, so a partial update can merge with it.) */
+		if (strcmp(db_type, "security_ips-filter") == 0) {
+			const char *slash = strchr(db_id, '/');
+			char pidbuf[16] = "";
+			if (slash)
+				snprintf(pidbuf, sizeof(pidbuf), "%.*s",
+					 (int)(slash - db_id), db_id);
+			char *pp = pidbuf[0] ?
+				sg_db_get("security_ips-profile", pidbuf) : NULL;
+			if (!pp) {
+				send_error(client_fd, SG_ERR_INVALID_ARG,
+					   "parent IPS profile does not exist");
+				return 0;
+			}
+			free(pp);
+		}
+
 		/* Validate key names, values, and required fields */
 		char val_err[SG_EXTRA_MAX];
 		sg_status_t val_st = validate_cfg_data(db_type, data,
@@ -5148,6 +5298,28 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			return 0;
 		}
 
+		/* IPS filter: exactly one of rule|category. Resolve the effective
+		 * values by merging the incoming payload over the existing row, so a
+		 * partial update (e.g. changing only `action`) keeps the rule/category
+		 * already stored instead of looking "both unset". */
+		if (strcmp(db_type, "security_ips-filter") == 0) {
+			char ru[VALBUFSZ] = "", ca[VALBUFSZ] = "";
+			if (sg_kv_has_key(data, "rule"))
+				extract_val(data, "rule", ru, sizeof(ru));
+			else if (existing)
+				extract_val(existing, "rule", ru, sizeof(ru));
+			if (sg_kv_has_key(data, "category"))
+				extract_val(data, "category", ca, sizeof(ca));
+			else if (existing)
+				extract_val(existing, "category", ca, sizeof(ca));
+			if ((ru[0] && ca[0]) || (!ru[0] && !ca[0])) {
+				free(existing);
+				send_error(client_fd, SG_ERR_INVALID_ARG,
+					   "set exactly one of 'rule' or 'category'");
+				return 0;
+			}
+		}
+
 		/* Cap the number of SSL inspection profiles — each profile runs
 		 * its own ssld, so prevent creating too many (process DoS). The
 		 * built-in no-inspection is not capped (updates are already
@@ -5173,6 +5345,16 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			    (ll >= 10 && memcmp(dp, "immutable=",    10) == 0) ||
 			    (ll >=  9 && memcmp(dp, "password=",      9) == 0) ||
 			    (ll >= 14 && memcmp(dp, "password-hash=", 14) == 0)) {
+				dp += ll;
+				if (el) dp++;
+				continue;
+			}
+			/* IPS filter: don't persist an empty rule=/category= — exactly
+			 * one is set, so the other arrives empty; drop it so the row
+			 * stays clean (a line "rule=" is ll==5, "category=" is ll==9). */
+			if (strcmp(db_type, "security_ips-filter") == 0 &&
+			    ((ll == 5 && memcmp(dp, "rule=",     5) == 0) ||
+			     (ll == 9 && memcmp(dp, "category=", 9) == 0))) {
 				dp += ll;
 				if (el) dp++;
 				continue;
@@ -5932,6 +6114,23 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 				extract_val(pdata, "cmkid", cmk, sizeof(cmk));
 				del_cmkid = (unsigned)atoi(cmk);
 				free(pdata);
+			}
+		}
+
+		/* Cascade: deleting an IPS profile removes its nested filter
+		 * children (prefix "<profid>/") — they have no profile ref to
+		 * block the delete, so prune them explicitly. */
+		if (strcmp(db_type, "security_ips-profile") == 0) {
+			char pfx[24];
+			int plen = snprintf(pfx, sizeof(pfx), "%s/", db_id);
+			char *fl = sg_db_list("security_ips-filter");
+			if (fl) {
+				char *sp = NULL;
+				for (char *fid = strtok_r(fl, "\n", &sp); fid;
+				     fid = strtok_r(NULL, "\n", &sp))
+					if (strncmp(fid, pfx, (size_t)plen) == 0)
+						sg_db_del("security_ips-filter", fid);
+				free(fl);
 			}
 		}
 
