@@ -14,6 +14,7 @@
 #include "stargazer_ipc.h"
 #include "sg_validate.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -52,11 +53,12 @@ static int rate_limit_check(void)
  */
 static int type_uses_name_as_id(const char *type)
 {
+	/* security_ips-profile is a NUMERIC-id table now (like firewall_policy):
+	 * the id is the profile id 1..31, 'name' is descriptive only. */
 	return strcmp(type, "firewall_address") == 0 ||
 	       strcmp(type, "firewall_service") == 0 ||
 	       strcmp(type, "system_admin") == 0 ||
-	       strcmp(type, "system_admin-profile") == 0 ||
-	       strcmp(type, "security_ips-profile") == 0;
+	       strcmp(type, "system_admin-profile") == 0;
 }
 
 static void reply_json(struct mg_connection *c, int status, const char *json)
@@ -68,6 +70,47 @@ static int mg_str_eq(struct mg_str a, const char *b)
 {
 	size_t blen = strlen(b);
 	return (a.len == blen && memcmp(a.buf, b, blen) == 0);
+}
+
+/*
+ * kv_append_filter - append "key=val\n" to a session-clear filter payload if
+ * `val` is non-empty and free of control chars (a newline would forge extra
+ * kv lines for mgmtd). Always frees `val` (from json_str). Returns 1 if a
+ * constraint was appended, else 0.
+ */
+static int kv_append_filter(char *buf, size_t cap, size_t *len,
+			    const char *key, char *val)
+{
+	int ok = val && val[0] != '\0';
+	for (const char *p = val; ok && *p; p++)
+		if ((unsigned char)*p < 0x20) ok = 0;	/* \n \r \t & ctrl */
+	if (ok) {
+		int n = snprintf(buf + *len, cap - *len, "%s=%s\n", key, val);
+		if (n > 0 && (size_t)n < cap - *len) *len += (size_t)n;
+		else ok = 0;				/* would truncate → drop */
+	}
+	free(val);
+	return ok;
+}
+
+/*
+ * kv_append_tuple - append "key=val " (space-joined) to one batch record.
+ * Rejects control chars AND spaces, since a space would split the record when
+ * mgmtd tokenizes it. Always frees `val`. Returns 1 if appended, else 0.
+ */
+static int kv_append_tuple(char *buf, size_t cap, size_t *len,
+			   const char *key, char *val)
+{
+	int ok = val && val[0] != '\0';
+	for (const char *p = val; ok && *p; p++)
+		if ((unsigned char)*p <= 0x20) ok = 0;	/* ctrl or space */
+	if (ok) {
+		int n = snprintf(buf + *len, cap - *len, "%s=%s ", key, val);
+		if (n > 0 && (size_t)n < cap - *len) *len += (size_t)n;
+		else ok = 0;
+	}
+	free(val);
+	return ok;
 }
 
 /*
@@ -202,6 +245,25 @@ static int parse_segments(struct mg_str uri, char segs[][128], int max)
 		p = slash ? slash + 1 : end;
 	}
 	return n;
+}
+
+/* In-place percent-decode (e.g. "2%2F1" → "2/1"). Path segments are split on
+ * literal '/', so a composite id like "<profid>/<seq>" must be sent encoded;
+ * decode it here before use. Decoded length is always <= input length. */
+static void url_decode_inplace(char *s)
+{
+	char *o = s;
+	for (char *p = s; *p; p++) {
+		if (p[0] == '%' && isxdigit((unsigned char)p[1]) &&
+		    isxdigit((unsigned char)p[2])) {
+			char h[3] = { p[1], p[2], 0 };
+			*o++ = (char)strtol(h, NULL, 16);
+			p += 2;
+		} else {
+			*o++ = *p;
+		}
+	}
+	*o = '\0';
 }
 
 /*
@@ -569,6 +631,11 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 	if (strcmp(segs[0], "config") == 0 && nseg >= 2) {
 		const char *type = segs[1];
 
+		/* The entry id (segs[2]) may be percent-encoded so a composite id
+		 * like "<profid>/<seq>" survives path splitting — decode it once here. */
+		if (nseg >= 3)
+			url_decode_inplace(segs[2]);
+
 		/* GET /api/config/{type} — list all entries */
 		if (nseg == 2 && mg_str_eq(hm->method, "GET")) {
 			/* Check for ?q= search param */
@@ -596,8 +663,9 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 
 		/* GET /api/config/{type}/{id} — get single entry */
 		if (nseg >= 3 && mg_str_eq(hm->method, "GET")) {
-			/* Validate entry ID to prevent injection attacks */
-			if (!sg_is_safe_id(segs[2])) {
+			/* Validate entry ID per the type's id rule (uint / safe-id /
+			 * composite profid/seq) — also prevents injection. */
+			if (!sg_reg_validate_entry_id(type, segs[2])) {
 				reply_json(c, 400,
 					   "{\"error\":\"Invalid entry ID\"}");
 				return -1;
@@ -761,8 +829,9 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 
 		/* PUT /api/config/{type}/{id} — update entry */
 		if (nseg >= 3 && mg_str_eq(hm->method, "PUT")) {
-			/* Validate entry ID to prevent injection attacks */
-			if (!sg_is_safe_id(segs[2])) {
+			/* Validate entry ID per the type's id rule (uint / safe-id /
+			 * composite profid/seq) — also prevents injection. */
+			if (!sg_reg_validate_entry_id(type, segs[2])) {
 				reply_json(c, 400,
 					   "{\"error\":\"Invalid entry ID\"}");
 				return -1;
@@ -806,8 +875,9 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 
 		/* DELETE /api/config/{type}/{id} — delete entry */
 		if (nseg >= 3 && mg_str_eq(hm->method, "DELETE")) {
-			/* Validate entry ID to prevent injection attacks */
-			if (!sg_is_safe_id(segs[2])) {
+			/* Validate entry ID per the type's id rule (uint / safe-id /
+			 * composite profid/seq) — also prevents injection. */
+			if (!sg_reg_validate_entry_id(type, segs[2])) {
 				reply_json(c, 400,
 					   "{\"error\":\"Invalid entry ID\"}");
 				return -1;
@@ -1182,6 +1252,101 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 		return 0;
 	}
 
+	/* ── POST /api/monitor/sessions/clear ───────────────────────────
+	 * Filtered clear, single-session delete, and multi-select batch all
+	 * post here. Body is either {proto?,src?,dst?,policy?,iif?,oif?} (one
+	 * filter) or {"tuples":[{proto,src,dst},...]} (batch). mgmtd validates
+	 * every value and enforces admin; webd only shuttles the payload. */
+	if (strcmp(segs[0], "monitor") == 0 && nseg == 3 &&
+	    strcmp(segs[1], "sessions") == 0 && strcmp(segs[2], "clear") == 0 &&
+	    mg_str_eq(hm->method, "POST")) {
+		char kv[SG_PAYLOAD_MAX];
+		size_t klen = 0;
+
+		if (mg_json_get(hm->body, "$.tuples", NULL) >= 0) {
+			/* Batch: up to 64 "proto=.. src=.. dst=..\n" records. */
+			char body[SG_PAYLOAD_MAX];
+			size_t blen = 0;
+			int i, recs = 0;
+
+			for (i = 0; i < 64; i++) {
+				char path[40];
+				snprintf(path, sizeof(path), "$.tuples[%d].proto", i);
+				char *pr = json_str(hm->body, path);
+				snprintf(path, sizeof(path), "$.tuples[%d].src", i);
+				char *sr = json_str(hm->body, path);
+				snprintf(path, sizeof(path), "$.tuples[%d].dst", i);
+				char *ds = json_str(hm->body, path);
+
+				if (!pr && !sr && !ds)
+					break;			/* past the array */
+				if (!pr || !sr || !ds) {
+					free(pr); free(sr); free(ds);
+					reply_json(c, 400,
+						   "{\"error\":\"Each tuple needs proto, src, dst\"}");
+					return -1;
+				}
+				kv_append_tuple(body, sizeof(body), &blen, "proto", pr);
+				kv_append_tuple(body, sizeof(body), &blen, "src",   sr);
+				kv_append_tuple(body, sizeof(body), &blen, "dst",   ds);
+				if (blen < sizeof(body)) body[blen++] = '\n';
+				recs++;
+			}
+			if (recs == 0) {
+				reply_json(c, 400, "{\"error\":\"No tuples\"}");
+				return -1;
+			}
+			klen = (size_t)snprintf(kv, sizeof(kv), "tuples=%d\n", recs);
+			if (klen + blen >= sizeof(kv)) {
+				reply_json(c, 400,
+					   "{\"error\":\"Too many sessions selected\"}");
+				return -1;
+			}
+			memcpy(kv + klen, body, blen);
+			klen += blen;
+			kv[klen] = '\0';
+		} else {
+			int n = 0;
+			n += kv_append_filter(kv, sizeof(kv), &klen, "proto",
+					      json_str(hm->body, "$.proto"));
+			n += kv_append_filter(kv, sizeof(kv), &klen, "src",
+					      json_str(hm->body, "$.src"));
+			n += kv_append_filter(kv, sizeof(kv), &klen, "dst",
+					      json_str(hm->body, "$.dst"));
+			n += kv_append_filter(kv, sizeof(kv), &klen, "policy",
+					      json_str(hm->body, "$.policy"));
+			n += kv_append_filter(kv, sizeof(kv), &klen, "iif",
+					      json_str(hm->body, "$.iif"));
+			n += kv_append_filter(kv, sizeof(kv), &klen, "oif",
+					      json_str(hm->body, "$.oif"));
+			if (n == 0) {
+				reply_json(c, 400,
+					   "{\"error\":\"No filter fields (proto|src|dst|policy|iif|oif)\"}");
+				return -1;
+			}
+		}
+
+		work_item_t item;
+		memset(&item, 0, sizeof(item));
+		item.conn_id     = c->id;
+		item.ipc_cmd     = SG_CMD_SESSION_CLEAR;
+		item.flow_type   = FLOW_SESSION_CLEAR;
+		item.session_tag = sess.ipc_session_tag;
+		snprintf(item.username, sizeof(item.username), "%s", sess.username);
+		item.payload = strdup(kv);
+		if (!item.payload) {
+			reply_json(c, 500, "{\"error\":\"Internal error\"}");
+			return -1;
+		}
+		item.payload_len = strlen(item.payload);
+		if (webd_pool_enqueue(&item) != 0) {
+			free(item.payload);
+			reply_json(c, 503, "{\"error\":\"Server busy\"}");
+			return -1;
+		}
+		return 0;
+	}
+
 	/* ── /api/monitor/ips ── IPS daemon status (key=value JSON) ──── */
 	if (strcmp(segs[0], "monitor") == 0 && nseg == 2 &&
 	    strcmp(segs[1], "ips") == 0 &&
@@ -1403,9 +1568,9 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 	    strcmp(segs[1], "alerts-clear") == 0 &&
 	    mg_str_eq(hm->method, "POST")) {
 
-		/* Qua mgmtd (root): /etc/stargazer/logs là 0700 root, webd (uid 900)
-		 * KHÔNG truncate trực tiếp được — trước đây open() fail âm thầm mà
-		 * vẫn báo {ok:true}. Giờ uỷ thác cho mgmtd xoá thật. */
+		/* Via mgmtd (root): /etc/stargazer/logs is 0700 root, so webd (uid 900)
+		 * CANNOT truncate it directly — previously open() failed silently but
+		 * still reported {ok:true}. Now delegate the actual deletion to mgmtd. */
 		work_item_t item;
 		memset(&item, 0, sizeof(item));
 		item.conn_id  = c->id;

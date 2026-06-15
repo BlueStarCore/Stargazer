@@ -1,16 +1,16 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * ca.c - Local CA (xem ca.h).
+ * ca.c - Local CA (see ca.h).
  */
-#define _POSIX_C_SOURCE 200809L   /* fdopen với -std=c11 */
+#define _POSIX_C_SOURCE 200809L   /* fdopen with -std=c11 */
 #include "ca.h"
 
 #include <stdio.h>
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <sys/file.h>   /* flock — serialize tạo CA giữa nhiều ssld */
-#include <sys/stat.h>   /* mkdir — tạo thư mục CA nếu storage persistent thiếu */
+#include <sys/file.h>   /* flock - serialize CA creation across multiple ssld */
+#include <sys/stat.h>   /* mkdir - create the CA dir if missing on persistent storage */
 #include <sys/types.h>
 
 #include <openssl/pem.h>
@@ -19,9 +19,9 @@
 #include <openssl/rand.h>
 
 #define CA_CN     "Stargazer SSL Inspection CA"
-#define CA_DAYS   (3650L * 24 * 3600)   /* 10 năm */
+#define CA_DAYS   (3650L * 24 * 3600)   /* 10 years */
 
-/* Thêm một extension X509v3 vào cert (self-issued: issuer==subject). */
+/* Add an X509v3 extension to the cert (self-issued: issuer==subject). */
 static int add_ext(X509 *cert, int nid, const char *value)
 {
 	X509V3_CTX ctx;
@@ -35,7 +35,7 @@ static int add_ext(X509 *cert, int nid, const char *value)
 	return rc == 1 ? 0 : -1;
 }
 
-/* Nạp PEM cert + key. Trả 0 nếu cả hai đọc được. */
+/* Load PEM cert + key. Returns 0 if both could be read. */
 static int ca_load(struct ca_ctx *ca, const char *cert_path, const char *key_path)
 {
 	FILE *cf = fopen(cert_path, "r");
@@ -56,11 +56,12 @@ static int ca_load(struct ca_ctx *ca, const char *cert_path, const char *key_pat
 	return 0;
 }
 
-/* mkdir -p thư mục chứa file_path (mode 0700). Thư mục CA
- * (/etc/stargazer/ssl) có thể chưa tồn tại trên storage persistent → ca_save
- * fopen sẽ ENOENT và CA không bao giờ ghi ra đĩa (ssld vẫn chạy với CA trong
- * RAM nhưng client không lấy được cert để cài → MITM hỏng). Tạo sẵn để
- * ca_save ghi được. Bỏ qua lỗi EEXIST ở từng cấp. */
+/* mkdir -p the directory containing file_path (mode 0700). The CA directory
+ * (/etc/stargazer/ssl) may not exist yet on persistent storage -> ca_save's
+ * fopen would ENOENT and the CA would never be written to disk (ssld still runs
+ * with the CA in RAM, but clients can't fetch the cert to install -> MITM is
+ * broken). Create it ahead of time so ca_save can write. Ignore EEXIST at each
+ * level. */
 static void ensure_parent_dir(const char *file_path)
 {
 	char dir[512];
@@ -79,11 +80,11 @@ static void ensure_parent_dir(const char *file_path)
 	mkdir(dir, 0700);
 }
 
-/* Ghi cert (0644) + key (0600) ra đĩa. Trả 0 nếu OK. */
+/* Write cert (0644) + key (0600) to disk. Returns 0 on OK. */
 static int ca_save(const struct ca_ctx *ca,
 		   const char *cert_path, const char *key_path)
 {
-	ensure_parent_dir(cert_path);   /* /etc/stargazer/ssl có thể chưa có */
+	ensure_parent_dir(cert_path);   /* /etc/stargazer/ssl may not exist yet */
 	FILE *cf = fopen(cert_path, "w");
 	if (!cf)
 		return -1;
@@ -92,7 +93,7 @@ static int ca_save(const struct ca_ctx *ca,
 	if (!ok)
 		return -1;
 
-	/* key: tạo với 0600 ngay từ open() để không lộ trong cửa sổ race */
+	/* key: create with 0600 right at open() so it's never exposed in a race window */
 	int fd = open(key_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
 	if (fd < 0)
 		return -1;
@@ -106,7 +107,7 @@ static int ca_save(const struct ca_ctx *ca,
 	return ok ? 0 : -1;
 }
 
-/* Sinh CA mới: EC P-256, self-signed, CA:TRUE. */
+/* Generate a new CA: EC P-256, self-signed, CA:TRUE. */
 static int ca_create(struct ca_ctx *ca)
 {
 	memset(ca, 0, sizeof(*ca));
@@ -121,7 +122,7 @@ static int ca_create(struct ca_ctx *ca)
 
 	X509_set_version(ca->cert, 2);   /* X509v3 */
 
-	/* serial ngẫu nhiên 64-bit dương */
+	/* random positive 64-bit serial */
 	{
 		unsigned char rnd[8];
 		if (RAND_bytes(rnd, sizeof(rnd)) != 1)
@@ -174,19 +175,20 @@ int ca_load_or_create(struct ca_ctx *ca,
 	memset(ca, 0, sizeof(*ca));
 
 	if (ca_load(ca, cert_path, key_path) == 0)
-		return 0;                       /* đã có CA — dùng lại */
+		return 0;                       /* CA already exists - reuse it */
 
-	/* Nhiều ssld (1/profile) có thể cùng khởi động khi CA chưa tồn tại →
-	 * RACE tạo CA khác nhau (client tin CA-A nhưng ssld-B ký CA-B → cảnh báo
-	 * cert). Serialize bằng flock: instance đầu tạo, các instance sau (chờ
-	 * lock) nạp lại CA vừa tạo → CẢ HỆ chung MỘT CA. */
+	/* Multiple ssld (one per profile) may start at once when the CA does not yet
+	 * exist -> a RACE creating different CAs (the client trusts CA-A but ssld-B
+	 * signs with CA-B -> cert warning). Serialize with flock: the first instance
+	 * creates it, later instances (waiting on the lock) reload the just-created
+	 * CA -> the WHOLE system shares ONE CA. */
 	char lock_path[512];
 	snprintf(lock_path, sizeof(lock_path), "%s.lock", key_path);
 	int lfd = open(lock_path, O_CREAT | O_RDWR, 0600);
 	if (lfd >= 0)
 		flock(lfd, LOCK_EX);
 
-	/* Re-check dưới lock: instance khác có thể vừa tạo xong. */
+	/* Re-check under the lock: another instance may have just finished creating it. */
 	if (ca_load(ca, cert_path, key_path) == 0) {
 		if (lfd >= 0) { flock(lfd, LOCK_UN); close(lfd); }
 		return 0;
@@ -196,11 +198,11 @@ int ca_load_or_create(struct ca_ctx *ca,
 	if (ca_create(ca) < 0) {
 		rc = -1;
 	} else if (ca_save(ca, cert_path, key_path) < 0) {
-		/* CA tạo được trong RAM nhưng KHÔNG ghi ra đĩa → client không lấy
-		 * được cert để cài, mọi flow bump sẽ báo lỗi cert. Coi như fail
-		 * để ssld chạy splice-only (pass-through) thay vì bump bằng một CA
-		 * không thể tin cậy được — trung thực hơn, fail an toàn. */
-		fprintf(stderr, "ca: LỖI không ghi được CA ra %s/%s: %m — "
+		/* CA created in RAM but NOT written to disk -> clients can't fetch the
+		 * cert to install, so every bump flow would raise a cert error. Treat
+		 * this as a failure so ssld runs splice-only (pass-through) instead of
+		 * bumping with a CA that can't be trusted - more honest, fails safe. */
+		fprintf(stderr, "ca: ERROR could not write CA to %s/%s: %m - "
 			"splice-only\n", cert_path, key_path);
 		rc = -1;
 	}

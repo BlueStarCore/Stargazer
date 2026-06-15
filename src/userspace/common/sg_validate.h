@@ -122,8 +122,16 @@ const char *sg_reg_field_default(const char *type_name, const char *key);
 int sg_reg_scrub_value(const char *type, const char *key, const char *val,
                        char *out, size_t outsz);
 
-/* Get entry ID rule for a type ("uint" or "safe-id"). */
+/* Get entry ID rule for a type ("uint", "profid/seq", or "safe-id"). */
 const char *sg_reg_entry_id_kind(const char *type_name);
+
+/* Nested sub-table lookup: child type for `config <subcmd>` inside a
+ * `config <parent_type>/edit` context, or NULL if there is no such sub-table. */
+const char *sg_reg_subtable_child(const char *parent_type, const char *subcmd);
+
+/* If `child_type` is a nested sub-table, returns human guidance on how to reach
+ * it (so standalone `configure <child>` can be rejected); NULL otherwise. */
+const char *sg_reg_subtable_path(const char *child_type);
 
 /* Get domain file path for a type. */
 const char *sg_reg_domain_for(const char *type_name);

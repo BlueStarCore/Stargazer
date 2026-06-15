@@ -22,6 +22,7 @@
 #define _GNU_SOURCE
 
 #include "cli_readline.h"
+#include "cli_ipc.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -759,6 +760,38 @@ static int tab_find_matches(const char *buf,
 
 /* ── ? help ───────────────────────────────────────────────────────────── */
 
+/*
+ * show_system_binaries — fetch the runnable-binary list from mgmtd and write
+ * it to the tty. Called by show_help() when the operator presses '?' at the
+ * `execute system` context (those binaries are not in the static command
+ * table, so this is the only way to enumerate them). The IPC lives here in
+ * the same layer that already does history IPC; readline stays unaware of the
+ * wire protocol beyond calling cli_ipc helpers. Newlines from mgmtd are
+ * rewritten to CR-LF because the terminal is in raw mode during readline.
+ */
+static void show_system_binaries(void)
+{
+	struct ipc_response resp = {0};
+	if (ipc_send_str(SG_CMD_SYS_LIST, "", &resp) != 0 ||
+	    resp.status != SG_OK || !resp.payload) {
+		ipc_resp_free(&resp);
+		return;
+	}
+
+	const char *p = resp.payload;
+	while (*p) {
+		const char *nl = strchr(p, '\n');
+		size_t len = nl ? (size_t)(nl - p) : strlen(p);
+		if (len)
+			tty_write(tty_fd, p, len);
+		tty_write(tty_fd, "\r\n", 2);
+		if (!nl)
+			break;
+		p = nl + 1;
+	}
+	ipc_resp_free(&resp);
+}
+
 static void show_help(const char *buf)
 {
 	int trailing_space = (buf[0] != '\0' && buf[strlen(buf) - 1] == ' ');
@@ -875,6 +908,23 @@ static void show_help(const char *buf)
 		tty_write(tty_fd, line, strlen(line));
 	}
 
+	/*
+	 * Dynamic listing: at the `execute system` context the runnable
+	 * binaries (ls, df, iptables, ...) are not registered commands, so the
+	 * static loop above only showed the management subcommands. Append the
+	 * live binary list from mgmtd. Triggers when the line (trailing spaces
+	 * trimmed) is exactly "execute system".
+	 */
+	{
+		char norm[CLI_MAX_LINE];
+		snprintf(norm, sizeof(norm), "%s", buf);
+		size_t nl = strlen(norm);
+		while (nl > 0 && norm[nl - 1] == ' ')
+			norm[--nl] = '\0';
+		if (strcmp(norm, "execute system") == 0)
+			show_system_binaries();
+	}
+
 	if (nseen == 0) {
 		if (buf[0] != '\0' && exact_desc[0] == '\0') {
 			const char *msg = "  Not a command.\r\n";
@@ -906,8 +956,6 @@ static void hist_add(const char *line)
 }
 
 /* ── IPC-based history (works inside sandbox) ─────────────────────────── */
-
-#include "cli_ipc.h"
 
 void cli_hist_load_ipc(void)
 {

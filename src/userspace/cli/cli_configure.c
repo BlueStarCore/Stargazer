@@ -105,20 +105,38 @@ static void kv_parse(struct kv_buf *b, const char *data)
 
 		if (llen > 0) {
 			const char *eq = memchr(p, '=', llen);
-			if (eq && b->count < KV_MAX_ENTRIES) {
+			if (eq) {
 				size_t klen = (size_t)(eq - p);
 				size_t vlen = llen - klen - 1;
 				if (klen > 0 && klen < KV_MAX_KEY) {
-					memcpy(b->entries[b->count].key, p, klen);
-					b->entries[b->count].key[klen] = '\0';
+					char k[KV_MAX_KEY];
+					memcpy(k, p, klen);
+					k[klen] = '\0';
 					if (vlen >= KV_MAX_VAL)
 						vlen = KV_MAX_VAL - 1;
-					memcpy(b->entries[b->count].val, eq + 1, vlen);
-					b->entries[b->count].val[vlen] = '\0';
-					b->count++;
+					/* Overwrite a duplicate key (mirror kv_set):
+					 * a repeated line must not reach the DB as a
+					 * second (type,id,key) row — that aborts the
+					 * whole write with a PK violation. */
+					int slot = -1;
+					for (int i = 0; i < b->count; i++) {
+						if (strcmp(b->entries[i].key, k) == 0) {
+							slot = i;
+							break;
+						}
+					}
+					if (slot < 0) {
+						if (b->count >= KV_MAX_ENTRIES)
+							goto next_line;
+						slot = b->count++;
+						memcpy(b->entries[slot].key, k, klen + 1);
+					}
+					memcpy(b->entries[slot].val, eq + 1, vlen);
+					b->entries[slot].val[vlen] = '\0';
 				}
 			}
 		}
+next_line:
 		if (!eol)
 			break;
 		p = eol + 1;
@@ -523,9 +541,9 @@ static void register_value_completions(const char *key, const char *kind)
 	/* Other kinds (cidr, ipv4, uint, safe-id, tz-token, etc.) — no value completions */
 }
 
-/* firewall_policy: IPS coi như TẮT nếu ips-status=disable; hoặc (legacy chưa có
- * ips-status) ips-profile rỗng/none. Dùng để ẩn ips-profile khỏi `show` khi tắt
- * (tắt = không liên kết profile nào). */
+/* firewall_policy: IPS is considered OFF if ips-status=disable; or (legacy with
+ * no ips-status) ips-profile is empty/none. Used to hide ips-profile from `show`
+ * when off (off = not linked to any profile). */
 static int policy_ips_off(const char *ips_status, const char *ips_profile)
 {
 	if (ips_status && *ips_status)
@@ -534,9 +552,9 @@ static int policy_ips_off(const char *ips_status, const char *ips_profile)
 		strcmp(ips_profile, "none") == 0);
 }
 
-/* Register set commands for a config type. `action` = giá trị action hiện tại
- * của entry (NULL nếu không liên quan) → ẩn gợi ý ssl-profile/ips-profile/
- * ips-status trên firewall_policy deny/drop (chỉ hợp lệ cho accept). */
+/* Register set commands for a config type. `action` = the entry's current action
+ * value (NULL if not relevant) → hide ssl-profile/ips-profile/ips-status hints on
+ * firewall_policy deny/drop (only valid for accept). */
 static void register_set_cmds(const char *type_name, const char *action)
 {
 	int policy_deny = type_name &&
@@ -563,16 +581,16 @@ static void register_set_cmds(const char *type_name, const char *action)
 		char saved = *end;
 		*end = '\0';
 
-		/* Field nội bộ (SG_FLD_HIDDEN: enabled, last-downloaded, builtin,
-		 * cmkid…) → KHÔNG gợi ý set. */
+		/* Internal field (SG_FLD_HIDDEN: enabled, last-downloaded, builtin,
+		 * cmkid…) → do NOT suggest set. */
 		if (sg_reg_is_hidden_key(type_name, tok)) {
 			*end = saved;
 			tok = end;
 			continue;
 		}
 
-		/* ips-status: field nội bộ (tự đồng bộ từ ips-profile) → KHÔNG hint.
-		 * ssl-profile/ips-profile: chỉ accept → ẩn gợi ý trên deny/drop. */
+		/* ips-status: internal field (auto-synced from ips-profile) → NO hint.
+		 * ssl-profile/ips-profile: accept only → hide hints on deny/drop. */
 		int is_policy = type_name &&
 			strcmp(type_name, "firewall_policy") == 0;
 		if ((is_policy && strcmp(tok, "ips-status") == 0) ||
@@ -619,14 +637,14 @@ static void register_unset_get_cmds(const char *type_name)
 		char saved = *end;
 		*end = '\0';
 
-		/* Field nội bộ (SG_FLD_HIDDEN) → không gợi ý unset/get. */
+		/* Internal field (SG_FLD_HIDDEN) → no unset/get hint. */
 		if (sg_reg_is_hidden_key(type_name, tok)) {
 			*end = saved;
 			tok = end;
 			continue;
 		}
 
-		/* ips-status: field nội bộ → không gợi ý unset/get trên policy. */
+		/* ips-status: internal field → no unset/get hint on policy. */
 		if (type_name && strcmp(type_name, "firewall_policy") == 0 &&
 		    strcmp(tok, "ips-status") == 0) {
 			*end = saved;
@@ -655,6 +673,9 @@ static void register_entry_cmds(const char *type_name, const char *action)
 	cli_register("next", "Save entry and return to table");
 	cli_register("end", "Save entry and exit context");
 	cli_register("abort", "Discard changes and exit");
+	/* Nested sub-tables (e.g. `config filter` inside an IPS profile). */
+	if (sg_reg_subtable_child(type_name, "filter"))
+		cli_register("config filter", "Configure signature/category filters");
 	register_set_cmds(type_name, action);
 	register_unset_get_cmds(type_name);
 }
@@ -838,6 +859,12 @@ static int handle_password(const char *entry_id, struct kv_buf *b)
 
 /* ── Entry context ────────────────────────────────────────────────────── */
 
+/* Nested sub-table (e.g. `config filter` inside a profile edit). Defined after
+ * context_table; forward-declared so context_entry can recurse into it. Returns 1
+ * if the user typed `end` (propagate exit all the way up), 0 otherwise. */
+static int context_subtable(const char *child_type, const char *label,
+			    const char *parent_id);
+
 static int context_entry(const char *type_name, const char *label,
 			 const char *entry_id, int *exit_all)
 {
@@ -940,26 +967,26 @@ static int context_entry(const char *type_name, const char *label,
 				       " and cannot be set\n", key);
 				continue;
 			}
-			/* ips-status là field NỘI BỘ — tự bật/tắt theo ips-profile.
-			 * Không cho set tay (dùng: set ips-profile <name> để bật,
-			 * set ips-profile none để tắt). */
+			/* ips-status is an INTERNAL field — auto on/off based on ips-profile.
+			 * No manual set allowed (use: set ips-profile <name> to enable,
+			 * set ips-profile none to disable). */
 			if (strcmp(type_name, "firewall_policy") == 0 &&
 			    strcmp(key, "ips-status") == 0) {
 				printf("  Error: invalid key 'ips-status' for %s\n",
 				       type_name);
 				continue;
 			}
-			/* Security profiles (ssl/ips) chỉ hợp lệ trên ACCEPT policy.
-			 * DENY/DROP drop gói ở L4, không inspect L7 → chặn ngay lúc
-			 * set (khớp validation backend + web ẩn dropdown). */
+			/* Security profiles (ssl/ips) are only valid on ACCEPT policy.
+			 * DENY/DROP drop packets at L4, no L7 inspection → reject at
+			 * set time (matches backend validation + web hides dropdown). */
 			if (strcmp(type_name, "firewall_policy") == 0 &&
 			    (strcmp(key, "ssl-profile") == 0 ||
 			     strcmp(key, "ips-profile") == 0)) {
 				const char *act = kv_get(&data, "action");
 				if (act && (strcmp(act, "deny") == 0 ||
 					    strcmp(act, "drop") == 0)) {
-					printf("  Error: '%s' chỉ đặt được khi "
-					       "action=accept (policy này action=%s)\n",
+					printf("  Error: '%s' can only be set when "
+					       "action=accept (this policy has action=%s)\n",
 					       key, act);
 					continue;
 				}
@@ -1009,9 +1036,9 @@ static int context_entry(const char *type_name, const char *label,
 				fprintf(stderr,
 					"[CFG-DBG] set: %s=%s"
 					" (valid)\n", key, val);
-			/* Tiện dụng: trên policy, set ips-profile (luôn là profile thật)
-			 * → tự bật toggle nội bộ ips-status=enable. Tắt = unset ips-profile
-			 * (xử lý ở nhánh unset). Web reload thấy switch gạt theo. */
+			/* Convenience: on a policy, set ips-profile (always a real profile)
+			 * → auto-enable the internal toggle ips-status=enable. Disable = unset
+			 * ips-profile (handled in the unset branch). Web reload sees the switch. */
 			if (strcmp(type_name, "firewall_policy") == 0 &&
 			    strcmp(key, "ips-profile") == 0) {
 				kv_set(&data, "ips-status", "enable");
@@ -1033,8 +1060,8 @@ static int context_entry(const char *type_name, const char *label,
 				       " and cannot be unset\n", key);
 				continue;
 			}
-			/* ips-status nội bộ — không cho unset tay (dùng unset
-			 * ips-profile để tắt IPS). */
+			/* ips-status is internal — no manual unset (use unset
+			 * ips-profile to disable IPS). */
 			if (strcmp(type_name, "firewall_policy") == 0 &&
 			    strcmp(key, "ips-status") == 0) {
 				printf("  Error: invalid key 'ips-status' for %s\n",
@@ -1047,7 +1074,7 @@ static int context_entry(const char *type_name, const char *label,
 				data.modified = 1;
 			}
 			kv_unset(&data, key);
-			/* unset ips-profile = tắt IPS → gỡ luôn toggle nội bộ. */
+			/* unset ips-profile = disable IPS → also remove the internal toggle. */
 			if (strcmp(type_name, "firewall_policy") == 0 &&
 			    strcmp(key, "ips-profile") == 0)
 				kv_unset(&data, "ips-status");
@@ -1093,13 +1120,13 @@ static int context_entry(const char *type_name, const char *label,
 					if (sg_reg_is_hidden_key(type_name,
 						   data.entries[i].key))
 						continue;
-					/* ips-status: field nội bộ — không show. */
+					/* ips-status: internal field — do not show. */
 					if (strcmp(type_name, "firewall_policy") == 0 &&
 					    strcmp(data.entries[i].key,
 						   "ips-status") == 0)
 						continue;
-					/* IPS tắt → không hiện ips-profile (không
-					 * liên kết profile nào). */
+					/* IPS off → do not show ips-profile (not
+					 * linked to any profile). */
 					if (p_off && strcmp(data.entries[i].key,
 							    "ips-profile") == 0)
 						continue;
@@ -1305,6 +1332,48 @@ static int context_entry(const char *type_name, const char *label,
 			if (strcmp(cmd, "end") == 0 && exit_all)
 				*exit_all = 1;
 			break;
+		} else if (strcmp(cmd, "config") == 0) {
+			/* Nested sub-table, e.g. `config filter` inside a profile.
+			 * The child entries are keyed "<this entry_id>/<seq>", so the
+			 * parent must exist first — persist it now (its CFG_SET also
+			 * triggers any apply on the mgmtd side). */
+			const char *child = sg_reg_subtable_child(type_name, key);
+			if (!child) {
+				printf("  Unknown sub-command: \"config %s\"\n", key);
+				continue;
+			}
+			const char *miss = validate_required(type_name, &data);
+			if (miss) {
+				printf("  Error: set required field(s)%s before"
+				       " 'config %s'.\n", miss, key);
+				continue;
+			}
+			{
+				char payload[4096];
+				int hl = snprintf(payload, sizeof(payload),
+						  "%s\n", section);
+				char serial[2048];
+				kv_serialize(&data, serial, sizeof(serial));
+				if ((size_t)hl + strlen(serial) < sizeof(payload)) {
+					memcpy(payload + hl, serial,
+					       strlen(serial) + 1);
+					struct ipc_response sr;
+					if (ipc_send(SG_CMD_CFG_SET, payload,
+						     (size_t)hl + strlen(serial),
+						     &sr) == 0 &&
+					    sr.status == SG_OK)
+						data.modified = 0;
+					ipc_resp_free(&sr);
+				}
+			}
+			char sublabel[256];
+			snprintf(sublabel, sizeof(sublabel), "%s %s / %s",
+				 label, entry_id, key);
+			if (context_subtable(child, sublabel, entry_id) &&
+			    exit_all) {
+				*exit_all = 1;
+				break;
+			}
 		} else if (strcmp(cmd, "abort") == 0) {
 			if (cfg_reject_extra(key, "abort"))
 				continue;
@@ -1316,7 +1385,7 @@ static int context_entry(const char *type_name, const char *label,
 			printf("  Changes discarded.\n");
 			break;
 		} else {
-			printf("  Unknown command: %s (try '?')\n", cmd);
+			printf("  Unknown command: \"%s\", try '?' \n", cmd);
 		}
 	}
 
@@ -1401,7 +1470,7 @@ static int context_table(const char *type_name, const char *label)
 							printf("    edit"
 							       " \"%s\"\n",
 							       id);
-							/* IPS tắt → ẩn ips-profile (xem entry show). */
+							/* IPS off → hide ips-profile (see entry show). */
 							struct kv_buf tkv;
 							kv_init(&tkv);
 							kv_parse(&tkv, dr.payload);
@@ -1431,14 +1500,14 @@ static int context_table(const char *type_name, const char *label)
 											if (eol) p++;
 											continue;
 										}
-										/* ips-status nội bộ → ẩn. */
+										/* ips-status internal → hide. */
 										if (klen == 10 &&
 										    strncmp(p, "ips-status", 10) == 0) {
 											p += llen;
 											if (eol) p++;
 											continue;
 										}
-										/* IPS tắt → ẩn ips-profile. */
+										/* IPS off → hide ips-profile. */
 										if (p_off && klen == 11 &&
 										    strncmp(p, "ips-profile", 11) == 0) {
 											p += llen;
@@ -1602,7 +1671,7 @@ static int context_table(const char *type_name, const char *label)
 					       " deleted.\n", arg);
 				} else if (dresp.status == SG_ERR_IN_USE &&
 					   dresp.extra[0]) {
-					/* FortiGate-style: đang được tham chiếu. */
+					/* FortiGate-style: currently referenced. */
 					printf("  %s\n  Command fail.\n",
 					       dresp.extra);
 				} else {
@@ -1626,7 +1695,7 @@ static int context_table(const char *type_name, const char *label)
 					printf("  Entry %s deleted.\n", arg);
 				} else if (dresp.status == SG_ERR_IN_USE &&
 					   dresp.extra[0]) {
-					/* FortiGate-style: đang được tham chiếu. */
+					/* FortiGate-style: currently referenced. */
 					printf("  %s\n  Command fail.\n",
 					       dresp.extra);
 				} else {
@@ -1646,7 +1715,7 @@ static int context_table(const char *type_name, const char *label)
 				continue;
 			break;
 		} else {
-			printf("  Unknown command: %s (try '?')\n", cmd);
+			printf("  Unknown command: \"%s\", try '?' \n", cmd);
 		}
 	}
 
@@ -1655,6 +1724,133 @@ static int context_table(const char *type_name, const char *label)
 			"[CFG-DBG] exit table: %s\n", type_name);
 	cli_pop();
 	return 0;
+}
+
+/* ── Nested sub-table context ─────────────────────────────────────────────
+ *
+ * A child table (e.g. `config filter`) reached from inside a parent entry edit.
+ * Child entries are keyed "<parent_id>/<seq>"; the user types `edit <seq>` and we
+ * form the composite id. `show`/`delete`/`edit` are scoped to this parent only.
+ * Returns 1 if the user typed `end` (caller propagates the exit), 0 otherwise. */
+static int context_subtable(const char *child_type, const char *label,
+			    const char *parent_id)
+{
+	cli_push();
+	register_table_cmds(child_type);
+
+	char prompt[384];
+	snprintf(prompt, sizeof(prompt), "(%s) # ", label);
+	size_t plen = strlen(parent_id);
+	int propagate_end = 0;
+
+	const char *line;
+	while ((line = cli_readline(prompt)) != NULL) {
+		char cmd[64], arg[256], extra[256], linebuf[1024];
+		snprintf(linebuf, sizeof(linebuf), "%s", line);
+		char *trimmed = trim(linebuf);
+		if (!*trimmed) continue;
+		char resolved[CLI_MAX_LINE];
+		if (cli_resolve_cmd(trimmed, resolved, sizeof(resolved)) != 0)
+			continue;
+		parse_line(resolved, cmd, sizeof(cmd), arg, sizeof(arg),
+			   extra, sizeof(extra));
+
+		if (strcmp(cmd, "show") == 0) {
+			if (cfg_reject_extra(arg, "show")) continue;
+			struct ipc_response resp;
+			int found = 0;
+			printf("config %s\n", label);
+			if (ipc_send_str(SG_CMD_CFG_LIST, child_type, &resp) == 0 &&
+			    resp.status == SG_OK && resp.payload) {
+				for (char *id = resp.payload; id && *id; ) {
+					char *nl = strchr(id, '\n');
+					if (nl) *nl = '\0';
+					/* only this parent's children "<pid>/<seq>" */
+					if (*id && strncmp(id, parent_id, plen) == 0 &&
+					    id[plen] == '/') {
+						char section[512];
+						snprintf(section, sizeof(section),
+							 "%s:%s", child_type, id);
+						struct ipc_response dr;
+						if (ipc_send_str(SG_CMD_CFG_GET,
+								 section, &dr) == 0 &&
+						    dr.status == SG_OK && dr.payload) {
+							found = 1;
+							printf("    edit %s\n",
+							       id + plen + 1);
+							for (const char *p = dr.payload;
+							     p && *p; ) {
+								const char *eol =
+									strchr(p, '\n');
+								size_t ll = eol ?
+								  (size_t)(eol - p) :
+								  strlen(p);
+								const char *eq =
+								  memchr(p, '=', ll);
+								if (eq && !(((size_t)(eq - p) == 7) &&
+								    strncmp(p, "builtin", 7) == 0))
+									printf("        set %.*s %.*s\n",
+									  (int)(eq - p), p,
+									  (int)(ll - (eq - p) - 1),
+									  eq + 1);
+								p += ll;
+								if (eol) p++;
+							}
+							printf("    next\n");
+						}
+						ipc_resp_free(&dr);
+					}
+					if (!nl) break;
+					id = nl + 1;
+				}
+			}
+			ipc_resp_free(&resp);
+			if (!found) printf("  No entries configured.\n");
+			else        printf("end\n");
+		} else if (strcmp(cmd, "edit") == 0) {
+			if (!arg[0]) { printf("  Usage: edit <seq>\n"); continue; }
+			if (cfg_reject_extra(extra, "edit")) continue;
+			int ok = 1;
+			for (const char *p = arg; *p; p++)
+				if (*p < '0' || *p > '9') ok = 0;
+			if (!ok) {
+				printf("  Error: invalid id '%s' (expected a"
+				       " number)\n", arg);
+				continue;
+			}
+			char cid[512];
+			snprintf(cid, sizeof(cid), "%s/%s", parent_id, arg);
+			int exit_all = 0;
+			context_entry(child_type, label, cid, &exit_all);
+			if (exit_all) { propagate_end = 1; break; }
+		} else if (strcmp(cmd, "delete") == 0) {
+			if (!arg[0]) { printf("  Usage: delete <seq>\n"); continue; }
+			if (cfg_reject_extra(extra, "delete")) continue;
+			char cid[512], section[600];
+			snprintf(cid, sizeof(cid), "%s/%s", parent_id, arg);
+			snprintf(section, sizeof(section), "%s:%s", child_type, cid);
+			struct ipc_response dresp;
+			if (ipc_send_str(SG_CMD_CFG_DEL, section, &dresp) == 0 &&
+			    dresp.status == SG_OK)
+				printf("  Entry %s deleted.\n", arg);
+			else
+				printf("  Error: %s\n", dresp.extra[0] ?
+				       dresp.extra : "delete failed");
+			ipc_resp_free(&dresp);
+		} else if (strcmp(cmd, "end") == 0) {
+			if (cfg_reject_extra(arg, "end")) continue;
+			propagate_end = 1;
+			break;
+		} else if (strcmp(cmd, "abort") == 0) {
+			if (cfg_reject_extra(arg, "abort")) continue;
+			break;
+		} else {
+			printf("  Unknown command: \"%s\", try '?' \n", cmd);
+		}
+	}
+
+	cli_pop();
+	return propagate_end;
 }
 
 /* ── Single context ───────────────────────────────────────────────────── */
@@ -1776,9 +1972,9 @@ static int context_single(const char *type_name, const char *label)
 				fprintf(stderr,
 					"[CFG-DBG] set: %s=%s"
 					" (valid)\n", key, val);
-			/* Tiện dụng: trên policy, set ips-profile (luôn là profile thật)
-			 * → tự bật toggle nội bộ ips-status=enable. Tắt = unset ips-profile
-			 * (xử lý ở nhánh unset). Web reload thấy switch gạt theo. */
+			/* Convenience: on a policy, set ips-profile (always a real profile)
+			 * → auto-enable the internal toggle ips-status=enable. Disable = unset
+			 * ips-profile (handled in the unset branch). Web reload sees the switch. */
 			if (strcmp(type_name, "firewall_policy") == 0 &&
 			    strcmp(key, "ips-profile") == 0) {
 				kv_set(&data, "ips-status", "enable");
@@ -1929,7 +2125,7 @@ static int context_single(const char *type_name, const char *label)
 			printf("  Changes discarded.\n");
 			break;
 		} else {
-			printf("  Unknown: %s (try '?')\n", cmd);
+			printf("  Unknown: \"%s\", try '?' \n", cmd);
 		}
 	}
 
@@ -2055,6 +2251,18 @@ int cli_configure(int argc, const char **argv)
 			fprintf(stderr,
 				"[CFG-DBG] configure: unknown"
 				" type_key=%s\n", type_key);
+		printf("  Unknown config path:");
+		for (int i = 0; i < argc; i++)
+			printf(" %s", argv[i]);
+		printf("\n  Run 'configure ?' to see available options.\n");
+		return 0;
+	}
+
+	/* A nested sub-table (e.g. security_ips-filter) is only reachable inside its
+	 * parent — it has no standalone `configure <child>` path at all. Treat it
+	 * exactly like an unknown path so it is not exposed as a top-level command. */
+	if (sg_reg_subtable_child("security_ips-profile", "filter") &&
+	    strcmp(type_key, "security_ips-filter") == 0) {
 		printf("  Unknown config path:");
 		for (int i = 0; i < argc; i++)
 			printf(" %s", argv[i]);

@@ -321,9 +321,11 @@ if [ -x /sbin/stargazer-mgmtd ]; then
 		sleep 2
 	done) &
 	# Block until mgmtd signals readiness via FIFO (zero-CPU wait).
-	# Config replay applies iptables/ip rules for every interface —
-	# can take 10-20s on large configs.  30s timeout covers worst case.
-	(sleep 30; echo timeout > "$_ready" 2>/dev/null) &
+	# Config replay applies iptables/ip rules for every interface and merges the
+	# IPS ruleset — can take a while on large configs / emulated targets.  45s
+	# timeout covers the worst case with headroom (mgmtd no longer builds the IPS
+	# automaton synchronously before signalling ready).
+	(sleep 45; echo timeout > "$_ready" 2>/dev/null) &
 	_to=$!
 	read _sig < "$_ready"
 	kill "$_to" 2>/dev/null; wait "$_to" 2>/dev/null
@@ -345,12 +347,12 @@ if [ -x /sbin/stargazer-mgmtd ]; then
 fi
 # webd is now started by mgmtd's supervisor — no init block needed.
 
-# stargazer-ipsd lifecycle quản lý bởi mgmtd (không phải init).
-# mgmtd start ipsd khi rebuild_forward_chain emit NFQUEUE rules (security_ips=enable
-# VÀ có ít nhất 1 policy ips-profile=default), stop ipsd khi không còn rule nào.
-# Init không start ipsd trực tiếp — đúng như webd được mgmtd supervise.
+# stargazer-ipsd lifecycle is managed by mgmtd (not init).
+# mgmtd starts ipsd when rebuild_forward_chain emits NFQUEUE rules (security_ips=enable
+# AND at least one policy has ips-profile=default), and stops ipsd when no rules remain.
+# Init does not start ipsd directly — just as webd is supervised by mgmtd.
 
-# crond — chạy lịch IPS signature auto-update (wrapper tự kiểm config bật/tắt).
+# crond — runs the IPS signature auto-update schedule (wrapper self-checks the enable/disable config).
 if command -v crond >/dev/null 2>&1; then
 	mkdir -p /var/spool/cron/crontabs
 	crond -b -c /var/spool/cron/crontabs -L /dev/null 2>/dev/null \

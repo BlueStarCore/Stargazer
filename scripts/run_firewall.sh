@@ -38,13 +38,13 @@ done
 
 # Create persistent data disk if missing
 if [[ ! -f "$DATA_IMG" ]]; then
-    mke2fs -t ext2 -L sgdata "$DATA_IMG" 64M 2>/dev/null
+    mke2fs -t ext2 -L sgdata "$DATA_IMG" 256M 2>/dev/null
     echo "Created data disk: $DATA_IMG"
 fi
 
 # Create persistent logs disk if missing
 if [[ ! -f "$LOGS_IMG" ]]; then
-    mke2fs -t ext2 -L sglogs "$LOGS_IMG" 64M 2>/dev/null
+    mke2fs -t ext2 -L sglogs "$LOGS_IMG" 256M 2>/dev/null
     echo "Created logs disk: $LOGS_IMG"
 fi
 

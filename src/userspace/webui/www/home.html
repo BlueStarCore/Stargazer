@@ -768,7 +768,7 @@
                     </div>
                     <div style="margin-top:12px;display:flex;align-items:center;gap:8px">
                         <span class="form-label" style="margin:0">How to apply</span>
-                        <span class="sg-info" tabindex="0" role="img" aria-label="Guide">i<span class="sg-tip">Enable IPS here, then attach it to a policy: Firewall &rarr; Policies &rarr; pick an <b>accept</b> policy &rarr; set <b>IPS Profile = default</b>.</span></span>
+                        <span class="sg-info" tabindex="0" role="img" aria-label="How to apply">i<span class="sg-tip">Enable IPS here, then attach it to a policy: Firewall &rarr; Policies &rarr; select an <b>accept</b> policy &rarr; set <b>IPS Profile = default</b>.</span></span>
                     </div>
                 </div>
 
@@ -962,7 +962,7 @@
                             <div class="form-row" data-key="name"><label class="form-label">Name</label><input class="form-input" type="text" placeholder="e.g. web_dmz" maxlength="64"></div>
                             <div class="form-row" data-key="status"><label class="form-label">Status</label><select class="form-input"><option value="enable" selected>Enabled</option><option value="disable">Disabled</option></select></div>
                             <div class="form-row form-row-full form-row-wide" data-key="comment"><label class="form-label">Comment</label><input class="form-input" type="text" placeholder="Optional description" maxlength="255"></div>
-                            <!-- categories: legacy fallback khi profile chưa có filter nào -->
+                            <!-- categories: legacy fallback when the profile has no filters yet -->
                             <input type="hidden" data-key="categories" value="all">
                         </div>
                         <div class="form-section" style="display:flex;align-items:center;justify-content:space-between">
@@ -977,7 +977,7 @@
                     <div class="modal-footer"><button class="btn btn-primary">Save</button><button class="btn" data-toggle-form="form-ips-profile">Cancel</button></div>
                 </div>
 
-                <!-- Modal: Add Signatures / Filter (kiểu FortiGate) -->
+                <!-- Modal: Add Signatures / Filter (FortiGate-style) -->
                 <div class="modal-overlay" id="ips-sig-modal" style="display:none">
                   <div class="form-card" role="dialog" aria-modal="true" aria-label="Add signatures" style="max-width:880px;width:92%;max-height:86vh;display:flex;flex-direction:column">
                     <div class="form-section" style="display:flex;align-items:center;justify-content:space-between">
@@ -1008,7 +1008,7 @@
                         <!-- Filter (category) pane -->
                         <div id="ips-pane-filter" style="display:none">
                             <div class="form-row"><label class="form-label">Category</label><select class="form-input" id="ips-filter-cat"><option value="all">all (every category)</option></select></div>
-                            <p class="form-hint" style="opacity:.6;margin-top:8px">Add a whole rule group by category; the Action selected above applies to the entire group (default = keep the rule's original action).</p>
+                            <p class="form-hint" style="opacity:.6;margin-top:8px">Add a whole group of rules by category, applying the Action selected above to the entire group (default = keep the original action).</p>
                         </div>
                     </div>
                     <div class="modal-footer"><button class="btn btn-primary" id="ips-sig-ok">OK</button><button class="btn" id="ips-sig-cancel">Cancel</button></div>
@@ -1209,7 +1209,7 @@
                 <div class="page-header"><h1 class="page-title">CERTIFICATES</h1></div>
                 <div class="form-card">
                     <div class="form-section">SSL INSPECTION CA</div>
-                    <p style="margin:0 0 10px;line-height:1.5">The firewall CA is used to re-sign certificates during <b>deep SSL inspection</b>. Install this CA into the client trust store so the browser does not report certificate errors. The CA is generated automatically the first time deep inspection is enabled.</p>
+                    <p style="margin:0 0 10px;line-height:1.5">The firewall's CA is used to re-sign certificates during <b>deep SSL inspection</b>. Install this CA into the client's trust store so the browser does not report certificate errors. The CA is generated automatically the first time deep inspection is enabled.</p>
                     <div class="form-row"><label class="form-label">CA status</label><span id="cert-ca-status" class="form-input" style="border:none;background:none">(checking…)</span></div>
                     <div class="form-actions">
                         <button class="btn btn-primary" id="cert-export-btn">Show CA (PEM)</button>
@@ -1228,6 +1228,7 @@
                 <div class="page-header">
                     <h1 class="page-title">SESSIONS</h1>
                     <div class="widget-search"><input type="text" id="sess-search" placeholder="Search src / dst / port..."></div>
+                    <button class="btn btn-danger" id="sess-clear-btn">Clear sessions&hellip;</button>
                 </div>
                 <div class="toolbar">
                     <span class="filter-label">Protocol</span>
@@ -1250,11 +1251,11 @@
                         <option value="CLOSE">CLOSE</option>
                         <option value="-">(none / UDP)</option>
                     </select>
-                    <button class="btn rf-btn" id="sess-filter-clear" style="margin-left:auto">Clear filters</button>
+                    <button class="btn btn-ghost" id="sess-filter-clear">Clear filters</button>
                 </div>
                 <div id="session-summary" class="session-summary">Active: <strong>--</strong></div>
                 <table class="data-table">
-                    <thead><tr><th>PROTO</th><th>SOURCE</th><th>DESTINATION</th><th>STATE</th><th>POLICY</th><th>IN</th><th>OUT</th><th>PACKETS</th><th>BYTES</th></tr></thead>
+                    <thead><tr><th class="th-checkbox"><input type="checkbox" id="sess-select-all" aria-label="Select all sessions on this page"></th><th>PROTO</th><th>SOURCE</th><th>DESTINATION</th><th>STATE</th><th>POLICY</th><th>IN</th><th>OUT</th><th>PACKETS</th><th>BYTES</th></tr></thead>
                     <tbody id="sess-tbody">
                     </tbody>
                 </table>
@@ -1270,6 +1271,21 @@
                         <span class="rf-page-num" id="sess-page-num"></span>
                         <button class="btn rf-btn" id="sess-next" aria-label="Next page">&#9654;</button>
                     </div>
+                </div>
+                <div class="add-form form-card" id="form-sess-clear" role="dialog" aria-modal="true" aria-label="Clear sessions form">
+                    <div class="form-section"><span class="modal-title-text">CLEAR SESSIONS</span><button class="modal-close" type="button" aria-label="Close" data-toggle-form="form-sess-clear">&#10005;</button></div>
+                    <div class="modal-body">
+                        <p class="form-hint">Deletes every connection matching all the fields you set. Leave a field blank to ignore it &mdash; at least one is required.</p>
+                        <div class="form-grid">
+                            <div class="form-row" data-key="proto"><label class="form-label">Protocol</label><input class="form-input" id="scf-proto" type="text" placeholder="tcp &middot; udp &middot; icmp" maxlength="12"></div>
+                            <div class="form-row" data-key="src"><label class="form-label">Source</label><input class="form-input" id="scf-src" type="text" placeholder="10.0.1.1 or 10.0.1.1:59436" maxlength="40"></div>
+                            <div class="form-row" data-key="dst"><label class="form-label">Destination</label><input class="form-input" id="scf-dst" type="text" placeholder="10.0.1.2 or 10.0.1.2:80" maxlength="40"></div>
+                            <div class="form-row" data-key="policy"><label class="form-label">Policy</label><input class="form-input" id="scf-policy" type="text" maxlength="64"></div>
+                            <div class="form-row" data-key="iif"><label class="form-label">Inbound interface</label><input class="form-input" id="scf-iif" type="text" placeholder="eth0" maxlength="16"></div>
+                            <div class="form-row" data-key="oif"><label class="form-label">Outbound interface</label><input class="form-input" id="scf-oif" type="text" placeholder="local" maxlength="16"></div>
+                        </div>
+                    </div>
+                    <div class="modal-footer"><button class="btn btn-danger" id="scf-submit" type="button">Clear matching</button><button class="btn" type="button" data-toggle-form="form-sess-clear">Cancel</button></div>
                 </div>
             </div>
 
@@ -1332,6 +1348,14 @@
     <span class="bulk-count" id="bulk-count">0 selected</span>
     <div class="bulk-actions" id="bulk-actions"></div>
     <button class="btn bulk-close" id="bulk-close">&#10005;</button>
+</div>
+<div class="context-menu" id="sess-context-menu" style="display:none">
+    <div class="context-menu-item ctx-danger" data-action="delete-session">&#10005; Delete session</div>
+</div>
+<div class="bulk-action-bar" id="sess-bulk-action-bar" style="display:none">
+    <span class="bulk-count" id="sess-bulk-count">0 selected</span>
+    <div class="bulk-actions"><button class="btn btn-danger" id="sess-bulk-delete">Delete selected</button></div>
+    <button class="btn bulk-close" id="sess-bulk-close">&#10005;</button>
 </div>
 <div class="modal-backdrop" id="modal-backdrop"></div>
 <script src="js/sg-common.js"></script>

@@ -1,15 +1,15 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * tls_policy.c - Quyết định SPLICE/BUMP theo SNI + bypass list (xem header).
+ * tls_policy.c - Decide SPLICE/BUMP from the SNI + bypass list (see header).
  */
-#define _POSIX_C_SOURCE 200809L   /* strdup (POSIX.1-2008) với -std=c11 */
+#define _POSIX_C_SOURCE 200809L   /* strdup (POSIX.1-2008) with -std=c11 */
 #include "tls_policy.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 
-/* So sánh hai chuỗi, không phân biệt hoa/thường. */
+/* Compare two strings, case-insensitive. */
 static int ci_eq(const char *a, const char *b)
 {
 	for (; *a && *b; a++, b++)
@@ -19,26 +19,26 @@ static int ci_eq(const char *a, const char *b)
 }
 
 /*
- * host kết thúc bằng ".suffix" (so không phân biệt hoa/thường)?
- * Dùng cho wildcard: "*.bank.com" → suffix="bank.com", cần host khớp
- * "<gì đó>.bank.com". host == suffix (không có nhãn trước) → KHÔNG khớp.
+ * Does host end with ".suffix" (case-insensitive)?
+ * Used for wildcards: "*.bank.com" → suffix="bank.com", host must match
+ * "<something>.bank.com". host == suffix (no preceding label) → NO match.
  */
 static int ci_dotsuffix(const char *host, const char *suffix)
 {
 	size_t hl = strlen(host), sl = strlen(suffix);
-	if (hl <= sl + 1)              /* cần ít nhất "x." trước suffix */
+	if (hl <= sl + 1)              /* need at least "x." before the suffix */
 		return 0;
-	if (host[hl - sl - 1] != '.')  /* ranh giới phải là dấu '.' */
+	if (host[hl - sl - 1] != '.')  /* boundary must be a '.' */
 		return 0;
 	return ci_eq(host + hl - sl, suffix);
 }
 
-/* Chuẩn hóa pattern vào buf: lowercase, bỏ '.' thừa đầu/cuối (giữ '*.'). */
+/* Normalize a pattern into buf: lowercase, strip stray leading/trailing '.' (keep '*.'). */
 static int normalize(const char *in, char *buf, size_t cap)
 {
 	if (!in)
 		return -1;
-	/* bỏ khoảng trắng đầu */
+	/* skip leading whitespace */
 	while (*in == ' ' || *in == '\t')
 		in++;
 
@@ -46,18 +46,18 @@ static int normalize(const char *in, char *buf, size_t cap)
 	for (; *in; in++) {
 		char c = *in;
 		if (c == ' ' || c == '\t')
-			break;                       /* dừng ở khoảng trắng */
+			break;                       /* stop at whitespace */
 		if (n + 1 >= cap)
-			return -1;                   /* quá dài */
+			return -1;                   /* too long */
 		buf[n++] = (char)tolower((unsigned char)c);
 	}
-	/* bỏ '.' thừa ở cuối (nhưng không đụng "*.") */
+	/* strip trailing stray '.' (but leave "*." alone) */
 	while (n > 0 && buf[n - 1] == '.')
 		n--;
 	buf[n] = '\0';
 	if (n == 0)
 		return -1;
-	/* "*." trống ("*." hoặc "*") → vô nghĩa */
+	/* empty "*." ("*." or "*") → meaningless */
 	if (!strcmp(buf, "*") || !strcmp(buf, "*."))
 		return -1;
 	return 0;
@@ -66,7 +66,7 @@ static int normalize(const char *in, char *buf, size_t cap)
 void tls_policy_init(struct tls_policy *p)
 {
 	memset(p, 0, sizeof(*p));
-	p->default_bump = 1;            /* inspect-all-trừ-list */
+	p->default_bump = 1;            /* inspect-all-except-list */
 	p->no_sni       = TLS_NO_SNI_BUMP;
 }
 

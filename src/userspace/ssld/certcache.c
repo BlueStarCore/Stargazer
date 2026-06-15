@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * certcache.c - Forge + cache leaf cert (xem certcache.h).
+ * certcache.c - Forge + cache leaf certs (see certcache.h).
  */
 #include "certcache.h"
 
@@ -17,13 +17,13 @@
 struct cc_entry {
 	char        sni[256];
 	X509       *cert;
-	EVP_PKEY   *key;     /* trỏ leaf key chung (không free riêng) */
-	unsigned    lru;     /* tem dùng gần nhất để evict */
+	EVP_PKEY   *key;     /* points to the shared leaf key (not freed individually) */
+	unsigned    lru;     /* last-used stamp, for eviction */
 };
 
 struct certcache {
 	struct ca_ctx   *ca;
-	EVP_PKEY        *leaf_key;   /* keypair chung cho mọi leaf */
+	EVP_PKEY        *leaf_key;   /* keypair shared by all leaves */
 	struct cc_entry *ent;
 	int              n, max;
 	unsigned         tick;
@@ -49,7 +49,8 @@ struct certcache *certcache_new(struct ca_ctx *ca, int max)
 	return cc;
 }
 
-/* Forge leaf mới CN/SAN=sni, ký bằng CA. Trả X509* (caller sở hữu) hoặc NULL. */
+/* Forge a new leaf with CN/SAN=sni, signed by the CA. Returns X509* (owned by
+ * caller) or NULL. */
 static X509 *forge(struct certcache *cc, const char *sni, X509 *upstream)
 {
 	X509 *crt = X509_new();
@@ -58,7 +59,7 @@ static X509 *forge(struct certcache *cc, const char *sni, X509 *upstream)
 
 	X509_set_version(crt, 2);
 
-	/* serial ngẫu nhiên */
+	/* random serial */
 	unsigned char rnd[16];
 	if (RAND_bytes(rnd, sizeof(rnd)) != 1)
 		goto err;
@@ -69,7 +70,7 @@ static X509 *forge(struct certcache *cc, const char *sni, X509 *upstream)
 	BN_to_ASN1_INTEGER(bn, X509_get_serialNumber(crt));
 	BN_free(bn);
 
-	/* thời hạn: mirror upstream nếu có, không thì 1 năm */
+	/* validity: mirror upstream if available, otherwise 1 year */
 	if (upstream) {
 		X509_set1_notBefore(crt, X509_get0_notBefore(upstream));
 		X509_set1_notAfter(crt, X509_get0_notAfter(upstream));
@@ -114,7 +115,7 @@ static X509 *forge(struct certcache *cc, const char *sni, X509 *upstream)
 			goto err;
 	}
 
-	/* ký bằng CA key */
+	/* sign with the CA key */
 	if (X509_sign(crt, cc->ca->key, EVP_sha256()) == 0)
 		goto err;
 
@@ -144,14 +145,14 @@ int certcache_get(struct certcache *cc, const char *sni, X509 *upstream,
 		}
 	}
 
-	/* miss → forge */
+	/* miss -> forge */
 	X509 *crt = forge(cc, sni, upstream);
 	if (!crt) {
 		pthread_mutex_unlock(&cc->lock);
 		return -1;
 	}
 
-	/* chọn slot: trống, hoặc evict LRU */
+	/* pick a slot: empty one, or evict LRU */
 	int slot;
 	if (cc->n < cc->max) {
 		slot = cc->n++;
@@ -160,7 +161,7 @@ int certcache_get(struct certcache *cc, const char *sni, X509 *upstream,
 		for (int i = 1; i < cc->n; i++)
 			if (cc->ent[i].lru < cc->ent[slot].lru)
 				slot = i;
-		X509_free(cc->ent[slot].cert);   /* key chung — không free */
+		X509_free(cc->ent[slot].cert);   /* shared key - not freed */
 	}
 
 	snprintf(cc->ent[slot].sni, sizeof(cc->ent[slot].sni), "%s", sni);

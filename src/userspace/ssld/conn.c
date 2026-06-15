@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * conn.c - Xử lý một kết nối (xem conn.h).
+ * conn.c - Handle a single connection (see conn.h).
  */
 #define _POSIX_C_SOURCE 200809L
 #include "conn.h"
@@ -9,9 +9,9 @@
 #include "bump.h"
 #include "tls_clienthello.h"
 #include "sig_rule.h"        /* ../ipsd: sig_match, struct flow_ctx, SIG_* */
-#include "insp_ipc.h"        /* Phase 4: IPC client → engine stateful của ipsd */
-#include <openssl/ssl.h>     /* SSL_write — block page ra client */
-#include <sys/un.h>          /* AF_UNIX socket tới ipsd insp server */
+#include "insp_ipc.h"        /* Phase 4: IPC client -> ipsd stateful engine */
+#include <openssl/ssl.h>     /* SSL_write - block page to client */
+#include <sys/un.h>          /* AF_UNIX socket to ipsd insp server */
 
 #include <stdio.h>
 #include <string.h>
@@ -21,11 +21,11 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <time.h>           /* timestamp cho alert log */
+#include <time.h>           /* timestamp for alert log */
 #include <fcntl.h>          /* open O_APPEND alert log */
-#include <sys/stat.h>       /* mkdir — đảm bảo /etc/stargazer/logs */
+#include <sys/stat.h>       /* mkdir - ensure /etc/stargazer/logs */
 
-/* Mở TCP tới đích gốc (đường splice). */
+/* Open TCP to the original destination (splice path). */
 static int connect_upstream(const struct sockaddr_in *dst)
 {
 	int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -39,10 +39,11 @@ static int connect_upstream(const struct sockaddr_in *dst)
 }
 
 /*
- * PEEK ClientHello bằng MSG_PEEK (KHÔNG tiêu thụ): lặp poll→peek tới khi parse
- * khác NEED_MORE hoặc đầy hạn mức. Byte vẫn nằm trong socket cho bước sau
- * (relay forward khi splice, hoặc SSL_accept đọc khi bump).
- * Trả kết quả parse; điền *out.
+ * PEEK the ClientHello with MSG_PEEK (does NOT consume): loop poll->peek until
+ * the parse returns something other than NEED_MORE or the limit is reached. The
+ * bytes stay in the socket for the next step (relay forward on splice, or
+ * SSL_accept reads them on bump).
+ * Returns the parse result; fills *out.
  */
 static enum tls_ch_result peek_clienthello(int fd, struct tls_clienthello *out)
 {
@@ -52,66 +53,81 @@ static enum tls_ch_result peek_clienthello(int fd, struct tls_clienthello *out)
 	for (int iter = 0; iter < 64; iter++) {
 		struct pollfd p = { .fd = fd, .events = POLLIN };
 		if (poll(&p, 1, 5000) <= 0)
-			break;                       /* timeout/lỗi */
+			break;                       /* timeout/error */
 		ssize_t n = recv(fd, buf, sizeof(buf), MSG_PEEK);
 		if (n <= 0) {
 			if (n < 0 && errno == EINTR)
 				continue;
-			break;                       /* client đóng */
+			break;                       /* client closed */
 		}
 		res = tls_parse_clienthello(buf, (size_t)n, out);
 		if (res != TLS_CH_NEED_MORE)
 			return res;
 		if ((size_t)n >= sizeof(buf))
-			return res;                  /* hết hạn mức */
+			return res;                  /* limit reached */
 	}
 	return res;
 }
 
-/* ── inspect callback: chạy signature engine trên plaintext đã giải mã ──── */
+/* -- inspect callback: run the signature engine on decrypted plaintext ----- */
 struct insp_ctx {
 	struct sig_ruleset *rs;
 	uint16_t            dport;
 	const char         *host;
-	/* cho alert log: 5-tuple của flow đã giải mã (điền ở ssld_handle_conn). */
+	/* for alert log: 5-tuple of the decrypted flow (filled in ssld_handle_conn). */
 	char                src_ip[INET_ADDRSTRLEN];
 	uint16_t            src_port;
 	char                dst_ip[INET_ADDRSTRLEN];
-	/* dedup: sid đã alert trên flow này → 1 alert/signature/flow (response bị
-	 * chia nhiều record hoặc client retry trên cùng connection sẽ KHÔNG spam). */
+	/* dedup: sids already alerted on this flow -> 1 alert/signature/flow (a
+	 * response split across records, or a client retry on the same connection,
+	 * will NOT spam). */
 	uint32_t            seen_sids[32];
 	int                 n_seen;
-	/* thông tin chặn (điền khi conn_inspect quyết DROP) — cho block page. */
+	/* block info (filled when conn_inspect decides DROP) - for the block page. */
 	uint32_t            block_sid;
 	char                block_msg[128];
-	/* Phase 4 IPC: socket tới ipsd insp server (-1 = fallback per-chunk). */
+	/* Phase 4 IPC: socket to the ipsd insp server (-1 = per-chunk fallback). */
 	int                 ipc_fd;
 	uint32_t            chunk_id;
-	int                 fail_closed;   /* IPC lỗi → chặn flow thay vì fallback */
+	int                 fail_closed;   /* IPC error -> block flow instead of fallback */
 };
 
-/* Log alert dùng CHUNG file với ipsd để `execute diagnose ips alerts` thấy được
- * cả phát hiện trên HTTPS đã giải mã (ipsd qua NFQUEUE chỉ thấy HTTP rõ; luồng
- * bump nằm hoàn toàn trong ssld). Cùng format dòng với ipsd/main.c log_alert.
- * O_APPEND lên file thường là atomic ⇒ nhiều writer (ipsd + nhiều ssld) không
- * xé dòng. Thư mục log có thể chưa tồn tại trên storage persistent → mkdir. */
+/* Log alerts to the SAME file as ipsd so `execute diagnose ips alerts` also sees
+ * detections on decrypted HTTPS (ipsd via NFQUEUE only sees cleartext HTTP; the
+ * bump flow lives entirely inside ssld). Same line format as ipsd/main.c
+ * log_alert. O_APPEND to a regular file is atomic => multiple writers (ipsd +
+ * several ssld) do not tear lines. The log dir may not exist on persistent
+ * storage -> mkdir. */
 #define SSLD_ALERT_LOG "/etc/stargazer/logs/ips-alert.log"
 
+/* is_ml: verdict came from the ML model (insp_verdict_body.src==1), not a
+ * signature. Render the SAME reason/score vocabulary as the NFQUEUE path
+ * (ipsd main.c log_alert): ML → reason=ml-block/ml-alert + numeric score;
+ * signature → reason=signature score=n/a. Mislabelling ML as "signature" (the
+ * old hardcoded behaviour) hid that these hits had no sid and came from the
+ * model — confusing on the firewall, where the reason is what gets triaged. */
 static void ssld_log_alert(const struct insp_ctx *ic, int drop,
-			   uint32_t sid, const char *msg)
+			   uint32_t sid, const char *msg, int is_ml, float score)
 {
 	time_t now = time(NULL);
 	struct tm tm; localtime_r(&now, &tm);
 	char ts[24]; strftime(ts, sizeof(ts), "%F %T", &tm);
 
+	const char *reason = is_ml ? (drop ? "ml-block" : "ml-alert") : "signature";
+	char scorebuf[16];
+	if (is_ml)
+		snprintf(scorebuf, sizeof(scorebuf), "%.3f", (double)score);
+	else
+		snprintf(scorebuf, sizeof(scorebuf), "n/a");
+
 	char line[512];
 	int ln = snprintf(line, sizeof(line),
 		"%s %s proto=6 src=%s:%u dst=%s:%u "
-		"reason=signature score=n/a sid=%u msg=%s\n",
+		"reason=%s score=%s sid=%u msg=%s\n",
 		ts, drop ? "DROP" : "ALERT",
 		ic->src_ip[0] ? ic->src_ip : "?", ic->src_port,
 		ic->dst_ip[0] ? ic->dst_ip : "?", ic->dport,
-		sid, msg ? msg : "");
+		reason, scorebuf, sid, msg ? msg : "");
 	if (ln < 0)
 		return;
 	if (ln > (int)sizeof(line))
@@ -120,7 +136,7 @@ static void ssld_log_alert(const struct insp_ctx *ic, int drop,
 	int fd = open(SSLD_ALERT_LOG,
 		      O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
 	if (fd < 0) {
-		mkdir("/etc/stargazer/logs", 0755);   /* dir có thể chưa có */
+		mkdir("/etc/stargazer/logs", 0755);   /* dir may not exist yet */
 		fd = open(SSLD_ALERT_LOG,
 			  O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
 		if (fd < 0)
@@ -131,9 +147,11 @@ static void ssld_log_alert(const struct insp_ctx *ic, int drop,
 	close(fd);
 }
 
-/* Dedup theo flow + ghi alert (1 dòng/sid/flow) + ghi block info nếu DROP. */
+/* Dedup per flow + log alert (1 line/sid/flow) + record block info if DROP.
+ * is_ml/score: pass the verdict's source so the log reason matches reality
+ * (ML vs signature); signature callers pass is_ml=0, score=0. */
 static void conn_alert(struct insp_ctx *ic, int drop, uint32_t sid,
-		       const char *msg, int to_server)
+		       const char *msg, int to_server, int is_ml, float score)
 {
 	if (drop) {
 		ic->block_sid = sid;
@@ -142,16 +160,17 @@ static void conn_alert(struct insp_ctx *ic, int drop, uint32_t sid,
 	}
 	for (int i = 0; i < ic->n_seen; i++)
 		if (ic->seen_sids[i] == sid)
-			return;             /* đã alert sid này trên flow */
+			return;             /* already alerted this sid on the flow */
 	if (ic->n_seen < (int)(sizeof(ic->seen_sids) / sizeof(ic->seen_sids[0])))
 		ic->seen_sids[ic->n_seen++] = sid;
-	ssld_log_alert(ic, drop, sid, msg);
+	ssld_log_alert(ic, drop, sid, msg, is_ml, score);
 	fprintf(stderr, "ssld: SIG %s host=%s dir=%s sid=%u msg=%s\n",
 		drop ? "DROP" : "ALERT", ic->host,
 		to_server ? "->srv" : "<-srv", sid, msg ? msg : "");
 }
 
-/* Fallback per-chunk (khi IPC không khả dụng) — soi rời từng buffer SSL_read. */
+/* Per-chunk fallback (when IPC is unavailable) - inspect each SSL_read buffer
+ * separately. */
 static int conn_inspect_local(struct insp_ctx *ic, const unsigned char *data,
 			      int len, int to_server)
 {
@@ -165,12 +184,13 @@ static int conn_inspect_local(struct insp_ctx *ic, const unsigned char *data,
 		return 0;
 	int drop = (ic->rs->rules[idx].action == SIG_DROP);
 	conn_alert(ic, drop, ic->rs->rules[idx].sid,
-		   ic->rs->rules[idx].msg, to_server);
+		   ic->rs->rules[idx].msg, to_server, 0 /*signature*/, 0.0f);
 	return drop ? 1 : 0;
 }
 
-/* Phase 4: đẩy chunk plaintext qua IPC tới engine stateful của ipsd (reass +
- * AC + verify), CHỜ verdict (prevent inline). Lỗi IPC → đóng + fallback. */
+/* Phase 4: push a plaintext chunk over IPC to the ipsd stateful engine (reass +
+ * AC + verify), WAIT for the verdict (inline prevent). IPC error -> close +
+ * fallback. */
 static int conn_inspect_ipc(struct insp_ctx *ic, const unsigned char *data,
 			    int len, int to_server)
 {
@@ -200,18 +220,21 @@ static int conn_inspect_ipc(struct insp_ctx *ic, const unsigned char *data,
 		close(ic->ipc_fd);
 		ic->ipc_fd = -1;
 		if (ic->fail_closed) {
-			/* fail-closed: IPC lỗi → chặn flow (an toàn hơn). */
-			conn_alert(ic, 1, 0, "IPC inspection unavailable", to_server);
+			/* fail-closed: IPC error -> block flow (safer). */
+			conn_alert(ic, 1, 0, "IPC inspection unavailable",
+				   to_server, 0 /*not ML*/, 0.0f);
 			return 1;
 		}
 		return conn_inspect_local(ic, data, len, to_server);
 	}
 	if (reply.v.action == INSP_DROP) {
-		conn_alert(ic, 1, reply.v.sid, reply.v.msg, to_server);
+		conn_alert(ic, 1, reply.v.sid, reply.v.msg, to_server,
+			   reply.v.src == 1 /*ML*/, reply.v.score);
 		return 1;
 	}
 	if (reply.v.action == INSP_ALERT)
-		conn_alert(ic, 0, reply.v.sid, reply.v.msg, to_server);
+		conn_alert(ic, 0, reply.v.sid, reply.v.msg, to_server,
+			   reply.v.src == 1 /*ML*/, reply.v.score);
 	return 0;
 }
 
@@ -226,8 +249,9 @@ static int conn_inspect(const unsigned char *data, int len, int to_server,
 	return conn_inspect_local(ic, data, len, to_server);
 }
 
-/* Mở socket IPC tới ipsd insp server + gửi OPEN (kèm leg_tuple cho ML).
- * client_fd để getpeername (client) + getsockname (fw). Trả fd, hoặc -1. */
+/* Open an IPC socket to the ipsd insp server + send OPEN (with leg_tuple for ML).
+ * client_fd is used for getpeername (client) + getsockname (fw). Returns fd, or
+ * -1. */
 static int ssld_ipc_open(int client_fd, uint16_t dport, const char *sni,
 			 const struct sockaddr_in *dst)
 {
@@ -247,10 +271,10 @@ static int ssld_ipc_open(int client_fd, uint16_t dport, const char *sni,
 	m.h.type       = INSP_OPEN;
 	m.o.srv_ip     = dst ? dst->sin_addr.s_addr : 0;
 	m.o.srv_port   = dport;
-	m.o.profile_id = 0;             /* áp mọi rule (ssld chưa scope profile) */
+	m.o.profile_id = 0;             /* apply all rules (ssld does not scope by profile yet) */
 	snprintf(m.o.sni, sizeof(m.o.sni), "%s", sni ? sni : "");
 
-	/* Phase 2 — leg client→ssld cho ipsd đọc CTA_ML. */
+	/* Phase 2 - client->ssld leg so ipsd can read CTA_ML. */
 	struct sockaddr_in pa, la;
 	socklen_t pl = sizeof(pa), ll = sizeof(la);
 	if (getpeername(client_fd, (struct sockaddr *)&pa, &pl) == 0) {
@@ -280,10 +304,10 @@ static void ssld_ipc_close(int fd)
 	close(fd);
 }
 
-/* ── Block page (FortiGate-style) — khớp webui/www/block.html ────────────── */
-/* Lưu ý: là format string của snprintf nên mọi '%' literal trong CSS phải là
- * '%%'; ở đây CSS tránh dùng '%' để khỏi rối. Placeholder: %s=URL, %s=signature,
- * %s=description. */
+/* -- Block page (FortiGate-style) - matches webui/www/block.html ----------- */
+/* Note: this is an snprintf format string, so every literal '%' in the CSS must
+ * be '%%'; the CSS here avoids '%' to keep it clean. Placeholders: %s=URL,
+ * %s=signature, %s=description. */
 static const char SSLD_BLOCK_HTML[] =
 "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">"
 "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
@@ -323,7 +347,7 @@ static const char SSLD_BLOCK_HTML[] =
 "<div class=\"foot\"><span>Stargazer NGFW &middot; Intrusion Prevention System</span>"
 "<span>Blocked by IPS engine</span></div></div></div></body></html>";
 
-/* Escape tối thiểu để chèn host vào HTML an toàn (chống nhúng thẻ). */
+/* Minimal escaping to insert the host into HTML safely (prevents tag injection). */
 static void html_escape(const char *in, char *out, size_t cap)
 {
 	size_t o = 0;
@@ -342,8 +366,9 @@ static void html_escape(const char *in, char *out, size_t cap)
 	out[o] = '\0';
 }
 
-/* SSL_write ghi HẾT (partial write → trang block bị cắt "...Content-Type: t").
- * Lặp tới khi đủ; WANT_READ/WRITE → thử lại. Trả 0 OK, -1 lỗi. */
+/* SSL_write everything (a partial write truncates the block page to
+ * "...Content-Type: t"). Loop until complete; WANT_READ/WRITE -> retry. Returns
+ * 0 OK, -1 error. */
 static int ssl_write_full(SSL *s, const void *buf, int len)
 {
 	const char *p = buf;
@@ -369,12 +394,12 @@ static void ssld_send_block_page(SSL *client, const struct insp_ctx *ic)
 	html_escape(hostraw, host, sizeof(host));
 	snprintf(url, sizeof(url), "https://%s/", host);
 
-	/* KHÔNG đưa signature/SID ra trang (tránh lộ chi tiết phát hiện). */
+	/* Do NOT put the signature/SID on the page (avoid leaking detection detail). */
 	char body[6144];
 	int blen = snprintf(body, sizeof(body), SSLD_BLOCK_HTML, url, "");
 	if (blen < 0)
 		return;
-	if (blen >= (int)sizeof(body))      /* snprintf cắt → dùng độ dài thực */
+	if (blen >= (int)sizeof(body))      /* snprintf truncated -> use actual length */
 		blen = (int)sizeof(body) - 1;
 	char hdr[256];
 	int hlen = snprintf(hdr, sizeof(hdr),
@@ -385,12 +410,13 @@ static void ssld_send_block_page(SSL *client, const struct insp_ctx *ic)
 		"Content-Length: %d\r\n\r\n", blen);
 	if (hlen <= 0)
 		return;
-	/* Ghi HẾT header rồi body — không để partial-write cắt response. */
+	/* Write the header in full, then the body - don't let a partial write cut
+	 * the response. */
 	if (ssl_write_full(client, hdr, hlen) == 0)
 		ssl_write_full(client, body, blen);
 }
 
-/* Callback cho bump_run: inspect DROP → ghi block page ra client. */
+/* Callback for bump_run: inspect DROP -> write the block page to the client. */
 static void conn_on_block(void *client_ssl, void *ud)
 {
 	ssld_send_block_page((SSL *)client_ssl, (const struct insp_ctx *)ud);
@@ -401,7 +427,7 @@ void ssld_handle_conn(int client_fd, const struct ssld_ctx *ctx,
 {
 	if (st) st->n_total++;
 
-	/* [1] đích gốc */
+	/* [1] original destination */
 	struct sockaddr_in dst;
 	if (origdst_get(client_fd, &dst) < 0) {
 		if (st) st->n_error++;
@@ -409,10 +435,11 @@ void ssld_handle_conn(int client_fd, const struct ssld_ctx *ctx,
 		return;
 	}
 
-	/* Chống loop: kết nối TỚI THẲNG cổng ssld (không đi qua REDIRECT) có
-	 * origdst == địa chỉ local của chính socket — còn flow hợp lệ thì origdst
-	 * là server:443 ≠ local:<listen_port>. Nếu để chạy tiếp, ssld sẽ mở
-	 * upstream về chính cổng của mình → đệ quy vô hạn (DoS). Từ chối ngay. */
+	/* Loop guard: a connection made DIRECTLY to the ssld port (not via REDIRECT)
+	 * has origdst == the socket's own local address - whereas a legitimate flow
+	 * has origdst = server:443 != local:<listen_port>. If allowed to proceed,
+	 * ssld would open an upstream back to its own port -> infinite recursion
+	 * (DoS). Reject immediately. */
 	struct sockaddr_in local;
 	socklen_t llen = sizeof(local);
 	if (getsockname(client_fd, (struct sockaddr *)&local, &llen) == 0 &&
@@ -426,23 +453,23 @@ void ssld_handle_conn(int client_fd, const struct ssld_ctx *ctx,
 	inet_ntop(AF_INET, &dst.sin_addr, dip, sizeof(dip));
 	int dport = ntohs(dst.sin_port);
 
-	/* [2] peek ClientHello (không tiêu thụ) */
+	/* [2] peek ClientHello (does not consume) */
 	struct tls_clienthello ch;
 	enum tls_ch_result res = peek_clienthello(client_fd, &ch);
 	int has_sni = (res == TLS_CH_OK && ch.has_sni);
 	const char *sni = has_sni ? ch.sni : NULL;
 
-	/* [3] quyết định */
+	/* [3] decision */
 	enum tls_action act = tls_policy_decide(ctx->pol, sni, has_sni);
 
-	/* [4b] BUMP — nếu có hạ tầng CA */
+	/* [4b] BUMP - if CA infrastructure is available */
 	if (act == TLS_BUMP && ctx->ca && ctx->cc) {
 		if (st) st->n_bump++;
 		struct insp_ctx ic = {
 			.rs = ctx->rules, .dport = (uint16_t)dport,
 			.host = has_sni ? ch.sni : dip,
 		};
-		/* 5-tuple cho alert log: dst = đích GỐC, src = client thật. */
+		/* 5-tuple for alert log: dst = ORIGINAL destination, src = real client. */
 		snprintf(ic.dst_ip, sizeof(ic.dst_ip), "%s", dip);
 		struct sockaddr_in peer;
 		socklen_t plen = sizeof(peer);
@@ -451,8 +478,8 @@ void ssld_handle_conn(int client_fd, const struct ssld_ctx *ctx,
 				  sizeof(ic.src_ip));
 			ic.src_port = ntohs(peer.sin_port);
 		}
-		/* Phase 4: thử nối IPC tới engine stateful của ipsd. no_ipc → bỏ qua
-		 * (soi per-chunk). Thất bại → ipc_fd=-1 → fallback theo failmode. */
+		/* Phase 4: try to connect IPC to the ipsd stateful engine. no_ipc -> skip
+		 * (per-chunk inspection). Failure -> ipc_fd=-1 -> fallback per failmode. */
 		ic.fail_closed = ctx->ipc_failclosed;
 		ic.ipc_fd = ctx->no_ipc ? -1
 				: ssld_ipc_open(client_fd, ic.dport, sni, &dst);
@@ -463,12 +490,12 @@ void ssld_handle_conn(int client_fd, const struct ssld_ctx *ctx,
 			.inspect = conn_inspect, .inspect_ud = &ic,
 			.on_block = conn_on_block,
 		};
-		bump_run(client_fd, sni, &dst, &bc);   /* consume client_fd */
+		bump_run(client_fd, sni, &dst, &bc);   /* consumes client_fd */
 		ssld_ipc_close(ic.ipc_fd);
 		return;
 	}
 
-	/* [4a] SPLICE (hoặc bump không khả dụng → fallback) */
+	/* [4a] SPLICE (or bump unavailable -> fallback) */
 	if (st) st->n_splice++;
 	fprintf(stderr, "ssld: SPLICE %s:%d sni=%s\n",
 		dip, dport, has_sni ? ch.sni : "(none)");
@@ -476,11 +503,11 @@ void ssld_handle_conn(int client_fd, const struct ssld_ctx *ctx,
 	int up = connect_upstream(&dst);
 	if (up < 0) {
 		if (st) st->n_error++;
-		fprintf(stderr, "ssld: connect %s:%d thất bại: %m\n", dip, dport);
+		fprintf(stderr, "ssld: connect %s:%d failed: %m\n", dip, dport);
 		close(client_fd);
 		return;
 	}
-	relay_pump(client_fd, up);   /* ClientHello còn trong socket → relay tự nhiên */
+	relay_pump(client_fd, up);   /* ClientHello still in socket -> relayed naturally */
 	close(up);
 	close(client_fd);
 }

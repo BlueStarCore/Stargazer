@@ -264,8 +264,9 @@ sg_status_t rebuild_nat_chains(char *result, size_t rsize)
 	free(out);
 	free(buf.data);
 
-	/* Steering đã apply → đồng bộ lifecycle ssld (start/stop/restart theo
-	 * security_ssl-inspection-profile). Đặt SAU restore để ssld nghe ngay khi có rule. */
+	/* Steering applied → sync the ssld lifecycle (start/stop/restart per
+	 * security_ssl-inspection-profile). Placed AFTER restore so ssld is
+	 * listening as soon as the rules exist. */
 	ssld_sync();
 
 	snprintf(result, rsize, "NAT chains rebuilt (%d SNAT, %d DNAT)",

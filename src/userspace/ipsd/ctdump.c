@@ -1,15 +1,15 @@
 /* SPDX-License-Identifier: MIT */
-#define _DEFAULT_SOURCE   /* be64toh / be32toh với musl và glibc strict */
+#define _DEFAULT_SOURCE   /* be64toh / be32toh under strict musl and glibc */
 /*
- * ctdump.c - query conntrack CTA_ML + CTA_COUNTERS qua ctnetlink (xem ctdump.h).
+ * ctdump.c - query conntrack CTA_ML + CTA_COUNTERS via ctnetlink (see ctdump.h).
  *
- * Tái dùng convention từ mgmtd_diag.c:
+ * Reuses conventions from mgmtd_diag.c:
  *   - sg_nla_find(): walk nlattr stream (handle nested + type-mask).
- *   - Hằng số SG_CTA_* khớp với mgmtd_diag.c để không lệch.
+ *   - SG_CTA_* constants match mgmtd_diag.c so they stay in sync.
  *   - struct sg_nfgenmsg: {u8 family, u8 version, u16 res_id}.
  *
- * Thêm CTA_COUNTERS (ACCT) — mgmtd đọc từ /proc text, ipsd đọc thẳng
- * từ ctnetlink để có pkts_fwd / pkts_bwd cho feature #7, #8, #12.
+ * Adds CTA_COUNTERS (ACCT) — mgmtd reads it from /proc text, ipsd reads it
+ * directly from ctnetlink to get pkts_fwd / pkts_bwd for features #7, #8, #12.
  */
 #define _GNU_SOURCE
 #include "ctdump.h"
@@ -22,14 +22,14 @@
 #include <errno.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
-#include <sys/time.h>          /* struct timeval cho SO_RCVTIMEO */
+#include <sys/time.h>          /* struct timeval for SO_RCVTIMEO */
 #include <endian.h>            /* be64toh (musl + glibc) */
 #include <linux/netlink.h>
 #include <linux/netfilter/nfnetlink.h>
 #include <netinet/in.h>
 
-/* ---- hằng số ctnetlink --------------------------------------------------- */
-/* Khớp với mgmtd_diag.c — không đổi tên */
+/* ---- ctnetlink constants ------------------------------------------------- */
+/* Match mgmtd_diag.c — do not rename */
 
 #define SG_NETLINK_NETFILTER     12
 #define SG_NFNL_SUBSYS_CTNETLINK  1
@@ -39,10 +39,10 @@
 
 /* CTA_TUPLE_ORIG = 1 (nested) */
 #define SG_CTA_TUPLE_ORIG      1
-#define SG_CTA_TUPLE_IP        1   /* nested trong TUPLE */
+#define SG_CTA_TUPLE_IP        1   /* nested in TUPLE */
 #define SG_CTA_IP_V4_SRC       1
 #define SG_CTA_IP_V4_DST       2
-#define SG_CTA_TUPLE_PROTO     2   /* nested trong TUPLE */
+#define SG_CTA_TUPLE_PROTO     2   /* nested in TUPLE */
 #define SG_CTA_PROTO_NUM       1
 #define SG_CTA_PROTO_SRC_PORT  2
 #define SG_CTA_PROTO_DST_PORT  3
@@ -50,11 +50,14 @@
 /* CTA_COUNTERS (ACCT) */
 #define SG_CTA_COUNTERS_ORIG   9   /* nested */
 #define SG_CTA_COUNTERS_REPLY  10  /* nested */
-#define SG_CTA_COUNTERS_PKTS   1   /* be64, trong COUNTERS */
+#define SG_CTA_COUNTERS_PKTS   1   /* be64, in COUNTERS */
 #define SG_CTA_COUNTERS_BYTES  2   /* be64 */
 
 /* CTA_ML = 27 (Stargazer extension) */
 #define SG_CTA_ML              27
+
+/* CTA_MARK = 8 (be32 connmark) — carries the IPS profile id on the HTTPS path */
+#define SG_CTA_MARK            8
 
 struct sg_nfgenmsg {
 	uint8_t  nfgen_family;
@@ -64,7 +67,7 @@ struct sg_nfgenmsg {
 
 /* ---- NLA helpers ---------------------------------------------------------- */
 
-/* Walk nlattr stream [data, data+len), trả payload của attr `want`. */
+/* Walk nlattr stream [data, data+len), return payload of attr `want`. */
 static const void *sg_nla_find(const void *data, int len, int want, int *plen)
 {
 	const struct nlattr *nla = data;
@@ -84,7 +87,7 @@ static const void *sg_nla_find(const void *data, int len, int want, int *plen)
 	return NULL;
 }
 
-/* Ghi một nlattr vào buf[*off..cap). Trả 0/-1. */
+/* Write an nlattr into buf[*off..cap). Returns 0/-1. */
 static int nla_put_raw(char *buf, int *off, int cap,
 		       uint16_t type, const void *data, int dlen)
 {
@@ -106,16 +109,16 @@ static int nla_put_raw(char *buf, int *off, int cap,
 	return 0;
 }
 
-/* Bắt đầu một nested attr: trả con trỏ tới nla_len để patch sau. */
+/* Start a nested attr: return a pointer to nla_len to patch later. */
 static int nla_nest_start(char *buf, int *off, int cap, uint16_t type)
 {
 	if (*off + NLA_HDRLEN > cap)
 		return -1;
 	struct nlattr *nla = (struct nlattr *)(buf + *off);
-	nla->nla_len  = NLA_HDRLEN;   /* sẽ patch trong nla_nest_end */
+	nla->nla_len  = NLA_HDRLEN;   /* patched in nla_nest_end */
 	nla->nla_type = type | (uint16_t)SG_NLA_F_NESTED;
 	*off += NLA_HDRLEN;
-	return *off - NLA_HDRLEN;     /* trả offset của nla để patch */
+	return *off - NLA_HDRLEN;     /* return the nla offset to patch */
 }
 
 static void nla_nest_end(char *buf, int nest_off, int cur_off)
@@ -172,14 +175,23 @@ int ctdump_parse_response(const void *attrs_data, int attrs_len,
 		}
 	}
 
+	/* ---- CTA_MARK (connmark; low bits carry the IPS profile id) ---- */
+	int mk_len = 0;
+	const void *mk = sg_nla_find(attrs_data, attrs_len, SG_CTA_MARK, &mk_len);
+	if (mk && mk_len == 4) {
+		uint32_t v; memcpy(&v, mk, 4);
+		out->mark = be32toh(v);
+		out->mark_valid = 1;
+	}
+
 	return 0;
 }
 
 /* ---- build targeted CT_GET request --------------------------------------- */
 
 /*
- * Dựng request CT_GET với CTA_TUPLE_ORIG = {src_ip, dst_ip, sport, dport, proto}.
- * KHÔNG có NLM_F_DUMP → kernel trả đúng 1 entry (hoặc NLMSG_ERROR ENOENT).
+ * Build a CT_GET request with CTA_TUPLE_ORIG = {src_ip, dst_ip, sport, dport, proto}.
+ * NO NLM_F_DUMP → the kernel returns exactly 1 entry (or NLMSG_ERROR ENOENT).
  * src_ip / dst_ip: host byte order. sport / dport: host byte order.
  */
 static int build_ct_get(char *buf, int cap,
@@ -232,7 +244,7 @@ static int build_ct_get(char *buf, int cap,
 	nlh->nlmsg_len   = (uint32_t)NLMSG_ALIGN((size_t)off);
 	nlh->nlmsg_type  = (uint16_t)((SG_NFNL_SUBSYS_CTNETLINK << 8) |
 				       SG_IPCTNL_MSG_CT_GET);
-	nlh->nlmsg_flags = NLM_F_REQUEST;   /* exact lookup — không DUMP */
+	nlh->nlmsg_flags = NLM_F_REQUEST;   /* exact lookup — no DUMP */
 	nlh->nlmsg_seq   = 1;
 
 	return off;
@@ -283,13 +295,13 @@ int ctdump_query(uint32_t src_ip, uint32_t dst_ip,
 
 		if (nh->nlmsg_type == NLMSG_ERROR) {
 			struct nlmsgerr *err = NLMSG_DATA(nh);
-			(void)err;   /* ENOENT → flow không tồn tại */
+			(void)err;   /* ENOENT → flow does not exist */
 			return -1;
 		}
 		if (nh->nlmsg_type == NLMSG_DONE)
 			break;
 
-		/* Payload: bỏ qua nfgenmsg header → attrs */
+		/* Payload: skip the nfgenmsg header → attrs */
 		const void *attrs = (const char *)NLMSG_DATA(nh) +
 				    NLMSG_ALIGN(sizeof(struct sg_nfgenmsg));
 		int alen = (int)nh->nlmsg_len - NLMSG_HDRLEN -
@@ -301,9 +313,9 @@ int ctdump_query(uint32_t src_ip, uint32_t dst_ip,
 	return -1;
 }
 
-/* ---- dump TẤT CẢ flow ---------------------------------------------------- */
+/* ---- dump ALL flows ------------------------------------------------------ */
 
-/* Parse CTA_TUPLE_ORIG → 5-tuple (host order) vào *f. Trả 0/-1. */
+/* Parse CTA_TUPLE_ORIG → 5-tuple (host order) into *f. Returns 0/-1. */
 static int parse_tuple(const void *attrs, int alen, struct ctdump_flow *f)
 {
 	int tl = 0;
@@ -337,7 +349,7 @@ static int parse_tuple(const void *attrs, int alen, struct ctdump_flow *f)
 
 int ctdump_dump_all(ctdump_flow_cb cb, void *ctx)
 {
-	/* Request: nlmsghdr + nfgenmsg, KHÔNG tuple, cờ NLM_F_DUMP → mọi flow. */
+	/* Request: nlmsghdr + nfgenmsg, NO tuple, NLM_F_DUMP flag → all flows. */
 	char req[64];
 	memset(req, 0, sizeof(req));
 	int off = NLMSG_HDRLEN + (int)NLMSG_ALIGN(sizeof(struct sg_nfgenmsg));
@@ -374,7 +386,7 @@ int ctdump_dump_all(ctdump_flow_cb cb, void *ctx)
 	while (!done) {
 		ssize_t rn = recv(fd, rbuf, 65536, 0);
 		if (rn <= 0)
-			break;                       /* timeout / lỗi → kết thúc dump */
+			break;                       /* timeout / error → end of dump */
 
 		struct nlmsghdr *nh;
 		int rem = (int)rn;
@@ -393,7 +405,7 @@ int ctdump_dump_all(ctdump_flow_cb cb, void *ctx)
 			struct ctdump_flow f;
 			memset(&f, 0, sizeof(f));
 			parse_tuple(attrs, al, &f);
-			ctdump_parse_response(attrs, al, &f.res);  /* memset res bên trong */
+			ctdump_parse_response(attrs, al, &f.res);  /* res is memset inside */
 			count++;
 			if (cb && cb(&f, ctx) != 0) { done = 1; break; }
 		}
@@ -403,7 +415,7 @@ int ctdump_dump_all(ctdump_flow_cb cb, void *ctx)
 	return count;
 }
 
-/* ---- tiện ích chuyển đổi ------------------------------------------------- */
+/* ---- conversion helpers -------------------------------------------------- */
 
 void ctdump_to_flow_stats(const struct ctdump_result *r,
 			  struct flow_stats *fs)
@@ -419,12 +431,12 @@ void ctdump_to_flow_stats(const struct ctdump_result *r,
 	fs->tcp_flags_fwd = r->ml.tcp_flags[0];
 	fs->tcp_flags_bwd = r->ml.tcp_flags[1];
 
-	/* pkts_fwd/bwd: ưu tiên ACCT (chính xác); fallback tính từ bytes */
+	/* pkts_fwd/bwd: prefer ACCT (exact); fall back to estimating from bytes */
 	if (r->acct_valid) {
 		fs->pkts_fwd = (uint32_t)(r->pkts_orig  <= UINT32_MAX ? r->pkts_orig  : UINT32_MAX);
 		fs->pkts_bwd = (uint32_t)(r->pkts_reply <= UINT32_MAX ? r->pkts_reply : UINT32_MAX);
 	} else {
-		/* không có ACCT: ước lượng từ bytes (không chính xác, chỉ dùng cho L1) */
+		/* no ACCT: estimate from bytes (inexact, L1 use only) */
 		uint32_t avg = 512;
 		fs->pkts_fwd = r->ml.bytes_fwd ? (uint32_t)((r->ml.bytes_fwd + avg - 1) / avg) : 0;
 		fs->pkts_bwd = r->ml.bytes_bwd ? (uint32_t)((r->ml.bytes_bwd + avg - 1) / avg) : 0;

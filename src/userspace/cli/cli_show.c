@@ -195,6 +195,11 @@ void show_configure(void)
 
 		const char *label = sg_reg_type_label(type);
 
+		/* IPS filters are nested children of a profile — rendered inside the
+		 * security_ips-profile block below, not as a standalone section. */
+		if (strcmp(type, "security_ips-filter") == 0)
+			continue;
+
 		if (mode == CFG_TABLE) {
 			/* Get list of IDs */
 			struct ipc_response lresp = {0};
@@ -251,6 +256,55 @@ void show_configure(void)
 					show_entry_keys(type, dresp.payload, "    ");
 				}
 				ipc_resp_free(&dresp);
+
+				/* IPS profile: render its nested filters (children whose
+				 * id is "<profid>/<seq>") as a `config filter` sub-block. */
+				if (strcmp(type, "security_ips-profile") == 0) {
+					struct ipc_response fl = {0};
+					if (ipc_send_str(SG_CMD_CFG_LIST,
+							 "security_ips-filter",
+							 &fl) == 0 &&
+					    fl.status == SG_OK && fl.payload) {
+						char pfx[24];
+						int plen = snprintf(pfx, sizeof(pfx),
+								    "%s/", id);
+						int opened = 0;
+						for (char *fid = fl.payload; fid && *fid; ) {
+							char *fnl = strchr(fid, '\n');
+							if (fnl) *fnl = '\0';
+							if (*fid && strncmp(fid, pfx,
+									    (size_t)plen) == 0) {
+								if (!opened) {
+									printf("    config filter\n");
+									opened = 1;
+								}
+								printf("      edit \"%s\"\n",
+								       fid + plen);
+								char fsec[512];
+								snprintf(fsec, sizeof(fsec),
+									 "security_ips-filter:%s",
+									 fid);
+								struct ipc_response fg;
+								if (ipc_send_str(
+									SG_CMD_CFG_GET, fsec,
+									&fg) == 0 &&
+								    fg.status == SG_OK &&
+								    fg.payload)
+									show_entry_keys(
+										"security_ips-filter",
+										fg.payload,
+										"        ");
+								ipc_resp_free(&fg);
+								printf("      next\n");
+							}
+							if (!fnl) break;
+							fid = fnl + 1;
+						}
+						if (opened)
+							printf("    end\n");
+					}
+					ipc_resp_free(&fl);
+				}
 
 				printf("  next\n");
 				if (!nl) break;

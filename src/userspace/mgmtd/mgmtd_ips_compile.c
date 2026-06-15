@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * mgmtd_ips_compile.c — Ghép ruleset theo category (xem header).
+ * mgmtd_ips_compile.c — Merge ruleset by category (see header).
  */
 #define _POSIX_C_SOURCE 200809L
 #include "mgmtd_ips_compile.h"
@@ -11,14 +11,14 @@
 #include <dirent.h>
 #include <strings.h>   /* strcasecmp */
 
-/* Đuôi ".rules"? */
+/* Has ".rules" extension? */
 static int has_rules_ext(const char *name)
 {
 	size_t n = strlen(name);
 	return n > 6 && strcasecmp(name + n - 6, ".rules") == 0;
 }
 
-/* Ghép nội dung repo_dir/<base> vào fp. Trả 1 nếu ghép được, 0 nếu thiếu file. */
+/* Append the contents of repo_dir/<base> to fp. Returns 1 if appended, 0 if file missing. */
 static int append_file(FILE *fp, const char *repo_dir, const char *base)
 {
 	char path[512];
@@ -39,7 +39,7 @@ static int append_file(FILE *fp, const char *repo_dir, const char *base)
 	return 1;
 }
 
-/* Trim khoảng trắng đầu/cuối token (in-place, trả con trỏ đã trim). */
+/* Trim leading/trailing whitespace from a token (in-place, returns trimmed pointer). */
 static char *trim(char *s)
 {
 	while (*s == ' ' || *s == '\t') s++;
@@ -65,13 +65,13 @@ int ips_compile_categories(const char *repo_dir, const char *categories,
 	int merged = 0;
 
 	if (strcmp(categories, "all") == 0) {
-		/* mọi *.rules trong repo (sắp xếp để ổn định) */
+		/* every *.rules in the repo (sorted for stability) */
 		DIR *d = opendir(repo_dir);
 		if (!d) {
 			fclose(fp);
 			return -1;
 		}
-		/* gom tên, sort, ghép */
+		/* collect names, sort, merge */
 		char names[128][256];
 		int cnt = 0;
 		struct dirent *de;
@@ -80,7 +80,7 @@ int ips_compile_categories(const char *repo_dir, const char *categories,
 				snprintf(names[cnt++], 256, "%s", de->d_name);
 		}
 		closedir(d);
-		/* sort đơn giản (n nhỏ) cho output deterministic */
+		/* simple sort (small n) for deterministic output */
 		for (int i = 0; i < cnt; i++)
 			for (int j = i + 1; j < cnt; j++)
 				if (strcmp(names[i], names[j]) > 0) {
@@ -92,7 +92,7 @@ int ips_compile_categories(const char *repo_dir, const char *categories,
 		for (int i = 0; i < cnt; i++)
 			merged += append_file(fp, repo_dir, names[i]);
 	} else {
-		/* danh sách "a,b,c" → repo/<a>.rules ... */
+		/* list "a,b,c" → repo/<a>.rules ... */
 		char *list = strdup(categories);
 		if (!list) {
 			fclose(fp);
@@ -117,14 +117,14 @@ int ips_compile_categories(const char *repo_dir, const char *categories,
 
 /* ── FortiGate IPS sensor: per-entry ACTION (P7) ──────────────────────── */
 
-/* Forward (định nghĩa đầy đủ phía dưới — dùng cho extract sid). */
+/* Forward (full definition below — used for extracting the sid). */
 static int extract_token(const char *line, const char *key, char stop,
 			 char *out, size_t cap);
 
-/* Map override sid → action (từ filter type=signature). Nhỏ (admin chọn tay). */
+/* Map override sid → action (from filter type=signature). Small (admin-selected by hand). */
 struct sid_override { char sid[32]; int action; };
 
-/* Tìm action override cho sid; trả -1 nếu không có. */
+/* Find the override action for a sid; returns -1 if none. */
 static int override_for_sid(const struct sid_override *ov, int n_ov,
 			    const char *sid)
 {
@@ -134,39 +134,39 @@ static int override_for_sid(const struct sid_override *ov, int n_ov,
 	return -1;
 }
 
-/* Action token mới theo enum; NULL = default (giữ token gốc). */
+/* New action token per enum; NULL = default (keep original token). */
 static const char *action_word(int action)
 {
 	switch (action) {
 	case IPS_FA_BLOCK: return "drop";
 	case IPS_FA_ALERT: return "alert";
-	default:           return NULL;   /* default → giữ action gốc */
+	default:           return NULL;   /* default → keep original action */
 	}
 }
 
 /*
- * Ghi một dòng rule, REWRITE token action đầu theo `action`.
- *   pass    → KHÔNG ghi (loại rule khỏi profile).
- *   default → giữ nguyên.   block→"drop".   alert→"alert".
- * Dòng comment (#) / rỗng → bỏ. Trả 1 nếu ghi một RULE, 0 nếu không.
+ * Write a rule line, REWRITE the first action token per `action`.
+ *   pass    → do NOT write (excludes the rule from the profile).
+ *   default → keep as-is.   block→"drop".   alert→"alert".
+ * Comment (#) / blank lines → skipped. Returns 1 if a RULE was written, 0 otherwise.
  */
 static int write_rule_line(FILE *fp, const char *line, int action)
 {
 	const char *p = line;
 	while (*p == ' ' || *p == '\t') p++;
 	if (*p == '\0' || *p == '\n' || *p == '#')
-		return 0;                  /* comment/blank — bỏ */
+		return 0;                  /* comment/blank — skip */
 	if (action == IPS_FA_PASS)
-		return 0;                  /* pass → whitelist, không ghi */
+		return 0;                  /* pass → whitelist, not written */
 
 	const char *newact = action_word(action);
-	if (!newact) {                     /* default: giữ nguyên dòng */
+	if (!newact) {                     /* default: keep line as-is */
 		fputs(line, fp);
 		if (line[strlen(line) - 1] != '\n')
 			fputc('\n', fp);
 		return 1;
 	}
-	/* thay token đầu (tới khoảng trắng) bằng newact, giữ phần còn lại */
+	/* replace first token (up to whitespace) with newact, keep the rest */
 	const char *sp = p;
 	while (*sp && *sp != ' ' && *sp != '\t') sp++;
 	fprintf(fp, "%s%s", newact, sp);
@@ -176,9 +176,9 @@ static int write_rule_line(FILE *fp, const char *line, int action)
 }
 
 /*
- * Ghép repo/<base> với action của category. Precedence: rule có sid nằm trong
- * override map (signature filter) → BỎ QUA ở đây (sẽ do append_sid ghi với
- * action signature). Trả số rule ghi.
+ * Merge repo/<base> with the category's action. Precedence: a rule whose sid is in the
+ * override map (signature filter) → SKIPPED here (append_sid will write it with the
+ * signature action). Returns the number of rules written.
  */
 static int append_rules(FILE *fp, const char *repo_dir, const char *base,
 			int action, const struct sid_override *ov, int n_ov)
@@ -193,14 +193,14 @@ static int append_rules(FILE *fp, const char *repo_dir, const char *base,
 	char line[8192];
 	while (fgets(line, sizeof(line), in)) {
 		if (cont) {
-			if (!skip_cont) fputs(line, fp); /* dòng nối tiếp rule đã ghi */
+			if (!skip_cont) fputs(line, fp); /* continuation of a written rule */
 		} else {
 			char sid[32];
 			skip_cont = 0;
-			/* Precedence: sid có override signature → bỏ ở category */
+			/* Precedence: sid with a signature override → skip in category */
 			if (extract_token(line, "sid:", ';', sid, sizeof(sid)) &&
 			    override_for_sid(ov, n_ov, sid) >= 0) {
-				skip_cont = 1;           /* bỏ luôn dòng nối tiếp */
+				skip_cont = 1;           /* also skip the continuation line */
 			} else {
 				n += write_rule_line(fp, line, action);
 			}
@@ -213,7 +213,7 @@ static int append_rules(FILE *fp, const char *repo_dir, const char *base,
 	return n;
 }
 
-/* Tìm rule có sid:<value>; trong repo, ghi với action signature override. */
+/* Find the rule with sid:<value>; in the repo, write it with the signature override action. */
 static int append_sid(FILE *fp, const char *repo_dir, const char *sid,
 		      int action)
 {
@@ -246,9 +246,9 @@ static int append_sid(FILE *fp, const char *repo_dir, const char *sid,
 	return n;
 }
 
-/* ── Catalog: liệt kê signature từ repo (JSON) ───────────────────────── */
+/* ── Catalog: list signatures from the repo (JSON) ───────────────────── */
 
-/* Tìm value của key:"..." trong line → out (đã unquote). Trả 1 nếu thấy. */
+/* Find the value of key:"..." in line → out (unquoted). Returns 1 if found. */
 static int extract_quoted(const char *line, const char *key,
 			  char *out, size_t cap)
 {
@@ -261,14 +261,14 @@ static int extract_quoted(const char *line, const char *key,
 	p++;
 	size_t n = 0;
 	while (*p && *p != '"' && n + 1 < cap) {
-		if (*p == '\\' && p[1]) p++;   /* bỏ escape */
+		if (*p == '\\' && p[1]) p++;   /* skip escape */
 		out[n++] = *p++;
 	}
 	out[n] = '\0';
 	return 1;
 }
 
-/* Tìm token sau "key" tới ký tự dừng (; , khoảng trắng) → out. */
+/* Find the token after "key" up to a stop character (; , whitespace) → out. */
 static int extract_token(const char *line, const char *key, char stop,
 			 char *out, size_t cap)
 {
@@ -283,7 +283,7 @@ static int extract_token(const char *line, const char *key, char stop,
 	return n > 0;
 }
 
-/* Ghi chuỗi JSON-escaped vào buf tại *pos (cap). */
+/* Write a JSON-escaped string into buf at *pos (cap). */
 static void json_str(char *buf, size_t *pos, size_t cap, const char *s)
 {
 	for (const char *p = s; *p && *pos + 8 < cap; p++) {
@@ -293,7 +293,7 @@ static void json_str(char *buf, size_t *pos, size_t cap, const char *s)
 	}
 }
 
-/* strstr không phân biệt hoa/thường (cho search catalog). */
+/* Case-insensitive strstr (for catalog search). */
 static const char *ci_strstr(const char *hay, const char *needle)
 {
 	if (!needle || !needle[0]) return hay;
@@ -334,7 +334,7 @@ int ips_catalog_to_json(const char *repo_dir, char *buf, size_t cap,
 			continue;
 		char cat[128];
 		snprintf(cat, sizeof(cat), "%.*s",
-			 (int)(strlen(de->d_name) - 6), de->d_name);  /* bỏ .rules */
+			 (int)(strlen(de->d_name) - 6), de->d_name);  /* strip .rules */
 
 		/* Filter: skip categories not in the allowed list */
 		if (allowed && n_allowed > 0) {
@@ -365,7 +365,7 @@ int ips_catalog_to_json(const char *repo_dir, char *buf, size_t cap,
 				continue;
 
 			char sid[32], name[256], action[16], cve[32] = "", classtype[64] = "", ref_url[128] = "";
-			/* action = token đầu */
+			/* action = first token */
 			{
 				size_t n = 0;
 				while (q[n] && q[n] != ' ' && n < sizeof(action) - 1) {
@@ -374,16 +374,16 @@ int ips_catalog_to_json(const char *repo_dir, char *buf, size_t cap,
 				action[n] = '\0';
 			}
 			if (!extract_token(line, "sid:", ';', sid, sizeof(sid)))
-				continue;   /* không có sid → bỏ */
+				continue;   /* no sid → skip */
 			if (!extract_quoted(line, "msg:", name, sizeof(name)))
 				snprintf(name, sizeof(name), "sid %s", sid);
 			extract_token(line, "reference:cve,", ';', cve, sizeof(cve));
 			extract_token(line, "classtype:", ';', classtype, sizeof(classtype));
 			extract_token(line, "reference:url,", ';', ref_url, sizeof(ref_url));
 
-			/* SEARCH server-side: chỉ entry khớp từ khoá (sid/name/
-			 * category/cve/classtype) mới xuất → response gọn, không bị
-			 * cắt giữa kết quả tìm kiếm. */
+			/* SEARCH server-side: only entries matching the keyword (sid/name/
+			 * category/cve/classtype) are emitted → compact response, not
+			 * truncated in the middle of the search results. */
 			if (has_q &&
 			    !ci_strstr(sid, query) && !ci_strstr(name, query) &&
 			    !ci_strstr(cat, query) && !ci_strstr(cve, query) &&
@@ -403,7 +403,7 @@ int ips_catalog_to_json(const char *repo_dir, char *buf, size_t cap,
 			if (pos + strlen(name) + 512 > cap) {
 				if (truncated) *truncated = 1;
 				fclose(in);
-				goto done;     /* hết chỗ → dừng hẳn */
+				goto done;     /* out of room → stop entirely */
 			}
 
 #define JAPPEND(...) do { \
@@ -456,15 +456,15 @@ int ips_compile_filters(const char *repo_dir, const struct ips_filter *filters,
 		return -1;
 	fprintf(fp, "# Stargazer IPS compiled ruleset (%d filter)\n", n_filters);
 
-	/* P7 precedence — build map override sid→action từ filter type=signature
-	 * (cụ thể nhất, thắng category). */
+	/* P7 precedence — build the override map sid→action from filter type=signature
+	 * (most specific, wins over category). */
 	struct sid_override ov[256];
 	int n_ov = 0;
 	for (int i = 0; i < n_filters && n_ov < (int)(sizeof(ov)/sizeof(ov[0])); i++) {
 		if (filters[i].type != IPS_FT_SIGNATURE)
 			continue;
 		size_t vl = strlen(filters[i].value);
-		if (vl >= sizeof(ov[n_ov].sid))      /* sid hợp lệ luôn ngắn */
+		if (vl >= sizeof(ov[n_ov].sid))      /* a valid sid is always short */
 			continue;
 		memcpy(ov[n_ov].sid, filters[i].value, vl + 1);
 		ov[n_ov].action = filters[i].action;
@@ -472,7 +472,7 @@ int ips_compile_filters(const char *repo_dir, const struct ips_filter *filters,
 	}
 
 	int rules = 0;
-	/* Pass 1: category — ghi rule với action category, BỎ sid có override. */
+	/* Pass 1: category — write rules with the category action, SKIP sids with an override. */
 	for (int i = 0; i < n_filters; i++) {
 		const struct ips_filter *f = &filters[i];
 		if (f->type != IPS_FT_CATEGORY)
@@ -482,7 +482,7 @@ int ips_compile_filters(const char *repo_dir, const struct ips_filter *filters,
 		fprintf(fp, "\n# filter: category %s action=%d\n", f->value, f->action);
 		rules += append_rules(fp, repo_dir, base, f->action, ov, n_ov);
 	}
-	/* Pass 2: signature override — ghi sid cụ thể với action của nó. */
+	/* Pass 2: signature override — write the specific sid with its own action. */
 	for (int i = 0; i < n_filters; i++) {
 		const struct ips_filter *f = &filters[i];
 		if (f->type != IPS_FT_SIGNATURE)

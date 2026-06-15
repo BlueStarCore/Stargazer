@@ -1448,14 +1448,29 @@ static int spawn_child(child_entry_t *e)
 		/* New session (detach from mgmtd's terminal) */
 		setsid();
 
-		/* Redirect stdio to /dev/null */
-		int devnull = open("/dev/null", O_RDWR);
+		/* STDIN → /dev/null. STDOUT/STDERR → a per-daemon logfile so a
+		 * crashing/exiting child leaves its reason on disk instead of having
+		 * it swallowed by /dev/null (which made ipsd's "exited code 0"
+		 * undiagnosable). Fall back to /dev/null if the log cannot be opened. */
+		int devnull = open("/dev/null", O_RDONLY);
 		if (devnull >= 0) {
 			dup2(devnull, STDIN_FILENO);
-			dup2(devnull, STDOUT_FILENO);
-			dup2(devnull, STDERR_FILENO);
-			if (devnull > STDERR_FILENO)
+			if (devnull > STDIN_FILENO)
 				close(devnull);
+		}
+		{
+			char logpath[256];
+			snprintf(logpath, sizeof(logpath),
+				 "/etc/stargazer/logs/%s.log", e->name);
+			int lf = open(logpath, O_WRONLY | O_CREAT | O_APPEND, 0640);
+			if (lf < 0)
+				lf = open("/dev/null", O_WRONLY);
+			if (lf >= 0) {
+				dup2(lf, STDOUT_FILENO);
+				dup2(lf, STDERR_FILENO);
+				if (lf > STDERR_FILENO)
+					close(lf);
+			}
 		}
 
 		execvp(e->argv[0], (char *const *)e->argv);
@@ -1508,6 +1523,40 @@ int supervisor_start(const char *name, const char *const argv[],
 	if (cfg_val)  snprintf(e->cfg_val,   sizeof(e->cfg_val),  "%s", cfg_val);
 
 	return spawn_child(e);
+}
+
+/*
+ * Run rebuild_ips_active() in a detached background process so a heavy IPS
+ * recompile (e.g. editing an all-categories profile) never blocks the mgmtd IPC
+ * loop. Same double-fork pattern as SG_CMD_IPS_UPDATE_NOW: the inner child
+ * reparents to init (no zombie) and opens its OWN SQLite handle — never share a
+ * sqlite3* across fork. The config + iptables are already applied by the caller;
+ * this only recompiles the ruleset and signals ipsd, so the caller can reply
+ * immediately. Falls back to an inline rebuild if fork() fails.
+ */
+static void ips_rebuild_async(void)
+{
+	pid_t mid = fork();
+	if (mid < 0) {
+		char rb[256];
+		rebuild_ips_active(rb, sizeof(rb));   /* fork failed → do it inline */
+		return;
+	}
+	if (mid == 0) {
+		if (g_listen_fd >= 0) close(g_listen_fd);
+		pid_t inner = fork();
+		if (inner == 0) {
+			sg_db_close();
+			if (sg_db_open(SG_DB_PATH) == 0) {
+				char rb[256];
+				rebuild_ips_active(rb, sizeof(rb));
+				sg_db_close();
+			}
+			_exit(0);
+		}
+		_exit(0);              /* wrapper exits → inner reparents to init */
+	}
+	waitpid(mid, NULL, 0);         /* reap wrapper (<1ms) */
 }
 
 void supervisor_stop(const char *name)
@@ -2251,8 +2300,44 @@ sg_status_t validate_cfg_data(const char *type, const char *data,
  * Phase 2: Seed/repair built-in immutable      (force-overwrite on conflict)
  * Phase 3: Backfill missing keys               (new fields added)
  * Phase 4: Backfill sequence numbers           (firewall_policy, network_nat)
+ * Phase 4c: Migrate name-keyed IPS profiles    (→ numeric ids + rewrite refs)
  * Phase 5: Purge stale types                   (types removed from registry)
  */
+
+/* Rewrite every <type>.<field> that equals oldval → newval. Used to fix up
+ * references after an IPS profile's id changes from a name to a number. */
+static int migrate_rewrite_ref(const char *type, const char *field,
+			       const char *oldval, const char *newval)
+{
+	char *list = sg_db_list(type);
+	if (!list)
+		return 0;
+	int n = 0;
+	char *sp = NULL;
+	for (char *id = strtok_r(list, "\n", &sp); id;
+	     id = strtok_r(NULL, "\n", &sp)) {
+		char *v = sg_db_get_val(type, id, field);
+		if (v && strcmp(v, oldval) == 0) {
+			sg_db_set_val(type, id, field, newval);
+			n++;
+		}
+		free(v);
+	}
+	free(list);
+	return n;
+}
+
+/* 1 if s is a non-empty all-digits string. */
+static int is_numeric_id(const char *s)
+{
+	if (!s || !*s)
+		return 0;
+	for (const char *p = s; *p; p++)
+		if (*p < '0' || *p > '9')
+			return 0;
+	return 1;
+}
+
 static void mgmtd_reconcile_config(void)
 {
 	const sg_type_info_t *types = sg_reg_types();
@@ -2309,7 +2394,7 @@ static void mgmtd_reconcile_config(void)
 			  "builtin=yes\n"
 			  "immutable=yes\n"
 			  "comment=Match all services\n" },
-			{ "security_ips-profile", "default",
+			{ "security_ips-profile", "1",
 			  "name=default\n"
 			  "status=enable\n"
 			  "categories=all\n"
@@ -2634,6 +2719,90 @@ static void mgmtd_reconcile_config(void)
 					 "firewall_policy:%s cmkid=%d",
 					 tok, next_cmkid);
 				next_cmkid++;
+				changes++;
+			}
+			free(list);
+		}
+	}
+
+	/* ── Phase 4c: migrate name-keyed IPS profiles → numeric ids ──
+	 *
+	 * security_ips-profile became a NUMERIC-id table (the entry id IS the
+	 * profile id 1..31 == the on-disk map filename <id>.rules). Upgraded DBs
+	 * have name-keyed rows ("default", "test1", …). Map each non-numeric id to
+	 * a number (old "default" folds into the seeded id 1; others take the lowest
+	 * free 2..31), move the row, and rewrite every reference
+	 * (firewall_policy.ips-profile, security_ips-filter.profile). Idempotent:
+	 * numeric ids are skipped → no-op on fresh / already-migrated DBs. Runs
+	 * AFTER Phase 2 seeded security_ips-profile:1, so default folds cleanly. */
+	{
+		char *list = sg_db_list("security_ips-profile");
+		if (list) {
+			char used[32] = {0};
+			char *l2 = strdup(list);
+			if (l2) {
+				char *sp = NULL;
+				for (char *t = strtok_r(l2, "\n", &sp); t;
+				     t = strtok_r(NULL, "\n", &sp)) {
+					int n = atoi(t);
+					if (is_numeric_id(t) && n >= 1 && n <= 31)
+						used[n] = 1;
+				}
+				free(l2);
+			}
+			char *sp = NULL;
+			for (char *id = strtok_r(list, "\n", &sp); id;
+			     id = strtok_r(NULL, "\n", &sp)) {
+				if (is_numeric_id(id))
+					continue;          /* already migrated */
+				int newid = -1;
+				if (strcmp(id, "default") == 0) {
+					newid = 1;         /* fold into seeded default */
+				} else {
+					for (int i = 2; i <= 31; i++)
+						if (!used[i]) { newid = i; break; }
+					if (newid < 0)
+						for (int i = 1; i <= 31; i++)
+							if (!used[i]) { newid = i; break; }
+				}
+				if (newid < 0) {
+					mgmt_log("ERROR", "reconcile: no free IPS "
+						 "profid for '%s' — dropping", id);
+					sg_db_del("security_ips-profile", id);
+					changes++;
+					continue;
+				}
+				char nid[8];
+				snprintf(nid, sizeof(nid), "%d", newid);
+				/* Move the row only if the target id is not already
+				 * populated (default→1 keeps the seeded built-in). */
+				char *targ = sg_db_get("security_ips-profile", nid);
+				if (!targ) {
+					char *data = sg_db_get("security_ips-profile", id);
+					if (data) {
+						sg_db_set("security_ips-profile", nid, data);
+						free(data);
+					}
+					/* Preserve a label: name-keyed rows may have had no
+					 * explicit `name` field (the id WAS the name). */
+					char *nm = sg_db_get_val("security_ips-profile",
+								 nid, "name");
+					int have_name = nm && nm[0];
+					free(nm);
+					if (!have_name)
+						sg_db_set_val("security_ips-profile",
+							      nid, "name", id);
+				}
+				free(targ);
+				sg_db_del("security_ips-profile", id);
+				used[newid] = 1;
+				int r1 = migrate_rewrite_ref("firewall_policy",
+							     "ips-profile", id, nid);
+				int r2 = migrate_rewrite_ref("security_ips-filter",
+							     "profile", id, nid);
+				mgmt_log("INFO", "reconcile: migrated IPS profile "
+					 "'%s' → id %s (%d policy + %d filter refs)",
+					 id, nid, r1, r2);
 				changes++;
 			}
 			free(list);
@@ -4285,7 +4454,7 @@ int check_references(const char *type, const char *id,
 	sg_ref_entry_t refs[16];
 	int nrefs = sg_reg_find_referencing(type, refs, 16);
 
-	/* Đếm TỔNG số entry đang tham chiếu (gộp mọi field/type). */
+	/* Count the TOTAL number of referencing entries (across all fields/types). */
 	int total = 0;
 	for (int i = 0; i < nrefs; i++) {
 		char *found = sg_db_find_referencing(refs[i].type,
@@ -4294,7 +4463,7 @@ int check_references(const char *type, const char *id,
 			int cnt = 0;
 			for (const char *p = found; *p; p++)
 				if (*p == '\n') cnt++;
-			if (cnt == 0 && found[0])   /* không có '\n' cuối */
+			if (cnt == 0 && found[0])   /* no trailing '\n' */
 				cnt = 1;
 			total += cnt;
 			free(found);
@@ -5146,6 +5315,36 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			return 0;
 		}
 
+		/* IPS profile id is the profile's scope bit (1..31) and its map
+		 * filename — bound it to that range (the connmark mask is 5 bits). */
+		if (strcmp(db_type, "security_ips-profile") == 0) {
+			int pid = atoi(db_id);
+			if (pid < 1 || pid > 31) {
+				send_error(client_fd, SG_ERR_INVALID_ARG,
+					   "IPS profile id must be 1..31");
+				return 0;
+			}
+		}
+
+		/* IPS filter is a nested child "<profid>/<seq>": the parent profile
+		 * must exist. (The rule|category XOR is checked below, after the
+		 * existing row is loaded, so a partial update can merge with it.) */
+		if (strcmp(db_type, "security_ips-filter") == 0) {
+			const char *slash = strchr(db_id, '/');
+			char pidbuf[16] = "";
+			if (slash)
+				snprintf(pidbuf, sizeof(pidbuf), "%.*s",
+					 (int)(slash - db_id), db_id);
+			char *pp = pidbuf[0] ?
+				sg_db_get("security_ips-profile", pidbuf) : NULL;
+			if (!pp) {
+				send_error(client_fd, SG_ERR_INVALID_ARG,
+					   "parent IPS profile does not exist");
+				return 0;
+			}
+			free(pp);
+		}
+
 		/* Validate key names, values, and required fields */
 		char val_err[SG_EXTRA_MAX];
 		sg_status_t val_st = validate_cfg_data(db_type, data,
@@ -5212,15 +5411,39 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			return 0;
 		}
 
-		/* Giới hạn số SSL inspection profile — mỗi profile chạy 1 ssld
-		 * riêng, nên chặn tạo quá nhiều (DoS process). Built-in
-		 * no-inspection không bị chặn (update bị immutable chặn ở trên). */
+		/* IPS filter: exactly one of rule|category. Resolve the effective
+		 * values by merging the incoming payload over the existing row, so a
+		 * partial update (e.g. changing only `action`) keeps the rule/category
+		 * already stored instead of looking "both unset". */
+		if (strcmp(db_type, "security_ips-filter") == 0) {
+			char ru[VALBUFSZ] = "", ca[VALBUFSZ] = "";
+			if (sg_kv_has_key(data, "rule"))
+				extract_val(data, "rule", ru, sizeof(ru));
+			else if (existing)
+				extract_val(existing, "rule", ru, sizeof(ru));
+			if (sg_kv_has_key(data, "category"))
+				extract_val(data, "category", ca, sizeof(ca));
+			else if (existing)
+				extract_val(existing, "category", ca, sizeof(ca));
+			if ((ru[0] && ca[0]) || (!ru[0] && !ca[0])) {
+				free(existing);
+				send_error(client_fd, SG_ERR_INVALID_ARG,
+					   "set exactly one of 'rule' or 'category'");
+				return 0;
+			}
+		}
+
+		/* Cap the number of SSL inspection profiles — each profile runs
+		 * its own ssld, so prevent creating too many (process DoS). The
+		 * built-in no-inspection is not capped (updates are already
+		 * blocked by the immutable check above). */
 		if (is_new_entry &&
 		    strcmp(db_type, "security_ssl-inspection-profile") == 0 &&
 		    sg_db_count(db_type) >= 8) {
 			free(existing);
 			send_error(client_fd, SG_ERR_INVALID_VAL,
-				   "SSL inspection profile limit reached (max 8)");
+				   "Reached the limit of 8 SSL inspection profiles");
+
 			return 0;
 		}
 
@@ -5236,6 +5459,16 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			    (ll >= 10 && memcmp(dp, "immutable=",    10) == 0) ||
 			    (ll >=  9 && memcmp(dp, "password=",      9) == 0) ||
 			    (ll >= 14 && memcmp(dp, "password-hash=", 14) == 0)) {
+				dp += ll;
+				if (el) dp++;
+				continue;
+			}
+			/* IPS filter: don't persist an empty rule=/category= — exactly
+			 * one is set, so the other arrives empty; drop it so the row
+			 * stays clean (a line "rule=" is ll==5, "category=" is ll==9). */
+			if (strcmp(db_type, "security_ips-filter") == 0 &&
+			    ((ll == 5 && memcmp(dp, "rule=",     5) == 0) ||
+			     (ll == 9 && memcmp(dp, "category=", 9) == 0))) {
 				dp += ll;
 				if (el) dp++;
 				continue;
@@ -5333,6 +5566,24 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			if (new_seq_str[0]) {
 				int new_seq = atoi(new_seq_str);
 				if (new_seq > 0) {
+					/* Reserve sequence 1 for the immutable
+					 * default-deny catch-all so a normal policy
+					 * can't push it off the bottom of the chain
+					 * (over-block) or be shadowed by it. NOTE:
+					 * immutable entries already returned at the
+					 * immutability check (~line 4946), so only
+					 * normal policies reach here. default-deny is
+					 * seeded at sequence=1 and is immutable, so 1
+					 * is a stable floor. */
+					if (strcmp(db_type, "firewall_policy") == 0 &&
+					    new_seq <= 1) {
+						free(existing);
+						send_error(client_fd,
+							   SG_ERR_INVALID_ARG,
+							   "sequence must be >= 2 (1 is "
+							   "reserved for default-deny)");
+						return 0;
+					}
 					if (is_new_entry) {
 						seq_insert_at(db_type, new_seq,
 							      db_id);
@@ -5533,9 +5784,9 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			}
 		}
 
-		/* security_ips-filter: persist rồi biên dịch lại ruleset IPS
-		 * (không đụng FORWARD chain — filter chỉ đổi nội dung ruleset).
-		 * Validate generic theo registry. */
+		/* security_ips-filter: persist, then recompile the IPS ruleset
+		 * (does not touch the FORWARD chain — a filter only changes the
+		 * ruleset contents). Generic validation via the registry. */
 		if (strcmp(db_type, "security_ips-filter") == 0) {
 			char vr[512];
 			sg_status_t vrc = validate_cfg_data(db_type, clean,
@@ -5546,13 +5797,20 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 				return 0;
 			}
 			if (sg_db_set(db_type, db_id, clean) != 0) {
+				char emsg[320];
+				snprintf(emsg, sizeof(emsg),
+					 "Failed to write config: %s",
+					 sg_db_last_err());
+				mgmt_log("ERROR", "sg_db_set failed for %s: %s",
+					 section, sg_db_last_err());
 				free(existing);
-				send_error(client_fd, SG_ERR_IO_FAIL,
-					   "Failed to write config");
+				send_error(client_fd, SG_ERR_IO_FAIL, emsg);
 				return 0;
 			}
-			char ir[256];
-			rebuild_ips_active(ir, sizeof(ir));
+			/* Recompile the IPS ruleset in the background — editing a
+			 * filter can be heavy (recompiles its profile's map); the
+			 * config is already persisted, so reply immediately. */
+			ips_rebuild_async();
 			free(existing);
 			send_ok(client_fd, "Config saved", NULL);
 			return 0;
@@ -5602,11 +5860,14 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 
 			/* Write to DB */
 			if (sg_db_set(db_type, db_id, clean) != 0) {
+				char emsg[320];
+				snprintf(emsg, sizeof(emsg),
+					 "Failed to write config: %s",
+					 sg_db_last_err());
 				free(existing);
-				mgmt_log("ERROR", "sg_db_set failed for %s",
-					 section);
-				send_error(client_fd, SG_ERR_IO_FAIL,
-					   "Failed to write config");
+				mgmt_log("ERROR", "sg_db_set failed for %s: %s",
+					 section, sg_db_last_err());
+				send_error(client_fd, SG_ERR_IO_FAIL, emsg);
 				return 0;
 			}
 
@@ -5648,14 +5909,19 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 				return 0;
 			}
 
-			/* IPS (Phase B): đổi profile/policy/ips → biên dịch lại
-			 * active.rules theo categories đang dùng + hot-reload ipsd.
-			 * Không fail-toàn-bộ nếu compile lỗi (chain đã apply OK);
-			 * chỉ log. */
-			if (strcmp(db_type, "security_ips") == 0 ||
-			    strcmp(db_type, "security_ips-profile") == 0 ||
-			    strcmp(db_type, "security_ips-filter") == 0 ||
-			    strcmp(db_type, "firewall_policy") == 0) {
+			/* IPS (Phase B): profile/policy/ips change → recompile
+			 * active.rules for the categories in use + hot-reload ipsd.
+			 * Do not fail the whole operation if compilation fails (the
+			 * chain already applied OK); just log it. */
+			if (strcmp(db_type, "security_ips-profile") == 0) {
+				/* Editing a profile may recompile a large ruleset →
+				 * background it so the reply is immediate (config +
+				 * chain are already applied). */
+				ips_rebuild_async();
+			} else if (strcmp(db_type, "security_ips") == 0 ||
+				   strcmp(db_type, "firewall_policy") == 0) {
+				/* Cheap with the table/scope skip logic (policy → no-op;
+				 * security_ips → flags + ml-https sysfs). Keep inline. */
 				char ips_r[256];
 				rebuild_ips_active(ips_r, sizeof(ips_r));
 			}
@@ -5704,8 +5970,12 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		existing = NULL;
 
 		if (sg_db_set(db_type, db_id, clean) != 0) {
-			mgmt_log("ERROR", "sg_db_set failed for %s", section);
-			send_error(client_fd, SG_ERR_IO_FAIL, "Failed to write config");
+			char emsg[320];
+			snprintf(emsg, sizeof(emsg),
+				 "Failed to write config: %s", sg_db_last_err());
+			mgmt_log("ERROR", "sg_db_set failed for %s: %s",
+				 section, sg_db_last_err());
+			send_error(client_fd, SG_ERR_IO_FAIL, emsg);
 			return 0;
 		}
 
@@ -5961,6 +6231,23 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			}
 		}
 
+		/* Cascade: deleting an IPS profile removes its nested filter
+		 * children (prefix "<profid>/") — they have no profile ref to
+		 * block the delete, so prune them explicitly. */
+		if (strcmp(db_type, "security_ips-profile") == 0) {
+			char pfx[24];
+			int plen = snprintf(pfx, sizeof(pfx), "%s/", db_id);
+			char *fl = sg_db_list("security_ips-filter");
+			if (fl) {
+				char *sp = NULL;
+				for (char *fid = strtok_r(fl, "\n", &sp); fid;
+				     fid = strtok_r(NULL, "\n", &sp))
+					if (strncmp(fid, pfx, (size_t)plen) == 0)
+						sg_db_del("security_ips-filter", fid);
+				free(fl);
+			}
+		}
+
 		if (sg_db_del(db_type, db_id) != 0) {
 			send_error(client_fd, SG_ERR_IO_FAIL, "Failed to delete section");
 			return 0;
@@ -5981,12 +6268,13 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			char ir[256]; rebuild_ips_active(ir, sizeof(ir));
 		} else if (strcmp(db_type, "security_ips-filter") == 0 ||
 			   strcmp(db_type, "security_ips-profile") == 0) {
-			/* Xóa filter/profile → biên dịch lại ruleset IPS */
+			/* Deleting a filter/profile → recompile the IPS ruleset */
 			char ir[256]; rebuild_ips_active(ir, sizeof(ir));
 		} else if (strcmp(db_type, "network_nat") == 0 ||
 			   strcmp(db_type, "security_ssl-inspection-profile") == 0) {
-			/* Xóa SSL profile → rebuild nat (gỡ steering policy trỏ
-			 * profile đã mất) + ssld_sync (dừng ssld của profile đó). */
+			/* Deleting an SSL profile → rebuild nat (remove steering
+			 * policies pointing at the now-gone profile) + ssld_sync
+			 * (stop that profile's ssld). */
 			char rb[512];
 			rebuild_nat_chains(rb, sizeof(rb));
 		} else if (strcmp(db_type, "network_route_static") == 0) {
@@ -6058,7 +6346,43 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			return 0;
 		}
 
+		/* Immutable entries (built-in default-deny) cannot be modified.
+		 * CFG_SET already rejects this, but the CLI applies BEFORE it
+		 * saves — without the same guard here the change hits the live
+		 * ruleset and only fails at the save step ("applied but failed
+		 * to save"). Reject up front. Boot replay calls apply_config()
+		 * directly and never reaches this dispatch, so the built-in
+		 * default-deny still applies at startup. */
+		{
+			char *cur = sg_db_get(type_str, id_str);
+			if (cur) {
+				int imm = is_immutable(cur);
+				free(cur);
+				if (imm) {
+					send_error(client_fd, SG_ERR_BUILTIN,
+						   "Immutable object cannot be modified");
+					return 0;
+				}
+			}
+		}
+
 		const char *data = nl2 + 1;
+
+		/* Mirror the CFG_SET/CFG_INSERT sequence floor here so the apply
+		 * is rejected up front. Otherwise CFG_APPLY "succeeds" and only
+		 * the later CFG_SET save fails, surfacing as the confusing
+		 * "Applied but save failed". Immutable entries already returned
+		 * above, so this only gates normal policies. */
+		if (strcmp(type_str, "firewall_policy") == 0) {
+			char seqv[VALBUFSZ];
+			extract_val(data, "sequence", seqv, sizeof(seqv));
+			if (seqv[0] && atoi(seqv) <= 1) {
+				send_error(client_fd, SG_ERR_INVALID_ARG,
+					   "sequence must be >= 2 (1 is reserved "
+					   "for default-deny)");
+				return 0;
+			}
+		}
 
 		/* Validate field formats AND required-key completeness.
 		 * CFG_APPLY always receives full payloads — CLI loads
@@ -6198,16 +6522,27 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			return 0;
 		}
 
-		/* Builtin policies cannot be reordered */
+		/* The built-in default-deny is immutable (not "builtin"), so reject
+		 * moving it; and a normal policy must not move to/below the
+		 * catch-all's slot (would collide at seq 1 and shadow everything).
+		 * Mirrors the CFG_SET sequence guard so the GUI's /move
+		 * (CFG_INSERT) path can't bypass it. */
 		{
 			char bi[VALBUFSZ];
 			extract_val(entry_data, "builtin", bi, sizeof(bi));
-			if (strcmp(bi, "yes") == 0) {
+			if (strcmp(bi, "yes") == 0 || is_immutable(entry_data)) {
 				free(entry_data);
 				send_error(client_fd, SG_ERR_BUILTIN,
-					   "Builtin policy cannot be moved");
+					   "Immutable/builtin policy cannot be moved");
 				return 0;
 			}
+		}
+		if (strcmp(db_type, "firewall_policy") == 0 && new_seq <= 1) {
+			free(entry_data);
+			send_error(client_fd, SG_ERR_INVALID_ARG,
+				   "sequence must be >= 2 (1 is reserved for "
+				   "default-deny)");
+			return 0;
 		}
 
 		/* Read old sequence */
@@ -6351,13 +6686,14 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		return handle_dhcp_lease_event(client_fd, user, payload, hdr);
 
 	case SG_CMD_IPS_REBUILD: {
-		/* Internal trigger (ips-update.sh sau khi cập nhật repo): biên
-		 * dịch lại active.rules theo profiles + hot-reload ipsd. Chỉ đọc
-		 * config DB sẵn có, fail-closed verify — không nhận dữ liệu ngoài. */
+		/* Internal trigger (ips-update.sh after updating the repo):
+		 * recompile active.rules for the profiles + hot-reload ipsd. Only
+		 * reads the existing config DB, fail-closed verify — takes no
+		 * external data. */
 		(void)user;
 		char rb[256];
 		rebuild_ips_active(rb, sizeof(rb));
-		send_ok(client_fd, NULL, rb);  /* rb vào payload → CLI/Web in được lý do */
+		send_ok(client_fd, NULL, rb);  /* rb goes into payload → CLI/Web can print the reason */
 		return 0;
 	}
 
@@ -6366,15 +6702,17 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		/*
 		 * Downloads can take a while.  Double-fork so the mgmtd MAIN loop
 		 * stays responsive (it keeps serving other IPC while the inner
-		 * child downloads).  KHÁC bản cũ: inner child GIỮ client_fd và
-		 * GỬI ĐÚNG kết quả (thành công/lỗi + lý do) về cho webd → UI hiện
-		 * toast thật, thay vì "Update started in background" rồi vứt kết
-		 * quả (khiến lỗi tải/syntax bị ẩn, người dùng không biết vì sao
-		 * custom rule không xuất hiện).
+		 * child downloads).  DIFFERENT from the old version: the inner
+		 * child KEEPS client_fd and sends the ACTUAL result (success/error
+		 * + reason) back to webd → the UI shows a real toast, instead of
+		 * "Update started in background" then discarding the result (which
+		 * hid download/syntax errors, leaving the user unsure why a custom
+		 * rule never appeared).
 		 *
-		 * Inner child reparent về init (không zombie); parent reap wrapper
-		 * và trả "owned"=1 để main loop không đụng client_fd (inner sở hữu).
-		 * Inner mở SQLite handle riêng — không share sqlite3* qua fork.
+		 * The inner child reparents to init (no zombie); the parent reaps
+		 * the wrapper and returns "owned"=1 so the main loop does not touch
+		 * client_fd (the inner child owns it). The inner child opens its own
+		 * SQLite handle — do not share sqlite3* across fork.
 		 */
 		char ids_copy[512] = "";
 		if (payload && payload[0])
@@ -6386,11 +6724,11 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			return 0;
 		}
 		if (mid == 0) {
-			/* Wrapper — KHÔNG đóng client_fd (để inner thừa kế + trả lời) */
+			/* Wrapper — do NOT close client_fd (so the inner child inherits it + replies) */
 			if (g_listen_fd >= 0) close(g_listen_fd);
 			pid_t inner = fork();
 			if (inner == 0) {
-				/* Inner child — reparented to init, sở hữu client_fd */
+				/* Inner child — reparented to init, owns client_fd */
 				sg_db_close();
 				if (sg_db_open(SG_DB_PATH) != 0) {
 					send_error(client_fd, SG_ERR_SYSTEM_FAIL,
@@ -6409,12 +6747,12 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 				close(client_fd);
 				_exit(0);
 			}
-			close(client_fd);   /* wrapper bỏ bản sao; chỉ inner giữ kênh */
+			close(client_fd);   /* wrapper drops its copy; only the inner child keeps the channel */
 			_exit(0);           /* wrapper exits → inner reparented to init */
 		}
 		waitpid(mid, NULL, 0);  /* reap wrapper (<1ms) */
-		close(client_fd);       /* parent bỏ bản sao; inner sở hữu fd */
-		return 1;               /* owned → main loop KHÔNG đóng client_fd */
+		close(client_fd);       /* parent drops its copy; the inner child owns the fd */
+		return 1;               /* owned → main loop does NOT close client_fd */
 	}
 
 	case SG_CMD_IPS_RULESETS_RELOAD: {
@@ -6988,6 +7326,12 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 		return handle_net_nslookup(client_fd, user, payload, hdr);
 	case SG_CMD_NET_ARPING:
 		return handle_net_arping(client_fd, user, payload, hdr);
+
+	/* ── Arbitrary system binary (fnsysctl-style, admin-only) ────── */
+	case SG_CMD_SYS_EXEC:
+		return handle_sys_exec(client_fd, user, payload, hdr);
+	case SG_CMD_SYS_LIST:
+		return handle_sys_list(client_fd, user, payload, hdr);
 
 	/* ── System diagnostics (handlers in mgmtd_diag.c) ───────────── */
 	case SG_CMD_DIAG_CPU:

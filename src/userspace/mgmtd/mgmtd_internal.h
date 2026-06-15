@@ -133,6 +133,10 @@ int handle_net_nslookup(int client_fd, const char *user,
 int handle_net_arping(int client_fd, const char *user,
 		      const char *payload, const sg_request_hdr_t *hdr);
 
+/* Run an arbitrary system binary as root (execvp, no shell). Admin-only. */
+int handle_sys_exec(int client_fd, const char *user,
+		    const char *payload, const sg_request_hdr_t *hdr);
+
 /* ── System diagnostics handlers (defined in mgmtd_diag.c) ───────────────── */
 
 int handle_diag_cpu(int client_fd, const char *user,
@@ -177,6 +181,8 @@ int handle_diag_ntp(int client_fd, const char *user,
 		    const char *payload, const sg_request_hdr_t *hdr);
 int handle_diag_busybox_list(int client_fd, const char *user,
 			     const char *payload, const sg_request_hdr_t *hdr);
+int handle_sys_list(int client_fd, const char *user,
+		    const char *payload, const sg_request_hdr_t *hdr);
 int handle_show_sessions(int client_fd, const char *user,
 			 const char *payload, const sg_request_hdr_t *hdr);
 int handle_session_clear(int client_fd, const char *user,

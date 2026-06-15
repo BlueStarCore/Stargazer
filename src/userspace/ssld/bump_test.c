@@ -1,18 +1,19 @@
 /* SPDX-License-Identifier: MIT */
 #define _GNU_SOURCE   /* memmem */
 /*
- * bump_test.c - test MITM end-to-end với TLS thật trên loopback.
+ * bump_test.c - end-to-end MITM test with real TLS over loopback.
  *
- * Sơ đồ:
- *   [TLS client tin CA]  ──►  [proxy: bump_run]  ──►  [origin TLS server]
+ * Layout:
+ *   [TLS client trusting CA]  ──►  [proxy: bump_run]  ──►  [origin TLS server]
  *
- * Chứng minh:
- *  1. Client cấu hình y như browser đã cài CA → handshake với cert GIẢ thành
- *     công (verify tới CA, tên khớp SNI). Đây là bằng chứng forge+CA đúng.
- *  2. Dữ liệu chảy hai chiều qua giải mã (client gửi request, nhận response).
- *  3. inspect() THẤY plaintext (request đã giải mã).
- *  4. inspect() trả CHẶN → kết nối bị cắt.
- *  5. verify_upstream=1 + origin self-signed → fail-closed (client handshake fail).
+ * Proves:
+ *  1. A client configured just like a browser that installed the CA -> handshake
+ *     with the FORGED cert succeeds (verifies to the CA, name matches SNI). This
+ *     proves forge+CA is correct.
+ *  2. Data flows both ways through decryption (client sends request, gets response).
+ *  3. inspect() SEES the plaintext (decrypted request).
+ *  4. inspect() returns BLOCK -> connection is cut.
+ *  5. verify_upstream=1 + self-signed origin -> fail-closed (client handshake fails).
  */
 #include "ca.h"
 #include "certcache.h"
@@ -37,11 +38,11 @@ static int g_fail;
 #define REQ  "GET /secret-path HTTP/1.1\r\nHost: test.local\r\n\r\n"
 #define RESP "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHELLO"
 
-/* ── origin TLS server (self-signed) ────────────────────────────────────── */
+/* -- origin TLS server (self-signed) --------------------------------------- */
 struct origin {
 	int             fd;       /* listener */
 	uint16_t        port;
-	struct ca_ctx  *id;       /* dùng làm cert server self-signed */
+	struct ca_ctx  *id;       /* used as the self-signed server cert */
 };
 
 static void *origin_thread(void *arg)
@@ -69,7 +70,7 @@ static void *origin_thread(void *arg)
 	return NULL;
 }
 
-/* ── proxy: nhận 1 kết nối, gọi bump_run ────────────────────────────────── */
+/* -- proxy: accept 1 connection, call bump_run ----------------------------- */
 struct proxy {
 	int                    fd;     /* listener */
 	uint16_t               port;
@@ -88,10 +89,10 @@ static void *proxy_thread(void *arg)
 	return NULL;
 }
 
-/* ── inspect callback: ghi lại plaintext to_server đã thấy ───────────────── */
+/* -- inspect callback: record the to_server plaintext seen ----------------- */
 static char g_seen[1024];
 static int  g_seen_len;
-static int  g_block;     /* nếu 1, chặn khi thấy request */
+static int  g_block;     /* if 1, block when the request is seen */
 
 static int test_inspect(const unsigned char *data, int len, int to_server,
 			void *ud)
@@ -103,11 +104,11 @@ static int test_inspect(const unsigned char *data, int len, int to_server,
 	}
 	if (g_block && to_server &&
 	    memmem(data, len, "secret-path", 11))
-		return 1;     /* CHẶN */
+		return 1;     /* BLOCK */
 	return 0;
 }
 
-/* ── helper: listener 127.0.0.1:0, trả fd + port ────────────────────────── */
+/* -- helper: listener 127.0.0.1:0, returns fd + port ----------------------- */
 static int make_loopback(uint16_t *port)
 {
 	int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -124,7 +125,8 @@ static int make_loopback(uint16_t *port)
 	return fd;
 }
 
-/* ── TLS client tin CA; trả response đọc được (NULL nếu handshake fail) ──── */
+/* -- TLS client trusting the CA; returns the response read (NULL if handshake
+ * fails) ------------------------------------------------------------------- */
 static int tls_client(uint16_t proxy_port, struct ca_ctx *ca,
 		      char *resp, int rcap)
 {
@@ -138,20 +140,20 @@ static int tls_client(uint16_t proxy_port, struct ca_ctx *ca,
 	}
 
 	SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
-	X509_STORE_add_cert(SSL_CTX_get_cert_store(ctx), ca->cert);  /* "đã cài CA" */
+	X509_STORE_add_cert(SSL_CTX_get_cert_store(ctx), ca->cert);  /* "CA installed" */
 	SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
 
 	SSL *s = SSL_new(ctx);
 	SSL_set_fd(s, fd);
 	SSL_set_tlsext_host_name(s, "test.local");
-	SSL_set1_host(s, "test.local");      /* kiểm tên khớp cert */
+	SSL_set1_host(s, "test.local");      /* check name matches cert */
 
 	int rc = -1;
 	if (SSL_connect(s) == 1) {
 		SSL_write(s, REQ, (int)strlen(REQ));
 		int n = SSL_read(s, resp, rcap - 1);
 		if (n > 0) { resp[n] = '\0'; rc = n; }
-		else rc = 0;          /* handshake OK nhưng không data (bị chặn) */
+		else rc = 0;          /* handshake OK but no data (blocked) */
 	}
 	SSL_shutdown(s);
 	SSL_free(s);
@@ -160,7 +162,7 @@ static int tls_client(uint16_t proxy_port, struct ca_ctx *ca,
 	return rc;
 }
 
-/* Chạy một kịch bản: trả response client nhận được + bump_rc. */
+/* Run a scenario: returns the response the client received + bump_rc. */
 static int run_scenario(struct ca_ctx *ca, struct certcache *cc,
 			int verify_upstream, int block,
 			char *resp, int rcap, int *bump_rc)
@@ -190,8 +192,8 @@ static int run_scenario(struct ca_ctx *ca, struct certcache *cc,
 	int n = tls_client(p.port, ca, resp, rcap);
 
 	pthread_join(pt, NULL);
-	/* origin thread có thể kẹt ở accept nếu fail-closed (client không tới
-	 * origin); đóng listener để nó thoát. */
+	/* the origin thread may be stuck in accept on fail-closed (the client never
+	 * reaches the origin); close the listener so it exits. */
 	close(o.fd);
 	pthread_join(ot, NULL);
 	close(p.fd);
@@ -209,7 +211,7 @@ int main(void)
 
 	struct ca_ctx ca;
 	if (ca_load_or_create(&ca, "/tmp/sg_bca_c.pem", "/tmp/sg_bca_k.pem") != 0) {
-		printf("FAIL: tạo CA\n");
+		printf("FAIL: create CA\n");
 		return 1;
 	}
 	struct certcache *cc = certcache_new(&ca, 16);
@@ -220,27 +222,27 @@ int main(void)
 	printf("== test 1: bump happy-path (verify_upstream=0) ==\n");
 	{
 		int n = run_scenario(&ca, cc, 0, 0, resp, sizeof(resp), &bump_rc);
-		CHECK(n > 0, "client handshake với cert GIẢ thành công (tin CA)");
+		CHECK(n > 0, "client handshake with FORGED cert succeeds (trusts CA)");
 		CHECK(n > 0 && strstr(resp, "HELLO"),
-		      "client nhận đúng response qua giải mã");
+		      "client receives the correct response through decryption");
 		CHECK(memmem(g_seen, g_seen_len, "secret-path", 11) != NULL,
-		      "inspect() thấy plaintext request đã giải mã");
+		      "inspect() sees the decrypted plaintext request");
 	}
 
-	printf("== test 2: inspect CHẶN → cắt kết nối ==\n");
+	printf("== test 2: inspect BLOCK -> cut connection ==\n");
 	{
 		int n = run_scenario(&ca, cc, 0, 1, resp, sizeof(resp), &bump_rc);
-		/* handshake vẫn xong (n>=0), nhưng không có response HELLO */
+		/* handshake still completes (n>=0), but there is no HELLO response */
 		CHECK(!(n > 0 && strstr(resp, "HELLO")),
-		      "request bị chặn → client KHÔNG nhận response");
+		      "request blocked -> client does NOT receive a response");
 	}
 
 	printf("== test 3: fail-closed (verify_upstream=1, origin self-signed) ==\n");
 	{
 		int n = run_scenario(&ca, cc, 1, 0, resp, sizeof(resp), &bump_rc);
-		CHECK(bump_rc != 0, "bump_run trả lỗi (fail-closed)");
+		CHECK(bump_rc != 0, "bump_run returns an error (fail-closed)");
 		CHECK(!(n > 0 && strstr(resp, "HELLO")),
-		      "client KHÔNG nhận được data khi upstream cert không tin");
+		      "client does NOT receive data when the upstream cert is untrusted");
 	}
 
 	certcache_free(cc);
@@ -248,6 +250,6 @@ int main(void)
 	unlink("/tmp/sg_bca_c.pem"); unlink("/tmp/sg_bca_k.pem");
 
 	if (g_fail) { printf("\n== %d TEST FAIL ==\n", g_fail); return 1; }
-	printf("\n== TẤT CẢ bump TEST PASS ==\n");
+	printf("\n== ALL bump TESTS PASS ==\n");
 	return 0;
 }

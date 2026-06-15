@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * nfq.c - NFQUEUE I/O qua raw AF_NETLINK (xem nfq.h).
+ * nfq.c - NFQUEUE I/O via raw AF_NETLINK (see nfq.h).
  */
 #define _GNU_SOURCE
 #include "nfq.h"
@@ -22,11 +22,15 @@
 #include <linux/udp.h>
 #include <linux/icmp.h>
 
-/* CTA_MARK cho NFQA_CT trong verdict */
-#define SG_CTA_MARK          8     /* khớp ctdump.c */
+/* CTA_* attributes carried inside NFQA_CT in the verdict (set the conntrack mark).
+ * These are CTA_* values from nfnetlink_conntrack.h — must be in range [0,CTA_MAX]
+ * or the kernel's strict nla validation rejects the whole NFQA_CT nest (then the
+ * mark is silently never applied). */
+#define SG_CTA_MARK          8     /* CTA_MARK      — matches ctdump.c */
+#define SG_CTA_MARK_MASK     21    /* CTA_MARK_MASK — apply only the masked bits  */
 #define SG_NLA_F_NESTED      0x8000
 
-/* ---- NLA helpers (nhỏ gọn, dùng nội bộ) ----------------------------------- */
+/* ---- NLA helpers (compact, internal use) ---------------------------------- */
 
 static int nla_put_u32(char *buf, int *off, int cap, uint16_t type, uint32_t v)
 {
@@ -125,7 +129,7 @@ static int build_queue_config(char *buf, int cap, uint16_t qnum)
 	if (nla_put_raw(buf, &off, cap, NFQA_CFG_CMD, &cmd, sizeof(cmd)) < 0)
 		return -1;
 
-	/* COPY_PACKET mode với range 0xffff */
+	/* COPY_PACKET mode with range 0xffff */
 	struct nfqnl_msg_config_params params;
 	params.copy_range = htonl(0xffff);
 	params.copy_mode  = NFQNL_COPY_PACKET;
@@ -134,10 +138,11 @@ static int build_queue_config(char *buf, int cap, uint16_t qnum)
 		return -1;
 
 	/*
-	 * KHÔNG gộp cờ NFQA_CFG_F_CONNTRACK vào đây. Trên kernel thiếu
-	 * CONFIG_NETFILTER_NETLINK_GLUE_CT, đặt cờ này trả -EOPNOTSUPP làm HỎNG
-	 * CẢ message → BIND/COPY không áp → queue không nhận gói (pkt_seen=0).
-	 * Cờ conntrack gửi RIÊNG, best-effort (build_queue_flags).
+	 * Do NOT fold the NFQA_CFG_F_CONNTRACK flag in here. On a kernel lacking
+	 * CONFIG_NETFILTER_NETLINK_GLUE_CT, setting this flag returns -EOPNOTSUPP
+	 * which BREAKS the WHOLE message → BIND/COPY not applied → the queue
+	 * receives no packets (pkt_seen=0). The conntrack flag is sent SEPARATELY,
+	 * best-effort (build_queue_flags).
 	 */
 	struct nlmsghdr *h = (struct nlmsghdr *)buf;
 	struct nfgenmsg *g = (struct nfgenmsg *)(buf + NLMSG_HDRLEN);
@@ -151,8 +156,9 @@ static int build_queue_config(char *buf, int cap, uint16_t qnum)
 	return off;
 }
 
-/* Chỉ đặt cờ NFQA_CFG_F_CONNTRACK (NFQA_CT trong packet notification + cho phép
- * verdict áp connmark). Gửi RIÊNG để lỗi cờ này không kéo theo hỏng BIND/COPY. */
+/* Set only the NFQA_CFG_F_CONNTRACK flag (NFQA_CT in the packet notification +
+ * allows the verdict to apply a connmark). Sent SEPARATELY so an error on this
+ * flag does not break BIND/COPY. */
 static int build_queue_flags(char *buf, int cap, uint16_t qnum)
 {
 	memset(buf, 0, (size_t)cap);
@@ -210,16 +216,17 @@ int nfq_open(struct nfq_ctx *ctx, uint16_t queue_num)
 			      (struct sockaddr *)&dst, sizeof(dst)) < 0)
 		goto err;
 
-	/* Queue BIND + COPY_PACKET (BẮT BUỘC — không có thì không nhận gói) */
+	/* Queue BIND + COPY_PACKET (MANDATORY — without it no packets are received) */
 	len = build_queue_config(buf, sizeof(buf), queue_num);
 	if (len < 0 || sendto(ctx->fd, buf, (size_t)len, 0,
 			      (struct sockaddr *)&dst, sizeof(dst)) < 0)
 		goto err;
 
-	/* CONNTRACK flag — BEST-EFFORT, gửi RIÊNG. Kernel thiếu glue_ct sẽ trả
-	 * -EOPNOTSUPP nhưng KHÔNG ảnh hưởng BIND/COPY ở trên → gói vẫn được giao.
-	 * Mất cờ chỉ làm verdict không áp được connmark (offload/block flow tiếp
-	 * theo); với detect mode không sao, prevent mode vẫn NF_DROP gói hiện tại. */
+	/* CONNTRACK flag — BEST-EFFORT, sent SEPARATELY. A kernel lacking glue_ct
+	 * returns -EOPNOTSUPP but does NOT affect the BIND/COPY above → packets are
+	 * still delivered. Losing the flag only means the verdict cannot apply a
+	 * connmark (offload/block the next flow); fine for detect mode, and prevent
+	 * mode still NF_DROPs the current packet. */
 	len = build_queue_flags(buf, sizeof(buf), queue_num);
 	if (len > 0)
 		(void)sendto(ctx->fd, buf, (size_t)len, 0,
@@ -271,7 +278,7 @@ int nfq_parse_packet(const uint8_t *data, uint16_t len, struct nfq_pkt *pkt)
 			(const struct tcphdr *)(data + ihl);
 		pkt->sport = ntohs(th->source);
 		pkt->dport = ntohs(th->dest);
-		pkt->tcp_seq = ntohl(th->seq);   /* seq của byte payload đầu (P1 reass) */
+		pkt->tcp_seq = ntohl(th->seq);   /* seq of the first payload byte (P1 reass) */
 		l4hdr = (uint16_t)(th->doff * 4);
 
 		if (th->fin) pkt->tcp_flags |= SIG_TCP_FIN;
@@ -281,7 +288,7 @@ int nfq_parse_packet(const uint8_t *data, uint16_t len, struct nfq_pkt *pkt)
 		if (th->ack) pkt->tcp_flags |= SIG_TCP_ACK;
 		if (th->urg) pkt->tcp_flags |= SIG_TCP_URG;
 
-		/* TCP window của gói SYN forward (không ack) → feature #13 */
+		/* TCP window of the forward SYN packet (no ack) → feature #13 */
 		if (th->syn && !th->ack)
 			pkt->init_win = (int32_t)ntohs(th->window);
 
@@ -365,8 +372,9 @@ again:
 			continue;
 
 		/* NFQA_MARK → skb mark; low byte = IPS profile id (per-policy
-		 * scoping). Đặt SAU nfq_parse_packet (hàm đó không đụng field này).
-		 * Dùng skb mark vì tin cậy hơn NFQA_CT trên kernel thiếu glue_ct. */
+		 * scoping). Set AFTER nfq_parse_packet (that function does not touch
+		 * this field). Use the skb mark since it is more reliable than NFQA_CT
+		 * on a kernel lacking glue_ct. */
 		pkt->ips_prof_id = 0;
 		int mkl = 0;
 		const void *mk = nla_find(attrs, alen, NFQA_MARK, &mkl);
@@ -374,22 +382,24 @@ again:
 			pkt->ips_prof_id =
 				(uint8_t)(ntohl(*(const uint32_t *)mk) & 0xFF);
 
-		/* NFQA_TIMESTAMP → thời điểm kernel ghi nhận gói (cho alert log).
-		 * struct {be64 sec; be64 usec}. Kernel chỉ gửi khi skb->tstamp được
-		 * set → vắng thì cap_sec=0 (log_alert fallback). memcpy vì payload
-		 * attribute chỉ căn 4-byte, đọc be64 trực tiếp có thể lệch alignment.
+		/* NFQA_TIMESTAMP → the moment the kernel recorded the packet (for the
+		 * alert log). struct {be64 sec; be64 usec}. The kernel only sends it
+		 * when skb->tstamp is set → absent means cap_sec=0 (log_alert
+		 * fallback). memcpy because the payload attribute is only 4-byte
+		 * aligned, so reading be64 directly may misalign.
 		 *
-		 * CẢNH BÁO: từ kernel ~5.18, skb->tstamp của gói FORWARD thường là
-		 * CLOCK_MONOTONIC (mô hình EDT), không phải wall-clock. nfnetlink_queue
-		 * dump thẳng ktime đó → sec ≈ uptime → "1970-01-01 + uptime". Guard:
-		 * chỉ nhận nếu trông như epoch thật (≥ 2020-01-01); monotonic muốn
-		 * vượt mốc này phải uptime ~50 năm → bất khả → bị loại, fallback. */
+		 * WARNING: since kernel ~5.18, skb->tstamp of a FORWARD packet is often
+		 * CLOCK_MONOTONIC (EDT model), not wall-clock. nfnetlink_queue dumps
+		 * that ktime straight through → sec ≈ uptime → "1970-01-01 + uptime".
+		 * Guard: only accept it if it looks like a real epoch (≥ 2020-01-01);
+		 * for monotonic to exceed this mark would require ~50 years of uptime →
+		 * impossible → rejected, fallback. */
 		pkt->cap_sec = 0;
 		int tsl = 0;
 		const void *tsp = nla_find(attrs, alen, NFQA_TIMESTAMP, &tsl);
 		if (tsp && tsl >= (int)sizeof(struct nfqnl_msg_packet_timestamp)) {
 			uint64_t sec;
-			memcpy(&sec, tsp, sizeof(sec));   /* field đầu = sec */
+			memcpy(&sec, tsp, sizeof(sec));   /* first field = sec */
 			int64_t s = (int64_t)be64toh(sec);
 			if (s >= 1577836800)              /* 2020-01-01 UTC */
 				pkt->cap_sec = s;
@@ -411,11 +421,12 @@ int nfq_verdict(struct nfq_ctx *ctx, uint32_t id, int accept,
 	int off = NLMSG_HDRLEN + (int)NLMSG_ALIGN(sizeof(struct nfgenmsg));
 
 	/*
-	 * NF_ACCEPT cho pass/alert: NFQUEUE rule dùng connbytes (0:N-1) làm
-	 * gate — không cần NF_REPEAT hay INSPECTED connmark. Sau N gói, connbytes
-	 * vượt N-1, rule không match nữa → gói tự đến policy CONNMARK+ACCEPT.
-	 * NF_DROP cho block: kèm connmark IPS_BLOCK → rule global DROP ở đầu
-	 * chain chặn mọi gói tiếp theo của flow đó.
+	 * NF_ACCEPT for pass/alert: the NFQUEUE rule uses connbytes (0:N-1) as the
+	 * gate — no NF_REPEAT or INSPECTED connmark needed. After N packets,
+	 * connbytes exceeds N-1, the rule no longer matches → the packet reaches
+	 * the policy CONNMARK+ACCEPT on its own. NF_DROP for block: with connmark
+	 * IPS_BLOCK → the global DROP rule at the head of the chain blocks every
+	 * subsequent packet of that flow.
 	 */
 	struct nfqnl_msg_verdict_hdr vh = {
 		.verdict = htonl(accept ? NF_ACCEPT : NF_DROP),
@@ -425,8 +436,8 @@ int nfq_verdict(struct nfq_ctx *ctx, uint32_t id, int accept,
 			NFQA_VERDICT_HDR, &vh, sizeof(vh)) < 0)
 		return -1;
 
-	/* Set connmark qua NFQA_CT → CTA_MARK (Linux ≥ 3.16).
-	 * Kernel áp: ct->mark = (ct->mark & ~mask) | (mark & mask). */
+	/* Set connmark via NFQA_CT → CTA_MARK (Linux ≥ 3.16).
+	 * Kernel applies: ct->mark = (ct->mark & ~mask) | (mark & mask). */
 	if (connmark_mask) {
 		int nest = nla_nest_start(buf, &off, (int)sizeof(buf), NFQA_CT);
 		if (nest < 0) return -1;
@@ -434,9 +445,13 @@ int nfq_verdict(struct nfq_ctx *ctx, uint32_t id, int accept,
 		if (nla_put_raw(buf, &off, (int)sizeof(buf),
 				SG_CTA_MARK, &m, 4) < 0)
 			return -1;
-		/* NFQA_CT_MASK (=28) để kernel áp mask */
+		/* CTA_MARK_MASK (21) — inside the NFQA_CT nest — so the kernel does
+		 * ct->mark = (ct->mark & ~mask) | (mark & mask), preserving policy_id
+		 * (bits 8-31) + DIRTY (bit 0). (Was wrongly 28 > CTA_MAX → the kernel
+		 * rejected the whole NFQA_CT nest and never set the convicted bit.) */
 		uint32_t mk = htonl(connmark_mask);
-		if (nla_put_raw(buf, &off, (int)sizeof(buf), 28, &mk, 4) < 0)
+		if (nla_put_raw(buf, &off, (int)sizeof(buf),
+				SG_CTA_MARK_MASK, &mk, 4) < 0)
 			return -1;
 		nla_nest_end(buf, nest, off);
 	}

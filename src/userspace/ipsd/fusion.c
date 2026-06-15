@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * fusion.c - decision fusion (xem fusion.h).
+ * fusion.c - decision fusion (see fusion.h).
  */
 #include "fusion.h"
 #include "sig_rule.h"   /* SIG_DROP / SIG_ALERT */
@@ -8,7 +8,7 @@
 void ips_config_default(struct ips_config *cfg)
 {
 	cfg->mode      = IPS_MODE_PREVENT;
-	cfg->thr_block = 0.95;   /* = THRESHOLD lúc train */
+	cfg->thr_block = 0.95;   /* = THRESHOLD at train time */
 	cfg->thr_alert = 0.50;
 }
 
@@ -20,7 +20,7 @@ struct ips_decision ips_fuse(const struct ips_config *cfg,
 		.sig_rule = sig_idx, .score = score, .ml_evaluated = 0,
 	};
 
-	/* Mức nặng do từng nguồn đề xuất. */
+	/* Severity level proposed by each source. */
 	int sig_v = IPS_PASS;
 	if (sig_idx >= 0)
 		sig_v = (sig_action == SIG_DROP) ? IPS_DROP : IPS_ALERT;
@@ -31,10 +31,10 @@ struct ips_decision ips_fuse(const struct ips_config *cfg,
 	else if (score >= cfg->thr_alert)
 		ml_v = IPS_ALERT;
 
-	/* Lấy mức nặng nhất. */
+	/* Take the most severe level. */
 	int final = sig_v > ml_v ? sig_v : ml_v;
 
-	/* Gán lý do: signature được ưu tiên khi nó "dẫn" (nặng ≥ ML). */
+	/* Assign reason: signature takes priority when it "leads" (severity >= ML). */
 	if (final == IPS_PASS)
 		d.reason = IPS_R_NONE;
 	else if (sig_v >= ml_v && sig_idx >= 0)
@@ -42,7 +42,7 @@ struct ips_decision ips_fuse(const struct ips_config *cfg,
 	else
 		d.reason = (final == IPS_DROP) ? IPS_R_ML_BLOCK : IPS_R_ML_ALERT;
 
-	/* Mode detect: không bao giờ chặn — hạ DROP xuống ALERT (giữ nguyên lý do). */
+	/* Mode detect: never block — downgrade DROP to ALERT (keep the reason). */
 	if (cfg->mode == IPS_MODE_DETECT && final == IPS_DROP)
 		final = IPS_ALERT;
 

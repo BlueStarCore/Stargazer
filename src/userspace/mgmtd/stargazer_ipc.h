@@ -109,6 +109,8 @@ typedef enum {
 	SG_CMD_SHOW_CONFIG   = 613,   /* Reserved: not yet implemented   */
 	SG_CMD_SHOW_STATS    = 614,
 	SG_CMD_SYS_FACTORY_RESET = 615, /* Factory reset to defaults         */
+	SG_CMD_SYS_EXEC      = 616,   /* Run a system binary as root (execvp, no shell) */
+	SG_CMD_SYS_LIST      = 617,   /* List runnable binaries in PATH (for `execute system ?`) */
 	SG_CMD_WHOAMI        = 620,   /* Get caller's profile+permissions */
 
 	/* Firewall/routing diagnostics (63x) */
@@ -167,15 +169,15 @@ typedef enum {
 	/* DHCP lease events (udhcpc script → mgmtd) */
 	SG_CMD_DHCP_LEASE_EVENT  = 682,  /* payload: iface=<name> action=bound|renew|deconfig */
 
-	/* SSL inspection: trả CA cert (PEM) cho client tải về cài */
+	/* SSL inspection: return the CA cert (PEM) for the client to download and install */
 	SG_CMD_SSL_CACERT        = 683,
 
 	/* IPS daemon status + alert log */
-	SG_CMD_IPS_STATUS        = 684,   /* trạng thái ipsd + counters   */
-	SG_CMD_IPS_ALERTS        = 685,   /* N dòng cuối ips-alert.log    */
+	SG_CMD_IPS_STATUS        = 684,   /* ipsd status + counters       */
+	SG_CMD_IPS_ALERTS        = 685,   /* last N lines of ips-alert.log */
 	SG_CMD_IPS_SIGNATURES    = 686,   /* catalog signature repo (JSON) */
 	SG_CMD_IPS_REBUILD       = 687,   /* recompile active.rules + reload (ips-update.sh) */
-	SG_CMD_IPS_UPDATE_NOW    = 688,   /* tải ruleset (security_ips-ruleset) + rebuild + reload */
+	SG_CMD_IPS_UPDATE_NOW    = 688,   /* fetch ruleset (security_ips-ruleset) + rebuild + reload */
 	SG_CMD_IPS_ALERTS_JSON       = 689,   /* parse ips-alert.log → JSON array */
 	SG_CMD_IPS_RULESETS_RELOAD   = 690,   /* scan custom dir for .xml → upsert DB entries */
 	SG_CMD_IPS_UPDATE_LOG        = 691,   /* tail ips-update.log → payload */
@@ -294,6 +296,7 @@ static inline int sg_cmd_audit_skip(sg_cmd_t cmd)
 	case SG_CMD_HISTORY_LOAD:
 	case SG_CMD_LOG_AUDIT:
 	case SG_CMD_LOG_SYSTEM:
+	case SG_CMD_SYS_LIST:        /* read-only binary enumeration, fires on `?` */
 	case SG_CMD_LOG_MGMTD:
 	case SG_CMD_DIAG_STARGAZER_LOG:
 	case SG_CMD_DIAG_STORAGE:

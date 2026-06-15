@@ -47,6 +47,7 @@
 #define FLOW_IPS_ALERTS_JSON 26
 #define FLOW_IPS_UPDATE_LOG  27
 #define FLOW_RES_PERCORE     28
+#define FLOW_SESSION_CLEAR   29
 
 typedef struct {
 	unsigned long   conn_id;        /* Mongoose connection ID */
