@@ -1,9 +1,10 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * ca_certcache_test.c - test sinh CA + forge leaf + kiểm chuỗi tin cậy.
+ * ca_certcache_test.c - test CA generation + leaf forging + trust chain check.
  *
- * Bằng chứng cốt lõi: leaf forge ra PHẢI verify được tới CA (đúng như client
- * đã cài CA sẽ thấy), và SAN/CN khớp SNI. Cũng kiểm cache hit + LRU evict.
+ * Core proof: a forged leaf MUST verify up to the CA (exactly as a client that
+ * installed the CA would see), and SAN/CN must match the SNI. Also checks cache
+ * hit + LRU eviction.
  */
 #include "ca.h"
 #include "certcache.h"
@@ -17,7 +18,7 @@ static int g_fail;
 #define CHECK(c, m) do { if (!(c)) { printf("  FAIL: %s\n", m); g_fail++; } \
 			 else printf("  ok:   %s\n", m); } while (0)
 
-/* Verify `leaf` chains tới `ca`. Trả 1 nếu hợp lệ. */
+/* Verify that `leaf` chains to `ca`. Returns 1 if valid. */
 static int verify_chain(X509 *leaf, X509 *ca)
 {
 	X509_STORE *store = X509_STORE_new();
@@ -34,7 +35,7 @@ static int verify_chain(X509 *leaf, X509 *ca)
 	return ok == 1;
 }
 
-/* SAN có chứa dNSName == want? */
+/* Does the SAN contain dNSName == want? */
 static int has_san(X509 *crt, const char *want)
 {
 	int found = 0;
@@ -61,57 +62,57 @@ int main(void)
 	char kpath[] = "/tmp/sg_ca_test_key.pem";
 	unlink(cpath); unlink(kpath);
 
-	printf("== test 1: sinh CA mới ==\n");
+	printf("== test 1: generate a new CA ==\n");
 	struct ca_ctx ca;
 	CHECK(ca_load_or_create(&ca, cpath, kpath) == 0, "ca_load_or_create");
-	CHECK(ca.cert && ca.key, "có cert + key");
+	CHECK(ca.cert && ca.key, "has cert + key");
 	{
 		char pem[4096];
 		int n = ca_export_cert_pem(&ca, pem, sizeof(pem));
 		CHECK(n > 0 && strstr(pem, "BEGIN CERTIFICATE"), "export PEM");
 	}
 
-	printf("== test 2: nạp lại CA từ đĩa (persist) ==\n");
+	printf("== test 2: reload CA from disk (persist) ==\n");
 	{
 		struct ca_ctx ca2;
-		CHECK(ca_load_or_create(&ca2, cpath, kpath) == 0, "nạp lại");
-		/* serial CA phải giống → cùng một CA, không sinh mới */
-		CHECK(X509_cmp(ca.cert, ca2.cert) == 0, "cùng CA cert (persist)");
+		CHECK(ca_load_or_create(&ca2, cpath, kpath) == 0, "reload");
+		/* the CA serial must match -> same CA, not newly generated */
+		CHECK(X509_cmp(ca.cert, ca2.cert) == 0, "same CA cert (persist)");
 		ca_free(&ca2);
 	}
 
-	printf("== test 3: forge leaf + verify chuỗi tới CA ==\n");
+	printf("== test 3: forge leaf + verify chain to CA ==\n");
 	struct certcache *cc = certcache_new(&ca, 4);
 	CHECK(cc != NULL, "certcache_new");
 	{
 		X509 *crt; EVP_PKEY *key;
 		CHECK(certcache_get(cc, "www.example.com", NULL, &crt, &key) == 0,
 		      "forge www.example.com");
-		CHECK(verify_chain(crt, ca.cert), "leaf verify tới CA");
-		CHECK(has_san(crt, "www.example.com"), "SAN dNSName khớp SNI");
+		CHECK(verify_chain(crt, ca.cert), "leaf verifies to CA");
+		CHECK(has_san(crt, "www.example.com"), "SAN dNSName matches SNI");
 	}
 
-	printf("== test 4: cache hit trả cùng cert ==\n");
+	printf("== test 4: cache hit returns the same cert ==\n");
 	{
 		X509 *a, *b; EVP_PKEY *ka, *kb;
 		certcache_get(cc, "cache.test", NULL, &a, &ka);
 		certcache_get(cc, "cache.test", NULL, &b, &kb);
-		CHECK(a == b, "cùng con trỏ cert (hit)");
-		CHECK(ka == kb, "cùng leaf key chung");
+		CHECK(a == b, "same cert pointer (hit)");
+		CHECK(ka == kb, "same shared leaf key");
 	}
 
-	printf("== test 5: LRU evict khi quá max ==\n");
+	printf("== test 5: LRU evict when over max ==\n");
 	{
-		/* max=4; đã có www.example.com, cache.test (2). Thêm 4 nữa → evict. */
+		/* max=4; already have www.example.com, cache.test (2). Add 4 more -> evict. */
 		X509 *c; EVP_PKEY *k;
 		const char *names[] = {"a.test","b.test","c.test","d.test"};
 		for (int i = 0; i < 4; i++)
 			CHECK(certcache_get(cc, names[i], NULL, &c, &k) == 0,
 			      names[i]);
-		/* vẫn forge được domain mới sau evict, verify vẫn đúng */
+		/* a new domain can still be forged after eviction, verify still passes */
 		CHECK(certcache_get(cc, "new.test", NULL, &c, &k) == 0,
-		      "forge sau evict");
-		CHECK(verify_chain(c, ca.cert), "leaf sau evict vẫn verify");
+		      "forge after evict");
+		CHECK(verify_chain(c, ca.cert), "leaf after evict still verifies");
 	}
 
 	certcache_free(cc);
@@ -119,6 +120,6 @@ int main(void)
 	unlink(cpath); unlink(kpath);
 
 	if (g_fail) { printf("\n== %d TEST FAIL ==\n", g_fail); return 1; }
-	printf("\n== TẤT CẢ ca/certcache TEST PASS ==\n");
+	printf("\n== ALL ca/certcache TESTS PASS ==\n");
 	return 0;
 }

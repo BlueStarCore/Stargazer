@@ -45,8 +45,8 @@ CONFIG_FEATURE_IP_SHORT_FORMS=y
 CONFIG_PING=y
 CONFIG_FEATURE_FANCY_PING=y
 
-# `nc` — netcat: LAN VM dùng làm target sink (nc -l -p N) để TCP handshake
-# hoàn tất, data packet đi qua firewall cho IPS soi payload signature.
+# `nc` — netcat: a LAN VM acts as the target sink (nc -l -p N) so the TCP handshake
+# completes and data packets pass through the firewall for IPS payload-signature inspection.
 CONFIG_NC=y
 CONFIG_NC_SERVER=y
 CONFIG_NC_EXTRA=y
@@ -202,6 +202,12 @@ CONFIG_KILL=y
 
 # `killall` — shutdown.sh fallback process kill
 CONFIG_KILLALL=y
+
+# `timeout` — bound the ipsd ruleset syntax check (`ipsd -C`); sig_build can
+# hang on malformed/oversized rulesets on slow ARM/QEMU. ips-update.sh wraps
+# the check in `timeout 60`; without the applet it fails with "timeout: not
+# found" and the update is misreported as a syntax failure.
+CONFIG_TIMEOUT=y
 
 # `sleep` — init/login timing waits
 CONFIG_SLEEP=y

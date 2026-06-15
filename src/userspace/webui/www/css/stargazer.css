@@ -738,6 +738,25 @@ html, body {
 .btn-danger:hover {
     background: rgba(229, 57, 53, 0.1);
 }
+
+/* Secondary "ghost" button — a quiet action that sits inline with filter
+ * controls (e.g. Clear filters). Lighter than .btn, readable, dawn accent on
+ * hover. Overrides .btn's heavier padding/shadow (same specificity, later). */
+.btn-ghost {
+    padding: 6px 14px;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--gray-text-mid);
+    background: transparent;
+    border: 1px solid var(--border-light);
+    box-shadow: none;
+}
+.btn-ghost:hover {
+    border-color: var(--dawn-orange);
+    color: var(--dawn-ember);
+    background: var(--dawn-glow);
+    box-shadow: none;
+}
 .form-row-disabled {
     opacity: 0.45;
     pointer-events: none;
@@ -1258,6 +1277,14 @@ html, body {
     align-items: center;
     gap: 12px;
     padding: 8px 0;
+}
+
+/* Muted explanatory line at the top of a modal body. */
+.form-hint {
+    margin: 0 0 10px;
+    color: var(--text-dim);
+    font-size: 12px;
+    line-height: 1.5;
 }
 
 /* Wide form-row variant — used for description/comment fields that
@@ -2042,6 +2069,8 @@ html, body {
 }
 .toast-success { background: var(--color-success); }
 .toast-error { background: var(--color-danger); }
+.toast-warn { background: var(--color-warning); }                       /* partial / incomplete sweep */
+.toast-info { background: var(--sky-mid); color: var(--text-primary); } /* neutral (nothing matched) */
 .toast-fade { opacity: 0; }
 
 /* ================================================================
@@ -2398,7 +2427,7 @@ tr.drop-below {
 .sg-info:hover .sg-tip,
 .sg-info:focus .sg-tip { visibility: visible; opacity: 1; }
 
-/* ── Overlay modal (IPS Add Signatures, kiểu FortiGate) ───────────────── */
+/* ── Overlay modal (IPS Add Signatures, FortiGate style) ───────────────── */
 .modal-overlay {
     position: fixed;
     inset: 0;
@@ -2463,7 +2492,7 @@ tr.drop-below {
 .rf-pager button.active { background:var(--dawn-orange); color:#fff; border-color:var(--dawn-orange); }
 .rf-pager button:disabled { opacity:0.4; cursor:default; }
 
-/* ── Toggle switch (IPS enable trên form policy) ───────────────────────── */
+/* ── Toggle switch (IPS enable on the policy form) ─────────────────────── */
 .switch { position: relative; display: inline-block; width: 46px; height: 24px; flex: 0 0 auto; }
 .switch input { position: absolute; opacity: 0; width: 0; height: 0; margin: 0; }
 .switch .slider {

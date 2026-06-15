@@ -1,24 +1,25 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * tls_policy.h - Quyết định SPLICE (relay thô) hay BUMP (MITM giải mã) cho một
- *                flow TLS, dựa trên SNI (xem tls_clienthello.h) + bypass list.
+ * tls_policy.h - Decide SPLICE (raw relay) or BUMP (MITM decrypt) for a TLS
+ *                flow, based on the SNI (see tls_clienthello.h) + bypass list.
  *
- * Đây là "não" của SSL inspection — stage runtime ngay sau bước PEEK:
+ * This is the "brain" of SSL inspection — the runtime stage right after PEEK:
  *
  *     ClientHello ──peek──► SNI ──tls_policy_decide()──► BUMP / SPLICE
  *
- * Triết lý: inspect MẶC ĐỊNH (BUMP) mọi flow, TRỪ những domain trong bypass
- * list (banking, app pin-cert, danh mục riêng tư) → SPLICE. Sai ở đây gây hậu
- * quả thật: bump nhầm app pin-cert = ĐỨT kết nối của người dùng; vì vậy bypass
- * list là bắt buộc, không phải tùy chọn.
+ * Philosophy: inspect BY DEFAULT (BUMP) every flow, EXCEPT domains in the bypass
+ * list (banking, cert-pinning apps, privacy-sensitive categories) → SPLICE.
+ * Getting this wrong has real consequences: wrongly bumping a cert-pinning app
+ * = a BROKEN connection for the user; so the bypass list is mandatory, not
+ * optional.
  *
- * Quy tắc match domain (case-insensitive):
- *   - "bank.com"    : khớp CHÍNH XÁC "bank.com".
- *   - "*.bank.com"  : khớp mọi subdomain "x.bank.com", "a.b.bank.com" — KHÔNG
- *                     khớp chính "bank.com" (đúng ngữ nghĩa wildcard TLS/DNS).
- * Thêm cả hai mục nếu muốn phủ luôn apex lẫn subdomain.
+ * Domain match rules (case-insensitive):
+ *   - "bank.com"    : matches EXACTLY "bank.com".
+ *   - "*.bank.com"  : matches every subdomain "x.bank.com", "a.b.bank.com" — but
+ *                     NOT "bank.com" itself (correct TLS/DNS wildcard semantics).
+ * Add both entries if you want to cover the apex as well as subdomains.
  *
- * KHÔNG cần OpenSSL/mbedTLS — chỉ so chuỗi; host-test được.
+ * No OpenSSL/mbedTLS needed — just string comparison; host-testable.
  */
 #ifndef SG_TLS_POLICY_H
 #define SG_TLS_POLICY_H
@@ -26,44 +27,44 @@
 #include <stddef.h>
 
 enum tls_action {
-	TLS_BUMP   = 0,   /* MITM: giải mã + đưa plaintext vào IPS engine */
-	TLS_SPLICE = 1,   /* relay TCP thô, KHÔNG giải mã (chỉ metadata/ML) */
+	TLS_BUMP   = 0,   /* MITM: decrypt + feed plaintext into the IPS engine */
+	TLS_SPLICE = 1,   /* raw TCP relay, NO decrypt (metadata/ML only) */
 };
 
-/* Chính sách khi flow TLS KHÔNG có SNI (ECH, client cũ, hoặc cố tình giấu). */
+/* Policy when a TLS flow has NO SNI (ECH, old client, or deliberately hidden). */
 enum tls_no_sni_policy {
-	TLS_NO_SNI_BUMP   = 0,  /* mặc định an toàn: vẫn inspect */
-	TLS_NO_SNI_SPLICE = 1,  /* nới: không SNI thì cho qua (ít an toàn hơn) */
+	TLS_NO_SNI_BUMP   = 0,  /* safe default: still inspect */
+	TLS_NO_SNI_SPLICE = 1,  /* relaxed: no SNI means let it pass (less safe) */
 };
 
 struct tls_policy {
-	char   **patterns;          /* bypass list (sở hữu, malloc)            */
+	char   **patterns;          /* bypass list (owned, malloc)             */
 	int      n, cap;
-	int      default_bump;      /* 1 = mặc định BUMP (inspect-all-trừ-list) */
+	int      default_bump;      /* 1 = default BUMP (inspect-all-except-list)*/
 	int      no_sni;            /* enum tls_no_sni_policy                   */
 };
 
-/* Khởi tạo rỗng: default BUMP (inspect tất cả), no-SNI → BUMP. */
+/* Empty init: default BUMP (inspect everything), no-SNI → BUMP. */
 void tls_policy_init(struct tls_policy *p);
 
 /*
- * Thêm một pattern vào bypass list ("bank.com" hoặc "*.bank.com").
- * Chuẩn hóa: lowercase, bỏ dấu '.' thừa ở đầu/cuối. Trả 0 nếu thêm được,
- * -1 nếu OOM hoặc pattern rỗng/không hợp lệ.
+ * Add a pattern to the bypass list ("bank.com" or "*.bank.com").
+ * Normalizes: lowercase, strip stray leading/trailing '.'. Returns 0 on success,
+ * -1 on OOM or an empty/invalid pattern.
  */
 int tls_policy_add_bypass(struct tls_policy *p, const char *pattern);
 
 /*
- * Quyết định cho một flow. `sni` là host_name từ tls_clienthello (có thể NULL/
- * rỗng nếu has_sni==0). Trả TLS_BUMP hoặc TLS_SPLICE.
- *   - has_sni==0           → theo p->no_sni.
- *   - SNI khớp bypass list → TLS_SPLICE.
- *   - còn lại              → TLS_BUMP nếu default_bump, ngược lại TLS_SPLICE.
+ * Decide for one flow. `sni` is the host_name from tls_clienthello (may be NULL/
+ * empty if has_sni==0). Returns TLS_BUMP or TLS_SPLICE.
+ *   - has_sni==0            → follow p->no_sni.
+ *   - SNI matches bypass list → TLS_SPLICE.
+ *   - otherwise             → TLS_BUMP if default_bump, else TLS_SPLICE.
  */
 enum tls_action tls_policy_decide(const struct tls_policy *p,
 				  const char *sni, int has_sni);
 
-/* Có khớp bypass list không (tách riêng để test/log). 1=khớp, 0=không. */
+/* Does it match the bypass list (split out for tests/logging). 1=match, 0=no. */
 int tls_policy_is_bypassed(const struct tls_policy *p, const char *sni);
 
 void tls_policy_free(struct tls_policy *p);

@@ -60,9 +60,9 @@
         var now = Date.now();
         var entry = apiCache[path];
         if (entry && (now - entry.t) < API_TTL_MS) {
-            /* Cache hit vẫn là "có data hợp lệ" → đếm như một api() thành công
-             * để cơ chế reveal trang (setActivePage) gỡ loading cover ngay,
-             * không phải chờ watchdog 8s khi tab dùng cachedApi (vd tab Rules). */
+            /* A cache hit is still "valid data" → count it as a successful api()
+             * so the page reveal mechanism (setActivePage) removes the loading cover
+             * immediately, instead of waiting the 8s watchdog when a tab uses cachedApi (e.g. Rules tab). */
             if (entry.v != null) apiSuccessCount++;
             return Promise.resolve(entry.v);
         }
@@ -78,10 +78,10 @@
         });
     }
 
-    /* Catalog signature fetch — SERVER-SIDE search (response IPC giới hạn 64KB;
-     * ruleset lớn không tải hết được, phải lọc theo từ khoá ở backend).
-     * Trả {items:[], truncated:0|1}. Tương thích server cũ trả array.
-     * Top-level: dùng chung cho cả module IPS 5-tab và modal "Add Signatures". */
+    /* Catalog signature fetch — SERVER-SIDE search (IPC response limited to 64KB;
+     * large rulesets cannot be loaded in full, must be filtered by keyword on the backend).
+     * Returns {items:[], truncated:0|1}. Compatible with old servers that return an array.
+     * Top-level: shared by both the IPS 5-tab module and the "Add Signatures" modal. */
     function fetchCatalog(q) {
         var path = '/ips/signatures';
         if (q) path += '?q=' + encodeURIComponent(q);
@@ -1769,8 +1769,8 @@
         if (!actionSel) return;
         var isDeny = actionSel.value === 'deny' || actionSel.value === 'drop';
 
-        /* IPS: toggle ips-status quyết định hiện dropdown profile. DENY/DROP ẩn
-         * cả toggle lẫn profile (chỉ hợp lệ cho accept — khớp backend). */
+        /* IPS: the ips-status toggle decides whether to show the profile dropdown. DENY/DROP hide
+         * both the toggle and the profile (only valid for accept — matches backend). */
         var ipsStatRow = form.querySelector('.form-row[data-key="ips-status"]');
         var ipsRow     = form.querySelector('.form-row[data-key="ips-profile"]');
         var ipsOn = false;
@@ -1781,7 +1781,7 @@
         }
         if (ipsRow) ipsRow.style.display = (isDeny || !ipsOn) ? 'none' : '';
 
-        /* SSL inspection cũng chỉ hợp lệ trên accept — DENY/DROP ẩn + reset. */
+        /* SSL inspection is also only valid on accept — DENY/DROP hide + reset. */
         var sslRow = form.querySelector('.form-row[data-key="ssl-profile"]');
         if (sslRow) {
             sslRow.style.display = isDeny ? 'none' : '';
@@ -2609,8 +2609,8 @@
             });
         }
 
-        /* Policy cũ (legacy) chưa có ips-status nhưng có ips-profile thật →
-         * suy ra toggle BẬT để edit+save không vô tình tắt IPS. */
+        /* Old (legacy) policy has no ips-status but has a real ips-profile →
+         * infer the toggle is ON so edit+save doesn't accidentally turn IPS off. */
         if (formBody && data['ips-status'] === undefined) {
             var ipsCb = formBody.querySelector(
                 '.form-row[data-key="ips-status"] input[type="checkbox"]');
@@ -3746,8 +3746,8 @@
                 var val = opt ? (opt.value || opt.text) : '';
                 if (val) payload[f.key] = val;
             } else if (inp.type === 'checkbox') {
-                /* Switch enum (data-on/data-off) → chuỗi enable/disable; checkbox
-                 * thường → boolean. */
+                /* Switch enum (data-on/data-off) → enable/disable string; a regular
+                 * checkbox → boolean. */
                 if (inp.dataset.on || inp.dataset.off) {
                     payload[f.key] = inp.checked
                         ? (inp.dataset.on  || 'enable')
@@ -4060,7 +4060,7 @@
         return Promise.resolve();
     }
 
-    /* SSL Inspection page: cảnh báo deep (kiểu FortiGate) + diagnostics. */
+    /* SSL Inspection page: deep warning (FortiGate-style) + diagnostics. */
     function initSslPageExtras(pg) {
         if (!pg) return;
         var modeSel   = pg.querySelector('.form-row[data-key="inspection-mode"] .form-input');
@@ -4101,7 +4101,7 @@
         }
     }
 
-    /* Certificates page: xem/export/download CA của SSL inspection. */
+    /* Certificates page: view/export/download the SSL inspection CA. */
     function initCertPage(pg) {
         if (!pg) return Promise.resolve();
         var statusEl = pg.querySelector('#cert-ca-status');
@@ -4114,7 +4114,7 @@
         if (exportBtn && !exportBtn._wired) {
             exportBtn._wired = 1;
             exportBtn.addEventListener('click', function () {
-                if (!caPem) { showToast('CA chưa có — bật deep SSL inspection để sinh CA', 'error'); return; }
+                if (!caPem) { showToast('No CA yet — enable deep SSL inspection to generate one', 'error'); return; }
                 if (pemEl) pemEl.textContent = caPem;
                 if (pemCard) pemCard.style.display = '';
             });
@@ -4122,7 +4122,7 @@
         if (dlBtn && !dlBtn._wired) {
             dlBtn._wired = 1;
             dlBtn.addEventListener('click', function () {
-                if (!caPem) { showToast('CA chưa có', 'error'); return; }
+                if (!caPem) { showToast('No CA yet', 'error'); return; }
                 var blob = new Blob([caPem], { type: 'application/x-pem-file' });
                 var a = document.createElement('a');
                 a.href = URL.createObjectURL(blob);
@@ -4136,10 +4136,10 @@
             caPem = (d && d.output) ? d.output : '';
             if (statusEl) statusEl.textContent = caPem
                 ? 'CA present (' + caPem.length + ' bytes PEM)'
-                : 'CA chưa tạo — bật deep SSL inspection để sinh tự động';
+                : 'CA not created — enable deep SSL inspection to generate automatically';
         }).catch(function () {
             caPem = '';
-            if (statusEl) statusEl.textContent = 'CA chưa tạo — bật deep SSL inspection để sinh tự động';
+            if (statusEl) statusEl.textContent = 'CA not created — enable deep SSL inspection to generate automatically';
         });
     }
 
@@ -4156,9 +4156,9 @@
             setTxt('ips-stat-status', d.status || '—');
             setTxt('ips-stat-mode', d.mode || '—');
             setTxt('ips-stat-snap',
-                   d.snapshot_bytes ? (d.snapshot_bytes + ' B') : '—');
-            /* P0 — độ phủ thật: full=được DROP, alert-cap=chỉ ALERT (thiếu
-             * keyword thu hẹp chưa hỗ trợ). */
+                   parseInt(d.snapshot_bytes, 10) > 0 ? (d.snapshot_bytes + ' B') : '—');
+            /* P0 — actual coverage: full=can DROP, alert-cap=ALERT only (narrowing
+             * keyword not yet supported). */
             if (d.loaded !== undefined) {
                 var full = parseInt(d.loaded_full || '0', 10);
                 var alertCap = parseInt(d.loaded_alert || '0', 10);
@@ -4177,10 +4177,10 @@
             var log = document.getElementById('ips-alert-log');
             if (log) log.textContent =
                 (d && d.output && d.output.trim()) ? d.output
-                                                   : '(chưa có alert nào)';
+                                                   : '(no alerts yet)';
         }).catch(function () {
             var log = document.getElementById('ips-alert-log');
-            if (log) log.textContent = '(không tải được alert log)';
+            if (log) log.textContent = '(failed to load alert log)';
         });
         return Promise.all([p1, p2]);
     }
@@ -4198,7 +4198,7 @@
 
         /* ── state ── */
         var _catalog  = null;   /* cached signature catalog array (current query) */
-        var _catalogTrunc = 0;  /* 1 → server cắt kết quả, cần thu hẹp từ khoá */
+        var _catalogTrunc = 0;  /* 1 → server truncated results, need to narrow the keyword */
         var _rulesPage = 0;
         var _rulesFilter = { q: '', action: '' };
         var _rulesSearchTimer = null;
@@ -4217,9 +4217,9 @@
             pg.querySelectorAll('.ips-tab-pane').forEach(function (p) {
                 p.style.display = (p.dataset.ipsPane === tab) ? '' : 'none';
             });
-            /* Trả promise của loader để initIpsPage await được — nếu không,
-             * cơ chế reveal trang sẽ không thấy api() thành công và phải chờ
-             * watchdog 8s (MAX_COVER_MS) mới gỡ loading cover. */
+            /* Return the loader's promise so initIpsPage can await it — otherwise
+             * the page reveal mechanism won't see a successful api() and would wait
+             * the 8s watchdog (MAX_COVER_MS) before removing the loading cover. */
             if (tab === 'settings') {
                 var card = pg.querySelector('[data-ips-pane="settings"] .form-card[data-settings]');
                 return card ? settingsLoad(card, 'security') : Promise.resolve();
@@ -4321,24 +4321,24 @@
                     checked.forEach(function (cb) { ids.push(cb.dataset.id); });
                     updateBtn.disabled = true;
                     updateBtn.textContent = 'Downloading…';
-                    /* Request CHỜ tới khi tải xong: mgmtd fork một inner child sở
-                     * hữu kết nối và trả ĐÚNG kết quả (thành công/lỗi + lý do).
-                     * Tải lớn có thể lâu — nút giữ trạng thái "Downloading…". */
+                    /* Request WAITS until the download completes: mgmtd forks an inner child that
+                     * owns the connection and returns the EXACT result (success/error + reason).
+                     * A large download can take a while — the button keeps the "Downloading…" state. */
                     api('/ips/update-now', { method: 'POST', body: { ids: ids.join(',') } })
                         .then(function (resp) {
                             showToast((resp && resp.output) ? resp.output
-                                      : ('Đã tải ' + ids.length + ' ruleset'), 'success');
+                                      : ('Downloaded ' + ids.length + ' ruleset'), 'success');
                         })
                         .catch(function (err) {
-                            /* err.message mang lý do chi tiết từ backend:
-                             * no internet / DNS sai / syntax hỏng / file rỗng… */
-                            showToast('Tải lỗi: ' + (err.message || 'lỗi mạng'), 'error');
+                            /* err.message carries the detailed reason from the backend:
+                             * no internet / wrong DNS / broken syntax / empty file… */
+                            showToast('Download failed: ' + (err.message || 'network error'), 'error');
                         })
                         .finally(function () {
                             updateBtn.disabled = false;
                             updateBtn.textContent = 'Download & Update Rules';
-                            /* Log chi tiết per-ruleset + cập nhật timestamp +
-                             * làm mới catalog (rule mới hiện ở tab Rules). */
+                            /* Detailed per-ruleset log + update timestamp +
+                             * refresh catalog (new rules appear in the Rules tab). */
                             api('/ips/update-log').then(function (d) {
                                 showIpsUpdateLog(pg, (d && d.output) ? d.output : '');
                             }).catch(function () {});
@@ -4467,7 +4467,7 @@
                 }
 
                 /* Rules tab: search + filter. Search re-fetches SERVER-SIDE
-                 * (catalog có thể quá lớn để tải hết — backend lọc theo q). */
+                 * (the catalog may be too large to load in full — backend filters by q). */
                 var qEl = pg.querySelector('#ips-rules-search');
                 if (qEl) qEl.addEventListener('input', function () {
                     _rulesFilter.q = qEl.value.trim().toLowerCase();
@@ -4521,8 +4521,8 @@
                 });
             }
 
-            /* Load first (or current active) tab — RETURN promise của nó để
-             * setActivePage reveal ngay khi data về, không phải chờ watchdog 8s. */
+            /* Load first (or current active) tab — RETURN its promise so
+             * setActivePage reveals as soon as data arrives, instead of waiting the 8s watchdog. */
             var activeTab = pg.querySelector('.page-tab.active');
             var tab = activeTab ? activeTab.dataset.ipsTab : 'settings';
             return ipsTabSwitch(tab);
@@ -4656,8 +4656,8 @@
         }
 
         function filteredRules() {
-            /* Từ khoá đã lọc SERVER-SIDE (fetchCatalog) — ở đây chỉ lọc theo
-             * action (server không lọc theo action). */
+            /* Keyword already filtered SERVER-SIDE (fetchCatalog) — here we only filter by
+             * action (the server does not filter by action). */
             var af = _rulesFilter.action;
             return (_catalog || []).filter(function (r) {
                 if (af && (r.action || 'alert') !== af) return false;
@@ -4834,7 +4834,7 @@
         var profForm = document.getElementById('form-ips-profile');
         var sigTbody = function () { return document.querySelector('#ips-sig-table tbody'); };
         var catalog  = [];
-        var catalogTrunc = 0;      /* 1 → server cắt kết quả */
+        var catalogTrunc = 0;      /* 1 → server truncated results */
         var pendingFilters = [];   /* filters buffered before profile is saved */
         var _searchTimer   = null; /* debounce handle */
 
@@ -4888,8 +4888,8 @@
             }).catch(function () { paint([]); });
         }
 
-        /* loadCatalog(q) — fetch SERVER-SIDE filtered (catalog có thể > 64KB).
-         * q rỗng = chunk đầu (có thể bị cắt → gợi ý gõ từ khoá). */
+        /* loadCatalog(q) — fetch SERVER-SIDE filtered (catalog may be > 64KB).
+         * empty q = first chunk (may be truncated → suggest typing a keyword). */
         function loadCatalog(q) {
             var tb = sigTbody();
             if (tb) tb.innerHTML = '<tr><td colspan="6">Loading…</td></tr>';
@@ -4897,8 +4897,8 @@
                 catalog = res.items || [];
                 catalogTrunc = res.truncated;
                 renderCatalog();
-                /* Dropdown category lấy từ res.categories (danh sách ĐẦY ĐỦ mọi
-                 * ruleset đã tải, không bị giới hạn 64KB) — chỉ build lần đầu. */
+                /* Category dropdown comes from res.categories (the FULL list of every
+                 * downloaded ruleset, not limited to 64KB) — only built the first time. */
                 if (!q) populateCategorySelect(res.categories);
             }).catch(function () {
                 if (tb) tb.innerHTML = '<tr><td colspan="6">Could not load catalog (no ruleset downloaded?).</td></tr>';
@@ -4908,7 +4908,7 @@
         function renderCatalog() {
             var tb = sigTbody();
             if (!tb) return;
-            /* catalog đã được backend lọc theo từ khoá → hiển thị trực tiếp */
+            /* catalog already filtered by keyword on the backend → display directly */
             var rows = catalog.slice(0, 100);
             var total = catalog.length;
             var countEl = document.getElementById('ips-sig-count');
@@ -4938,7 +4938,7 @@
             var sel = document.getElementById('ips-filter-cat');
             if (!sel) return;
             var cats = {};
-            /* Ưu tiên danh sách đầy đủ từ backend; fallback: suy từ catalog đã tải. */
+            /* Prefer the full list from the backend; fallback: derive from the loaded catalog. */
             if (categories && categories.length)
                 categories.forEach(function (c) { if (c) cats[c] = 1; });
             else
@@ -5702,7 +5702,7 @@
 
         tbody.innerHTML = '';
         if (page.length === 0) {
-            tbody.appendChild(buildEmptyRow(9));
+            tbody.appendChild(buildEmptyRow(10));
         } else {
             var frag = document.createDocumentFragment();
             page.forEach(function (s) {
@@ -5710,6 +5710,20 @@
                 var bytesStr = s.bytes ? formatBytes(parseInt(s.bytes, 10) || 0) : '-';
 
                 var tr = document.createElement('tr');
+                /* Carry the exact tuple so right-click / bulk delete address
+                 * precisely the flow the operator sees (src/dst are ip:port). */
+                tr.dataset.proto = s.proto || '';
+                tr.dataset.src = s.src || '';
+                tr.dataset.dst = s.dst || '';
+
+                var cbTd = document.createElement('td');
+                cbTd.className = 'td-checkbox';
+                var cb = document.createElement('input');
+                cb.type = 'checkbox';
+                cb.className = 'sess-row-select';
+                cbTd.appendChild(cb);
+                tr.appendChild(cbTd);
+
                 tr.appendChild(makeTd((s.proto || '').toUpperCase()));
                 tr.appendChild(makeTd(s.src || ''));
                 tr.appendChild(makeTd(s.dst || ''));
@@ -5737,6 +5751,12 @@
         if (pageNum) pageNum.textContent = totalPages === 0 ? '0 / 0' : (sessState.page + 1) + ' / ' + totalPages;
         if (prevBtn) prevBtn.disabled = sessState.page === 0;
         if (nextBtn) nextBtn.disabled = sessState.page >= totalPages - 1;
+
+        /* Rows were rebuilt — any prior tick is gone from the DOM, so drop
+         * the stale select-all + bulk-bar state. */
+        var selAll = document.getElementById('sess-select-all');
+        if (selAll) selAll.checked = false;
+        updateSessBulkBar();
     }
 
     /* Bind session pager controls */
@@ -5788,6 +5808,190 @@
         if (sessFilterProto) sessFilterProto.value = '';
         if (sessFilterState) sessFilterState.value = '';
         renderSessionRows();
+    });
+
+    /* ============================================================
+     *  Session delete — right-click one, multi-select, or by filter.
+     *  All route through POST /monitor/sessions/clear (mgmtd enforces
+     *  admin and reports matched/deleted/failed honestly). Listeners are
+     *  bound once here; per-row data lives on the <tr> from render.
+     * ============================================================ */
+
+    function sessionDelete(proto, src, dst) {
+        return api('/monitor/sessions/clear', {
+            method: 'POST',
+            body: { proto: proto, src: src, dst: dst }
+        });
+    }
+
+    /* One honest toast from a clear/delete result. kv_to_json makes every
+     * value a string, so parse before comparing ("0" is truthy in JS). */
+    function reportClear(r, verb) {
+        var m = parseInt(r && r.matched, 10) || 0;
+        var d = parseInt(r && r.deleted, 10) || 0;
+        var f = parseInt(r && r.failed, 10) || 0;
+        var incomplete = r && r.dump_complete === '0';
+        if (m === 0) { showToast('No sessions matched', 'info'); return; }
+        if (f > 0 || incomplete) {
+            showToast(verb + ' ' + d + ' of ' + m +
+                      (f ? ' · ' + f + ' failed' : '') +
+                      (incomplete ? ' · incomplete' : ''), 'warn');
+        } else {
+            showToast(verb + ' ' + d + ' session' + (d === 1 ? '' : 's'), 'success');
+        }
+    }
+
+    function selectedSessRows() {
+        return Array.prototype.slice.call(
+            document.querySelectorAll('#sess-tbody .sess-row-select:checked'))
+            .map(function (cb) { return cb.closest('tr'); });
+    }
+
+    function updateSessBulkBar() {
+        var bar = document.getElementById('sess-bulk-action-bar');
+        if (!bar) return;
+        var n = selectedSessRows().length;
+        bar.style.display = n ? 'flex' : 'none';
+        var count = document.getElementById('sess-bulk-count');
+        if (count) count.textContent = n + ' selected';
+    }
+
+    function clearSessSelection() {
+        document.querySelectorAll('#sess-tbody .sess-row-select:checked').forEach(function (cb) {
+            cb.checked = false;
+            var tr = cb.closest('tr');
+            if (tr) tr.classList.remove('row-selected');
+        });
+        var selAll = document.getElementById('sess-select-all');
+        if (selAll) selAll.checked = false;
+        updateSessBulkBar();
+    }
+
+    /* Right-click a row → delete that exact flow. */
+    var sessCtx = document.getElementById('sess-context-menu');
+    var sessCtxRow = null;
+    if (sessCtx) {
+        document.addEventListener('contextmenu', function (e) {
+            var row = e.target.closest('#sess-tbody tr');
+            if (!row || !row.dataset.src) { sessCtx.style.display = 'none'; return; }
+            e.preventDefault();
+            sessCtxRow = row;
+            sessCtx.style.display = 'block';
+            var rect = sessCtx.getBoundingClientRect();
+            sessCtx.style.left = Math.min(e.clientX, window.innerWidth - rect.width - 4) + 'px';
+            sessCtx.style.top = Math.min(e.clientY, window.innerHeight - rect.height - 4) + 'px';
+        });
+        document.addEventListener('click', function () { sessCtx.style.display = 'none'; });
+        sessCtx.addEventListener('click', function (e) {
+            if (!e.target.closest('[data-action="delete-session"]') || !sessCtxRow) return;
+            e.stopPropagation();
+            sessCtx.style.display = 'none';
+            var row = sessCtxRow;
+            confirmAction('Delete session ' + row.dataset.src + ' → ' + row.dataset.dst + '?')
+                .then(function (ok) {
+                    if (!ok) return;
+                    sessionDelete(row.dataset.proto, row.dataset.src, row.dataset.dst)
+                        .then(function (res) { reportClear(res, 'Deleted'); renderSessions(); })
+                        .catch(function (err) { showToast(err.message || 'Delete failed', 'error'); });
+                });
+        });
+    }
+
+    /* Checkbox selection → bulk bar. */
+    var sessTbodyEl = document.getElementById('sess-tbody');
+    if (sessTbodyEl) sessTbodyEl.addEventListener('change', function (e) {
+        if (!e.target.classList || !e.target.classList.contains('sess-row-select')) return;
+        var tr = e.target.closest('tr');
+        if (tr) tr.classList.toggle('row-selected', e.target.checked);
+        updateSessBulkBar();
+    });
+
+    var sessSelectAll = document.getElementById('sess-select-all');
+    if (sessSelectAll) sessSelectAll.addEventListener('change', function () {
+        var on = this.checked;
+        document.querySelectorAll('#sess-tbody .sess-row-select').forEach(function (cb) {
+            cb.checked = on;
+            var tr = cb.closest('tr');
+            if (tr) tr.classList.toggle('row-selected', on);
+        });
+        updateSessBulkBar();
+    });
+
+    var sessBulkCloseBtn = document.getElementById('sess-bulk-close');
+    if (sessBulkCloseBtn) sessBulkCloseBtn.addEventListener('click', clearSessSelection);
+
+    var sessBulkDeleteBtn = document.getElementById('sess-bulk-delete');
+    if (sessBulkDeleteBtn) sessBulkDeleteBtn.addEventListener('click', function () {
+        var rows = selectedSessRows();
+        if (!rows.length) return;
+        var tuples = rows.map(function (r) {
+            return { proto: r.dataset.proto, src: r.dataset.src, dst: r.dataset.dst };
+        });
+        confirmAction('Delete ' + tuples.length + ' selected session' +
+                      (tuples.length === 1 ? '' : 's') + '?').then(function (ok) {
+            if (!ok) return;
+            /* mgmtd caps a batch at 64 tuples; chunk well under that. */
+            var chunks = [];
+            for (var i = 0; i < tuples.length; i += 48)
+                chunks.push(tuples.slice(i, i + 48));
+            var tot = { matched: 0, deleted: 0, failed: 0, incomplete: false };
+            var chain = Promise.resolve();
+            chunks.forEach(function (ch) {
+                chain = chain.then(function () {
+                    return api('/monitor/sessions/clear', { method: 'POST', body: { tuples: ch } })
+                        .then(function (res) {
+                            tot.matched += parseInt(res.matched, 10) || 0;
+                            tot.deleted += parseInt(res.deleted, 10) || 0;
+                            tot.failed += parseInt(res.failed, 10) || 0;
+                            if (res.dump_complete === '0') tot.incomplete = true;
+                        })
+                        .catch(function () { tot.failed += ch.length; });
+                });
+            });
+            chain.then(function () {
+                reportClear({
+                    matched: String(tot.matched),
+                    deleted: String(tot.deleted),
+                    failed: String(tot.failed),
+                    dump_complete: tot.incomplete ? '0' : '1'
+                }, 'Deleted');
+                clearSessSelection();
+                renderSessions();
+            });
+        });
+    });
+
+    /* Clear-by-filter modal — fields match exactly what mgmtd can filter. */
+    var sessClearBtn = document.getElementById('sess-clear-btn');
+    if (sessClearBtn) sessClearBtn.addEventListener('click', function () {
+        var pr = document.getElementById('scf-proto');
+        if (pr) pr.value = (sessFilterProto && sessFilterProto.value) || '';   /* prefill */
+        ['src', 'dst', 'policy', 'iif', 'oif'].forEach(function (k) {
+            var el = document.getElementById('scf-' + k);
+            if (el) el.value = '';
+        });
+        openModal('form-sess-clear');
+    });
+
+    var scfSubmit = document.getElementById('scf-submit');
+    if (scfSubmit) scfSubmit.addEventListener('click', function () {
+        var body = {};
+        ['proto', 'src', 'dst', 'policy', 'iif', 'oif'].forEach(function (k) {
+            var el = document.getElementById('scf-' + k);
+            var v = el ? el.value.trim() : '';
+            if (v) body[k] = v;
+        });
+        if (!Object.keys(body).length) { showToast('Set at least one field', 'error'); return; }
+        confirmAction('Clear all sessions matching this filter?').then(function (ok) {
+            if (!ok) return;
+            api('/monitor/sessions/clear', { method: 'POST', body: body })
+                .then(function (res) {
+                    closeModal(false);
+                    reportClear(res, 'Cleared');
+                    renderSessions();
+                })
+                .catch(function (err) { showToast(err.message || 'Clear failed', 'error'); });
+        });
     });
 
     function formatBytes(n) {
@@ -5877,8 +6081,8 @@
         });
     }
 
-    /* IPS profile select on the policy form. Bỏ "none" (đã thay bằng toggle
-     * ips-status); mặc định built-in "default" (toàn bộ signature) luôn đầu. */
+    /* IPS profile select on the policy form. Drop "none" (replaced by the
+     * ips-status toggle); the built-in "default" (all signatures) is always first. */
     function populateIpsProfileSelects() {
         return cachedApi('/config/security_ips-profile').then(function (data) {
             var entries = (data && data.entries) ? data.entries : [];

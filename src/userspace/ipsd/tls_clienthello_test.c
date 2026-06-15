@@ -2,9 +2,10 @@
 /*
  * tls_clienthello_test.c - test parser ClientHello/SNI.
  *
- * Tự ráp ClientHello bằng byte để kiểm: SNI hợp lệ, không SNI, buffer cụt
- * (NEED_MORE), không phải ClientHello, và các input độc làm tràn nếu thiếu
- * bounds-check (độ dài lồng khai man). Chạy dưới ASan/UBSan: tràn = crash test.
+ * Builds ClientHellos byte-by-byte to test: valid SNI, no SNI, truncated buffer
+ * (NEED_MORE), not a ClientHello, and malicious inputs that would overflow
+ * without bounds-checks (lying nested lengths). Run under ASan/UBSan: an
+ * overflow = a crashed test.
  */
 #include "tls_clienthello.h"
 
@@ -19,7 +20,7 @@ static int g_fail;
 	else         { printf("  ok:   %s\n", msg); }                    \
 } while (0)
 
-/* ---- builder ClientHello động ------------------------------------------- */
+/* ---- dynamic ClientHello builder ---------------------------------------- */
 
 struct buf {
 	uint8_t *d;
@@ -28,7 +29,7 @@ struct buf {
 
 static void bput(struct buf *b, const void *src, size_t n)
 {
-	if (n == 0) return;   /* tránh memcpy(_, NULL, 0) — UB dù n=0 */
+	if (n == 0) return;   /* avoid memcpy(_, NULL, 0) — UB even when n=0 */
 	if (b->len + n > b->cap) {
 		b->cap = (b->len + n) * 2 + 64;
 		b->d = realloc(b->d, b->cap);
@@ -40,12 +41,12 @@ static void b8(struct buf *b, uint8_t v)  { bput(b, &v, 1); }
 static void b16(struct buf *b, uint16_t v){ uint8_t t[2]={v>>8,v&0xff}; bput(b,t,2); }
 
 /*
- * Ráp một ClientHello hợp lệ; nếu sni != NULL thì kèm extension server_name.
- * Trả buffer (caller free d).
+ * Build a valid ClientHello; if sni != NULL, include a server_name extension.
+ * Returns the buffer (caller frees d).
  */
 static struct buf build_ch(const char *sni)
 {
-	struct buf hs = {0};   /* phần thân handshake (sau header 4 byte) */
+	struct buf hs = {0};   /* handshake body (after the 4-byte header) */
 
 	b16(&hs, 0x0303);                 /* client_version TLS 1.2 */
 	for (int i = 0; i < 32; i++) b8(&hs, (uint8_t)i);  /* random */
@@ -95,76 +96,77 @@ int main(void)
 {
 	struct tls_clienthello ch;
 
-	printf("== test 1: ClientHello hợp lệ có SNI ==\n");
+	printf("== test 1: valid ClientHello with SNI ==\n");
 	{
 		struct buf b = build_ch("www.example.com");
 		enum tls_ch_result r = tls_parse_clienthello(b.d, b.len, &ch);
-		CHECK(r == TLS_CH_OK, "kết quả OK");
-		CHECK(ch.has_sni == 1, "có SNI");
-		CHECK(strcmp(ch.sni, "www.example.com") == 0, "SNI đúng nội dung");
+		CHECK(r == TLS_CH_OK, "result OK");
+		CHECK(ch.has_sni == 1, "has SNI");
+		CHECK(strcmp(ch.sni, "www.example.com") == 0, "SNI content correct");
 		CHECK(ch.legacy_version == 0x0303, "client_version 0x0303");
 		free(b.d);
 	}
 
-	printf("== test 2: ClientHello không có SNI ==\n");
+	printf("== test 2: ClientHello without SNI ==\n");
 	{
 		struct buf b = build_ch(NULL);
 		enum tls_ch_result r = tls_parse_clienthello(b.d, b.len, &ch);
-		CHECK(r == TLS_CH_OK, "kết quả OK");
-		CHECK(ch.has_sni == 0, "không SNI");
+		CHECK(r == TLS_CH_OK, "result OK");
+		CHECK(ch.has_sni == 0, "no SNI");
 		free(b.d);
 	}
 
-	printf("== test 3: buffer cụt → NEED_MORE ==\n");
+	printf("== test 3: truncated buffer → NEED_MORE ==\n");
 	{
 		struct buf b = build_ch("truncated.test");
-		/* cắt còn 10 byte: đủ record header, thiếu thân */
+		/* cut to 10 bytes: enough for record header, body missing */
 		enum tls_ch_result r = tls_parse_clienthello(b.d, 10, &ch);
-		CHECK(r == TLS_CH_NEED_MORE, "thiếu thân record → NEED_MORE");
-		/* cắt còn 3 byte: chưa đủ record header */
+		CHECK(r == TLS_CH_NEED_MORE, "missing record body → NEED_MORE");
+		/* cut to 3 bytes: not even a full record header */
 		r = tls_parse_clienthello(b.d, 3, &ch);
-		CHECK(r == TLS_CH_NEED_MORE, "thiếu record header → NEED_MORE");
+		CHECK(r == TLS_CH_NEED_MORE, "missing record header → NEED_MORE");
 		free(b.d);
 	}
 
-	printf("== test 4: không phải ClientHello ==\n");
+	printf("== test 4: not a ClientHello ==\n");
 	{
 		uint8_t app[] = { 23, 0x03, 0x03, 0x00, 0x05, 1,2,3,4,5 };
 		enum tls_ch_result r = tls_parse_clienthello(app, sizeof(app), &ch);
 		CHECK(r == TLS_CH_NOT_CH, "content_type=23 (app data) → NOT_CH");
 
-		/* handshake nhưng msg_type != ClientHello (2 = ServerHello) */
+		/* handshake but msg_type != ClientHello (2 = ServerHello) */
 		uint8_t sh[] = { 22, 0x03,0x03, 0x00,0x04, 0x02, 0x00,0x00,0x00 };
 		r = tls_parse_clienthello(sh, sizeof(sh), &ch);
 		CHECK(r == TLS_CH_NOT_CH, "msg_type=ServerHello → NOT_CH");
 	}
 
-	printf("== test 5: input độc — list_len khai man vượt biên ==\n");
+	printf("== test 5: malicious input — list_len lies past the boundary ==\n");
 	{
 		struct buf b = build_ch("evil.test");
-		/* server_name_list len nằm ngay sau ext header (4B) + ext_len(2B
-		 * của khối extensions). Tìm extension server_name và phá list_len.
-		 * Đơn giản hơn: phá 2 byte cuối thành độ dài rất lớn để chắc chắn
-		 * có chỗ lồng độ dài vượt biên record. */
+		/* server_name_list len sits right after the ext header (4B) +
+		 * ext_len (2B of the extensions block). Locate the server_name
+		 * extension and corrupt list_len. Simpler: corrupt the last 2 bytes
+		 * into a very large length so there is definitely a nested length
+		 * exceeding the record boundary. */
 		b.d[b.len - 1] = 0xff;
 		b.d[b.len - 2] = 0xff;
 		enum tls_ch_result r = tls_parse_clienthello(b.d, b.len, &ch);
 		CHECK(r == TLS_CH_MALFORMED || r == TLS_CH_OK,
-		      "độ dài hỏng → MALFORMED/OK, không crash (ASan)");
+		      "corrupt length → MALFORMED/OK, no crash (ASan)");
 		free(b.d);
 	}
 
-	printf("== test 6: session_id_len khai man ==\n");
+	printf("== test 6: session_id_len lies ==\n");
 	{
 		struct buf b = build_ch("x.test");
-		/* session_id_len ở offset: 5(rec)+4(hs)+2(ver)+32(random) = 43 */
-		b.d[43] = 0xff;   /* nói có 255 byte session_id — vượt khung */
+		/* session_id_len at offset: 5(rec)+4(hs)+2(ver)+32(random) = 43 */
+		b.d[43] = 0xff;   /* claims 255 bytes of session_id — past the frame */
 		enum tls_ch_result r = tls_parse_clienthello(b.d, b.len, &ch);
-		CHECK(r == TLS_CH_MALFORMED, "session_id_len vượt khung → MALFORMED");
+		CHECK(r == TLS_CH_MALFORMED, "session_id_len past frame → MALFORMED");
 		free(b.d);
 	}
 
-	printf("== test 7: record_len lớn hơn buffer → NEED_MORE ==\n");
+	printf("== test 7: record_len larger than buffer → NEED_MORE ==\n");
 	{
 		struct buf b = build_ch("more.test");
 		b.d[3] = 0xff; b.d[4] = 0xff;   /* record_len = 65535 */
@@ -173,21 +175,21 @@ int main(void)
 		free(b.d);
 	}
 
-	printf("== test 8: SNI quá dài → MALFORMED (không tràn sni[]) ==\n");
+	printf("== test 8: SNI too long → MALFORMED (no sni[] overflow) ==\n");
 	{
 		char big[400];
 		memset(big, 'a', sizeof(big) - 1);
 		big[sizeof(big) - 1] = '\0';
 		struct buf b = build_ch(big);
 		enum tls_ch_result r = tls_parse_clienthello(b.d, b.len, &ch);
-		CHECK(r == TLS_CH_MALFORMED, "host_name 399 ký tự → MALFORMED");
+		CHECK(r == TLS_CH_MALFORMED, "399-char host_name → MALFORMED");
 		free(b.d);
 	}
 
-	printf("== test 9: NULL/zero an toàn ==\n");
+	printf("== test 9: NULL/zero safety ==\n");
 	{
 		enum tls_ch_result r = tls_parse_clienthello(NULL, 0, &ch);
-		CHECK(r == TLS_CH_NEED_MORE, "buf NULL → NEED_MORE");
+		CHECK(r == TLS_CH_NEED_MORE, "NULL buf → NEED_MORE");
 		r = tls_parse_clienthello((const uint8_t *)"", 0, &ch);
 		CHECK(r == TLS_CH_NEED_MORE, "len 0 → NEED_MORE");
 	}
@@ -196,6 +198,6 @@ int main(void)
 		printf("\n== %d TEST FAIL ==\n", g_fail);
 		return 1;
 	}
-	printf("\n== TẤT CẢ TLS ClientHello TEST PASS ==\n");
+	printf("\n== ALL TLS ClientHello TESTS PASS ==\n");
 	return 0;
 }

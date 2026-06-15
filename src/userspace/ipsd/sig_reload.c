@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * sig_reload.c - hot-reload ruleset (xem sig_reload.h + Snort README.reload).
+ * sig_reload.c - hot-reload ruleset (see sig_reload.h + Snort README.reload).
  */
 #define _GNU_SOURCE   /* pipe2, O_CLOEXEC, pthread_rwlock_t, sigaction */
 #include "sig_reload.h"
@@ -14,13 +14,14 @@
 #include <time.h>
 #include <errno.h>
 
-/* Con trỏ module-level cho signal handler — bắt buộc vì handler không nhận arg.
- * Chỉ set một lần trong sig_reload_init(); không bao giờ đổi sau đó. */
+/* Module-level pointer for the signal handler — required because the handler
+ * takes no arg. Set once in sig_reload_init(); never changed afterward. */
 static struct sig_reload *sr_global = NULL;
 
 /*
- * P0 — độ phủ thật: ghi breakdown ra file để mgmtd/UI đọc (SG_CMD_IPS_STATUS).
- * "% thực sự enforce" = loaded_full / (loaded_full+loaded_alert). Không giấu.
+ * P0 — true coverage: write the breakdown to a file for mgmtd/UI to read
+ * (SG_CMD_IPS_STATUS). "% actually enforced" = loaded_full /
+ * (loaded_full+loaded_alert). Nothing hidden.
  */
 #define IPSD_STATS_FILE "/run/stargazer-ipsd.stats"
 static void write_load_stats(const struct sig_load_stats *st)
@@ -38,7 +39,7 @@ static void write_load_stats(const struct sig_load_stats *st)
 	fclose(f);
 }
 
-/* ---- signal handler (async-signal-safe: chỉ write) ----------------------- */
+/* ---- signal handler (async-signal-safe: write only) --------------------- */
 
 static void sigusr1_handler(int sig)
 {
@@ -46,8 +47,8 @@ static void sigusr1_handler(int sig)
 	if (!sr_global)
 		return;
 	char b = 'R';
-	/* write() là async-signal-safe. Lỗi bỏ qua — nếu pipe đầy thì SIGUSR1
-	 * đã được báo hiệu rồi (1 byte tồn đọng = đủ để trigger). */
+	/* write() is async-signal-safe. Errors ignored — if the pipe is full then
+	 * SIGUSR1 has already been signaled (1 pending byte = enough to trigger). */
 	(void)write(sr_global->pipe_wr, &b, 1);
 }
 
@@ -60,7 +61,7 @@ static void *reload_thread_fn(void *arg)
 	struct sig_load_stats st;
 	int rc;
 
-	/* [a] cấp phát + init ruleset mới */
+	/* [a] allocate + init new ruleset */
 	fresh = malloc(sizeof(*fresh));
 	if (!fresh) {
 		fprintf(stderr, "sig_reload: malloc failed\n");
@@ -68,7 +69,7 @@ static void *reload_thread_fn(void *arg)
 	}
 	sig_ruleset_init(fresh);
 
-	/* [b] nạp từ đĩa */
+	/* [b] load from disk */
 	pthread_mutex_lock(&sr->spawn_lock);
 	char path[256];
 	memcpy(path, sr->rules_path, sizeof(path));
@@ -99,7 +100,7 @@ static void *reload_thread_fn(void *arg)
 		st.skipped_no_content, st.skipped_no_sid, st.errors, path);
 	write_load_stats(&st);
 
-	/* [c] build AC — bước tốn kém; bản cũ vẫn chạy trong lúc này */
+	/* [c] build AC — the expensive step; the old version keeps running meanwhile */
 	if (sig_build(fresh) != 0) {
 		fprintf(stderr, "sig_reload: sig_build failed — rollback\n");
 		sig_ruleset_free(fresh);
@@ -107,21 +108,25 @@ static void *reload_thread_fn(void *arg)
 		goto fail;
 	}
 
-	/* [d-f] swap dưới write-lock: sau khi lock xong KHÔNG malloc/free */
+	/* Apply the current per-profile selection onto the freshly built table so the
+	 * new automaton comes up already scoped (a table reload implies a full apply). */
+	sig_load_profile_maps(fresh, sr->prof_dir);
+
+	/* [d-f] swap under write-lock: NO malloc/free once the lock is held */
 	{
 		struct sig_ruleset *old;
 		pthread_rwlock_wrlock(&sr->rwlock);
 		old        = sr->active;
-		sr->active = fresh;     /* atomic từ góc nhìn reader */
+		sr->active = fresh;     /* atomic from the reader's point of view */
 		sr->pending = NULL;
 		pthread_rwlock_unlock(&sr->rwlock);
 
-		/* [g] free bản cũ SAU khi đã unlock — không còn reader nào giữ ref */
+		/* [g] free the old version AFTER unlocking — no reader holds a ref anymore */
 		sig_ruleset_free(old);
 		free(old);
 	}
 
-	/* [h] thống kê + đánh dấu rảnh */
+	/* [h] stats + mark idle */
 	sr->reload_count++;
 	sr->last_result = 0;
 	pthread_mutex_lock(&sr->spawn_lock);
@@ -151,28 +156,53 @@ int sig_reload_init(struct sig_reload *sr, const char *rules_path)
 	memset(sr, 0, sizeof(*sr));
 	sr->pipe_rd = sr->pipe_wr = -1;
 
-	/* ruleset ban đầu */
+	/* initial ruleset */
 	initial = malloc(sizeof(*initial));
 	if (!initial)
 		return -1;
 	sig_ruleset_init(initial);
 
-	if (sig_load_file(initial, rules_path, &st) < 0 || st.loaded == 0) {
+	/* A bad/empty on-disk ruleset must NOT crash-loop ipsd (mgmtd no longer
+	 * pre-verifies it). Fall back to an empty-but-valid ruleset and keep
+	 * running (inspects nothing); a later SIGUSR1 reload recovers once mgmtd
+	 * writes a good active.rules. Only a true infra failure (empty build) is
+	 * fatal. */
+	if (sig_load_file(initial, rules_path, &st) < 0 || st.loaded == 0 ||
+	    sig_build(initial) != 0) {
 		fprintf(stderr,
-			"sig_reload_init: failed to load %s (loaded=%d err=%d)\n",
+			"sig_reload_init: %s unusable — starting with an empty ruleset "
+			"(loaded=%d err=%d); a SIGUSR1 reload will recover\n",
 			rules_path, st.loaded, st.errors);
 		sig_ruleset_free(initial);
-		free(initial);
-		return -1;
-	}
-	if (sig_build(initial) != 0) {
-		fprintf(stderr, "sig_reload_init: sig_build failed\n");
-		sig_ruleset_free(initial);
-		free(initial);
-		return -1;
+		sig_ruleset_init(initial);          /* reset to empty */
+		if (sig_build(initial) != 0) {      /* root-only build; should never fail */
+			fprintf(stderr, "sig_reload_init: empty sig_build failed\n");
+			free(initial);
+			return -1;
+		}
 	}
 	sr->active = initial;
 	snprintf(sr->rules_path, sizeof(sr->rules_path), "%s", rules_path);
+
+	/* prof_dir = sibling "profiles/" of the rules/ dir: strip "/active.rules"
+	 * then "/rules", append "/profiles" (".../ips/rules/active.rules" →
+	 * ".../ips/profiles"). */
+	snprintf(sr->prof_dir, sizeof(sr->prof_dir), "%s", rules_path);
+	{
+		char *s = strrchr(sr->prof_dir, '/');     /* → "/active.rules" */
+		if (s) *s = '\0';
+		s = strrchr(sr->prof_dir, '/');           /* → "/rules"        */
+		if (s) {
+			*s = '\0';
+			size_t n = strlen(sr->prof_dir);
+			snprintf(sr->prof_dir + n, sizeof(sr->prof_dir) - n, "/profiles");
+		} else {
+			snprintf(sr->prof_dir, sizeof(sr->prof_dir), "profiles");
+		}
+	}
+	/* Apply current per-profile selection onto the initial table (no-op if the
+	 * dir is absent — e.g. before any profile is compiled). */
+	sig_load_profile_maps(initial, sr->prof_dir);
 
 	/* self-pipe non-blocking + close-on-exec */
 	if (pipe2(fds, O_NONBLOCK | O_CLOEXEC) != 0) {
@@ -192,7 +222,7 @@ int sig_reload_init(struct sig_reload *sr, const char *rules_path)
 		return -1;
 	}
 
-	/* SIGUSR1 handler: async-signal-safe, SA_RESTART agar syscall tidak terputus */
+	/* SIGUSR1 handler: async-signal-safe, SA_RESTART so syscalls are not interrupted */
 	sr_global = sr;
 	struct sigaction sa;
 	memset(&sa, 0, sizeof(sa));
@@ -211,18 +241,18 @@ int sig_reload_init(struct sig_reload *sr, const char *rules_path)
 	return 0;
 }
 
-/* Spawn reload thread. Caller MUST hold spawn_lock. Trả 0/-1. */
+/* Spawn reload thread. Caller MUST hold spawn_lock. Returns 0/-1. */
 static int spawn_reload_locked(struct sig_reload *sr)
 {
 	if (sr->thread != 0)
-		return 1;    /* đang reload rồi */
+		return 1;    /* already reloading */
 
 	pthread_t tid;
 	if (pthread_create(&tid, NULL, reload_thread_fn, sr) != 0) {
 		fprintf(stderr, "sig_reload: pthread_create failed\n");
 		return -1;
 	}
-	/* detach: thread tự dọn; sig_reload_wait() join bằng cách poll sr->thread */
+	/* detach: thread cleans up itself; sig_reload_wait() joins by polling sr->thread */
 	pthread_detach(tid);
 	sr->thread = tid;
 	return 0;
@@ -230,7 +260,7 @@ static int spawn_reload_locked(struct sig_reload *sr)
 
 int sig_reload_handle_signal(struct sig_reload *sr)
 {
-	/* drain pipe (có thể nhiều byte nếu signal đến nhiều lần) */
+	/* drain pipe (may be multiple bytes if the signal arrived several times) */
 	char buf[64];
 	while (read(sr->pipe_rd, buf, sizeof(buf)) > 0)
 		;
@@ -255,6 +285,16 @@ int sig_reload_match(struct sig_reload *sr, const uint8_t *payload,
 	return r;
 }
 
+int sig_reload_apply_scope(struct sig_reload *sr)
+{
+	/* Re-read the per-profile maps onto the live ruleset under the write-lock.
+	 * In-place field updates over rules[] — NO automaton rebuild. */
+	pthread_rwlock_wrlock(&sr->rwlock);
+	int rc = sig_load_profile_maps(sr->active, sr->prof_dir);
+	pthread_rwlock_unlock(&sr->rwlock);
+	return rc;
+}
+
 int sig_reload_trigger(struct sig_reload *sr, const char *new_path)
 {
 	pthread_mutex_lock(&sr->spawn_lock);
@@ -262,12 +302,12 @@ int sig_reload_trigger(struct sig_reload *sr, const char *new_path)
 		snprintf(sr->rules_path, sizeof(sr->rules_path), "%s", new_path);
 	int rc = spawn_reload_locked(sr);
 	pthread_mutex_unlock(&sr->spawn_lock);
-	return (rc == 1) ? 1 : rc;    /* 1 = đang bận, 0 = started, -1 = error */
+	return (rc == 1) ? 1 : rc;    /* 1 = busy, 0 = started, -1 = error */
 }
 
 int sig_reload_wait(struct sig_reload *sr)
 {
-	/* poll sr->thread (đã detach nên không join được) với sleep ngắn */
+	/* poll sr->thread (detached, so cannot join) with a short sleep */
 	for (int i = 0; i < 5000; i++) {
 		pthread_mutex_lock(&sr->spawn_lock);
 		int idle = (sr->thread == 0);
@@ -277,7 +317,7 @@ int sig_reload_wait(struct sig_reload *sr)
 		struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 }; /* 1ms */
 		nanosleep(&ts, NULL);
 	}
-	/* sau 5 giây vẫn không xong — bất thường, trả lỗi */
+	/* still not done after 5 seconds — abnormal, return error */
 	fprintf(stderr, "sig_reload_wait: timeout waiting for reload thread\n");
 	return -1;
 }
@@ -287,7 +327,7 @@ void sig_reload_free(struct sig_reload *sr)
 	if (!sr)
 		return;
 
-	/* đợi thread xong trước khi free */
+	/* wait for the thread to finish before freeing */
 	sig_reload_wait(sr);
 
 	if (sr->active) {

@@ -146,14 +146,20 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize);
 sg_status_t rebuild_nat_chains(char *result, size_t rsize);
 
 /* ── IPS ruleset compile + hot-reload (mgmtd_apply_ips.c, Phase B) ───────── */
-/* Compile per-profile rulesets + union active.rules từ repo theo categories,
- * verify bằng ipsd -C, atomic swap, SIGUSR1 ipsd. Gọi sau khi đổi
+/* Compile per-profile rulesets + union active.rules from the repo by category,
+ * verify with ipsd -C, atomic swap, SIGUSR1 ipsd. Called after changing
  * security_ips / security_ips-profile / firewall_policy. */
 sg_status_t rebuild_ips_active(char *result, size_t rsize);
-/* Bit index ổn định (0..30) cho IPS profile enable, theo thứ tự sg_db_list. Dùng
- * CHUNG bởi firewall (skb MARK = bit+1) và ips compile (sgprof:bit; → mask) để hai
- * bên khớp số. -1 nếu profile không tồn tại / disable / vượt 31 profile. */
+/* Stable bit index (0..30) for IPS profile enable, in sg_db_list order. Shared
+ * by both the firewall (skb MARK = bit+1) and ips compile (sgprof:bit; → mask)
+ * so the two sides agree on the number. -1 if the profile does not exist /
+ * is disabled / exceeds 31 profiles. */
 int ips_profile_bit(const char *name);
+/* Stable per-profile id (1..31): returns the security_ips-profile `profid`
+ * attribute, auto-assigning + persisting the lowest free id if unset. Drives the
+ * scope bit, the <profid>.rules map filename, and the iptables MARK. -1 if the
+ * name is empty or all 31 ids are taken. */
+int ips_profid(const char *name);
 sg_status_t run_ips_update_now(const char *ids_csv, char *result, size_t rsize);
 sg_status_t ips_rulesets_reload_custom(char *result, size_t rsize);
 
@@ -162,8 +168,9 @@ sg_status_t validate_firewall_policy(const char *id, const char *data,
 				     char *result, size_t rsize);
 sg_status_t validate_nat(const char *id, const char *data,
 			 char *result, size_t rsize);
-/* IPS bật trên policy theo toggle ips-status (tương thích ngược với policy cũ
- * chưa có ips-status). Dùng cho cả forward chain lẫn SSL steering coupling. */
+/* IPS enabled on a policy per the ips-status toggle (backward compatible with
+ * old policies that have no ips-status). Used by both the forward chain and
+ * the SSL steering coupling. */
 int ips_policy_on(const char *status, const char *profile);
 
 sg_status_t validate_ips(const char *id, const char *data,
@@ -179,8 +186,8 @@ sg_status_t validate_ips(const char *id, const char *data,
  * proceeds — fail-safe = no steering, normal traffic). */
 int emit_ssl_steering(struct dynbuf *buf);
 
-/* Start/stop/restart stargazer-ssld theo security_ssl-inspection-profile.
- * Gọi sau khi rebuild_nat_chains apply steering. off-by-default → no-op. */
+/* Start/stop/restart stargazer-ssld per security_ssl-inspection-profile.
+ * Called after rebuild_nat_chains applies steering. off-by-default → no-op. */
 void ssld_sync(void);
 
 /* ── Per-feature apply handlers ─────────────────────────────────────────── */

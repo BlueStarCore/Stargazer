@@ -1,11 +1,12 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * ml_scan.c - cache init_win + ghi điểm checkpoint (xem ml_scan.h).
+ * ml_scan.c - init_win cache + checkpoint scoring (see ml_scan.h).
  *
- * ML KHÔNG còn chạy bằng thread polling. process_packet (main.c) chấm ML đúng
- * 1 lần/flow tại CHECKPOINT min(N gói, K byte, T tuổi) khi signature chưa khớp;
- * mỗi lần chấm gọi ml_record_score() → ring RAM; main loop gọi ml_scores_flush()
- * đẩy ra /run/stargazer-ipsd.scores cho `execute diagnose ips scores`.
+ * ML is NO longer driven by a polling thread. process_packet (main.c) scores ML
+ * exactly once per flow at the CHECKPOINT min(N packets, K bytes, T age) when no
+ * signature has matched; each scoring calls ml_record_score() → RAM ring; the
+ * main loop calls ml_scores_flush() to push to /run/stargazer-ipsd.scores for
+ * `execute diagnose ips scores`.
  */
 #define _GNU_SOURCE
 #include "ml_scan.h"
@@ -21,20 +22,23 @@
 #define THR_ALERT   0.50
 #define THR_BLOCK   0.95
 
-/* ---- cache Init_Win_bytes_forward theo flow ------------------------------
+/* ---- per-flow Init_Win_bytes_forward cache -------------------------------
  *
- * init_win là feature trọng số CAO; nếu cache MISS (→ -1) model nghiêng BENIGN
- * (trong CIC-IDS-2017, init_win=-1 ⇒ 0% attack), tức -1 = FALSE NEGATIVE tiềm
- * tàng. Vì vậy cache phải sống đến checkpoint (min N=16 gói / 14KB / 8s) NGAY
- * CẢ DƯỚI TẢI DoS (slowhttptest -c 1000 -r 200 mở hàng nghìn flow/giây).
+ * init_win is a HIGH-weight feature; on a cache MISS (→ -1) the model leans
+ * BENIGN (in CIC-IDS-2017, init_win=-1 ⇒ 0% attack), so -1 is a potential FALSE
+ * NEGATIVE. The cache must therefore survive until the checkpoint (min N=16
+ * packets / 14KB / 8s) EVEN UNDER DoS LOAD (slowhttptest -c 1000 -r 200 opens
+ * thousands of flows per second).
  *
- * Thiết kế chống evict:
- *   - SET-ASSOCIATIVE 4-way: một va chạm băm KHÔNG evict ngay, phải đầy cả 4 way
- *     mới thay nạn nhân CŨ NHẤT (theo stamp) → giữ flow mới đủ lâu tới checkpoint.
- *   - Bảng 16384 bucket × 4 = 65536 entry (~1.3MB) — thừa cho vài chục nghìn
- *     flow đồng thời.
- *   - TRA CẢ HAI HƯỚNG tuple: put lưu tuple SYN xuôi (client→server) nhưng gói
- *     checkpoint có thể là gói NGƯỢC (server→client) → get thử cả tuple đảo. */
+ * Anti-evict design:
+ *   - 4-way SET-ASSOCIATIVE: one hash collision does NOT evict immediately; all
+ *     4 ways must be full before the OLDEST victim (by stamp) is replaced → new
+ *     flows survive long enough to reach the checkpoint.
+ *   - 16384 buckets × 4 = 65536 entries table (~1.3MB) — ample for tens of
+ *     thousands of concurrent flows.
+ *   - LOOK UP BOTH tuple DIRECTIONS: put stores the forward SYN tuple
+ *     (client→server) but the checkpoint packet may be the REVERSE packet
+ *     (server→client) → get also tries the reversed tuple. */
 #define IWIN_BUCKETS 16384   /* power-of-2 */
 #define IWIN_WAYS    4
 struct iwin_ent {
@@ -42,10 +46,10 @@ struct iwin_ent {
 	uint16_t sp, dp;
 	uint8_t  proto, used;
 	int32_t  win;
-	uint32_t stamp;          /* thứ tự nạp — evict stamp nhỏ nhất (cũ nhất) */
+	uint32_t stamp;          /* insertion order — evict smallest (oldest) stamp */
 };
 static struct iwin_ent  g_iwin[IWIN_BUCKETS][IWIN_WAYS];
-static uint32_t          g_iwin_stamp;   /* bộ đếm nạp, bảo vệ bởi g_iwin_lk */
+static uint32_t          g_iwin_stamp;   /* insertion counter, guarded by g_iwin_lk */
 static pthread_mutex_t   g_iwin_lk = PTHREAD_MUTEX_INITIALIZER;
 
 static uint32_t iwin_hash(uint8_t proto, uint32_t sip, uint32_t dip,
@@ -68,26 +72,26 @@ void ml_iwin_put(uint8_t proto, uint32_t sip, uint32_t dip,
 	uint32_t b = iwin_hash(proto, sip, dip, sp, dp);
 	pthread_mutex_lock(&g_iwin_lk);
 	struct iwin_ent *set = g_iwin[b];
-	int victim = -1;              /* way trống nếu có */
-	int oldest_w = 0;            /* way cũ nhất (fallback khi đầy) */
+	int victim = -1;              /* free way if any */
+	int oldest_w = 0;            /* oldest way (fallback when full) */
 	uint32_t oldest = UINT32_MAX;
 	for (int w = 0; w < IWIN_WAYS; w++) {
 		struct iwin_ent *e = &set[w];
-		/* tuple đã có → cập nhật tại chỗ (refresh stamp) */
+		/* tuple already present → update in place (refresh stamp) */
 		if (e->used && e->sip == sip && e->dip == dip &&
 		    e->sp == sp && e->dp == dp && e->proto == proto) {
 			oldest_w = w;
 			goto install;
 		}
 		if (!e->used && victim < 0)
-			victim = w;          /* nhớ way trống đầu tiên */
+			victim = w;          /* remember the first free way */
 		if (e->stamp < oldest) {
 			oldest = e->stamp;
-			oldest_w = w;        /* nạn nhân cũ nhất nếu phải evict */
+			oldest_w = w;        /* oldest victim if eviction is needed */
 		}
 	}
 	if (victim >= 0)
-		oldest_w = victim;          /* ưu tiên way trống */
+		oldest_w = victim;          /* prefer a free way */
 install:
 	{
 		struct iwin_ent *e = &set[oldest_w];
@@ -98,7 +102,7 @@ install:
 	pthread_mutex_unlock(&g_iwin_lk);
 }
 
-/* Tra một hướng tuple trong set (gọi dưới lock). -1 nếu không khớp. */
+/* Look up one tuple direction in the set (called under lock). -1 if no match. */
 static int32_t iwin_lookup_locked(uint8_t proto, uint32_t sip, uint32_t dip,
 				  uint16_t sp, uint16_t dp)
 {
@@ -117,22 +121,22 @@ int32_t ml_iwin_get(uint8_t proto, uint32_t sip, uint32_t dip,
 		    uint16_t sp, uint16_t dp)
 {
 	pthread_mutex_lock(&g_iwin_lk);
-	/* Hướng xuôi (gói checkpoint là client→server). */
+	/* Forward direction (checkpoint packet is client→server). */
 	int32_t r = iwin_lookup_locked(proto, sip, dip, sp, dp);
-	/* Miss → thử tuple ĐẢO: gói checkpoint là server→client nhưng init_win
-	 * lưu theo tuple SYN xuôi. */
+	/* Miss → try the REVERSED tuple: the checkpoint packet is server→client
+	 * but init_win was stored under the forward SYN tuple. */
 	if (r < 0)
 		r = iwin_lookup_locked(proto, dip, sip, dp, sp);
 	pthread_mutex_unlock(&g_iwin_lk);
 	return r;
 }
 
-/* ---- ring điểm flow đã chấm ----------------------------------------------- */
+/* ---- ring of scored flows ------------------------------------------------- */
 #define SCORE_RING 256
 static char g_score_ring[SCORE_RING][192];
 static int  g_score_pos;
 static int  g_score_full;
-static int  g_score_dirty;   /* có gì mới chưa flush */
+static int  g_score_dirty;   /* something new not yet flushed */
 
 static const char *verdict_str(double s)
 {

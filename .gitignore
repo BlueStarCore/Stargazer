@@ -49,13 +49,13 @@ ai-conversation/
 # Local code-intelligence index (codegraph MCP)
 .codegraph/
 
-# ML training / pcap-tooling artifacts (không phải mã nguồn, dung lượng lớn)
+# ML training / pcap-tooling artifacts (not source code, large in size)
 CICFlowMeter/
 Machine Learning/
 *.pcap
 error_screenshot.png
 
-# Pentest / lab artifacts (không phải mã nguồn — tái tạo được, đừng commit)
+# Pentest / lab artifacts (not source code — reproducible, do not commit)
 hulk/
 hydra.restore
 *.restore

@@ -1,21 +1,22 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * mgmtd_apply_ips.c — Biên dịch + nạp ruleset IPS theo profile/filter (Phase B
+ * mgmtd_apply_ips.c — Compile + load the IPS ruleset per profile/filter (Phase B
  * + FortiGate-style filter).
  *
- * Kho global : /etc/stargazer/ips/repo/<category>.rules
+ * Global repo: /etc/stargazer/ips/repo/<category>.rules
  * Per-profile: /etc/stargazer/ips/profiles/<name>.rules
- *              compile từ bảng security_ips-filter (category/signature + action
- *              per-entry kiểu FortiGate, P7), hoặc fallback field `categories`
- *              nếu profile chưa có filter nào.
- * Active     : /etc/stargazer/ips/rules/active.rules = NỐI ruleset của các
- *              profile đang được policy accept dùng.
+ *              compiled from the security_ips-filter table (category/signature +
+ *              per-entry action, FortiGate-style, P7), or fall back to the
+ *              `categories` field if the profile has no filters.
+ * Active     : /etc/stargazer/ips/rules/active.rules = CONCATENATION of the
+ *              rulesets of every profile in use by an accept policy.
  *
- * rebuild_ips_active(): compile từng profile enable → verify ipsd -C → atomic
- * swap active.rules → SIGUSR1 ipsd (hot-reload không gián đoạn).
+ * rebuild_ips_active(): compile each enabled profile → verify with ipsd -C →
+ * atomic swap active.rules → SIGUSR1 ipsd (uninterrupted hot-reload).
  *
- * GIỚI HẠN: ipsd 1 queue/1 ruleset → active = nối các profile in-use; chưa
- * phân biệt per-flow theo policy (bước sau: ipsd chọn ruleset theo connmark).
+ * LIMITATION: ipsd has 1 queue / 1 ruleset → active = concatenation of the
+ * in-use profiles; per-flow distinction by policy not yet supported (later step:
+ * ipsd selects a ruleset by connmark).
  */
 #define _POSIX_C_SOURCE 200809L
 #include "mgmtd_apply.h"
@@ -28,6 +29,7 @@
 #include <signal.h>
 #include <time.h>
 #include <dirent.h>
+#include <unistd.h>
 #include <sys/stat.h>
 
 #define IPS_BASE_DIR   "/etc/stargazer/ips"
@@ -39,14 +41,25 @@
 #define IPSD_BIN       "/sbin/stargazer-ipsd"
 #define MAX_FILTERS    256
 
-/* Verify ruleset bằng ipsd -C. Trả 0 nếu hợp lệ (exit 0). */
-static int ips_verify(const char *path)
+/* Byte-compare two files without loading them (active.rules can be tens of MB).
+ * Returns 1 if identical, 0 otherwise (including if either cannot be opened). */
+static int files_equal(const char *a, const char *b)
 {
-	const char *argv[] = { IPSD_BIN, "-C", "-r", path, "-n", NULL };
-	int code = -1;
-	char *out = pipe_exec_stdin(argv, "", 0, &code);
-	free(out);
-	return code == 0 ? 0 : -1;
+	FILE *fa = fopen(a, "rb");
+	FILE *fb = fopen(b, "rb");
+	int eq = 1;
+	if (!fa || !fb)
+		eq = 0;
+	while (eq) {
+		char ba[8192], bb[8192];
+		size_t na = fread(ba, 1, sizeof(ba), fa);
+		size_t nb = fread(bb, 1, sizeof(bb), fb);
+		if (na != nb || memcmp(ba, bb, na) != 0) { eq = 0; break; }
+		if (na == 0) break;   /* both at EOF, all equal */
+	}
+	if (fa) fclose(fa);
+	if (fb) fclose(fb);
+	return eq;
 }
 
 static int parse_filter_type(const char *s)
@@ -66,8 +79,8 @@ static int parse_filter_action(const char *s)
 }
 
 /*
- * Gom filter (status=enable) thuộc `profile` vào out[]. Trả số filter.
- * Mỗi entry mang type/value + action per-entry (P7).
+ * Gather the filters (status=enable) belonging to `profile` into out[]. Returns
+ * the filter count. Each entry carries type/value + per-entry action (P7).
  */
 static int gather_filters(const char *profile, struct ips_filter *out, int max)
 {
@@ -98,9 +111,9 @@ static int gather_filters(const char *profile, struct ips_filter *out, int max)
 }
 
 /*
- * Compile MỘT profile → profiles/<name>.rules. Ưu tiên bảng filter; nếu profile
- * chưa có filter nào → fallback field `categories` (back-compat Phase B).
- * Trả số rule, -1 nếu lỗi.
+ * Compile ONE profile → profiles/<name>.rules. Prefer the filter table; if the
+ * profile has no filters → fall back to the `categories` field (Phase B
+ * back-compat). Returns the rule count, -1 on error.
  */
 static int compile_one_profile(const char *name, char *out_path, size_t opcap)
 {
@@ -109,9 +122,37 @@ static int compile_one_profile(const char *name, char *out_path, size_t opcap)
 	struct ips_filter filters[MAX_FILTERS];
 	int nf = gather_filters(name, filters, MAX_FILTERS);
 
+	/* Signature filters are per-sid action OVERRIDES layered on a category base.
+	 * If the profile defines its base via the `categories` field (no category-type
+	 * filter) but adds signature filters, inject the categories as category filters
+	 * so the overrides overlay the full selection — otherwise ips_compile_filters
+	 * would emit ONLY the listed sids and silently drop every other rule (the
+	 * profile collapses, and even the overridden sid loses its default alert). */
+	int have_cat = 0;
+	for (int i = 0; i < nf; i++)
+		if (filters[i].type == IPS_FT_CATEGORY) { have_cat = 1; break; }
+	if (nf > 0 && !have_cat) {
+		char *cat = sg_db_get_val("security_ips-profile", name, "categories");
+		char tmp[1024];
+		snprintf(tmp, sizeof(tmp), "%s", (cat && cat[0]) ? cat : "all");
+		char *sp = NULL;
+		for (char *c = strtok_r(tmp, ",", &sp); c && nf < MAX_FILTERS;
+		     c = strtok_r(NULL, ",", &sp)) {
+			while (*c == ' ' || *c == '\t') c++;
+			char *e = c + strlen(c);
+			while (e > c && (e[-1] == ' ' || e[-1] == '\t')) *--e = '\0';
+			if (!*c) continue;
+			filters[nf].type   = IPS_FT_CATEGORY;
+			filters[nf].action = IPS_FA_DEFAULT;   /* base keeps each rule's action */
+			snprintf(filters[nf].value, sizeof(filters[nf].value), "%s", c);
+			nf++;
+		}
+		free(cat);
+	}
+
 	if (nf > 0) {
 		int r = ips_compile_filters(IPS_REPO_DIR, filters, nf, out_path);
-		mgmt_log("INFO", "ips: profile '%s' compiled từ %d filter → %d rule",
+		mgmt_log("INFO", "ips: profile '%s' compiled from %d filter(s) → %d rule(s)",
 			 name, nf, r);
 		return r;
 	}
@@ -120,7 +161,7 @@ static int compile_one_profile(const char *name, char *out_path, size_t opcap)
 	char *cat = sg_db_get_val("security_ips-profile", name, "categories");
 	int r = ips_compile_categories(IPS_REPO_DIR,
 				       (cat && cat[0]) ? cat : "all", out_path);
-	mgmt_log("INFO", "ips: profile '%s' compiled từ categories '%s' → %d rule",
+	mgmt_log("INFO", "ips: profile '%s' compiled from categories '%s' → %d rule(s)",
 		 name, (cat && cat[0]) ? cat : "all", r);
 	free(cat);
 	return r;
@@ -143,7 +184,7 @@ int ips_profile_bit(const char *name)
 		if (!en)
 			continue;
 		if (idx > 30)
-			break;                  /* hết bit cho uint32 mask */
+			break;                  /* out of bits for the uint32 mask */
 		if (strcmp(id, name) == 0) { bit = idx; break; }
 		idx++;
 	}
@@ -151,73 +192,17 @@ int ips_profile_bit(const char *name)
 	return bit;
 }
 
-/* ── Dedup theo sid khi gộp active.rules (per-policy scoping) ───────────────
- * Một sid có thể nằm trong NHIỀU profile in-use. Aho-Corasick của ipsd chỉ giữ
- * MỘT rule / pattern (last-wins) → emit sid trùng nhiều lần sẽ che bớt bản sao.
- * Vì vậy gộp: mỗi sid emit ĐÚNG MỘT lần, `sgprof:` = OR bit MỌI profile chứa nó.
- * Map sid→mask: open-addressing, key uint32, 8B/slot. */
-struct sidslot { uint32_t sid, mask; uint8_t used, emitted; };
-
-static struct sidslot *sidmap_get(struct sidslot *m, size_t cap, uint32_t sid)
-{
-	size_t i = ((size_t)sid * 2654435761u) & (cap - 1);
-	for (size_t n = 0; n < cap; n++) {
-		struct sidslot *e = &m[i];
-		if (!e->used) { e->used = 1; e->sid = sid; return e; }
-		if (e->sid == sid) return e;
-		i = (i + 1) & (cap - 1);
-	}
-	return NULL;            /* đầy (cap chọn dư) — bỏ qua dedup cho sid này */
-}
-
-/* Trích sid từ một dòng rule Suricata; 0 nếu không có. */
+/* Extract the sid from a Suricata rule line; 0 if none. */
 static uint32_t line_sid(const char *line)
 {
 	const char *s = strstr(line, "sid:");
 	return s ? (uint32_t)strtoul(s + 4, NULL, 10) : 0;
 }
 
-/* Pass 1: quét file rule của một profile, OR bit vào mask của từng sid. */
-static void sidmap_scan(struct sidslot *m, size_t cap, const char *path, int bit)
-{
-	if (bit < 0) return;
-	FILE *in = fopen(path, "r");
-	if (!in) return;
-	char line[16384];
-	while (fgets(line, sizeof(line), in)) {
-		uint32_t sid = line_sid(line);
-		if (!sid) continue;
-		struct sidslot *e = sidmap_get(m, cap, sid);
-		if (e) e->mask |= (1u << bit);
-	}
-	fclose(in);
-}
 
-/* Pass 2: emit rule của một profile, mỗi sid CHỈ một lần (lần đầu gặp), gắn
- * `sgprof:0x<mask>;` trước ')' cuối. Trả 1 nếu mở được file. */
-static int sidmap_emit(FILE *dst, struct sidslot *m, size_t cap,
-		       const char *path)
-{
-	FILE *in = fopen(path, "r");
-	if (!in) return 0;
-	char line[16384];
-	while (fgets(line, sizeof(line), in)) {
-		uint32_t sid = line_sid(line);
-		char *rp = strrchr(line, ')');
-		if (!sid || !rp || line[0] == '#') continue;  /* chỉ emit dòng rule */
-		struct sidslot *e = sidmap_get(m, cap, sid);
-		if (!e || e->emitted) continue;               /* đã emit → bỏ (dedup) */
-		e->emitted = 1;
-		*rp = '\0';
-		fprintf(dst, "%s sgprof:0x%x;)%s", line, e->mask, rp + 1);
-	}
-	fclose(in);
-	return 1;
-}
-
-/* Ghi /etc/stargazer/ips/.update.conf cho cron (ips-update-cron.sh) đọc —
- * tránh cron phải gọi ipc-cli (vấn đề auth). Liệt kê tất cả enabled ruleset
- * từ bảng security_ips-ruleset. */
+/* Write /etc/stargazer/ips/.update.conf for cron (ips-update-cron.sh) to read —
+ * avoids cron having to call ipc-cli (auth issue). Lists every enabled ruleset
+ * from the security_ips-ruleset table. */
 static void ips_write_update_conf(void)
 {
 	char *en = sg_db_get_val("security_ips", "0", "auto-update");
@@ -227,7 +212,7 @@ static void ips_write_update_conf(void)
 	fprintf(f, "enabled=%s\n", (en && en[0]) ? en : "disable");
 	free(en);
 
-	/* Liệt kê enabled entries từ security_ips-ruleset */
+	/* List enabled entries from security_ips-ruleset */
 	char *ids = sg_db_list("security_ips-ruleset");
 	int count = 0;
 	if (ids) {
@@ -247,153 +232,294 @@ static void ips_write_update_conf(void)
 	fclose(f);
 }
 
-sg_status_t rebuild_ips_active(char *result, size_t rsize)
+int ips_profid(const char *name)
 {
-	/* Đảm bảo CẢ cây thư mục IPS tồn tại (no-op nếu có). Trên device,
-	 * /etc/stargazer là partition lưu trữ riêng (sống qua firmware upgrade) —
-	 * nếu được tạo bởi firmware cũ chưa có cây IPS thì rules/ có thể thiếu →
-	 * fopen(IPS_ACTIVE_TMP) fail "cannot open active tmp" → ipsd không bao giờ
-	 * có active.rules để nạp. mkdir tuần tự vì mkdir() không tạo parent. */
+	if (!name || !*name)
+		return -1;
+	char *v = sg_db_get_val("security_ips-profile", name, "profid");
+	int id = v ? atoi(v) : 0;
+	free(v);
+	if (id >= 1 && id <= 31)
+		return id;
+
+	/* Assign the lowest free id 1..31 and persist it (stable thereafter). */
+	char used[32] = {0};
+	char *list = sg_db_list("security_ips-profile");
+	if (list) {
+		char *sp = NULL;
+		for (char *p = strtok_r(list, "\n", &sp); p;
+		     p = strtok_r(NULL, "\n", &sp)) {
+			char *pv = sg_db_get_val("security_ips-profile", p, "profid");
+			int pid = pv ? atoi(pv) : 0;
+			free(pv);
+			if (pid >= 1 && pid <= 31) used[pid] = 1;
+		}
+		free(list);
+	}
+	int n = -1;
+	for (int i = 1; i <= 31; i++)
+		if (!used[i]) { n = i; break; }
+	if (n < 0)
+		return -1;                          /* all 31 ids taken */
+	char buf[8];
+	snprintf(buf, sizeof(buf), "%d", n);
+	sg_db_set_val("security_ips-profile", name, "profid", buf);
+	return n;
+}
+
+/* Build profiles/<profid>.rules = "sid action" for one profile. Reuses
+ * compile_one_profile (resolves categories/filters → rule text with the
+ * effective action) into a temp full-text file, then projects it to the
+ * sid→action map and drops the heavy intermediate. Returns rule count, -1 err. */
+static int compile_profile_map(const char *name)
+{
+	int profid = ips_profid(name);
+	if (profid < 1)
+		return -1;
+
+	char text[512];                         /* intermediate profiles/<name>.rules */
+	int n = compile_one_profile(name, text, sizeof(text));
+	if (n < 0)
+		return -1;
+
+	char map[512], maptmp[600];
+	snprintf(map,    sizeof(map),    "%s/%04d.rules", IPS_PROF_DIR, profid);
+	snprintf(maptmp, sizeof(maptmp), "%s/.%04d.tmp",  IPS_PROF_DIR, profid);
+
+	FILE *in  = fopen(text, "r");
+	FILE *out = fopen(maptmp, "w");
+	if (in && out) {
+		char line[16384];
+		while (fgets(line, sizeof(line), in)) {
+			uint32_t sid = line_sid(line);
+			if (!sid) continue;
+			const char *p = line;
+			while (*p == ' ' || *p == '\t') p++;
+			/* effective action = first token (drop→block, else alert) */
+			const char *act = (strncmp(p, "drop", 4) == 0) ? "block" : "alert";
+			fprintf(out, "%u %s\n", sid, act);
+		}
+	}
+	if (in)  fclose(in);
+	if (out) fclose(out);
+	rename(maptmp, map);            /* atomic publish of the map */
+	remove(text);                   /* drop the heavy full-text intermediate */
+	return n;
+}
+
+/* Signature of a profile's selection: its category/filter definition + the rule
+ * TABLE generation (active.rules mtime). rebuild_ips_scope skips a profile whose
+ * map is already current — so a policy change or an unrelated edit recompiles
+ * nothing, and a download (table mtime changes) recompiles every profile. */
+static void profile_sig(const char *name, char *out, size_t cap)
+{
+	unsigned long long h = 1469598103934665603ULL;   /* FNV-1a */
+#define SIG_MIX(s) do { for (const char *q = (s); q && *q; q++) { \
+		h ^= (unsigned char)*q; h *= 1099511628211ULL; } } while (0)
+	char *catv = sg_db_get_val("security_ips-profile", name, "categories");
+	SIG_MIX(name); SIG_MIX("|"); SIG_MIX(catv ? catv : "all"); SIG_MIX("|");
+	free(catv);
+
+	char *fl = sg_db_list("security_ips-filter");
+	if (fl) {
+		char *sp = NULL;
+		for (char *id = strtok_r(fl, "\n", &sp); id;
+		     id = strtok_r(NULL, "\n", &sp)) {
+			char *pf = sg_db_get_val("security_ips-filter", id, "profile");
+			if (pf && strcmp(pf, name) == 0) {
+				char *ty = sg_db_get_val("security_ips-filter", id, "type");
+				char *va = sg_db_get_val("security_ips-filter", id, "value");
+				char *ac = sg_db_get_val("security_ips-filter", id, "action");
+				char *stt = sg_db_get_val("security_ips-filter", id, "status");
+				SIG_MIX(ty ? ty : "");  SIG_MIX(":");
+				SIG_MIX(va ? va : "");  SIG_MIX(":");
+				SIG_MIX(ac ? ac : "");  SIG_MIX(":");
+				SIG_MIX(stt ? stt : ""); SIG_MIX(";");
+				free(ty); free(va); free(ac); free(stt);
+			}
+			free(pf);
+		}
+		free(fl);
+	}
+	struct stat stt;
+	long mt = (stat(IPS_ACTIVE, &stt) == 0) ? (long)stt.st_mtime : 0;
+	char mbuf[40];
+	snprintf(mbuf, sizeof(mbuf), "|t%ld", mt);
+	SIG_MIX(mbuf);
+#undef SIG_MIX
+	snprintf(out, cap, "%016llx", h);
+}
+
+/* Order-independent signature of the repo .rules files (each file's
+ * name+mtime+size, XORed). Lets rebuild_ips_table skip the merge ENTIRELY when
+ * the downloaded rules are unchanged — so a normal boot does NO recompile (it
+ * just loads the persisted active.rules). */
+static void repo_sig(char *out, size_t cap)
+{
+	unsigned long long h = 1469598103934665603ULL;
+	DIR *d = opendir(IPS_REPO_DIR);
+	if (d) {
+		struct dirent *de;
+		while ((de = readdir(d))) {
+			const char *dot = strrchr(de->d_name, '.');
+			if (!dot || strcmp(dot, ".rules") != 0) continue;
+			char p[512];
+			snprintf(p, sizeof(p), "%s/%s", IPS_REPO_DIR, de->d_name);
+			struct stat stt;
+			if (stat(p, &stt) != 0) continue;
+			unsigned long long e = 1469598103934665603ULL;
+			for (const char *q = de->d_name; *q; q++) {
+				e ^= (unsigned char)*q; e *= 1099511628211ULL;
+			}
+			e ^= (unsigned long long)stt.st_mtime * 1099511628211ULL;
+			e ^= (unsigned long long)stt.st_size;
+			h ^= e;                 /* XOR → independent of readdir order */
+		}
+		closedir(d);
+	}
+	snprintf(out, cap, "%016llx", h);
+}
+
+/* Rebuild active.rules (the TABLE = all repo rules). Skipped (no merge at all)
+ * when the repo is unchanged. Signals SIGUSR1 (full table reload → AC rebuild)
+ * ONLY when the content actually changed. */
+static sg_status_t rebuild_ips_table(char *result, size_t rsize)
+{
 	mkdir(IPS_BASE_DIR,  0700);
 	mkdir(IPS_REPO_DIR,  0700);
 	mkdir(IPS_PROF_DIR,  0700);
 	mkdir(IPS_RULES_DIR, 0700);
-	ips_write_update_conf();     /* đồng bộ conf cho cron */
 
-	/* [1] compile từng profile enable → profiles/<name>.rules */
-	char *plist = sg_db_list("security_ips-profile");
-	if (plist) {
-		char *sp = NULL;
-		for (char *id = strtok_r(plist, "\n", &sp); id;
-		     id = strtok_r(NULL, "\n", &sp)) {
-			char *st = sg_db_get_val("security_ips-profile", id, "status");
-			if (st && strcmp(st, "enable") == 0) {
-				char op[512];
-				compile_one_profile(id, op, sizeof(op));
-			}
-			free(st);
+	/* Fast path (the common case, incl. EVERY boot): repo unchanged + table
+	 * present → skip the whole merge. */
+	char sig[24], oldsig[24] = "", sigp[512];
+	repo_sig(sig, sizeof(sig));
+	snprintf(sigp, sizeof(sigp), "%s/.repo.sig", IPS_RULES_DIR);
+	FILE *sf = fopen(sigp, "r");
+	if (sf) {
+		if (fgets(oldsig, sizeof(oldsig), sf)) {
+			char *nl = strchr(oldsig, '\n'); if (nl) *nl = '\0';
 		}
-		free(plist);
+		fclose(sf);
 	}
-
-	/* [2] active.rules tạm = GỘP ruleset các profile in-use, DEDUP theo sid với
-	 * sgprof = OR bit mọi profile chứa sid (per-policy scoping). */
-
-	/* [2a] Thu thập profile in-use (policy accept+enable, profile enable,
-	 * != none), kèm bit của nó. Dedup theo tên profile. */
-	char inuse[32][64];
-	int  inuse_bit[32];
-	int  n_inuse = 0;
-	char *fpl = sg_db_list("firewall_policy");
-	if (fpl) {
-		char *sp = NULL;
-		for (char *id = strtok_r(fpl, "\n", &sp); id;
-		     id = strtok_r(NULL, "\n", &sp)) {
-			char *act = sg_db_get_val("firewall_policy", id, "action");
-			char *ipp = sg_db_get_val("firewall_policy", id, "ips-profile");
-			char *pst = sg_db_get_val("firewall_policy", id, "status");
-			char *ipstat = sg_db_get_val("firewall_policy", id, "ips-status");
-			int accept = act && (strcmp(act, "accept") == 0 ||
-					     strcmp(act, "allow") == 0);
-			int enabled = !pst || strcmp(pst, "disable") != 0;
-			/* toggle ips-status: disable → bỏ qua; rỗng (legacy) → theo
-			 * profile như cũ (tương thích ngược, không cần migrate). */
-			int ips_off = ipstat && strcmp(ipstat, "disable") == 0;
-			if (accept && enabled && !ips_off && ipp && ipp[0] &&
-			    strcmp(ipp, "none") != 0) {
-				char *pstat = sg_db_get_val("security_ips-profile",
-							    ipp, "status");
-				int dup = 0;
-				for (int i = 0; i < n_inuse; i++)
-					if (strcmp(inuse[i], ipp) == 0) dup = 1;
-				int bit = ips_profile_bit(ipp);
-				if (pstat && strcmp(pstat, "enable") == 0 &&
-				    !dup && bit >= 0 && n_inuse < 32) {
-					snprintf(inuse[n_inuse], 64, "%s", ipp);
-					inuse_bit[n_inuse] = bit;
-					n_inuse++;
-				}
-				free(pstat);
-			}
-			free(act); free(ipp); free(pst); free(ipstat);
-		}
-		free(fpl);
-	}
-
-	/* [2b] Map sid→mask (Pass 1) rồi emit dedup (Pass 2). */
-	FILE *tmp = fopen(IPS_ACTIVE_TMP, "w");
-	if (!tmp) {
-		snprintf(result, rsize, "IPS: cannot open active tmp");
-		return SG_ERR_SYSTEM_FAIL;
-	}
-	fprintf(tmp, "# Stargazer IPS active ruleset (dedup theo sid, per-policy"
-		     " scoping qua sgprof bitmask)\n");
-
-	const size_t SIDCAP = 131072;   /* dư cho ET-open (~40k sid) */
-	struct sidslot *smap = calloc(SIDCAP, sizeof(*smap));
-	int used = 0;
-	if (smap) {
-		for (int i = 0; i < n_inuse; i++) {
-			char pp[512];
-			snprintf(pp, sizeof(pp), "%s/%.63s.rules",
-				 IPS_PROF_DIR, inuse[i]);
-			sidmap_scan(smap, SIDCAP, pp, inuse_bit[i]);
-		}
-		for (int i = 0; i < n_inuse; i++) {
-			char pp[512];
-			snprintf(pp, sizeof(pp), "%s/%.63s.rules",
-				 IPS_PROF_DIR, inuse[i]);
-			if (sidmap_emit(tmp, smap, SIDCAP, pp))
-				used++;
-		}
-		free(smap);
-	}
-	fclose(tmp);
-
-	if (used == 0) {
-		/* không profile in-use → không đụng active.rules cũ (an toàn) */
-		remove(IPS_ACTIVE_TMP);
-		snprintf(result, rsize,
-			 "IPS: no profile in use, active ruleset unchanged");
+	if (strcmp(oldsig, sig) == 0 && access(IPS_ACTIVE, R_OK) == 0) {
+		snprintf(result, rsize, "table unchanged (cached)");
 		return SG_OK;
 	}
 
-	/* [3] verify ipsd -C — ruleset hỏng KHÔNG swap (fail-closed) */
-	if (ips_verify(IPS_ACTIVE_TMP) != 0) {
-		mgmt_log("ERROR", "ips: ipsd -C báo active ruleset không hợp lệ "
-			 "— giữ bản cũ");
-		remove(IPS_ACTIVE_TMP);
-		snprintf(result, rsize, "IPS active failed syntax check");
+	int n = ips_compile_categories(IPS_REPO_DIR, "all", IPS_ACTIVE_TMP);
+	if (n < 0) {
+		snprintf(result, rsize, "IPS: cannot build rule table");
 		return SG_ERR_SYSTEM_FAIL;
 	}
-
-	/* [4] atomic swap + hot-reload */
-	if (rename(IPS_ACTIVE_TMP, IPS_ACTIVE) != 0) {
-		mgmt_log("ERROR", "ips: rename active thất bại: %m");
-		remove(IPS_ACTIVE_TMP);
-		snprintf(result, rsize, "IPS active swap failed");
-		return SG_ERR_SYSTEM_FAIL;
-	}
-
-	pid_t pid = supervisor_get_pid("stargazer-ipsd");
-	if (pid > 0) {
-		kill(pid, SIGUSR1);
-		mgmt_log("INFO", "ips: active.rules rebuilt (%d profile) → "
-			 "SIGUSR1 ipsd (pid %d) hot-reload", used, (int)pid);
+	int reloaded = 0;
+	if (files_equal(IPS_ACTIVE_TMP, IPS_ACTIVE)) {
+		remove(IPS_ACTIVE_TMP);     /* repo touched but content identical */
 	} else {
-		mgmt_log("INFO", "ips: active.rules rebuilt (%d profile); ipsd "
-			 "chưa chạy", used);
+		if (rename(IPS_ACTIVE_TMP, IPS_ACTIVE) != 0) {
+			mgmt_log("ERROR", "ips: rename of table failed: %m");
+			remove(IPS_ACTIVE_TMP);
+			snprintf(result, rsize, "IPS table swap failed");
+			return SG_ERR_SYSTEM_FAIL;
+		}
+		pid_t pid = supervisor_get_pid("stargazer-ipsd");
+		if (pid > 0) kill(pid, SIGUSR1);   /* table changed → AC rebuild */
+		mgmt_log("INFO", "ips: rule table rebuilt (%d rule) → SIGUSR1 ipsd", n);
+		ssld_sync();                       /* ssld reloads the table on restart */
+		reloaded = 1;
+	}
+	/* Persist the repo signature so the next call (e.g. boot) can skip. */
+	FILE *w = fopen(sigp, "w");
+	if (w) { fprintf(w, "%s\n", sig); fclose(w); }
+	snprintf(result, rsize, reloaded ? "table rebuilt (%d rule)"
+					 : "table content unchanged (%d rule)", n);
+	return SG_OK;
+}
+
+/* Rebuild the per-profile selection maps. Only profiles whose signature changed
+ * are recompiled; maps of removed/disabled profiles are pruned. Signals SIGUSR2
+ * (cheap scope reload, NO AC rebuild) ONLY when something changed. */
+static sg_status_t rebuild_ips_scope(char *result, size_t rsize)
+{
+	mkdir(IPS_PROF_DIR, 0700);
+	ips_write_update_conf();
+
+	int valid[32] = {0};
+	int changed = 0, nprof = 0;
+	char *list = sg_db_list("security_ips-profile");
+	if (list) {
+		char *sp = NULL;
+		for (char *id = strtok_r(list, "\n", &sp); id;
+		     id = strtok_r(NULL, "\n", &sp)) {
+			char *st = sg_db_get_val("security_ips-profile", id, "status");
+			int en = !st || strcmp(st, "disable") != 0;
+			free(st);
+			if (!en) continue;
+			int profid = ips_profid(id);
+			if (profid < 1) continue;
+			valid[profid] = 1; nprof++;
+
+			char sig[24], old[24] = "", sigp[512], mapp[512];
+			profile_sig(id, sig, sizeof(sig));
+			snprintf(sigp, sizeof(sigp), "%s/%04d.sig",   IPS_PROF_DIR, profid);
+			snprintf(mapp, sizeof(mapp), "%s/%04d.rules", IPS_PROF_DIR, profid);
+			FILE *sf = fopen(sigp, "r");
+			if (sf) {
+				if (fgets(old, sizeof(old), sf)) {
+					char *nl = strchr(old, '\n'); if (nl) *nl = '\0';
+				}
+				fclose(sf);
+			}
+			if (strcmp(old, sig) == 0 && access(mapp, R_OK) == 0)
+				continue;               /* map already current → skip */
+			if (compile_profile_map(id) >= 0) {
+				FILE *w = fopen(sigp, "w");
+				if (w) { fprintf(w, "%s\n", sig); fclose(w); }
+				changed++;
+			}
+		}
+		free(list);
 	}
 
-	/* ssld soi plaintext HTTPS đã giải mã bằng CÙNG active.rules nhưng nạp rule
-	 * lúc khởi động (không hot-reload). active.rules vừa đổi → đồng bộ ssld:
-	 * mtime mới vào sig của ssld_sync → instance nào đang chạy sẽ restart để nạp
-	 * ruleset mới. Không có ssld nào → no-op. */
-	ssld_sync();
+	/* Prune maps/sigs of profids no longer enabled. */
+	DIR *d = opendir(IPS_PROF_DIR);
+	if (d) {
+		struct dirent *de;
+		while ((de = readdir(d))) {
+			int pid2 = 0; char ext[8] = "";
+			if (sscanf(de->d_name, "%d.%7s", &pid2, ext) == 2 &&
+			    pid2 >= 1 && pid2 <= 31 && !valid[pid2] &&
+			    (strcmp(ext, "rules") == 0 || strcmp(ext, "sig") == 0)) {
+				char p[512];
+				snprintf(p, sizeof(p), "%s/%s", IPS_PROF_DIR, de->d_name);
+				remove(p);
+				changed++;
+			}
+		}
+		closedir(d);
+	}
 
-	/* Phase 4 Pha 2: đồng bộ hook kernel ML-HTTPS (LOCAL_IN) theo cờ ml-https.
-	 * enable → ml_account_local=1 (kernel tích lũy CTA_ML cho leg ssld);
-	 * disable → 0 (hook no-op, kernel y hệt cũ). Lỗi ghi → bỏ qua (gated). */
+	if (changed) {
+		pid_t pid = supervisor_get_pid("stargazer-ipsd");
+		if (pid > 0) kill(pid, SIGUSR2);    /* scope changed → cheap reload */
+		mgmt_log("INFO", "ips: profile maps rebuilt (%d profile, %d changed) "
+			 "→ SIGUSR2 ipsd", nprof, changed);
+	}
+	snprintf(result, rsize, "scope (%d profile, %d changed)", nprof, changed);
+	return SG_OK;
+}
+
+sg_status_t rebuild_ips_active(char *result, size_t rsize)
+{
+	/* TABLE (heavy; only when the repo/download changed → files_equal skip)
+	 * then per-profile SCOPE maps (cheap; only changed profiles recompile).
+	 * Profile/policy edits leave the table unchanged → no SIGUSR1/AC rebuild;
+	 * only changed profiles emit SIGUSR2. */
+	char tr[256] = "", sc[256] = "";
+	rebuild_ips_table(tr, sizeof(tr));
+	rebuild_ips_scope(sc, sizeof(sc));
+
+	/* Phase 4 Stage 2: sync the kernel ML-HTTPS hook (LOCAL_IN) with ml-https. */
 	{
 		char *ml = sg_db_get_val("security_ips", "0", "ml-https");
 		int on = ml && strcmp(ml, "enable") == 0;
@@ -403,7 +529,7 @@ sg_status_t rebuild_ips_active(char *result, size_t rsize)
 		if (pf) { fputc(on ? '1' : '0', pf); fclose(pf); }
 	}
 
-	snprintf(result, rsize, "IPS active rebuilt (%d profile in use)", used);
+	snprintf(result, rsize, "IPS rebuilt: %s; %s", tr, sc);
 	return SG_OK;
 }
 
@@ -420,9 +546,9 @@ sg_status_t run_ips_update_now(const char *ids_csv, char *result, size_t rsize)
 	static const char *UPD = "/usr/libexec/stargazer/ips-update.sh";
 	char *ids = sg_db_list("security_ips-ruleset");
 	int   updated = 0, errors = 0;
-	char  failed[512] = "";        /* tên các ruleset tải lỗi (cho thông báo) */
+	char  failed[512] = "";        /* names of rulesets that failed to download (for the message) */
 	size_t fpos = 0;
-	char  reason[256] = "";        /* lý do lỗi ĐẦU TIÊN (trích từ script) */
+	char  reason[256] = "";        /* the FIRST error reason (extracted from the script) */
 
 	if (!ids) {
 		snprintf(result, rsize, "No rulesets configured");
@@ -479,9 +605,10 @@ sg_status_t run_ips_update_now(const char *ids_csv, char *result, size_t rsize)
 
 		const char *argv[] = { UPD, url, catname, NULL };
 		char *out = safe_exec(argv);
-		/* Lỗi = không chạy được script (out NULL) HOẶC script in "ERROR"
-		 * (tải thất bại / file rỗng / verify hỏng). Chi tiết đã vào
-		 * ips-update.log; ở đây chỉ gom tên để báo người dùng. */
+		/* Error = the script failed to run (out NULL) OR the script printed
+		 * "ERROR" (download failed / empty file / verify broken). The details
+		 * already went to ips-update.log; here we only collect names to report
+		 * to the user. */
 		int ok = (out && !strstr(out, "ERROR"));
 		if (!ok) {
 			errors++;
@@ -489,8 +616,8 @@ sg_status_t run_ips_update_now(const char *ids_csv, char *result, size_t rsize)
 					  "%s%s", fpos ? ", " : "", catname);
 			if (fn > 0 && (size_t)fn < sizeof(failed) - fpos)
 				fpos += (size_t)fn;
-			/* Trích dòng ERROR đầu tiên làm lý do hiển thị (no internet /
-			 * DNS sai / syntax hỏng / file rỗng…). */
+			/* Extract the first ERROR line as the displayed reason (no
+			 * internet / wrong DNS / broken syntax / empty file…). */
 			if (!reason[0]) {
 				const char *e = out ? strstr(out, "ERROR") : NULL;
 				if (e)
@@ -498,7 +625,7 @@ sg_status_t run_ips_update_now(const char *ids_csv, char *result, size_t rsize)
 						 (int)strcspn(e, "\n"), e);
 				else
 					snprintf(reason, sizeof(reason),
-						 "không chạy được script tải");
+						 "could not run the download script");
 			}
 		} else {
 			updated++;
@@ -519,15 +646,15 @@ sg_status_t run_ips_update_now(const char *ids_csv, char *result, size_t rsize)
 	char rb[256];
 	rebuild_ips_active(rb, sizeof(rb));
 
-	/* Thông báo rõ cho người dùng (toast trên UI). */
+	/* Clear notification for the user (toast in the UI). */
 	if (errors > 0) {
 		snprintf(result, rsize,
-			 "Tải thất bại %d ruleset (%s): %s. %d ruleset OK.",
+			 "Failed to download %d ruleset(s) (%s): %s. %d ruleset(s) OK.",
 			 errors, failed[0] ? failed : "?",
-			 reason[0] ? reason : "kiểm tra mạng/URL nguồn", updated);
+			 reason[0] ? reason : "check network / source URL", updated);
 		return SG_ERR_SYSTEM_FAIL;
 	}
-	snprintf(result, rsize, "Đã cập nhật %d ruleset thành công.", updated);
+	snprintf(result, rsize, "Updated %d ruleset(s) successfully.", updated);
 	return SG_OK;
 }
 
