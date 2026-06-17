@@ -16,7 +16,7 @@
 
 #include <stdint.h>
 
-#define FEAT_COUNT 14
+#define FEAT_COUNT 17
 
 /* index per feature_order.json — do not change the order. */
 enum {
@@ -34,6 +34,9 @@ enum {
 	FEAT_URG_CNT,
 	FEAT_DOWNUP_RATIO,
 	FEAT_INIT_WIN_FWD,
+	FEAT_TOTLEN_FWD,   /* Total Length of Fwd Packets = bytes_fwd (Infiltration) */
+	FEAT_TOTLEN_BWD,   /* Total Length of Bwd Packets = bytes_bwd                */
+	FEAT_FLOW_DUR,     /* Flow Duration (µs) = last_ns - first_ns                */
 };
 
 /*

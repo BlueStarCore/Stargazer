@@ -791,7 +791,7 @@ int handle_ips_alerts(int client_fd, const char *user,
 
 	char *out = read_last_lines("/etc/stargazer/logs/ips-alert.log", nlines);
 	if (!out || !out[0]) {
-		send_ok(client_fd, NULL, "(no alerts yet)\n");
+		send_ok(client_fd, NULL, "NO ALERTS\n");
 		free(out);
 		return 0;
 	}

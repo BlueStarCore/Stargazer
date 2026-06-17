@@ -581,6 +581,14 @@ static void register_set_cmds(const char *type_name, const char *action)
 		char saved = *end;
 		*end = '\0';
 
+		/* Internal field (SG_FLD_HIDDEN: enabled, last-downloaded, builtin,
+		 * cmkid…) → do NOT suggest set. */
+		if (sg_reg_is_hidden_key(type_name, tok)) {
+			*end = saved;
+			tok = end;
+			continue;
+		}
+
 		/* ips-status: internal field (auto-synced from ips-profile) → NO hint.
 		 * ssl-profile/ips-profile: accept only → hide hints on deny/drop. */
 		int is_policy = type_name &&
@@ -628,6 +636,13 @@ static void register_unset_get_cmds(const char *type_name)
 		while (*end && *end != ' ') end++;
 		char saved = *end;
 		*end = '\0';
+
+		/* Internal field (SG_FLD_HIDDEN) → no unset/get hint. */
+		if (sg_reg_is_hidden_key(type_name, tok)) {
+			*end = saved;
+			tok = end;
+			continue;
+		}
 
 		/* ips-status: internal field → no unset/get hint on policy. */
 		if (type_name && strcmp(type_name, "firewall_policy") == 0 &&
@@ -1099,8 +1114,11 @@ static int context_entry(const char *type_name, const char *label,
 						       kv_get(&data, "ips-profile"));
 				printf("    edit \"%s\"\n", entry_id);
 				for (int i = 0; i < data.count; i++) {
-					if (strcmp(data.entries[i].key,
-						   "builtin") == 0)
+					/* Field nội bộ (SG_FLD_HIDDEN: builtin,
+					 * enabled, last-downloaded, cmkid…) —
+					 * không hiện trong show cấu hình. */
+					if (sg_reg_is_hidden_key(type_name,
+						   data.entries[i].key))
 						continue;
 					/* ips-status: internal field — do not show. */
 					if (strcmp(type_name, "firewall_policy") == 0 &&

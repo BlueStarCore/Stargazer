@@ -62,3 +62,4 @@ hydra.restore
 rockyou*.txt
 stargazer-ca.crt
 *.crt
+__pycache__/

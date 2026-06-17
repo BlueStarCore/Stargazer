@@ -129,7 +129,7 @@ static const struct field_entry field_table[] = {
 	{ "security_ips-ruleset", "name",           "safe-id",             1, NULL,      "Ruleset name (optional; entry id is the identity)", 0 },
 	{ "security_ips-ruleset", "description",   "string",              1, NULL,      "Human-readable ruleset description", 0 },
 	{ "security_ips-ruleset", "url",           "string",              0, NULL,      "HTTP/HTTPS URL of the .rules file", 0 },
-	{ "security_ips-ruleset", "enabled",       "enum:enable,disable", 0, "disable", "Download this ruleset on update", 0 },
+	{ "security_ips-ruleset", "enabled",       "enum:enable,disable", 0, "disable", "Download this ruleset on update (internal — managed via web/seed, not settable from CLI)", SG_FLD_HIDDEN },
 	{ "security_ips-ruleset", "builtin",       "enum:yes,no",         0, "no",      "Built-in entry (cannot be deleted)", SG_FLD_HIDDEN },
 	{ "security_ips-ruleset", "last-downloaded","string",             1, NULL,      "Timestamp of last successful download", SG_FLD_HIDDEN },
 

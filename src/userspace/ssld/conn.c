@@ -100,21 +100,34 @@ struct insp_ctx {
  * storage -> mkdir. */
 #define SSLD_ALERT_LOG "/etc/stargazer/logs/ips-alert.log"
 
+/* is_ml: verdict came from the ML model (insp_verdict_body.src==1), not a
+ * signature. Render the SAME reason/score vocabulary as the NFQUEUE path
+ * (ipsd main.c log_alert): ML → reason=ml-block/ml-alert + numeric score;
+ * signature → reason=signature score=n/a. Mislabelling ML as "signature" (the
+ * old hardcoded behaviour) hid that these hits had no sid and came from the
+ * model — confusing on the firewall, where the reason is what gets triaged. */
 static void ssld_log_alert(const struct insp_ctx *ic, int drop,
-			   uint32_t sid, const char *msg)
+			   uint32_t sid, const char *msg, int is_ml, float score)
 {
 	time_t now = time(NULL);
 	struct tm tm; localtime_r(&now, &tm);
 	char ts[24]; strftime(ts, sizeof(ts), "%F %T", &tm);
 
+	const char *reason = is_ml ? (drop ? "ml-block" : "ml-alert") : "signature";
+	char scorebuf[16];
+	if (is_ml)
+		snprintf(scorebuf, sizeof(scorebuf), "%.3f", (double)score);
+	else
+		snprintf(scorebuf, sizeof(scorebuf), "n/a");
+
 	char line[512];
 	int ln = snprintf(line, sizeof(line),
 		"%s %s proto=6 src=%s:%u dst=%s:%u "
-		"reason=signature score=n/a sid=%u msg=%s\n",
+		"reason=%s score=%s sid=%u msg=%s\n",
 		ts, drop ? "DROP" : "ALERT",
 		ic->src_ip[0] ? ic->src_ip : "?", ic->src_port,
 		ic->dst_ip[0] ? ic->dst_ip : "?", ic->dport,
-		sid, msg ? msg : "");
+		reason, scorebuf, sid, msg ? msg : "");
 	if (ln < 0)
 		return;
 	if (ln > (int)sizeof(line))
@@ -134,9 +147,11 @@ static void ssld_log_alert(const struct insp_ctx *ic, int drop,
 	close(fd);
 }
 
-/* Dedup per flow + log alert (1 line/sid/flow) + record block info if DROP. */
+/* Dedup per flow + log alert (1 line/sid/flow) + record block info if DROP.
+ * is_ml/score: pass the verdict's source so the log reason matches reality
+ * (ML vs signature); signature callers pass is_ml=0, score=0. */
 static void conn_alert(struct insp_ctx *ic, int drop, uint32_t sid,
-		       const char *msg, int to_server)
+		       const char *msg, int to_server, int is_ml, float score)
 {
 	if (drop) {
 		ic->block_sid = sid;
@@ -148,7 +163,7 @@ static void conn_alert(struct insp_ctx *ic, int drop, uint32_t sid,
 			return;             /* already alerted this sid on the flow */
 	if (ic->n_seen < (int)(sizeof(ic->seen_sids) / sizeof(ic->seen_sids[0])))
 		ic->seen_sids[ic->n_seen++] = sid;
-	ssld_log_alert(ic, drop, sid, msg);
+	ssld_log_alert(ic, drop, sid, msg, is_ml, score);
 	fprintf(stderr, "ssld: SIG %s host=%s dir=%s sid=%u msg=%s\n",
 		drop ? "DROP" : "ALERT", ic->host,
 		to_server ? "->srv" : "<-srv", sid, msg ? msg : "");
@@ -169,7 +184,7 @@ static int conn_inspect_local(struct insp_ctx *ic, const unsigned char *data,
 		return 0;
 	int drop = (ic->rs->rules[idx].action == SIG_DROP);
 	conn_alert(ic, drop, ic->rs->rules[idx].sid,
-		   ic->rs->rules[idx].msg, to_server);
+		   ic->rs->rules[idx].msg, to_server, 0 /*signature*/, 0.0f);
 	return drop ? 1 : 0;
 }
 
@@ -206,17 +221,20 @@ static int conn_inspect_ipc(struct insp_ctx *ic, const unsigned char *data,
 		ic->ipc_fd = -1;
 		if (ic->fail_closed) {
 			/* fail-closed: IPC error -> block flow (safer). */
-			conn_alert(ic, 1, 0, "IPC inspection unavailable", to_server);
+			conn_alert(ic, 1, 0, "IPC inspection unavailable",
+				   to_server, 0 /*not ML*/, 0.0f);
 			return 1;
 		}
 		return conn_inspect_local(ic, data, len, to_server);
 	}
 	if (reply.v.action == INSP_DROP) {
-		conn_alert(ic, 1, reply.v.sid, reply.v.msg, to_server);
+		conn_alert(ic, 1, reply.v.sid, reply.v.msg, to_server,
+			   reply.v.src == 1 /*ML*/, reply.v.score);
 		return 1;
 	}
 	if (reply.v.action == INSP_ALERT)
-		conn_alert(ic, 0, reply.v.sid, reply.v.msg, to_server);
+		conn_alert(ic, 0, reply.v.sid, reply.v.msg, to_server,
+			   reply.v.src == 1 /*ML*/, reply.v.score);
 	return 0;
 }
 

@@ -58,9 +58,12 @@ static int ssl_write_all(SSL *ssl, const unsigned char *buf, int len)
  * Pump one direction: read plaintext from `from`, inspect it, write to `to`.
  * Returns 1 if still open, 0 on EOF/clean close, -1 on error or inspect BLOCK.
  * Drain SSL_pending so data already in the SSL buffer doesn't get stuck.
+ * `out_written` (if != NULL): accumulates bytes written to `to` — used to know
+ * whether the response has started reaching the client (decides whether to
+ * inject the block page).
  */
 static int pump_ssl(SSL *from, SSL *to, int to_server,
-		    const struct bump_cfg *cfg)
+		    const struct bump_cfg *cfg, size_t *out_written)
 {
 	unsigned char buf[BUMP_BUF];
 	do {
@@ -72,6 +75,8 @@ static int pump_ssl(SSL *from, SSL *to, int to_server,
 			}
 			if (ssl_write_all(to, buf, n) < 0)
 				return -1;
+			if (out_written)
+				*out_written += (size_t)n;
 			continue;
 		}
 		int e = SSL_get_error(from, n);
@@ -188,6 +193,7 @@ int bump_run(int client_fd, const char *sni, const struct sockaddr_in *dst,
 	/* -- [3] relay plaintext both ways + inspect ------------------------ */
 	{
 		int c_open = 1, u_open = 1, blocked = 0;
+		size_t cli_written = 0;   /* byte response đã gửi tới client */
 		struct pollfd pfd[2];
 		while (c_open || u_open) {
 			pfd[0].fd = c_open ? client_fd : -1;
@@ -202,21 +208,26 @@ int bump_run(int client_fd, const char *sni, const struct sockaddr_in *dst,
 			}
 			if (c_open &&
 			    (pfd[0].revents & (POLLIN | POLLHUP | POLLERR))) {
-				int s = pump_ssl(cssl, ussl, 1, cfg);
+				int s = pump_ssl(cssl, ussl, 1, cfg, NULL);
 				if (s == -2) blocked = 1;
 				if (s <= 0) { c_open = 0; if (s < 0) u_open = 0; }
 			}
 			if (!blocked && u_open &&
 			    (pfd[1].revents & (POLLIN | POLLHUP | POLLERR))) {
-				int s = pump_ssl(ussl, cssl, 0, cfg);
+				int s = pump_ssl(ussl, cssl, 0, cfg, &cli_written);
 				if (s == -2) blocked = 1;
 				if (s <= 0) { u_open = 0; if (s < 0) c_open = 0; }
 			}
 			if (blocked) break;
 		}
-		/* DROP -> write the block page (FortiGate-style) to the client before
-		 * closing. */
-		if (blocked && cfg->on_block)
+		/* DROP → write the block page (FortiGate-style) to the client before
+		 * closing. Only inject when NO response byte has reached the client yet:
+		 * if the response already started (DROP on the server→client direction,
+		 * e.g. a signature in the response body), appending an HTTP 403 would be
+		 * parsed by the browser as the BODY of the previous response → it shows
+		 * the raw text "HTTP/1.1 403 Forbidden Content-Type: t...". In that case
+		 * just close the connection (client sees a load error, not a fake page). */
+		if (blocked && cfg->on_block && cli_written == 0)
 			cfg->on_block(cssl, cfg->inspect_ud);
 	}
 	rc = 0;

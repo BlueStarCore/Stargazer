@@ -55,6 +55,12 @@ struct insp_conn {
 	/* Phase 2 — leg client→ssld (host order) for ML; ml_done: scored once per conn. */
 	uint32_t             leg_cli_ip, leg_fw_ip;   /* host order */
 	uint16_t             leg_cli_port, leg_fw_port;
+	/* Original destination (server:443) of the redirected flow, host order. The
+	 * conntrack ORIGINAL tuple is (client → server), NOT (client → fw:ssld_port):
+	 * REDIRECT records the pre-DNAT destination. So CTA_MARK (prof_id) and CTA_ML
+	 * must be looked up with srv as the tuple dst, not leg_fw. */
+	uint32_t             srv_ip;                  /* host order */
+	uint16_t             srv_port;                /* host order */
 	uint8_t              ml_done;
 };
 
@@ -156,10 +162,11 @@ static void insp_handle_data(struct insp_conn *c, struct sig_reload *sr,
 	 * when ml-https is enabled) → ips_score → ips_fuse. Called OUTSIDE rdlock (netlink I/O).
 	 * Tuple mismatch / empty CTA_ML → ml_valid=0 → skip (clean degrade). */
 	if (vb->action == INSP_PASS && g_ips_cfg && !c->ml_done &&
-	    c->leg_cli_ip && c->leg_fw_ip) {
+	    c->leg_cli_ip && c->srv_ip) {
 		struct ctdump_result ctr;
-		if (ctdump_query(c->leg_cli_ip, c->leg_fw_ip,
-				 c->leg_cli_port, c->leg_fw_port,
+		/* ORIGINAL tuple (client → server:443), see the OPEN handler note. */
+		if (ctdump_query(c->leg_cli_ip, c->srv_ip,
+				 c->leg_cli_port, c->srv_port,
 				 6 /* IPPROTO_TCP */, &ctr) == 0 && ctr.ml_valid) {
 			struct flow_stats fs;
 			ctdump_to_flow_stats(&ctr, &fs);
@@ -226,8 +233,15 @@ static void *insp_conn_thread(void *arg)
 			struct insp_open_body *o = (struct insp_open_body *)
 				(buf + sizeof(struct insp_hdr));
 			c.fc.proto       = SIG_PROTO_TCP;
-			c.fc.dport       = o->srv_port;
-			c.fc.prof_id     = o->profile_id;   /* ssld sends 0 today */
+			/* Plaintext sau giải mã TLS LÀ HTTP ở L7. Hầu hết ET HTTP
+			 * signature scoped $HTTP_PORTS={80,8080,8000,8008} — KHÔNG
+			 * có 443. Nếu đưa cổng TLS thật (443) vào fc.dport thì
+			 * port_match() trượt → MỌI rule HTTP bị bỏ qua âm thầm trên
+			 * HTTPS giải mã (đã chứng minh: dport=443 không khớp, dport=80
+			 * khớp). Chuẩn hoá về 80 để soi như HTTP, độc lập cổng TLS.
+			 * (srv_port gốc vẫn ở o->srv_port nếu cần cho log/leg.) */
+			c.fc.dport       = 80;
+			c.fc.prof_id     = o->profile_id;   /* ssld sends 0; overridden from connmark below */
 			c.fc.established = 1;   /* proxy leg already established */
 			o->sni[sizeof(o->sni) - 1] = '\0';
 			snprintf(c.sni, sizeof(c.sni), "%s", o->sni);
@@ -236,16 +250,21 @@ static void *insp_conn_thread(void *arg)
 			c.leg_fw_ip    = ntohl(o->leg_fw_ip);
 			c.leg_cli_port = o->leg_cli_port;
 			c.leg_fw_port  = o->leg_fw_port;
+			/* srv = original dst (server:443); srv_ip net order, srv_port host. */
+			c.srv_ip       = ntohl(o->srv_ip);
+			c.srv_port     = o->srv_port;
 
 			/* Per-policy IPS scoping on the HTTPS path: ssld can't tag the
 			 * flow, so mgmtd stamps the IPS profile id into the connmark
-			 * (bits 3-7) at PREROUTING. Recover it from the client→ssld leg's
-			 * conntrack entry (CTA_MARK). Failure / no profid → keep ssld's
-			 * value (0 = inspect against every rule, fail-safe). */
-			if (c.leg_cli_ip && c.leg_fw_ip) {
+			 * (bits 3-7) at PREROUTING. Recover it from the redirected flow's
+			 * conntrack entry (CTA_MARK), keyed by its ORIGINAL tuple
+			 * (client → server:443) — NOT (client → fw:ssld_port), which matches
+			 * no tuple. Failure / no profid → keep ssld's value (0 = inspect
+			 * against every rule, fail-safe). */
+			if (c.leg_cli_ip && c.srv_ip) {
 				struct ctdump_result ctr;
-				if (ctdump_query(c.leg_cli_ip, c.leg_fw_ip,
-						 c.leg_cli_port, c.leg_fw_port,
+				if (ctdump_query(c.leg_cli_ip, c.srv_ip,
+						 c.leg_cli_port, c.srv_port,
 						 6 /* IPPROTO_TCP */, &ctr) == 0 &&
 				    ctr.mark_valid) {
 					uint8_t pid = (uint8_t)

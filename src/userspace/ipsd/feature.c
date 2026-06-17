@@ -23,6 +23,8 @@ const char *const feature_names[FEAT_COUNT] = {
 	"Fwd Packet Length Mean", "Bwd Packet Length Mean",
 	"SYN Flag Count", "ACK Flag Count", "PSH Flag Count", "URG Flag Count",
 	"Down/Up Ratio", "Init_Win_bytes_forward",
+	"Total Length of Fwd Packets", "Total Length of Bwd Packets",
+	"Flow Duration",
 };
 
 /*
@@ -86,4 +88,10 @@ void feature_extract(const struct sg_nf_conn_ml *ml,
 
 	/* --- Init window forward; -1 if unknown --- */
 	out[FEAT_INIT_WIN_FWD] = (init_win_fwd < 0) ? -1.0 : (double)init_win_fwd;
+
+	/* --- Volume/thời lượng flow (Infiltration: tải payload lớn, kéo dài) --- */
+	out[FEAT_TOTLEN_FWD] = (double)ml->bytes_fwd;
+	out[FEAT_TOTLEN_BWD] = (double)ml->bytes_bwd;
+	out[FEAT_FLOW_DUR]   = (ml->last_ns > ml->first_ns)
+			       ? (double)(ml->last_ns - ml->first_ns) / 1000.0 : 0.0;
 }

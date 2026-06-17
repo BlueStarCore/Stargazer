@@ -1313,6 +1313,112 @@ static int sup_copy_argv(child_entry_t *e, const char *const argv[])
 	return 0;
 }
 
+/* ── Orphan reclaim ──────────────────────────────────────────────────────
+ * Supervised children are setsid() so they SURVIVE an mgmtd restart (kernel
+ * reparents them to init). The fresh mgmtd's in-memory table is empty, so it
+ * would spawn a DUPLICATE that fails to bind the listen port while the orphan
+ * keeps serving STALE config — observed: ssld serving an old ruleset, and
+ * `ssld_running=no` in diagnostics though the process is alive.
+ * We persist each child's pid+comm to a pidfile and kill any live orphan
+ * recorded there before respawning. */
+#define SUP_PIDDIR "/run/stargazer-sup"
+
+static void sup_pidfile_path(const char *name, char *out, size_t cap)
+{
+	snprintf(out, cap, "%s/%s.pid", SUP_PIDDIR, name);
+}
+
+/* Read /proc/<pid>/comm (kernel TASK_COMM_LEN ≤ 16) → out without trailing \n.
+ * Returns 0 on success. Used to guard against PID recycling. */
+static int sup_proc_comm(pid_t pid, char *out, size_t cap)
+{
+	char path[64];
+	snprintf(path, sizeof(path), "/proc/%d/comm", (int)pid);
+	FILE *f = fopen(path, "r");
+	if (!f)
+		return -1;
+	out[0] = '\0';
+	if (fgets(out, (int)cap, f)) {
+		size_t n = strlen(out);
+		if (n && out[n - 1] == '\n')
+			out[n - 1] = '\0';
+	}
+	fclose(f);
+	return out[0] ? 0 : -1;
+}
+
+static void sup_pidfile_write(const child_entry_t *e)
+{
+	mkdir(SUP_PIDDIR, 0700);
+	char path[160];
+	sup_pidfile_path(e->name, path, sizeof(path));
+	FILE *f = fopen(path, "w");
+	if (!f)
+		return;
+	const char *bin = e->argv[0] ? e->argv[0] : "";
+	const char *base = strrchr(bin, '/');
+	base = base ? base + 1 : bin;
+	/* line1 = pid, line2 = comm (kernel truncates to 15 chars). */
+	fprintf(f, "%d\n%.15s\n", (int)e->pid, base);
+	fclose(f);
+}
+
+static void sup_pidfile_remove(const char *name)
+{
+	char path[160];
+	sup_pidfile_path(name, path, sizeof(path));
+	unlink(path);
+}
+
+/* Best-effort: kill a live orphan recorded in the pidfile (verified by comm so
+ * a recycled PID is never killed) before a fresh spawn. */
+static void sup_reclaim_orphan(const char *name)
+{
+	char path[160];
+	sup_pidfile_path(name, path, sizeof(path));
+	FILE *f = fopen(path, "r");
+	if (!f)
+		return;
+	int pid = 0;
+	char stored_comm[32] = "";
+	if (fscanf(f, "%d", &pid) != 1)
+		pid = 0;
+	int c;
+	while ((c = fgetc(f)) != EOF && c != '\n')   /* skip rest of pid line */
+		;
+	if (fgets(stored_comm, sizeof(stored_comm), f)) {
+		size_t n = strlen(stored_comm);
+		if (n && stored_comm[n - 1] == '\n')
+			stored_comm[n - 1] = '\0';
+	}
+	fclose(f);
+
+	if (pid <= 1 || kill((pid_t)pid, 0) != 0) {   /* already gone */
+		sup_pidfile_remove(name);
+		return;
+	}
+	/* PID still alive — confirm it is the SAME binary we launched. */
+	char cur_comm[32];
+	if (sup_proc_comm((pid_t)pid, cur_comm, sizeof(cur_comm)) != 0 ||
+	    (stored_comm[0] && strcmp(cur_comm, stored_comm) != 0)) {
+		sup_pidfile_remove(name);                 /* PID reused — not ours */
+		return;
+	}
+	mgmt_log("WARN", "supervisor: reclaiming orphan %s (pid %d) left by a "
+		 "previous mgmtd — killing before respawn", name, pid);
+	kill((pid_t)pid, SIGTERM);
+	for (int i = 0; i < 20; i++) {                /* up to 2s */
+		usleep(100000);
+		if (kill((pid_t)pid, 0) != 0)
+			break;
+	}
+	if (kill((pid_t)pid, 0) == 0) {
+		kill((pid_t)pid, SIGKILL);
+		usleep(100000);
+	}
+	sup_pidfile_remove(name);
+}
+
 /*
  * Fork+exec a supervised child. Child: close all fds >= 3, reset signals
  * to SIG_DFL, setsid, redirect stdio to /dev/null.
@@ -1373,6 +1479,7 @@ static int spawn_child(child_entry_t *e)
 
 	e->pid = pid;
 	clock_gettime(CLOCK_MONOTONIC, &e->started_at);
+	sup_pidfile_write(e);
 	mgmt_log("INFO", "supervisor: started %s (pid %d)", e->name, (int)pid);
 	return 0;
 }
@@ -1387,6 +1494,11 @@ int supervisor_start(const char *name, const char *const argv[],
 	if (e && e->pid > 0) {
 		supervisor_stop(name);
 		e = NULL;
+	} else {
+		/* No live in-memory record: a previous mgmtd may have left an
+		 * orphan still holding the listen port (else the fresh child
+		 * fails to bind and the orphan serves stale config). Clear it. */
+		sup_reclaim_orphan(name);
 	}
 
 	e = sup_alloc(name);
@@ -1473,6 +1585,7 @@ void supervisor_stop(const char *name)
 	}
 
 reaped:
+	sup_pidfile_remove(e->name);
 	mgmt_log("INFO", "supervisor: stopped %s", e->name);
 	sup_unregister(e);
 }
@@ -5330,6 +5443,7 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 			free(existing);
 			send_error(client_fd, SG_ERR_INVALID_VAL,
 				   "Reached the limit of 8 SSL inspection profiles");
+
 			return 0;
 		}
 

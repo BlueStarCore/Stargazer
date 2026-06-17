@@ -688,10 +688,20 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	/* Build the IPS engine config (ips_config) from the daemon config up front:
+	 * insp_ipc_start stores a pointer to it for the daemon's lifetime, and the
+	 * IPC path reads cfg->mode — passing &g_cfg (a different struct, ipsd_config)
+	 * would misread `mode` as `enabled` and force PREVENT even in detect mode. */
+	struct ips_config ips_cfg;
+	ips_config_default(&ips_cfg);
+	ips_cfg.mode      = g_cfg.mode;
+	ips_cfg.thr_block = g_cfg.thr_block;
+	ips_cfg.thr_alert = g_cfg.thr_alert;
+
 	/* Phase 4 (additive): IPC inspection server for HTTPS-deep from ssld.
 	 * Shares the ruleset (rdlock) with NFQUEUE. On error → log + keep running
 	 * without IPC. */
-	if (insp_ipc_start(&sr, &g_cfg) != 0)
+	if (insp_ipc_start(&sr, &ips_cfg) != 0)
 		fprintf(stderr, "ipsd: insp_ipc server failed to start "
 			"(HTTPS-deep will use ssld's per-chunk fallback)\n");
 
@@ -702,13 +712,6 @@ int main(int argc, char **argv)
 		sig_reload_free(&sr);
 		return 1;
 	}
-
-	/* ips_config from g_cfg */
-	struct ips_config ips_cfg;
-	ips_config_default(&ips_cfg);
-	ips_cfg.mode      = g_cfg.mode;
-	ips_cfg.thr_block = g_cfg.thr_block;
-	ips_cfg.thr_alert = g_cfg.thr_alert;
 
 	/* [3] Signal handlers */
 	struct sigaction sa_stop = { .sa_handler = handle_stop,
