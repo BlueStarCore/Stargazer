@@ -34,9 +34,9 @@ enum {
 	FEAT_URG_CNT,
 	FEAT_DOWNUP_RATIO,
 	FEAT_INIT_WIN_FWD,
-	FEAT_TOTLEN_FWD,   /* Total Length of Fwd Packets = bytes_fwd (Infiltration) */
-	FEAT_TOTLEN_BWD,   /* Total Length of Bwd Packets = bytes_bwd                */
-	FEAT_FLOW_DUR,     /* Flow Duration (µs) = last_ns - first_ns                */
+	FEAT_TOTLEN_FWD,     /* Total Length of Fwd Packets = bytes_fwd (≡ Subflow F.Bytes) */
+	FEAT_FLOW_DUR,       /* Flow Duration (µs) = last_ns - first_ns                     */
+	FEAT_BWD_PKTLEN_STD, /* Bwd Packet Length Std: var(bytes_bwd, bwd_pktlen_sq_sum, pkts_bwd) */
 };
 
 /*
@@ -62,6 +62,7 @@ struct sg_nf_conn_ml {
 	uint32_t fwd_iat_count;
 	uint32_t syn_count, ack_count, psh_count, urg_count;
 	uint32_t pktlen_count;                    /* payload sample count (both directions) */
+	uint64_t bwd_pktlen_sq_sum;               /* reply-dir payload Σx² → Bwd Packet Length Std */
 };
 
 /*

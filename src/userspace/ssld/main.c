@@ -13,6 +13,7 @@
 #define _GNU_SOURCE
 #include "conn.h"
 #include "tls_policy.h"
+#include "revmap.h"
 #include "ca.h"
 #include "certcache.h"
 #include "sig_rule.h"        /* ../ipsd: sig_ruleset, sig_load_file, sig_build */
@@ -109,7 +110,11 @@ static void usage(const char *prog)
 		"  -S         splice-only (DISABLE bump - no decryption)\n"
 		"  -V         verify the real server cert (fail-closed on error)\n"
 		"  -c <file>  CA cert (default %s)\n"
-		"  -k <file>  CA key  (default %s)\n",
+		"  -k <file>  CA key  (default %s)\n"
+		"  -R <file>  reverse map (\"Protect SSL Server\" inbound deep inspection)\n"
+		"  -C         certificate inspection (validate cert + SNI web-filter, no decrypt)\n"
+		"  -L <file>  web-filter block list (SNI/FQDN, one per line) for -C\n"
+		"  -I         profile is bound to an IPS-enabled policy\n",
 		prog, DEFAULT_PORT, DEFAULT_CACERT, DEFAULT_CAKEY);
 }
 
@@ -118,11 +123,13 @@ int main(int argc, char **argv)
 	uint16_t port = DEFAULT_PORT;
 	const char *bypass_file = NULL, *rules_file = NULL;
 	const char *ca_cert = DEFAULT_CACERT, *ca_key = DEFAULT_CAKEY;
+	const char *revmap_file = NULL, *block_file = NULL;
 	int no_sni_splice = 0, splice_only = 0, verify_upstream = 0;
+	int cert_inspect = 0, ips_on = 0;     /* certificate-inspection mode */
 	int no_ipc = 0, ipc_failclosed = 0;   /* Phase 4 */
 	int opt;
 
-	while ((opt = getopt(argc, argv, "p:b:r:BSVQFc:k:h")) != -1) {
+	while ((opt = getopt(argc, argv, "p:b:r:BSVQFc:k:R:L:CIh")) != -1) {
 		switch (opt) {
 		case 'p': port = (uint16_t)atoi(optarg); break;
 		case 'b': bypass_file = optarg; break;
@@ -134,6 +141,10 @@ int main(int argc, char **argv)
 		case 'F': ipc_failclosed = 1; break;  /* P4: IPC error -> block flow */
 		case 'c': ca_cert = optarg; break;
 		case 'k': ca_key = optarg; break;
+		case 'R': revmap_file = optarg; break; /* reverse "Protect SSL Server" map */
+		case 'C': cert_inspect = 1; break;     /* certificate inspection (no decrypt) */
+		case 'I': ips_on = 1; break;           /* profile bound to an IPS-enabled policy */
+		case 'L': block_file = optarg; break;  /* SNI/FQDN web-filter block list */
 		case 'h': default: usage(argv[0]); return (opt == 'h') ? 0 : 1;
 		}
 	}
@@ -147,6 +158,13 @@ int main(int argc, char **argv)
 		if (n >= 0)
 			fprintf(stderr, "ssld: loaded %d bypass pattern(s)\n", n);
 	}
+
+	/* certificate-inspection web-filter block list (reuses the SNI matcher) */
+	struct tls_policy block;
+	tls_policy_init(&block);
+	int block_n = block_file ? load_bypass_file(&block, block_file) : 0;
+	if (block_n > 0)
+		fprintf(stderr, "ssld: loaded %d web-filter block pattern(s)\n", block_n);
 
 	/* CA + certcache (for bump) */
 	struct ca_ctx ca;
@@ -162,10 +180,19 @@ int main(int argc, char **argv)
 		}
 	}
 
-	/* signature ruleset (optional) */
+	/* reverse map ("Protect SSL Server") — inbound deep inspection (optional) */
+	struct revmap *revmap = revmap_file ? revmap_load(revmap_file) : NULL;
+	if (revmap)
+		fprintf(stderr, "ssld: reverse map loaded (%s) - inbound inspection enabled\n",
+			revmap_file);
+	else if (revmap_file)
+		fprintf(stderr, "ssld: reverse map %s empty/invalid - no inbound inspection\n",
+			revmap_file);
+
+	/* signature ruleset (optional) — used by both forward bump and reverse */
 	struct sig_ruleset rs;
 	struct sig_ruleset *rules = NULL;
-	if (rules_file && bump_ready) {
+	if (rules_file && (bump_ready || revmap)) {
 		sig_ruleset_init(&rs);
 		struct sig_load_stats ls;
 		int added = sig_load_file(&rs, rules_file, &ls);
@@ -185,6 +212,10 @@ int main(int argc, char **argv)
 		.ca  = bump_ready ? &ca : NULL,
 		.cc  = bump_ready ? cc  : NULL,
 		.rules = rules,
+		.revmap = revmap,
+		.cert_inspect = cert_inspect,
+		.ips_on = ips_on,
+		.block = block_n > 0 ? &block : NULL,
 		.verify_upstream = verify_upstream,
 		.no_ipc = no_ipc,
 		.ipc_failclosed = ipc_failclosed,
@@ -230,8 +261,10 @@ int main(int argc, char **argv)
 
 cleanup:
 	if (rules) sig_ruleset_free(&rs);
+	if (revmap) revmap_free(revmap);
 	if (cc) certcache_free(cc);
 	if (bump_ready) ca_free(&ca);
+	tls_policy_free(&block);
 	tls_policy_free(&pol);
 	return 0;
 }

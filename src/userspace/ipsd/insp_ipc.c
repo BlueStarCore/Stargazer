@@ -17,6 +17,7 @@
 #include "nfq.h"         /* SG_CMK_IPS_PROFID_* (profile id in the connmark) */
 #include "ips_model.h"   /* ips_score */
 #include "fusion.h"      /* ips_fuse, struct ips_decision */
+#include "ml_eval.h"     /* ips_ml_eval + ML_CKP_* (shared with NFQUEUE path) */
 #include "engine.h"      /* struct ips_config */
 #include "feature.h"     /* FEAT_COUNT, struct flow_stats */
 #include <arpa/inet.h>   /* ntohl */
@@ -40,9 +41,8 @@ static _Atomic unsigned long g_conns_total, g_conns_open, g_chunks,
 /* Phase 2 — ML config (mode/threshold) from main; pointer to g_cfg (stable). */
 static const struct ips_config *g_ips_cfg;
 
-/* ML checkpoint thresholds (match main.c). */
-#define INSP_ML_PKTS   24u
-#define INSP_ML_BYTES  14000ULL
+/* ML checkpoint thresholds + ips_ml_eval are shared in ml_eval.h (same caps as
+ * the NFQUEUE path). */
 
 /* Virtual flow of an HTTPS connection (owned by the handler thread). */
 struct insp_conn {
@@ -104,6 +104,51 @@ static int insp_on_match(int rule_id, uint64_t end_off, int dir, void *ctx)
 	return (m->best_action == SIG_DROP);   /* DROP → stop early */
 }
 
+/*
+ * ML scoring on the client→ssld leg. Reads the leg's CTA_ML (accumulated by the
+ * kernel LOCAL_IN hook when ml_account_local is on), and — once the flow crosses
+ * the checkpoint (N packets / K bytes) — scores it ONCE via ips_ml_eval and folds
+ * the result into *vb. Shared by INSP_DATA (after a signature PASS) and INSP_SCORE
+ * (cert-mode, no plaintext). Runs OUTSIDE any rwlock (does netlink I/O).
+ * Tuple mismatch / empty CTA_ML → ml_valid=0 → skip (clean degrade).
+ */
+static void insp_ml_leg(struct insp_conn *c, struct insp_verdict_body *vb)
+{
+	if (!(vb->action == INSP_PASS && g_ips_cfg && !c->ml_done &&
+	      c->leg_cli_ip && c->srv_ip))
+		return;
+
+	struct ctdump_result ctr;
+	/* ORIGINAL tuple (client → server:443), see the OPEN handler note. */
+	if (ctdump_query(c->leg_cli_ip, c->srv_ip, c->leg_cli_port, c->srv_port,
+			 6 /* IPPROTO_TCP */, &ctr) != 0 || !ctr.ml_valid)
+		return;
+
+	struct flow_stats fs;
+	ctdump_to_flow_stats(&ctr, &fs);
+	uint32_t N = fs.pkts_fwd + fs.pkts_bwd;
+	/* Early trigger: N packets. FINAL fallback: the 16KB signature scan window
+	 * (both directions of the decrypted plaintext) is exhausted → score ML now.
+	 * No 14KB byte gate. */
+	if (N < ML_CKP_PKTS && reass_inspected_bytes(&c->rf) < REASS_MAX_BYTES)
+		return;   /* not enough accumulated yet — wait for the checkpoint */
+
+	struct ips_decision d = ips_ml_eval(&ctr, fs.pkts_fwd, fs.pkts_bwd,
+					    -1, g_ips_cfg);
+	c->ml_done = 1;
+	vb->src    = 1;                 /* ML */
+	vb->score  = (float)d.score;
+	if (d.verdict == IPS_DROP)
+		vb->action = INSP_DROP;
+	else if (d.verdict == IPS_ALERT)
+		vb->action = INSP_ALERT;
+	if (vb->action != INSP_PASS) {
+		snprintf(vb->msg, sizeof(vb->msg), "ML anomaly (score %.2f)",
+			 d.score);
+		atomic_fetch_add(&g_ml_hits, 1);
+	}
+}
+
 /* Inspect one DATA chunk, return verdict via *vb (filled in). */
 static void insp_handle_data(struct insp_conn *c, struct sig_reload *sr,
 			     int dir01, uint32_t chunk_id,
@@ -157,43 +202,9 @@ static void insp_handle_data(struct insp_conn *c, struct sig_reload *sr,
 	if (vb->action != INSP_PASS) atomic_fetch_add(&g_sig_hits, 1);
 	if (vb->action == INSP_DROP) atomic_fetch_add(&g_blocked, 1);
 
-	/* Phase 2 — ML for HTTPS: NO signature match + not yet scored + has leg →
-	 * read CTA_ML of the client→ssld leg (accumulated by the kernel LOCAL_IN hook
-	 * when ml-https is enabled) → ips_score → ips_fuse. Called OUTSIDE rdlock (netlink I/O).
-	 * Tuple mismatch / empty CTA_ML → ml_valid=0 → skip (clean degrade). */
-	if (vb->action == INSP_PASS && g_ips_cfg && !c->ml_done &&
-	    c->leg_cli_ip && c->srv_ip) {
-		struct ctdump_result ctr;
-		/* ORIGINAL tuple (client → server:443), see the OPEN handler note. */
-		if (ctdump_query(c->leg_cli_ip, c->srv_ip,
-				 c->leg_cli_port, c->srv_port,
-				 6 /* IPPROTO_TCP */, &ctr) == 0 && ctr.ml_valid) {
-			struct flow_stats fs;
-			ctdump_to_flow_stats(&ctr, &fs);
-			uint32_t N = fs.pkts_fwd + fs.pkts_bwd;
-			uint64_t B = ctr.ml.bytes_fwd + ctr.ml.bytes_bwd;
-			if (N >= INSP_ML_PKTS || B >= INSP_ML_BYTES) {
-				double feat[FEAT_COUNT];
-				ctdump_to_features(&ctr, fs.pkts_fwd, fs.pkts_bwd,
-						   -1, feat);
-				double sc = ips_score(feat);
-				struct ips_decision d =
-					ips_fuse(g_ips_cfg, -1, 0, sc);
-				c->ml_done = 1;
-				vb->src   = 1;          /* ML */
-				vb->score = (float)sc;
-				if (d.verdict == IPS_DROP)
-					vb->action = INSP_DROP;
-				else if (d.verdict == IPS_ALERT)
-					vb->action = INSP_ALERT;
-				if (vb->action != INSP_PASS) {
-					snprintf(vb->msg, sizeof(vb->msg),
-						 "ML anomaly (score %.2f)", sc);
-					atomic_fetch_add(&g_ml_hits, 1);
-				}
-			}
-		}
-	}
+	/* ML on the client→ssld leg — only when no signature matched (shared with the
+	 * cert-mode INSP_SCORE path, which calls insp_ml_leg directly). */
+	insp_ml_leg(c, vb);
 }
 
 struct conn_arg { int fd; struct sig_reload *sr; };
@@ -297,6 +308,21 @@ static void *insp_conn_thread(void *arg)
 			insp_handle_data(&c, sr, d->dir, d->chunk_id,
 					 buf + off, len, &reply.v);
 
+			if (send(fd, &reply, sizeof(reply), MSG_NOSIGNAL) < 0)
+				break;
+
+		} else if (h->type == INSP_SCORE) {
+			/* cert mode: ML-ONLY on the leg, no plaintext / no signature. */
+			struct {
+				struct insp_hdr          h;
+				struct insp_verdict_body v;
+			} reply;
+			memset(&reply, 0, sizeof(reply));
+			reply.h.type    = INSP_VERDICT;
+			reply.h.conn_id = h->conn_id;
+			reply.v.action  = INSP_PASS;
+			reply.v.score   = -1.0f;
+			insp_ml_leg(&c, &reply.v);
 			if (send(fd, &reply, sizeof(reply), MSG_NOSIGNAL) < 0)
 				break;
 

@@ -130,7 +130,8 @@ void reass_set_scan_limit(struct reass_flow *rf, int dir, uint32_t limit,
 const uint8_t *reass_dir_buf(const struct reass_flow *rf, int dir,
 			     uint32_t *contig_len);
 
-/* Total inspected (contiguous) bytes across both directions — caller compares with K to offload. */
+/* Total inspected (contiguous) bytes across BOTH directions. Used as the final
+ * ML-checkpoint fallback (compare with REASS_MAX_BYTES) and to offload. */
 uint32_t reass_inspected_bytes(const struct reass_flow *rf);
 
 void reass_flow_free(struct reass_flow *rf);

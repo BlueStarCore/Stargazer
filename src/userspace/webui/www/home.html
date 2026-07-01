@@ -1144,10 +1144,18 @@
                         <div class="form-grid">
                             <div class="form-row" data-key="name"><label class="form-label">Name</label><input class="form-input" type="text" placeholder="e.g. deep_lan" maxlength="64"></div>
                             <div class="form-row" data-key="status"><label class="form-label">Status</label><select class="form-input"><option value="enable" selected>Enabled</option><option value="disable">Disabled</option></select></div>
-                            <div class="form-row" data-key="inspection-mode"><label class="form-label">Inspection Mode</label><select class="form-input"><option value="certificate" selected>Certificate (SNI/cert only — no decrypt)</option><option value="deep">Deep (full MITM decrypt)</option></select></div>
-                            <div class="form-row" data-key="no-sni"><label class="form-label">TLS without SNI</label><select class="form-input"><option value="bump" selected>Bump (decrypt)</option><option value="splice">Splice (bypass)</option></select></div>
-                            <div class="form-row" data-key="untrusted-server-cert"><label class="form-label">Untrusted Server Cert</label><select class="form-input"><option value="block" selected>Block</option><option value="allow">Allow</option></select></div>
-                            <div class="form-row" data-key="unsupported"><label class="form-label">Unsupported (cert-pinning)</label><select class="form-input"><option value="allow" selected>Allow (bypass)</option><option value="block">Block</option></select></div>
+                            <div class="form-row" data-key="inspection-mode"><label class="form-label">Enable SSL inspection of</label><select class="form-input"><option value="multiple-clients" selected>Multiple Clients Connecting to Multiple Servers</option><option value="protecting-server">Protecting SSL Server</option></select></div>
+                            <!-- Multiple Clients (outbound) -->
+                            <div class="form-row" data-mode="multiple-clients" data-key="inspection-method"><label class="form-label">Inspection Method</label><select class="form-input"><option value="certificate" selected>SSL Certificate Inspection (SNI/cert only)</option><option value="deep">Full SSL Inspection (deep — MITM decrypt)</option></select></div>
+                            <div class="form-row" data-mode="multiple-clients" data-key="no-sni"><label class="form-label">TLS without SNI</label><select class="form-input"><option value="bump" selected>Bump (decrypt)</option><option value="splice">Splice (bypass)</option></select></div>
+                            <div class="form-row" data-mode="multiple-clients" data-key="untrusted-server-cert"><label class="form-label">Untrusted Server Cert</label><select class="form-input"><option value="block" selected>Block</option><option value="allow">Allow</option></select></div>
+                            <div class="form-row" data-mode="multiple-clients" data-key="unsupported"><label class="form-label">Unsupported (cert-pinning)</label><select class="form-input"><option value="allow" selected>Allow (bypass)</option><option value="block">Block</option></select></div>
+                            <!-- Protecting SSL Server (inbound) -->
+                            <div class="form-row" data-mode="protecting-server" data-key="server-cert"><label class="form-label">Server Certificate</label><select class="form-input server-cert-select"><option value="">-- Select imported certificate --</option></select></div>
+                            <div class="form-row" data-mode="protecting-server" data-key="protect-vip"><label class="form-label">VIP / WAN IP</label><input class="form-input" type="text" placeholder="203.0.113.10"></div>
+                            <div class="form-row" data-mode="protecting-server" data-key="protect-backend"><label class="form-label">Backend Server IP</label><input class="form-input" type="text" placeholder="10.0.0.20"></div>
+                            <div class="form-row" data-mode="protecting-server" data-key="protect-backend-port"><label class="form-label">Backend Port</label><input class="form-input" type="number" min="1" max="65535" placeholder="443"></div>
+                            <div class="form-row" data-mode="protecting-server" data-key="protect-sni"><label class="form-label">Pin SNI (optional)</label><input class="form-input" type="text" placeholder="www.example.com"></div>
                             <div class="form-row form-row-full form-row-wide" data-key="exempt"><label class="form-label">Exempt domains (SNI)</label><input class="form-input" type="text" placeholder="*.bank.com,*.health.gov"></div>
                             <div class="form-row form-row-full form-row-wide" data-key="comment"><label class="form-label">Comment</label><input class="form-input" type="text" placeholder="Optional description" maxlength="255"></div>
                         </div>
@@ -1206,8 +1214,37 @@
 
             <!-- ======== SYSTEM > CERTIFICATES PAGE ======== -->
             <div id="page-sys-certificates" class="page" style="display:none">
-                <div class="page-header"><h1 class="page-title">CERTIFICATES</h1></div>
+                <div class="page-header">
+                    <h1 class="page-title">CERTIFICATES</h1>
+                    <button class="btn-create" id="cert-import-toggle"><span class="btn-create-plus">+</span> Import Certificate</button>
+                </div>
+
+                <!-- Import certificate dialog (custom multipart upload, not the generic config form) -->
+                <div class="add-form form-card" id="form-cert-import" role="dialog" aria-modal="true" aria-label="Import certificate">
+                    <div class="form-section"><span class="modal-title-text">IMPORT CERTIFICATE</span><button class="modal-close" type="button" id="cert-import-close" aria-label="Close">&#10005;</button></div>
+                    <div class="modal-body">
+                        <p style="margin:0 0 12px;line-height:1.5;color:#555">Import a server certificate (PEM) and its private key. Used by <b>SSL Profile → Protecting SSL Server</b> to decrypt inbound HTTPS with the real certificate.</p>
+                        <div class="form-grid">
+                            <div class="form-row" data-key="name"><label class="form-label">Certificate Name</label><input class="form-input" id="cert-imp-name" type="text" placeholder="e.g. web_server" maxlength="63"></div>
+                            <div class="form-row"><label class="form-label">Certificate file (PEM)</label><label class="file-upload"><input type="file" id="cert-imp-cert" accept=".pem,.crt,.cer" class="file-upload-input"><span class="file-upload-btn">Choose File</span><span class="file-upload-name" id="cert-imp-cert-name">No file selected</span></label></div>
+                            <div class="form-row"><label class="form-label">Private key file (PEM)</label><label class="file-upload"><input type="file" id="cert-imp-key" accept=".pem,.key" class="file-upload-input"><span class="file-upload-btn">Choose File</span><span class="file-upload-name" id="cert-imp-key-name">No file selected</span></label></div>
+                            <div class="form-row form-row-full form-row-wide"><label class="form-label">Comment</label><input class="form-input" id="cert-imp-comment" type="text" placeholder="Optional description" maxlength="255"></div>
+                        </div>
+                        <div id="cert-imp-msg" style="margin-top:8px;font-size:12px;color:#c0392b"></div>
+                    </div>
+                    <div class="modal-footer"><button class="btn btn-primary" id="cert-imp-submit">Import</button><button class="btn" id="cert-import-cancel">Cancel</button></div>
+                </div>
+
+                <!-- Imported (local) certificates -->
                 <div class="form-card">
+                    <div class="form-section">LOCAL CERTIFICATES</div>
+                    <table class="data-table">
+                        <thead><tr><th>NAME</th><th>PRIVATE KEY</th><th>COMMENT</th><th style="width:80px"></th></tr></thead>
+                        <tbody id="cert-list-body"><tr><td colspan="4" style="color:#888">(loading…)</td></tr></tbody>
+                    </table>
+                </div>
+
+                <div class="form-card" style="margin-top:12px">
                     <div class="form-section">SSL INSPECTION CA</div>
                     <p style="margin:0 0 10px;line-height:1.5">The firewall's CA is used to re-sign certificates during <b>deep SSL inspection</b>. Install this CA into the client's trust store so the browser does not report certificate errors. The CA is generated automatically the first time deep inspection is enabled.</p>
                     <div class="form-row"><label class="form-label">CA status</label><span id="cert-ca-status" class="form-input" style="border:none;background:none">(checking…)</span></div>

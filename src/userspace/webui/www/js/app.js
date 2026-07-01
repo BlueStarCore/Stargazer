@@ -321,6 +321,8 @@
             /* Refresh SSL-profile dropdown on policy form so new profiles appear */
             invalidateApiCache('/config/security_ssl-inspection-profile');
             populateSslProfileSelects();
+            invalidateApiCache('/config/system_certificate');
+            populateCertificateSelects();
             initSslPageExtras(pageEl);
         }
         else if (page === 'sys-certificates') { promises.push(initCertPage(pageEl)); }
@@ -1828,6 +1830,14 @@
                 /* closeModal reset the type select — re-sync the
                  * type-dependent rows (address form: subnet vs fqdn) */
                 syncAddressFormRows();
+                /* SSL profile: re-attach the rows for the (reset) mode so a
+                 * create form opened after a prior edit isn't left with stale
+                 * out-of-mode fields in the DOM. */
+                if (id === 'form-ssl-profile') {
+                    /* Pick up certs imported since the page first loaded. */
+                    invalidateApiCache('/config/system_certificate');
+                    initSslPageExtras(document.getElementById('page-sec-ssl'));
+                }
             }
         });
     });
@@ -2007,14 +2017,23 @@
             hasStatus: true,
             statusLabels: { on: 'Enabled', off: 'Disabled', dotOn: 'enable', dotOff: 'disable' },
             fields: [
-                { label: 'Name',            key: 'name',                  col: 0, bulkEditable: false },
-                { label: 'Inspection Mode', key: 'inspection-mode',       col: 1, bulkEditable: false },
-                { label: 'Status',          key: 'status',                col: 2, bulkEditable: true },
-                { label: 'No-SNI',          key: 'no-sni',                col: -1, bulkEditable: false },
-                { label: 'Untrusted Cert',  key: 'untrusted-server-cert', col: -1, bulkEditable: false },
-                { label: 'Unsupported',     key: 'unsupported',           col: -1, bulkEditable: false },
-                { label: 'Exempt',          key: 'exempt',                col: -1, bulkEditable: false },
-                { label: 'Comment',         key: 'comment',               col: 3, bulkEditable: false }
+                { label: 'Name',              key: 'name',                  col: 0, bulkEditable: false },
+                { label: 'Inspection Mode',   key: 'inspection-mode',       col: 1, bulkEditable: false },
+                { label: 'Status',            key: 'status',                col: 2, bulkEditable: true },
+                /* Multiple-clients (outbound) fields */
+                { label: 'Inspection Method', key: 'inspection-method',     col: -1, bulkEditable: false },
+                { label: 'No-SNI',            key: 'no-sni',                col: -1, bulkEditable: false },
+                { label: 'Untrusted Cert',    key: 'untrusted-server-cert', col: -1, bulkEditable: false },
+                { label: 'Unsupported',       key: 'unsupported',           col: -1, bulkEditable: false },
+                /* Protecting-server (inbound) fields */
+                { label: 'Server Cert',       key: 'server-cert',           col: -1, bulkEditable: false },
+                { label: 'Server Key',        key: 'server-key',            col: -1, bulkEditable: false },
+                { label: 'Protect VIP',       key: 'protect-vip',           col: -1, bulkEditable: false },
+                { label: 'Protect Backend',   key: 'protect-backend',       col: -1, bulkEditable: false },
+                { label: 'Backend Port',      key: 'protect-backend-port',  col: -1, bulkEditable: false },
+                { label: 'Protect SNI',       key: 'protect-sni',           col: -1, bulkEditable: false },
+                { label: 'Exempt',            key: 'exempt',                col: -1, bulkEditable: false },
+                { label: 'Comment',           key: 'comment',               col: 3, bulkEditable: false }
             ]
         },
         ipsRulesets: {
@@ -2556,18 +2575,37 @@
 
         /* Try API first, fall back to reading from DOM */
         api('/config/' + cfgType(entity) + '/' + rowId).then(function (data) {
-            if (data) {
-                populateForm(config, keyMap, data, body);
-            } else {
+            var loaded = data;
+            if (!loaded) {
                 /* Demo fallback: read from table row cells */
                 var colOffset = config.orderable ? 2 : 1;
-                var rowData = {};
+                loaded = {};
                 config.fields.forEach(function (field) {
                     var cell = row.cells[field.col + colOffset]; /* +1 checkbox, +1 drag handle if orderable */
-                    if (cell) rowData[field.key] = cellText(cell);
+                    if (cell) loaded[field.key] = cellText(cell);
                 });
-                populateForm(config, keyMap, rowData, body);
             }
+
+            /* SSL profile: the mode-scoped fields are removed from the DOM when
+             * out of their mode, so set the mode and attach the in-mode rows
+             * BEFORE building the key map / populating — otherwise an inbound
+             * profile's server-cert/protect-* inputs aren't present to fill. */
+            if (config.formId === 'form-ssl-profile') {
+                var sslPg = document.getElementById('page-sec-ssl');
+                var msel = sslPg.querySelector('.form-row[data-key="inspection-mode"] .form-input');
+                if (msel && loaded['inspection-mode']) selectOption(msel, String(loaded['inspection-mode']));
+                initSslPageExtras(sslPg);          /* attaches this mode's rows */
+                keyMap = buildKeyInputMap(body, config);  /* remap with attached rows */
+                /* server-cert options load async; re-apply the saved value once
+                 * they arrive (populateForm below sets it before options exist). */
+                if (loaded['server-cert']) {
+                    populateCertificateSelects().then(function () {
+                        var cs = sslPg.querySelector('.server-cert-select');
+                        if (cs) selectOption(cs, String(loaded['server-cert']));
+                    });
+                }
+            }
+            populateForm(config, keyMap, loaded, body);
 
             loader.remove();
             if (grid) grid.style.display = '';
@@ -4064,13 +4102,52 @@
     function initSslPageExtras(pg) {
         if (!pg) return;
         var modeSel   = pg.querySelector('.form-row[data-key="inspection-mode"] .form-input');
+        var methodSel = pg.querySelector('.form-row[data-key="inspection-method"] .form-input');
         var statusSel = pg.querySelector('.form-row[data-key="status"] .form-input');
         var exemptInp = pg.querySelector('.form-row[data-key="exempt"] .form-input');
         var warn      = pg.querySelector('#ssl-deep-warning');
         var exSummary = pg.querySelector('#ssl-exempt-summary');
+        /* Cache the full set on first run (every row is still in the DOM then);
+         * an Array keeps references to rows even after they are detached, so a
+         * later mode switch can re-attach them. Re-querying would miss detached
+         * rows and they could never come back. */
+        var scopedRows = pg._sslScopedRows;
+        if (!scopedRows) {
+            scopedRows = Array.prototype.slice.call(pg.querySelectorAll('.form-row[data-mode]'));
+            pg._sslScopedRows = scopedRows;
+        }
+
+        /* FortiGate-style: only the fields belonging to the selected "Enable SSL
+         * inspection of" mode exist in the form. Out-of-mode rows are *removed
+         * from the DOM* (not just hidden) so there is no trace of them in that
+         * mode's config — mirrors the CLI, where an out-of-mode key is rejected
+         * as unknown. A comment-node anchor marks each row's original slot so it
+         * is re-attached in the right place when its mode is selected. Detached
+         * rows are skipped by buildPayloadFromForm, so they never get submitted. */
+        function applyMode() {
+            var mode = (modeSel && modeSel.value) || 'multiple-clients';
+            scopedRows.forEach(function (r) {
+                if (!r._anchor && r.parentNode) {
+                    r._anchor = document.createComment('ssl-field:' + r.dataset.key);
+                    r.parentNode.insertBefore(r._anchor, r);
+                }
+                if (r.dataset.mode === mode) {
+                    if (!r.parentNode && r._anchor && r._anchor.parentNode) {
+                        r._anchor.parentNode.insertBefore(r, r._anchor.nextSibling);
+                    }
+                } else if (r.parentNode) {
+                    r.parentNode.removeChild(r);
+                }
+            });
+            /* The server-cert <select> only exists in the DOM while
+             * protecting-server is active (rows are detached out-of-mode), so
+             * fill it here — re-attaching restores the empty placeholder. */
+            if (mode === 'protecting-server') populateCertificateSelects();
+        }
 
         function updateWarn() {
-            var deep = modeSel && modeSel.value === 'deep';
+            var mode = (modeSel && modeSel.value) || 'multiple-clients';
+            var deep = mode === 'multiple-clients' && methodSel && methodSel.value === 'deep';
             var on   = statusSel && statusSel.value === 'enable';
             if (warn) warn.style.display = (deep && on) ? '' : 'none';
             if (exSummary) {
@@ -4078,9 +4155,13 @@
                 exSummary.textContent = ex ? ex : '(none configured)';
             }
         }
-        [modeSel, statusSel].forEach(function (s) {
-            if (s && !s._sslWired) { s.addEventListener('change', updateWarn); s._sslWired = 1; }
+        [modeSel, methodSel, statusSel].forEach(function (s) {
+            if (s && !s._sslWired) {
+                s.addEventListener('change', function () { applyMode(); updateWarn(); });
+                s._sslWired = 1;
+            }
         });
+        applyMode();
         if (exemptInp && !exemptInp._sslWired) {
             exemptInp.addEventListener('input', updateWarn); exemptInp._sslWired = 1;
         }
@@ -4132,6 +4213,122 @@
             });
         }
 
+        /* ── Imported certificates: list + import + delete ──────────── */
+        var listBody = pg.querySelector('#cert-list-body');
+        var importForm = pg.querySelector('#form-cert-import');
+
+        function loadCertList() {
+            if (!listBody) return Promise.resolve();
+            invalidateApiCache('/config/system_certificate');
+            return api('/config/system_certificate').then(function (data) {
+                var entries = (data && data.entries) ? data.entries : [];
+                listBody.innerHTML = '';
+                if (!entries.length) {
+                    listBody.innerHTML = '<tr><td colspan="4" style="color:#888">No certificates imported yet.</td></tr>';
+                    return;
+                }
+                var esc = SgCommon.escHTML;
+                entries.forEach(function (e) {
+                    var id = e.id || e.name || '';
+                    var tr = document.createElement('tr');
+                    var hasKey = (e['has-key'] === 'yes');
+                    tr.innerHTML =
+                        '<td>' + esc(id) + '</td>' +
+                        '<td>' + (hasKey ? '<span style="color:#27ae60">Yes</span>' : '<span style="color:#888">No</span>') + '</td>' +
+                        '<td>' + esc(e.comment || '') + '</td>' +
+                        '<td><button class="btn btn-danger btn-sm" data-cert-del="' + esc(id) + '">Delete</button></td>';
+                    listBody.appendChild(tr);
+                });
+            }).catch(function () {
+                if (listBody) listBody.innerHTML = '<tr><td colspan="4" style="color:#c0392b">Failed to load certificates.</td></tr>';
+            });
+        }
+
+        if (listBody && !listBody._wired) {
+            listBody._wired = 1;
+            listBody.addEventListener('click', function (ev) {
+                var btn = ev.target.closest('[data-cert-del]');
+                if (!btn) return;
+                var id = btn.getAttribute('data-cert-del');
+                confirmAction('Delete certificate "' + id + '"? This fails if an SSL profile still uses it.').then(function (ok) {
+                    if (!ok) return;
+                    api('/config/system_certificate/' + encodeURIComponent(id), { method: 'DELETE' })
+                    .then(function () { showToast('Certificate deleted', 'success'); loadCertList(); })
+                    .catch(function (err) { showToast((err && err.message) || 'Delete failed (certificate in use?)', 'error'); });
+                });
+            });
+        }
+
+        /* File-name display for the two upload inputs */
+        ['cert', 'key'].forEach(function (which) {
+            var inp = pg.querySelector('#cert-imp-' + which);
+            var lbl = pg.querySelector('#cert-imp-' + which + '-name');
+            if (inp && lbl && !inp._wired) {
+                inp._wired = 1;
+                inp.addEventListener('change', function () {
+                    lbl.textContent = inp.files.length ? inp.files[0].name : 'No file selected';
+                });
+            }
+        });
+
+        /* The form is an .add-form modal (hidden by CSS, shown via the .visible
+         * class + backdrop) — use the shared openModal/closeModal, NOT inline
+         * display, otherwise CSS keeps it hidden. */
+        function closeImport() { closeModal(); }
+        var impToggle = pg.querySelector('#cert-import-toggle');
+        var impClose  = pg.querySelector('#cert-import-close');
+        var impCancel = pg.querySelector('#cert-import-cancel');
+        if (impToggle && !impToggle._wired) {
+            impToggle._wired = 1;
+            impToggle.addEventListener('click', function () {
+                var msg = pg.querySelector('#cert-imp-msg'); if (msg) msg.textContent = '';
+                openModal('form-cert-import');
+            });
+        }
+        if (impClose && !impClose._wired)  { impClose._wired = 1;  impClose.addEventListener('click', closeImport); }
+        if (impCancel && !impCancel._wired){ impCancel._wired = 1; impCancel.addEventListener('click', closeImport); }
+
+        var impSubmit = pg.querySelector('#cert-imp-submit');
+        if (impSubmit && !impSubmit._wired) {
+            impSubmit._wired = 1;
+            impSubmit.addEventListener('click', function () {
+                var name = (pg.querySelector('#cert-imp-name') || {}).value || '';
+                var certF = pg.querySelector('#cert-imp-cert');
+                var keyF  = pg.querySelector('#cert-imp-key');
+                var comment = (pg.querySelector('#cert-imp-comment') || {}).value || '';
+                var msg = pg.querySelector('#cert-imp-msg');
+                if (msg) msg.textContent = '';
+                if (!name.trim()) { if (msg) msg.textContent = 'Certificate name is required.'; return; }
+                if (!certF || !certF.files.length) { if (msg) msg.textContent = 'Choose a certificate (PEM) file.'; return; }
+
+                var fd = new FormData();
+                fd.append('name', name.trim());
+                fd.append('certificate', certF.files[0]);
+                if (keyF && keyF.files.length) fd.append('key', keyF.files[0]);
+                if (comment.trim()) fd.append('comment', comment.trim());
+
+                impSubmit.disabled = true;
+                impSubmit.textContent = 'Importing...';
+                api('/system/certificate/import', { method: 'POST', body: fd })
+                .then(function (data) {
+                    impSubmit.disabled = false; impSubmit.textContent = 'Import';
+                    if (!data) { if (msg) msg.textContent = 'No backend available.'; return; }
+                    showToast('Certificate imported', 'success');
+                    closeImport();
+                    if (certF) certF.value = ''; if (keyF) keyF.value = '';
+                    var cn = pg.querySelector('#cert-imp-cert-name'); if (cn) cn.textContent = 'No file selected';
+                    var kn = pg.querySelector('#cert-imp-key-name'); if (kn) kn.textContent = 'No file selected';
+                    loadCertList();
+                })
+                .catch(function (err) {
+                    impSubmit.disabled = false; impSubmit.textContent = 'Import';
+                    if (msg) msg.textContent = (err && err.message) || 'Import failed.';
+                });
+            });
+        }
+
+        loadCertList();
+
         return api('/monitor/ssl-cacert').then(function (d) {
             caPem = (d && d.output) ? d.output : '';
             if (statusEl) statusEl.textContent = caPem
@@ -4141,6 +4338,25 @@
             caPem = '';
             if (statusEl) statusEl.textContent = 'CA not created — enable deep SSL inspection to generate automatically';
         });
+    }
+
+    /* Populate the SSL-profile "server-cert" dropdown from imported certs. */
+    function populateCertificateSelects() {
+        return cachedApi('/config/system_certificate').then(function (data) {
+            var entries = (data && data.entries) ? data.entries : [];
+            document.querySelectorAll('.server-cert-select').forEach(function (sel) {
+                var cur = sel.value;
+                sel.innerHTML = '<option value="">-- Select imported certificate --</option>';
+                entries.forEach(function (e) {
+                    var id = e.id || e.name || '';
+                    if (!id) return;
+                    var opt = document.createElement('option');
+                    opt.value = id; opt.textContent = id;
+                    sel.appendChild(opt);
+                });
+                if (cur) sel.value = cur;
+            });
+        }).catch(function () {});
     }
 
     /* ── IPS Monitor: status card + recent alert log ──────────────── */

@@ -480,18 +480,21 @@ int handle_ssl_diag(int client_fd, const char *user,
 			int builtin = strcmp(id, "no-inspection") == 0;
 			char *st   = sg_db_get_val(SSL_PROF, id, "status");
 			char *mode = sg_db_get_val(SSL_PROF, id, "inspection-mode");
+			char *method = sg_db_get_val(SSL_PROF, id, "inspection-method");
 			char *nosni= sg_db_get_val(SSL_PROF, id, "no-sni");
 			char *untr = sg_db_get_val(SSL_PROF, id, "untrusted-server-cert");
 			char *exmpt= sg_db_get_val(SSL_PROF, id, "exempt");
 			int en   = !builtin && st && !strcmp(st, "enable");
-			int deep = mode && !strcmp(mode, "deep");
+			int deep = method && !strcmp(method, "deep");
 
 			ADD("\n[profile %s]%s\n", id, builtin ? " (builtin)" : "");
 			if (builtin) {
 				ADD("  inspection=none (traffic passes through, no decryption)\n");
 			} else {
 				ADD("  status=%s\n", en ? "enable" : "disable");
-				ADD("  inspection_mode=%s\n", mode ? mode : "certificate");
+				ADD("  inspection_mode=%s\n", mode ? mode : "multiple-clients");
+				if (!(mode && !strcmp(mode, "protecting-server")))
+					ADD("  inspection_method=%s\n", method ? method : "certificate");
 				ADD("  no_sni=%s\n", nosni ? nosni : "bump");
 				ADD("  untrusted_server_cert=%s\n", untr ? untr : "block");
 				int ex = 0;
@@ -517,7 +520,7 @@ int handle_ssl_diag(int client_fd, const char *user,
 				}
 			}
 			if (en) idx++;
-			free(st); free(mode); free(nosni); free(untr); free(exmpt);
+			free(st); free(mode); free(method); free(nosni); free(untr); free(exmpt);
 		}
 		free(list);
 	}
@@ -2946,9 +2949,19 @@ int handle_show_sessions(int client_fd, const char *user,
 	if (nlmap < 0)
 		nlmap = 0;   /* getifaddrs failure → local flows just show "-" */
 
+	/* Cap the emitted listing so the IPC response never exceeds
+	 * SG_RESPONSE_MAX. Without this, a port scan (nmap -p-) creates tens of
+	 * thousands of conntrack entries, the dump grows to several MB, and the
+	 * client — which only reads payloads <= SG_RESPONSE_MAX — skips it, leaving
+	 * megabytes of stale bytes in the socket that desync every later command
+	 * (the symptom: `session list` hangs the CLI until the connection resets).
+	 * Leave headroom for the "active=" header and response framing. */
+	const size_t LIST_CAP = SG_RESPONSE_MAX - 4096;
 	long count = 0;
+	int truncated = 0;
 	char line[1024];
 	while (fgets(line, sizeof(line), fp_ct)) {
+		if (out.used >= LIST_CAP) { truncated = 1; break; }
 		if (ct_emit_line(line, &out, pmap, npmap, imap, nimap,
 				 lmap, nlmap, fp) == 0)
 			count++;
@@ -2959,12 +2972,20 @@ int handle_show_sessions(int client_fd, const char *user,
 	free(lmap);
 
 	struct dynbuf resp;
-	if (dbuf_init(&resp, out.used + 64) < 0) {
+	if (dbuf_init(&resp, out.used + 128) < 0) {
 		send_ok(client_fd, NULL, out.data);
 		free(out.data);
 		return 0;
 	}
-	dbuf_printf(&resp, "active=%ld\n", count);
+	if (truncated)
+		dbuf_printf(&resp,
+			    "active=%ld truncated=1\n"
+			    "# listing capped at %zuKB — narrow with a filter "
+			    "(e.g. 'session list dst <ip>') or use 'session stats' "
+			    "for the full count\n",
+			    count, (size_t)(LIST_CAP / 1024));
+	else
+		dbuf_printf(&resp, "active=%ld\n", count);
 	dbuf_append(&resp, out.data, out.used);
 	send_ok(client_fd, NULL, resp.data);
 	free(out.data);
@@ -3222,6 +3243,7 @@ struct sg_nf_conn_ml {
 	uint32_t psh_count;
 	uint32_t urg_count;
 	uint32_t pktlen_count;
+	uint64_t bwd_pktlen_sq_sum;   /* reply-dir payload Σx² → Bwd Packet Length Std */
 };
 
 /* Find attribute `want` in an nlattr stream [data, data+len); return payload. */

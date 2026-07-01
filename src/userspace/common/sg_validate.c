@@ -39,6 +39,7 @@ static const sg_type_info_t type_table[] = {
 	{ "security_ips-filter",    CFG_TABLE,  "configure", "Configure IPS profile filters (category/signature + action, FortiGate-style)" },
 	{ "security_ips-ruleset",   CFG_TABLE,  "configure", "Configure IPS ruleset sources (URL entries for download)" },
 	{ "security_ssl-inspection-profile", CFG_TABLE, "configure", "Configure SSL inspection profiles (FortiGate-style)" },
+	{ "system_certificate",     CFG_TABLE,  "admin",     "Import/manage server certificates (PEM)" },
 	{ "system_password-policy", CFG_SINGLE, "admin",     "Configure global password policy"    },
 	{ "system_admin-profile",   CFG_TABLE,  "admin",     "Configure admin permission profiles" },
 	{ "system_admin",           CFG_TABLE,  "admin",     "Configure admin accounts"            },
@@ -139,12 +140,31 @@ static const struct field_entry field_table[] = {
 	 * profile gets its own ssld. */
 	{ "security_ssl-inspection-profile", "name",                  "safe-id",               0, NULL,          "Profile name", 0 },
 	{ "security_ssl-inspection-profile", "status",                "enum:enable,disable",   0, "enable",      "Enable this profile", 0 },
-	{ "security_ssl-inspection-profile", "inspection-mode",       "enum:certificate,deep", 0, "certificate", "certificate=SNI/cert only; deep=MITM decrypt", 0 },
-	{ "security_ssl-inspection-profile", "no-sni",                "enum:bump,splice",      0, "bump",        "Action for TLS without SNI", 0 },
+	{ "security_ssl-inspection-profile", "inspection-mode",       "enum:multiple-clients,protecting-server", 0, "multiple-clients", "multiple-clients=outbound (clients→servers); protecting-server=inbound (protect an internal server)", 0 },
+	{ "security_ssl-inspection-profile", "inspection-method",     "enum:certificate,deep",  0, "certificate", "[multiple-clients] certificate=SNI/cert only (no decrypt); deep=full MITM decrypt", 0 },
+	{ "security_ssl-inspection-profile", "no-sni",                "enum:bump,splice",      0, "bump",        "[multiple-clients] action for TLS without SNI", 0 },
 	{ "security_ssl-inspection-profile", "untrusted-server-cert", "enum:allow,block",      0, "block",       "Untrusted server cert → allow/block", 0 },
 	{ "security_ssl-inspection-profile", "unsupported",           "enum:allow,block",      0, "allow",       "Unsupported (cert-pinning/cipher) → allow/block", 0 },
 	{ "security_ssl-inspection-profile", "exempt",                "string",                1, NULL,          "Exempt SNI domains (comma list)", 0 },
 	{ "security_ssl-inspection-profile", "comment",               "string",                1, NULL,          "Optional description", 0 },
+	/* protect-server (inbound reverse "Protect SSL Server") — consumed by ssld_sync.
+	 * server-cert references an imported certificate (system_certificate); ssld_sync
+	 * resolves it to /etc/stargazer/ssl/certs/<name>/{cert,key}.pem. The bundled key
+	 * comes with the import, so there is no separate server-key field. */
+	{ "security_ssl-inspection-profile", "server-cert",          "ref:system_certificate", 1, NULL,  "Imported server certificate (protect-server)", 0 },
+	{ "security_ssl-inspection-profile", "protect-vip",          "ipv4",         1, NULL,  "VIP/WAN IP the external client targets (protect-server)", 0 },
+	{ "security_ssl-inspection-profile", "protect-backend",      "ipv4",         1, NULL,  "Internal backend server IP (protect-server)", 0 },
+	{ "security_ssl-inspection-profile", "protect-backend-port", "uint:1:65535", 1, "443", "Backend TLS port (protect-server)", 0 },
+	{ "security_ssl-inspection-profile", "protect-sni",          "string",       1, NULL,  "Pin to this SNI (optional, protect-server)", 0 },
+	{ "security_ssl-inspection-profile", "block-sni",            "string",       1, NULL,  "Web-filter: block these SNI/FQDN (comma list, *.domain ok) — certificate mode", 0 },
+
+	/* system_certificate (CFG_TABLE) — imported PEM certificates. The PEM material
+	 * lives as files under /etc/stargazer/ssl/certs/<id>/; the DB row carries only
+	 * metadata. Entries are created by the dedicated import path (CERT_IMPORT IPC),
+	 * not by plain `set`, so the fields below are read-only/internal except comment. */
+	{ "system_certificate", "name",    "safe-id",             0, NULL, "Certificate name (identifier)", 0 },
+	{ "system_certificate", "has-key", "enum:yes,no",         1, "no", "Whether a private key was imported (set by import)", SG_FLD_HIDDEN },
+	{ "system_certificate", "comment", "string",              1, NULL, "Optional description", 0 },
 
 	/* system_interface */
 	{ "system_interface", "mode",        "enum:static,dhcp", 0, "static", "Addressing mode", 0 },
@@ -588,8 +608,9 @@ sg_is_access_services(const char *s)
 	return 1;
 }
 
-int
-sg_is_port_or_range(const char *s)
+/* One token: a single port "80" or a dash range "80-443". */
+static int
+sg_is_port_token(const char *s)
 {
 	if (!s || !*s)
 		return 0;
@@ -626,6 +647,36 @@ sg_is_port_or_range(const char *s)
 	}
 
 	return sg_is_uint_range(s, 1, 65535);
+}
+
+int
+sg_is_port_or_range(const char *s)
+{
+	if (!s || !*s)
+		return 0;
+
+	/* Comma-separated list of ports and/or dash ranges:
+	 * "80", "80-443", "80,443", "80,443,8000-8080". Each token is a single
+	 * port or a dash range. Cap at 15 tokens (iptables multiport limit). */
+	char tok[32];
+	const char *p = s;
+	int ntok = 0;
+	while (*p) {
+		const char *comma = strchr(p, ',');
+		size_t span = comma ? (size_t)(comma - p) : strlen(p);
+		if (span == 0 || span >= sizeof(tok))
+			return 0;                /* empty token / too long */
+		if (++ntok > 15)
+			return 0;                /* exceeds iptables multiport limit */
+		memcpy(tok, p, span);
+		tok[span] = '\0';
+		if (!sg_is_port_token(tok))
+			return 0;
+		if (!comma)
+			break;
+		p = comma + 1;
+	}
+	return 1;
 }
 
 int
@@ -790,6 +841,39 @@ sg_reg_is_hidden_key(const char *type_name, const char *key)
 	return 0;
 }
 
+/*
+ * security_ssl-inspection-profile: which inspection-mode a field belongs to.
+ * 'm' = multiple-clients (outbound) only, 'p' = protecting-server (inbound) only,
+ * 0 = valid in any mode. FortiGate-style: a field of one mode is not settable in
+ * the other (CLI rejects + hides it, web hides it).
+ */
+static char ssl_field_mode(const char *key)
+{
+	if (!key) return 0;
+	if (!strcmp(key, "server-cert") ||
+	    !strcmp(key, "protect-vip") || !strcmp(key, "protect-backend") ||
+	    !strcmp(key, "protect-backend-port") || !strcmp(key, "protect-sni"))
+		return 'p';
+	if (!strcmp(key, "inspection-method") || !strcmp(key, "no-sni") ||
+	    !strcmp(key, "untrusted-server-cert") || !strcmp(key, "unsupported") ||
+	    !strcmp(key, "block-sni"))
+		return 'm';
+	return 0;   /* name/status/comment/exempt/inspection-mode → any mode */
+}
+
+/* 1 if `key` is settable on an ssl-inspection-profile whose inspection-mode is
+ * `mode` (NULL/"" → default multiple-clients). Non-ssl types → always 1. */
+int sg_ssl_field_allowed(const char *type_name, const char *key, const char *mode)
+{
+	if (!type_name || strcmp(type_name, "security_ssl-inspection-profile") != 0)
+		return 1;
+	char fm = ssl_field_mode(key);
+	if (fm == 0)
+		return 1;
+	char cur = (mode && strcmp(mode, "protecting-server") == 0) ? 'p' : 'm';
+	return fm == cur;
+}
+
 int
 sg_reg_is_optional(const char *type_name, const char *key)
 {
@@ -946,7 +1030,7 @@ sg_reg_value_rule(const char *type_name, const char *key)
 		return buf;
 	}
 	if (strcmp(kind, "port-or-range") == 0)
-		return "port or range (e.g. 80, 1024-65535)";
+		return "port, range, or comma list (e.g. 80, 1024-65535, 80,443)";
 	if (strcmp(kind, "password-interactive") == 0)
 		return "interactive prompt";
 	if (strcmp(kind, "string") == 0)

@@ -1809,6 +1809,51 @@ static void flow_firmware_upload(work_item_t *item)
 	send_result(item->conn_id, 200, json, json ? strlen(json) : 0);
 }
 
+static void flow_cert_import(work_item_t *item)
+{
+	/* item->payload = "name=<n>\ncert=/tmp/sg-cert.<r>\nkey=/tmp/sg-key.<r>\n..."
+	 * On success mgmtd consumes + removes the staged files; on any failure path
+	 * remove them here so /tmp does not accumulate uploads. */
+	char cstage[96] = {0}, kstage[96] = {0};
+	if (item->payload) {
+		const char *p;
+		if ((p = strstr(item->payload, "cert=")) != NULL) {
+			snprintf(cstage, sizeof(cstage), "%s", p + 5);
+			char *nl = strchr(cstage, '\n'); if (nl) *nl = '\0';
+		}
+		if ((p = strstr(item->payload, "\nkey=")) != NULL) {
+			snprintf(kstage, sizeof(kstage), "%s", p + 5);
+			char *nl = strchr(kstage, '\n'); if (nl) *nl = '\0';
+		}
+	}
+
+	webd_ipc_response_t resp;
+	if (webd_ipc_send(SG_CMD_CERT_IMPORT, item->username,
+			  item->session_tag,
+			  item->payload ? item->payload : "", &resp) != 0) {
+		if (cstage[0]) unlink(cstage);
+		if (kstage[0]) unlink(kstage);
+		char *json = json_error("Backend unavailable", NULL);
+		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
+		return;
+	}
+	if (resp.status != SG_OK) {
+		if (cstage[0]) unlink(cstage);
+		if (kstage[0]) unlink(kstage);
+		send_ipc_error(item->conn_id, resp.status, resp.extra);
+		webd_ipc_resp_free(&resp);
+		return;
+	}
+	/* Success: mgmtd copied the PEM into the store but does NOT remove our
+	 * staged /tmp uploads (the CLI path reuses the same handler with the user's
+	 * own files) — so clean them up here. */
+	if (cstage[0]) unlink(cstage);
+	if (kstage[0]) unlink(kstage);
+	webd_ipc_resp_free(&resp);
+	char *json = strdup("{\"ok\":true}");
+	send_result(item->conn_id, 200, json, json ? strlen(json) : 0);
+}
+
 static void flow_reboot(work_item_t *item)
 {
 	webd_ipc_response_t resp;
@@ -2225,6 +2270,7 @@ static void *worker_fn(void *arg)
 		case FLOW_MONITOR_DHCP:     flow_monitor_dhcp(&item);     break;
 		case FLOW_MONITOR_SESSIONS: flow_monitor_sessions(&item); break;
 		case FLOW_SESSION_CLEAR:    flow_session_clear(&item);    break;
+		case FLOW_CERT_IMPORT:      flow_cert_import(&item);      break;
 		case FLOW_IPS_STATUS:       flow_ips_status(&item);       break;
 		case FLOW_IPS_ALERTS:       flow_ips_alerts(&item);       break;
 		case FLOW_IPS_SIGS:         flow_ips_signatures(&item);   break;

@@ -116,8 +116,9 @@ int bump_run(int client_fd, const char *sni, const struct sockaddr_in *dst,
 	inet_ntop(AF_INET, &dst->sin_addr, dip, sizeof(dip));
 	const char *host = (sni && *sni) ? sni : dip;
 
-	/* -- [1] connect + TLS handshake TO THE REAL SERVER ----------------- */
-	up_fd = connect_tcp(dst);
+	/* -- [1] connect + TLS handshake TO THE REAL SERVER (reverse: backend) -- */
+	const struct sockaddr_in *up = cfg->upstream ? cfg->upstream : dst;
+	up_fd = connect_tcp(up);
 	if (up_fd < 0) {
 		fprintf(stderr, "bump: connect %s failed: %m\n", dip);
 		goto out;
@@ -156,13 +157,32 @@ int bump_run(int client_fd, const char *sni, const struct sockaddr_in *dst,
 	}
 	upcert = SSL_get1_peer_certificate(ussl);   /* to mirror validity */
 
-	/* -- [2] forge cert + TLS handshake WITH THE CLIENT (act as server) -- */
+	/* -- [2] server identity + TLS handshake WITH THE CLIENT (act as server) -- */
 	cctx = SSL_CTX_new(TLS_server_method());
 	if (!cctx)
 		goto out;
 	SSL_CTX_set_min_proto_version(cctx, TLS1_2_VERSION);
 
-	{
+	if (cfg->reverse) {
+		/* REVERSE ("Protect SSL Server"): present the REAL server cert+key, so the
+		 * external client validates against the public CA chain as usual — no
+		 * Stargazer-CA install required on the client. */
+		if (SSL_CTX_use_certificate(cctx, cfg->srv_cert) != 1 ||
+		    SSL_CTX_use_PrivateKey(cctx, cfg->srv_key) != 1) {
+			fprintf(stderr, "bump: reverse cert/key %s failed\n", host);
+			goto out;
+		}
+		/* Send the intermediate chain so the client can build a path to a trusted
+		 * root. up_ref each (add_extra_chain_cert takes ownership; cctx is freed
+		 * per-connection while the chain lives in the shared revmap). */
+		for (int i = 0; cfg->srv_chain &&
+				i < sk_X509_num(cfg->srv_chain); i++) {
+			X509 *ic = sk_X509_value(cfg->srv_chain, i);
+			if (X509_up_ref(ic))
+				SSL_CTX_add_extra_chain_cert(cctx, ic);
+		}
+	} else {
+		/* FORWARD: forge a leaf signed by our CA (client must trust the CA). */
 		X509 *leaf = NULL; EVP_PKEY *key = NULL;
 		if (certcache_get(cfg->cc, host, upcert, &leaf, &key) < 0) {
 			fprintf(stderr, "bump: forge cert %s failed\n", host);
@@ -187,8 +207,9 @@ int bump_run(int client_fd, const char *sni, const struct sockaddr_in *dst,
 		goto out;
 	}
 
-	fprintf(stderr, "bump: %s%s ✓ decrypted\n",
-		host, cfg->verify_upstream ? " (verified)" : "");
+	fprintf(stderr, "bump: %s%s%s ✓ decrypted\n", host,
+		cfg->reverse ? " (reverse)" : "",
+		cfg->verify_upstream ? " (verified)" : "");
 
 	/* -- [3] relay plaintext both ways + inspect ------------------------ */
 	{

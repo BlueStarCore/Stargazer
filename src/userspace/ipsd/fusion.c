@@ -9,7 +9,7 @@ void ips_config_default(struct ips_config *cfg)
 {
 	cfg->mode      = IPS_MODE_PREVENT;
 	cfg->thr_block = 0.95;   /* = THRESHOLD at train time */
-	cfg->thr_alert = 0.50;
+	cfg->thr_alert = 0.7;
 }
 
 struct ips_decision ips_fuse(const struct ips_config *cfg,
