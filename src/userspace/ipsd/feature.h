@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * feature.h - build the 14-feature vector for LightGBM from flow statistics.
+ * feature.h - build the 17-feature vector for LightGBM from flow statistics.
  *
  * Three data sources (see docs/ips-master-plan.md §3.4 + ips-ipsd-progress):
  *   1) struct sg_nf_conn_ml  — raw accumulator from conntrack (via CTA_ML).
@@ -8,7 +8,7 @@
  *   3) init_win_fwd          — TCP window of the forward SYN packet, from NFQUEUE
  *                              (-1 if unknown / not TCP).
  *
- * The order of the 14 elements MUST match feature_order.json (the model is
+ * The order of the 17 elements MUST match feature_order.json (the model is
  * trained in this order).
  */
 #ifndef SG_FEATURE_H
@@ -66,7 +66,7 @@ struct sg_nf_conn_ml {
 };
 
 /*
- * Build the feature[14] vector. No allocation, no errors — always fills all 14
+ * Build the feature[17] vector. No allocation, no errors — always fills all 17
  * elements (safe value 0 / -1 when data is missing).
  */
 void feature_extract(const struct sg_nf_conn_ml *ml,

@@ -23,7 +23,7 @@ Sources: `src/modules/pkt_forward.c`, `src/userspace/mgmtd/mgmtd_apply_*.c`,
 - There are **two payload-inspection doors sharing one engine**:
   - **Cleartext / non-TLS** → NFQUEUE → `ipsd` main loop.
   - **HTTPS** → REDIRECT → `ssld` decrypts → plaintext over AF_UNIX → `ipsd` insp server.
-- **ML scores a 14-feature vector** (not raw packets), **once per flow**.
+- **ML scores a 17-feature vector** (not raw packets), **once per flow**.
 - **Fail-safe / fail-closed:** no IPS policy → no NFQUEUE emitted → `ipsd` idle.
   SSL inspection off → `ssld` not launched. CA write failure → splice-only.
 
@@ -213,8 +213,8 @@ one handler thread owning a virtual flow:
 ### 3.7 ML pipeline
 **Offline** (`Machine Learning/`):
 - `stargazer_train_export.ipynb` trains a **LightGBM** model → `stargazer_ids*.txt`.
-- `feature_order.json` is the **feature-order contract** (14 features → being
-  extended to 17 for Infiltration: + Total Length Fwd/Bwd, Flow Duration).
+- `feature_order.json` is the **feature-order contract** (17 features: the base
+  14 + Total Length of Fwd Packets, Flow Duration, Bwd Packet Length Std).
 - Treelite/tl2cgen compiles the model to pure C → `ipsd/model/predict.c`.
 
 **Online** (`ipsd`):
@@ -283,7 +283,7 @@ one handler thread owning a virtual flow:
 | SSL steering + ssld lifecycle + profid connmark | `src/userspace/mgmtd/mgmtd_apply_ssl.c` |
 | NFQUEUE loop + cascade + ML checkpoint | `src/userspace/ipsd/main.c` |
 | ctnetlink CTA_ML/ACCT/CTA_MARK reader | `src/userspace/ipsd/ctdump.c` |
-| 14-feature vector | `src/userspace/ipsd/feature.c` |
+| 17-feature vector | `src/userspace/ipsd/feature.c` |
 | Signature engine | `reass.c`, `ac.c`, `sig_rule.c` |
 | Sig + ML fusion | `src/userspace/ipsd/fusion.c` |
 | LightGBM model (tl2cgen) | `src/userspace/ipsd/ips_model.c`, `model/predict.c` |

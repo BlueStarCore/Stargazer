@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * feature.c - 14 features for LightGBM (see feature.h).
+ * feature.c - 17 features for LightGBM (see feature.h).
  *
  * All features computed as double (userspace, not bound by the kernel's
  * no-float rule). Formulas follow the EXACT CICFlowMeter definitions — the
