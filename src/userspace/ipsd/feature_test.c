@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * feature_test.c - tests the arithmetic of the 14 features + edge cases, runs on HOST.
+ * feature_test.c - tests the arithmetic of the 17 features + edge cases, runs on HOST.
  *
  *   gcc -O2 -Wall -Wextra -fsanitize=address,undefined \
  *       -o /tmp/feature_test feature.c feature_test.c -lm && /tmp/feature_test
