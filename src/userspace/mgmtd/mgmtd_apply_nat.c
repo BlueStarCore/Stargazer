@@ -128,6 +128,109 @@ skip:
 	return -1;
 }
 
+/* ── Proxy-ARP for DNAT VIPs ─────────────────────────────────────────────────
+ *
+ * A DNAT rule can target a "floating" public IP (VIP) the firewall does not
+ * own — e.g. WAN is 203.0.0.1/24 but the port-forward is on 203.0.0.10.
+ * iptables DNAT only rewrites L3; nothing answers ARP for the VIP, so a client
+ * on the srcintf segment cannot even reach it (must add a static route/ARP by
+ * hand). FortiGate-style NGFWs make the box respond for the VIP. We do the
+ * reliable Linux equivalent for a same-subnet VIP: assign it as a /32 secondary
+ * address on the incoming interface so the box answers ARP (RTN_LOCAL). Plain
+ * proxy-ARP does NOT work here — the kernel only proxies when the VIP routes out
+ * a *different* device, which a same-subnet VIP does not. PREROUTING DNAT still
+ * runs before the routing decision, so traffic to the VIP is forwarded, not
+ * delivered locally.
+ *
+ * Only /32 host VIPs on a concrete srcintf are handled (a subnet dstaddr is a
+ * misconfiguration — it would also make the DNAT swallow the box's own IP — and
+ * is skipped). The set we assigned is tracked in /run/sg-nat-vips (tmpfs) so a
+ * later rebuild removes VIPs a rule change dropped.
+ */
+#define NAT_VIP_STATE "/run/sg-nat-vips"
+
+/* Returns the exit code of `ip addr <verb> <vipcidr> dev <dev>` (0 = applied). */
+static int ip_addr_op(const char *verb, const char *vipcidr, const char *dev)
+{
+	const char *argv[] = { "ip", "addr", verb, vipcidr, "dev", dev, NULL };
+	int rc = 0;
+	char *out = pipe_exec_stdin(argv, "", 0, &rc);
+	free(out);
+	return rc;
+}
+
+static void apply_nat_vips(void)
+{
+	/* 1. Remove the VIPs assigned by the previous apply. */
+	FILE *sf = fopen(NAT_VIP_STATE, "r");
+	if (sf) {
+		char line[160];
+		while (fgets(line, sizeof(line), sf)) {
+			char vip[64], dev[VALBUFSZ];
+			if (sscanf(line, "%63s %127s", vip, dev) == 2)
+				ip_addr_op("del", vip, dev);
+		}
+		fclose(sf);
+	}
+
+	/* 2. Assign the VIP of every enabled /32-dstaddr DNAT rule and record it. */
+	FILE *nf = fopen(NAT_VIP_STATE ".tmp", "w");
+	char *list = sg_db_list("network_nat");
+	if (list) {
+		char *sp = NULL;
+		for (char *id = strtok_r(list, "\n", &sp); id;
+		     id = strtok_r(NULL, "\n", &sp)) {
+			char *data = sg_db_get("network_nat", id);
+			if (!data)
+				continue;
+			char nattype[VALBUFSZ], srcintf[VALBUFSZ];
+			char dstaddr[VALBUFSZ], status[VALBUFSZ];
+			extract_val(data, "type",    nattype, sizeof(nattype));
+			extract_val(data, "srcintf", srcintf, sizeof(srcintf));
+			extract_val(data, "dstaddr", dstaddr, sizeof(dstaddr));
+			extract_val(data, "status",  status,  sizeof(status));
+			free(data);
+
+			if (strcmp(nattype, "dnat") != 0)   continue;
+			if (strcmp(status, "disable") == 0) continue;
+			if (is_any_or_all(srcintf))         continue; /* need a real iface */
+
+			/* dstaddr must resolve to a single host (/32 or bare IP). */
+			char resolved[VALBUFSZ];
+			const char *cidr = resolve_address(dstaddr, resolved,
+							   sizeof(resolved));
+			if (!cidr || strcmp(cidr, "SKIP") == 0)
+				continue;
+			const char *slash = strchr(cidr, '/');
+			if (slash && strcmp(slash, "/32") != 0)
+				continue;                     /* subnet dstaddr → skip */
+
+			char vipcidr[80];
+			if (slash)
+				snprintf(vipcidr, sizeof(vipcidr), "%s", cidr);
+			else
+				snprintf(vipcidr, sizeof(vipcidr), "%s/32", cidr);
+
+			/* Only record (for later cleanup) a VIP we actually added.
+			 * If it already exists — e.g. dstaddr IS the WAN IP (a
+			 * port-forward on the box's own address) — `ip addr add`
+			 * fails "File exists"; we must NOT record it, or the next
+			 * rebuild's `ip addr del` would strip the interface's real
+			 * IP. Such a VIP already answers ARP, so nothing to do. */
+			if (ip_addr_op("add", vipcidr, srcintf) == 0) {
+				if (nf)
+					fprintf(nf, "%s %s\n", vipcidr, srcintf);
+				mgmt_log("INFO", "nat: VIP %s bound on %s for DNAT "
+					 "reachability", vipcidr, srcintf);
+			}
+		}
+		free(list);
+	}
+	if (nf)
+		fclose(nf);
+	rename(NAT_VIP_STATE ".tmp", NAT_VIP_STATE);
+}
+
 /* ── Rebuild ─────────────────────────────────────────────────────────────── */
 
 sg_status_t rebuild_nat_chains(char *result, size_t rsize)
@@ -263,6 +366,10 @@ sg_status_t rebuild_nat_chains(char *result, size_t rsize)
 
 	free(out);
 	free(buf.data);
+
+	/* DNAT VIPs → bind as /32 secondary IPs so the box answers ARP for a
+	 * floating public IP that the port-forward targets (route-mode DNAT). */
+	apply_nat_vips();
 
 	/* Steering applied → sync the ssld lifecycle (start/stop/restart per
 	 * security_ssl-inspection-profile). Placed AFTER restore so ssld is
