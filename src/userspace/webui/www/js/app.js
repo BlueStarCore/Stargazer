@@ -303,6 +303,7 @@
         else if (page === 'resources') { promises.push(renderResourceGauges(), renderResourceDetails()); }
         else if (page === 'home-network') { promises.push(renderNetworkOverview()); }
         else if (page === 'sec-ips') { promises.push(initIpsPage(pageEl)); }
+        else if (page === 'fw-log') { promises.push(initFwLogPage(pageEl)); }
         else if (page === 'sec-ips-profiles') {
             var profTable = pageEl ? pageEl.querySelector('table[data-entity]') : null;
             if (profTable) promises.push(loadEntityPage(profTable.dataset.entity, profTable));
@@ -4443,8 +4444,6 @@
                 return loadIpsRulesets();
             } else if (tab === 'rules') {
                 return loadIpsRules();
-            } else if (tab === 'alerts') {
-                return loadIpsAlerts();
             } else if (tab === 'schedule') {
                 var scard = pg.querySelector('[data-ips-pane="schedule"] .form-card[data-settings]');
                 return scard ? settingsLoad(scard, 'security-schedule') : Promise.resolve();
@@ -4706,35 +4705,7 @@
                     loadIpsRules();
                 });
 
-                /* Alerts tab buttons */
-                var arBtn = pg.querySelector('#ips-alerts-refresh');
-                if (arBtn) arBtn.addEventListener('click', loadIpsAlerts);
-                var acBtn = pg.querySelector('#ips-alerts-clear');
-                if (acBtn) acBtn.addEventListener('click', function () {
-                    api('/ips/alerts-clear', { method: 'POST' })
-                        .then(function () { _alerts = []; renderIpsAlertsTable(); showToast('Alerts cleared', 'success'); })
-                        .catch(function () { showToast('Clear failed', 'error'); });
-                });
-                /* Alert info modal close buttons */
-                var adClose  = pg.querySelector('#ips-alert-detail-close');
-                var adClose2 = pg.querySelector('#ips-alert-detail-close2');
-                function closeAlertModal() {
-                    var m = pg.querySelector('#ips-alert-detail-modal');
-                    if (m) m.style.display = 'none';
-                }
-                if (adClose)  adClose.addEventListener('click', closeAlertModal);
-                if (adClose2) adClose2.addEventListener('click', closeAlertModal);
-
-                /* Alert info modal — delegate Info button clicks */
-                var alertTbody = pg.querySelector('#ips-alerts-tbody');
-                if (alertTbody) alertTbody.addEventListener('click', function (e) {
-                    var btn = e.target.closest('.ips-alert-info');
-                    if (!btn) return;
-                    var idx = parseInt(btn.dataset.idx, 10);
-                    var a = _alerts[idx];
-                    if (!a) return;
-                    showAlertDetail(a);
-                });
+                /* IPS alerts moved to LOG & REPORT > Firewall Log (initFwLogPage). */
             }
 
             /* Load first (or current active) tab — RETURN its promise so
@@ -4967,8 +4938,10 @@
         }
 
         /* ── Alerts tab ── */
+        function fwLogEl() { return document.getElementById('page-fw-log'); }
+
         function loadIpsAlerts() {
-            var pg = pageEl(); if (!pg) return Promise.resolve();
+            var pg = fwLogEl(); if (!pg) return Promise.resolve();
             var tbody = pg.querySelector('#ips-alerts-tbody');
             if (tbody) tbody.innerHTML = '<tr><td colspan="8" class="table-empty">Loading…</td></tr>';
             return api('/ips/alerts-json').then(function (data) {
@@ -4976,13 +4949,13 @@
                 renderIpsAlertsTable();
             }).catch(function () {
                 _alerts = [];
-                var t = (pageEl() || {}).querySelector ? pageEl().querySelector('#ips-alerts-tbody') : null;
+                var t = (fwLogEl() || {}).querySelector ? fwLogEl().querySelector('#ips-alerts-tbody') : null;
                 if (t) t.innerHTML = '<tr><td colspan="8" class="table-empty">Failed to load alerts</td></tr>';
             });
         }
 
         function renderIpsAlertsTable() {
-            var pg = pageEl(); if (!pg) return;
+            var pg = fwLogEl(); if (!pg) return;
             var tbody = pg.querySelector('#ips-alerts-tbody');
             var cntEl = pg.querySelector('#ips-alerts-count');
             if (!tbody) return;
@@ -5016,7 +4989,7 @@
         }
 
         function showAlertDetail(a) {
-            var pg = pageEl(); if (!pg) return;
+            var pg = fwLogEl(); if (!pg) return;
             var modal = pg.querySelector('#ips-alert-detail-modal');
             var body  = pg.querySelector('#ips-alert-detail-body');
             if (!modal || !body) return;
@@ -5038,6 +5011,44 @@
             ].join('');
             modal.style.display = 'flex';
         }
+
+        /* ── LOG & REPORT > Firewall Log: IPS alerts (wiring + load) ── */
+        window.initFwLogPage = function (pg) {
+            if (!pg) return Promise.resolve();
+            if (!pg._fwLogInited) {
+                pg._fwLogInited = true;
+
+                var arBtn = pg.querySelector('#ips-alerts-refresh');
+                if (arBtn) arBtn.addEventListener('click', loadIpsAlerts);
+
+                var acBtn = pg.querySelector('#ips-alerts-clear');
+                if (acBtn) acBtn.addEventListener('click', function () {
+                    api('/ips/alerts-clear', { method: 'POST' })
+                        .then(function () { _alerts = []; renderIpsAlertsTable(); showToast('Alerts cleared', 'success'); })
+                        .catch(function () { showToast('Clear failed', 'error'); });
+                });
+
+                var adClose  = pg.querySelector('#ips-alert-detail-close');
+                var adClose2 = pg.querySelector('#ips-alert-detail-close2');
+                function closeAlertModal() {
+                    var m = pg.querySelector('#ips-alert-detail-modal');
+                    if (m) m.style.display = 'none';
+                }
+                if (adClose)  adClose.addEventListener('click', closeAlertModal);
+                if (adClose2) adClose2.addEventListener('click', closeAlertModal);
+
+                var alertTbody = pg.querySelector('#ips-alerts-tbody');
+                if (alertTbody) alertTbody.addEventListener('click', function (e) {
+                    var btn = e.target.closest('.ips-alert-info');
+                    if (!btn) return;
+                    var idx = parseInt(btn.dataset.idx, 10);
+                    var a = _alerts[idx];
+                    if (!a) return;
+                    showAlertDetail(a);
+                });
+            }
+            return loadIpsAlerts();
+        };
 
     })();  /* end IPS 5-tab module */
 
