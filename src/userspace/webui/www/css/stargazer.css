@@ -1052,9 +1052,11 @@ html, body {
 }
 
 
-/* Sortable header row */
+/* Sortable header row — grid so columns spread evenly (like the DHCP table). */
 .rf-header {
-    display: flex;
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr 1fr 2fr;
+    justify-items: start;
     align-items: center;
     gap: 12px;
     padding: 12px 20px;
@@ -1077,16 +1079,20 @@ html, body {
 
 .rf-col.rf-sort-active { color: var(--dawn-peach); }
 
-.rf-col-type   { min-width: 72px; text-align: center; }
-.rf-col-status { min-width: 90px; }
-.rf-col-hits   { min-width: 80px; text-align: right; }
-.rf-col-iface  { min-width: 56px; text-align: center; }
+/* Grid handles column widths now; keep all header labels left-aligned so they
+ * line up with the left-aligned cell content (like the DHCP table). */
+.rf-col-type,
+.rf-col-status,
+.rf-col-hits,
+.rf-col-iface,
+.rf-col-dest   { text-align: left; }
 .rf-col-flow   { flex-shrink: 0; width: 40px; text-align: center; cursor: default; }
-.rf-col-dest   { flex: 1; }
 
-/* Route data rows */
+/* Route data rows — same grid template as the header so cells line up. */
 .route-row {
-    display: flex;
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr 1fr 2fr;
+    justify-items: start;
     align-items: center;
     gap: 12px;
     padding: 10px 20px;
@@ -1120,11 +1126,13 @@ html, body {
     flex-shrink: 0;
 }
 
-.route-type.direct  { background: var(--color-success); }
-.route-type.static  { background: var(--color-accent-blue); }
-.route-type.bgp     { background: var(--color-accent-purple); }
-.route-type.ospf    { background: var(--dawn-orange); }
-.route-type.rip     { background: var(--gray-text-dim); }
+.route-type.direct    { background: var(--color-success); }
+.route-type.connected { background: var(--color-success); }
+.route-type.static    { background: var(--color-accent-blue); }
+.route-type.default   { background: var(--color-accent-blue); }
+.route-type.bgp       { background: var(--color-accent-purple); }
+.route-type.ospf      { background: var(--dawn-orange); }
+.route-type.rip       { background: var(--gray-text-dim); }
 
 /* Status label */
 .route-status {
@@ -1157,6 +1165,15 @@ html, body {
     font-size: 18px;
     color: var(--text-dim);
     flex-shrink: 0;
+}
+
+/* Destination cell groups the optional gateway + arrow + destination so the
+ * whole thing sits in one grid column. */
+.route-dest-cell {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
 }
 
 /* Monospace boxes for iface / gateway / destination */
@@ -1266,6 +1283,7 @@ html, body {
     padding: 16px 0 10px;
     border-bottom: 1px solid var(--border-light);
     margin-bottom: 14px;
+    position: relative;   /* anchor .modal-close to the header, not the whole card */
 }
 
 .form-section:first-child {
@@ -2365,13 +2383,15 @@ tr.drop-below {
         font-size: 11px;
     }
 
-    /* Route flow — stack on mobile */
+    /* Route flow — drop the desktop grid and stack on mobile */
     .rf-header {
+        display: flex;
         flex-wrap: wrap;
         gap: 6px;
     }
 
     .route-row {
+        display: flex;
         flex-wrap: wrap;
         gap: 6px;
         padding: 10px 12px;
@@ -2507,3 +2527,99 @@ tr.drop-below {
 }
 .switch input:checked + .slider { background: var(--dawn-orange); border-color: var(--dawn-ember); }
 .switch input:checked + .slider::before { transform: translateX(22px); }
+
+/* ============================================================
+ *  LOG & REPORT > Reports (IPS/IDS security report)
+ * ============================================================ */
+.report-doc {
+    background: var(--bg-card);
+    border: 1px solid var(--border-light);
+    border-radius: 8px;
+    padding: 28px 32px;
+    max-width: 1000px;
+    color: #1a1d24;
+}
+.report-cover {
+    text-align: center;
+    padding: 12px 0 24px;
+    border-bottom: 2px solid var(--border-light);
+    margin-bottom: 20px;
+}
+.report-brand {
+    font-size: 13px; letter-spacing: 2px; text-transform: uppercase;
+    color: var(--color-danger); font-weight: 700;
+}
+.report-title { font-size: 26px; margin: 8px 0 14px; color: #1a1d24; }
+.report-meta { font-size: 13px; color: #555; line-height: 1.7; }
+.report-section { margin: 24px 0; page-break-inside: avoid; }
+.report-h2 {
+    font-size: 16px; color: #24466b; font-weight: 600;
+    border-bottom: 1px solid var(--border-light);
+    padding-bottom: 6px; margin: 0 0 12px;
+}
+.report-note { font-size: 11px; font-weight: 400; color: #888; }
+.report-sub { font-size: 13px; font-weight: 600; color: #555; margin: 14px 0 6px; }
+.report-hint { font-size: 11px; color: #888; margin-top: 6px; }
+.report-canvas-wrap { width: 100%; overflow-x: auto; }
+#rpt-history { max-width: 100%; height: auto; }
+.report-footer {
+    margin-top: 28px; padding-top: 10px;
+    border-top: 1px solid var(--border-light);
+    font-size: 11px; color: #999; text-align: center;
+}
+
+/* summary stat tiles */
+.report-stat-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 12px;
+}
+.report-stat {
+    background: var(--bg-row-alt); border: 1px solid var(--border-light);
+    border-radius: 6px; padding: 12px 14px;
+}
+.report-stat-val { font-size: 24px; font-weight: 700; color: #1a1d24; }
+.report-stat-lbl { font-size: 12px; color: #666; margin-top: 2px; }
+
+/* top-N tables with inline bars */
+.report-rank { width: 100%; border-collapse: collapse; font-size: 13px; }
+.report-rank td { padding: 5px 8px; border-bottom: 1px solid var(--border-light); vertical-align: middle; }
+.report-rank td.rank-label { white-space: nowrap; max-width: 340px; overflow: hidden; text-overflow: ellipsis; }
+.report-rank td.rank-count { text-align: right; white-space: nowrap; width: 60px; font-variant-numeric: tabular-nums; }
+.report-rank td.rank-bar { width: 45%; }
+.report-bar-track { background: var(--border-light); border-radius: 3px; height: 12px; width: 100%; }
+.report-bar-fill { background: #24466b; border-radius: 3px; height: 12px; }
+.report-empty { color: #999; font-size: 13px; padding: 8px 0; }
+
+/* severity chips (report summary) — colour comes from the shared .sev-* classes */
+.sev-row { display: flex; gap: 12px; flex-wrap: wrap; }
+.sev-chip {
+    flex: 1; min-width: 120px; border-radius: 6px; padding: 10px 14px;
+    border: 1px solid var(--border-light);
+}
+.sev-chip .sev-n { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.sev-chip .sev-l { font-size: 12px; text-transform: uppercase; letter-spacing: .5px; }
+
+/* severity badge — shared by the alert log column and the report */
+.sev-badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;
+    font-weight:600;line-height:1.6;white-space:nowrap}
+.sev-critical{background:#fdecea;color:#b71c1c}
+.sev-major{background:#fff0e6;color:#c1521a}
+.sev-minor{background:#fff8e1;color:#946200}
+.sev-info{background:#eef4ff;color:#2a5488}
+.sev-unknown{background:#eef0f3;color:#777}
+.sev-anomaly{background:#efeafd;color:#5b4b9e}   /* ML: a category, not a severity level */
+
+/* ---- Print: show ONLY the report document ---- */
+@media print {
+    body * { visibility: hidden !important; }
+    #report-root, #report-root * { visibility: visible !important; }
+    #report-root {
+        position: absolute; left: 0; top: 0; width: 100%;
+        margin: 0; border: none; border-radius: 0; padding: 0;
+        background: #fff; color: #000;
+        box-shadow: none;
+    }
+    .report-controls { display: none !important; }
+    .report-section { page-break-inside: avoid; }
+    @page { margin: 14mm; }
+}

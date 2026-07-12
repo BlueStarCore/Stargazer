@@ -184,6 +184,15 @@ typedef enum {
 	SG_CMD_IPS_ALERTS_CLEAR      = 692,   /* truncate ips-alert.log (root) */
 	SG_CMD_IPS_SCORES            = 693,   /* per-flow ML scores (ipsd dump loop) */
 	SG_CMD_SSL_DIAG              = 694,   /* SSL inspection diagnostics (debug) */
+	SG_CMD_CERT_IMPORT           = 695,   /* import a server cert/key (payload: name=+cert=+key= staged paths) */
+
+	/* Local Reports (IPS/IDS) — generated report snapshots + schedule */
+	SG_CMD_REPORT_GENERATE       = 696,   /* snapshot alerts in range → /etc/stargazer/reports/<id>.json */
+	SG_CMD_REPORT_LIST           = 697,   /* list generated reports → JSON array */
+	SG_CMD_REPORT_GET            = 698,   /* return one report (payload: id=<id>) verbatim JSON */
+	SG_CMD_REPORT_DELETE         = 699,   /* delete a report (payload: id=<id>) */
+	SG_CMD_REPORT_SCHED_GET      = 700,   /* read report schedule config → JSON */
+	SG_CMD_REPORT_SCHED_SET      = 701,   /* write report schedule config (payload: mode=+hour=+day=) */
 
 	/* Keepalive / ping (9xx) */
 	SG_CMD_PING          = 900,

@@ -303,6 +303,8 @@
         else if (page === 'resources') { promises.push(renderResourceGauges(), renderResourceDetails()); }
         else if (page === 'home-network') { promises.push(renderNetworkOverview()); }
         else if (page === 'sec-ips') { promises.push(initIpsPage(pageEl)); }
+        else if (page === 'fw-log') { promises.push(initFwLogPage(pageEl)); }
+        else if (page === 'reports') { promises.push(initReportsPage(pageEl)); }
         else if (page === 'sec-ips-profiles') {
             var profTable = pageEl ? pageEl.querySelector('table[data-entity]') : null;
             if (profTable) promises.push(loadEntityPage(profTable.dataset.entity, profTable));
@@ -321,6 +323,8 @@
             /* Refresh SSL-profile dropdown on policy form so new profiles appear */
             invalidateApiCache('/config/security_ssl-inspection-profile');
             populateSslProfileSelects();
+            invalidateApiCache('/config/system_certificate');
+            populateCertificateSelects();
             initSslPageExtras(pageEl);
         }
         else if (page === 'sys-certificates') { promises.push(initCertPage(pageEl)); }
@@ -1091,17 +1095,35 @@
 
     /* Fetch real route data from API → populate routeData */
     function fetchRouteData() {
-        return api('/config/network_route_static').then(function (data) {
-            if (!data || !data.entries) return;
-            routeData = data.entries.map(function (e) {
+        /* Live kernel routing table: connected + static + default routes,
+         * exactly as the FIB holds them (FortiGate-style). */
+        return api('/system/routes/live').then(function (data) {
+            var rows = (data && data.routes) ? data.routes : [];
+            routeData = rows.map(function (e) {
                 return {
-                    type:   'STATIC',
-                    status: (e.status || 'enable') === 'enable' ? 'ACTIVE' : 'DISABLED',
-                    iface:  e.device || '',
-                    gw:     e.gateway || '',
-                    dest:   e.dst || '0.0.0.0/0',
+                    type:   e.type || 'STATIC',
+                    status: 'ACTIVE',
+                    iface:  e.iface || '',
+                    gw:     e.gw || '',
+                    dest:   e.dest || '0.0.0.0/0',
                     hits:   0
                 };
+            });
+        }).catch(function () {
+            /* Fallback: if the live table is unavailable, show the configured
+             * static routes (with their enable/disable status). */
+            return api('/config/network_route_static').then(function (data) {
+                if (!data || !data.entries) { routeData = []; return; }
+                routeData = data.entries.map(function (e) {
+                    return {
+                        type:   'STATIC',
+                        status: (e.status || 'enable') === 'enable' ? 'ACTIVE' : 'DISABLED',
+                        iface:  e.device || '',
+                        gw:     e.gateway || '',
+                        dest:   e.dst || '0.0.0.0/0',
+                        hits:   0
+                    };
+                });
             });
         });
     }
@@ -1193,13 +1215,15 @@
 
         div.appendChild(makeSpan('route-hits', fmtNum(r.hits)));
         div.appendChild(makeSpan('route-iface', r.iface));
-        div.appendChild(makeSpan('route-arrow', '\u2192'));  /* → */
 
+        /* One grid cell for the destination: [gateway arrow] destination. */
+        var destCell = makeSpan('route-dest-cell', null);
         if (r.gw) {
-            div.appendChild(makeSpan('route-gw', r.gw));
-            div.appendChild(makeSpan('route-arrow', '\u2192'));
+            destCell.appendChild(makeSpan('route-gw', r.gw));
+            destCell.appendChild(makeSpan('route-arrow', '\u2192'));
         }
-        div.appendChild(makeSpan('route-dest', r.dest));
+        destCell.appendChild(makeSpan('route-dest', r.dest));
+        div.appendChild(destCell);
         return div;
     }
 
@@ -1828,6 +1852,14 @@
                 /* closeModal reset the type select — re-sync the
                  * type-dependent rows (address form: subnet vs fqdn) */
                 syncAddressFormRows();
+                /* SSL profile: re-attach the rows for the (reset) mode so a
+                 * create form opened after a prior edit isn't left with stale
+                 * out-of-mode fields in the DOM. */
+                if (id === 'form-ssl-profile') {
+                    /* Pick up certs imported since the page first loaded. */
+                    invalidateApiCache('/config/system_certificate');
+                    initSslPageExtras(document.getElementById('page-sec-ssl'));
+                }
             }
         });
     });
@@ -2007,14 +2039,21 @@
             hasStatus: true,
             statusLabels: { on: 'Enabled', off: 'Disabled', dotOn: 'enable', dotOff: 'disable' },
             fields: [
-                { label: 'Name',            key: 'name',                  col: 0, bulkEditable: false },
-                { label: 'Inspection Mode', key: 'inspection-mode',       col: 1, bulkEditable: false },
-                { label: 'Status',          key: 'status',                col: 2, bulkEditable: true },
-                { label: 'No-SNI',          key: 'no-sni',                col: -1, bulkEditable: false },
-                { label: 'Untrusted Cert',  key: 'untrusted-server-cert', col: -1, bulkEditable: false },
-                { label: 'Unsupported',     key: 'unsupported',           col: -1, bulkEditable: false },
-                { label: 'Exempt',          key: 'exempt',                col: -1, bulkEditable: false },
-                { label: 'Comment',         key: 'comment',               col: 3, bulkEditable: false }
+                { label: 'Name',              key: 'name',                  col: 0, bulkEditable: false },
+                { label: 'Inspection Mode',   key: 'inspection-mode',       col: 1, bulkEditable: false },
+                { label: 'Status',            key: 'status',                col: 2, bulkEditable: true },
+                /* Multiple-clients (outbound) fields */
+                { label: 'Inspection Method', key: 'inspection-method',     col: -1, bulkEditable: false },
+                { label: 'No-SNI',            key: 'no-sni',                col: -1, bulkEditable: false },
+                { label: 'Untrusted Cert',    key: 'untrusted-server-cert', col: -1, bulkEditable: false },
+                { label: 'Unsupported',       key: 'unsupported',           col: -1, bulkEditable: false },
+                /* Protecting-server (inbound) fields */
+                { label: 'Server Cert',       key: 'server-cert',           col: -1, bulkEditable: false },
+                { label: 'Server Key',        key: 'server-key',            col: -1, bulkEditable: false },
+                { label: 'Protect VIP',       key: 'protect-vip',           col: -1, bulkEditable: false },
+                { label: 'Protect SNI',       key: 'protect-sni',           col: -1, bulkEditable: false },
+                { label: 'Exempt',            key: 'exempt',                col: -1, bulkEditable: false },
+                { label: 'Comment',           key: 'comment',               col: 3, bulkEditable: false }
             ]
         },
         ipsRulesets: {
@@ -2556,18 +2595,37 @@
 
         /* Try API first, fall back to reading from DOM */
         api('/config/' + cfgType(entity) + '/' + rowId).then(function (data) {
-            if (data) {
-                populateForm(config, keyMap, data, body);
-            } else {
+            var loaded = data;
+            if (!loaded) {
                 /* Demo fallback: read from table row cells */
                 var colOffset = config.orderable ? 2 : 1;
-                var rowData = {};
+                loaded = {};
                 config.fields.forEach(function (field) {
                     var cell = row.cells[field.col + colOffset]; /* +1 checkbox, +1 drag handle if orderable */
-                    if (cell) rowData[field.key] = cellText(cell);
+                    if (cell) loaded[field.key] = cellText(cell);
                 });
-                populateForm(config, keyMap, rowData, body);
             }
+
+            /* SSL profile: the mode-scoped fields are removed from the DOM when
+             * out of their mode, so set the mode and attach the in-mode rows
+             * BEFORE building the key map / populating — otherwise an inbound
+             * profile's server-cert/protect-* inputs aren't present to fill. */
+            if (config.formId === 'form-ssl-profile') {
+                var sslPg = document.getElementById('page-sec-ssl');
+                var msel = sslPg.querySelector('.form-row[data-key="inspection-mode"] .form-input');
+                if (msel && loaded['inspection-mode']) selectOption(msel, String(loaded['inspection-mode']));
+                initSslPageExtras(sslPg);          /* attaches this mode's rows */
+                keyMap = buildKeyInputMap(body, config);  /* remap with attached rows */
+                /* server-cert options load async; re-apply the saved value once
+                 * they arrive (populateForm below sets it before options exist). */
+                if (loaded['server-cert']) {
+                    populateCertificateSelects().then(function () {
+                        var cs = sslPg.querySelector('.server-cert-select');
+                        if (cs) selectOption(cs, String(loaded['server-cert']));
+                    });
+                }
+            }
+            populateForm(config, keyMap, loaded, body);
 
             loader.remove();
             if (grid) grid.style.display = '';
@@ -4064,13 +4122,52 @@
     function initSslPageExtras(pg) {
         if (!pg) return;
         var modeSel   = pg.querySelector('.form-row[data-key="inspection-mode"] .form-input');
+        var methodSel = pg.querySelector('.form-row[data-key="inspection-method"] .form-input');
         var statusSel = pg.querySelector('.form-row[data-key="status"] .form-input');
         var exemptInp = pg.querySelector('.form-row[data-key="exempt"] .form-input');
         var warn      = pg.querySelector('#ssl-deep-warning');
         var exSummary = pg.querySelector('#ssl-exempt-summary');
+        /* Cache the full set on first run (every row is still in the DOM then);
+         * an Array keeps references to rows even after they are detached, so a
+         * later mode switch can re-attach them. Re-querying would miss detached
+         * rows and they could never come back. */
+        var scopedRows = pg._sslScopedRows;
+        if (!scopedRows) {
+            scopedRows = Array.prototype.slice.call(pg.querySelectorAll('.form-row[data-mode]'));
+            pg._sslScopedRows = scopedRows;
+        }
+
+        /* FortiGate-style: only the fields belonging to the selected "Enable SSL
+         * inspection of" mode exist in the form. Out-of-mode rows are *removed
+         * from the DOM* (not just hidden) so there is no trace of them in that
+         * mode's config — mirrors the CLI, where an out-of-mode key is rejected
+         * as unknown. A comment-node anchor marks each row's original slot so it
+         * is re-attached in the right place when its mode is selected. Detached
+         * rows are skipped by buildPayloadFromForm, so they never get submitted. */
+        function applyMode() {
+            var mode = (modeSel && modeSel.value) || 'multiple-clients';
+            scopedRows.forEach(function (r) {
+                if (!r._anchor && r.parentNode) {
+                    r._anchor = document.createComment('ssl-field:' + r.dataset.key);
+                    r.parentNode.insertBefore(r._anchor, r);
+                }
+                if (r.dataset.mode === mode) {
+                    if (!r.parentNode && r._anchor && r._anchor.parentNode) {
+                        r._anchor.parentNode.insertBefore(r, r._anchor.nextSibling);
+                    }
+                } else if (r.parentNode) {
+                    r.parentNode.removeChild(r);
+                }
+            });
+            /* The server-cert <select> only exists in the DOM while
+             * protecting-server is active (rows are detached out-of-mode), so
+             * fill it here — re-attaching restores the empty placeholder. */
+            if (mode === 'protecting-server') populateCertificateSelects();
+        }
 
         function updateWarn() {
-            var deep = modeSel && modeSel.value === 'deep';
+            var mode = (modeSel && modeSel.value) || 'multiple-clients';
+            var deep = mode === 'multiple-clients' && methodSel && methodSel.value === 'deep';
             var on   = statusSel && statusSel.value === 'enable';
             if (warn) warn.style.display = (deep && on) ? '' : 'none';
             if (exSummary) {
@@ -4078,9 +4175,13 @@
                 exSummary.textContent = ex ? ex : '(none configured)';
             }
         }
-        [modeSel, statusSel].forEach(function (s) {
-            if (s && !s._sslWired) { s.addEventListener('change', updateWarn); s._sslWired = 1; }
+        [modeSel, methodSel, statusSel].forEach(function (s) {
+            if (s && !s._sslWired) {
+                s.addEventListener('change', function () { applyMode(); updateWarn(); });
+                s._sslWired = 1;
+            }
         });
+        applyMode();
         if (exemptInp && !exemptInp._sslWired) {
             exemptInp.addEventListener('input', updateWarn); exemptInp._sslWired = 1;
         }
@@ -4132,6 +4233,122 @@
             });
         }
 
+        /* ── Imported certificates: list + import + delete ──────────── */
+        var listBody = pg.querySelector('#cert-list-body');
+        var importForm = pg.querySelector('#form-cert-import');
+
+        function loadCertList() {
+            if (!listBody) return Promise.resolve();
+            invalidateApiCache('/config/system_certificate');
+            return api('/config/system_certificate').then(function (data) {
+                var entries = (data && data.entries) ? data.entries : [];
+                listBody.innerHTML = '';
+                if (!entries.length) {
+                    listBody.innerHTML = '<tr><td colspan="4" style="color:#888">No certificates imported yet.</td></tr>';
+                    return;
+                }
+                var esc = SgCommon.escHTML;
+                entries.forEach(function (e) {
+                    var id = e.id || e.name || '';
+                    var tr = document.createElement('tr');
+                    var hasKey = (e['has-key'] === 'yes');
+                    tr.innerHTML =
+                        '<td>' + esc(id) + '</td>' +
+                        '<td>' + (hasKey ? '<span style="color:#27ae60">Yes</span>' : '<span style="color:#888">No</span>') + '</td>' +
+                        '<td>' + esc(e.comment || '') + '</td>' +
+                        '<td><button class="btn btn-danger btn-sm" data-cert-del="' + esc(id) + '">Delete</button></td>';
+                    listBody.appendChild(tr);
+                });
+            }).catch(function () {
+                if (listBody) listBody.innerHTML = '<tr><td colspan="4" style="color:#c0392b">Failed to load certificates.</td></tr>';
+            });
+        }
+
+        if (listBody && !listBody._wired) {
+            listBody._wired = 1;
+            listBody.addEventListener('click', function (ev) {
+                var btn = ev.target.closest('[data-cert-del]');
+                if (!btn) return;
+                var id = btn.getAttribute('data-cert-del');
+                confirmAction('Delete certificate "' + id + '"? This fails if an SSL profile still uses it.').then(function (ok) {
+                    if (!ok) return;
+                    api('/config/system_certificate/' + encodeURIComponent(id), { method: 'DELETE' })
+                    .then(function () { showToast('Certificate deleted', 'success'); loadCertList(); })
+                    .catch(function (err) { showToast((err && err.message) || 'Delete failed (certificate in use?)', 'error'); });
+                });
+            });
+        }
+
+        /* File-name display for the two upload inputs */
+        ['cert', 'key'].forEach(function (which) {
+            var inp = pg.querySelector('#cert-imp-' + which);
+            var lbl = pg.querySelector('#cert-imp-' + which + '-name');
+            if (inp && lbl && !inp._wired) {
+                inp._wired = 1;
+                inp.addEventListener('change', function () {
+                    lbl.textContent = inp.files.length ? inp.files[0].name : 'No file selected';
+                });
+            }
+        });
+
+        /* The form is an .add-form modal (hidden by CSS, shown via the .visible
+         * class + backdrop) — use the shared openModal/closeModal, NOT inline
+         * display, otherwise CSS keeps it hidden. */
+        function closeImport() { closeModal(); }
+        var impToggle = pg.querySelector('#cert-import-toggle');
+        var impClose  = pg.querySelector('#cert-import-close');
+        var impCancel = pg.querySelector('#cert-import-cancel');
+        if (impToggle && !impToggle._wired) {
+            impToggle._wired = 1;
+            impToggle.addEventListener('click', function () {
+                var msg = pg.querySelector('#cert-imp-msg'); if (msg) msg.textContent = '';
+                openModal('form-cert-import');
+            });
+        }
+        if (impClose && !impClose._wired)  { impClose._wired = 1;  impClose.addEventListener('click', closeImport); }
+        if (impCancel && !impCancel._wired){ impCancel._wired = 1; impCancel.addEventListener('click', closeImport); }
+
+        var impSubmit = pg.querySelector('#cert-imp-submit');
+        if (impSubmit && !impSubmit._wired) {
+            impSubmit._wired = 1;
+            impSubmit.addEventListener('click', function () {
+                var name = (pg.querySelector('#cert-imp-name') || {}).value || '';
+                var certF = pg.querySelector('#cert-imp-cert');
+                var keyF  = pg.querySelector('#cert-imp-key');
+                var comment = (pg.querySelector('#cert-imp-comment') || {}).value || '';
+                var msg = pg.querySelector('#cert-imp-msg');
+                if (msg) msg.textContent = '';
+                if (!name.trim()) { if (msg) msg.textContent = 'Certificate name is required.'; return; }
+                if (!certF || !certF.files.length) { if (msg) msg.textContent = 'Choose a certificate (PEM) file.'; return; }
+
+                var fd = new FormData();
+                fd.append('name', name.trim());
+                fd.append('certificate', certF.files[0]);
+                if (keyF && keyF.files.length) fd.append('key', keyF.files[0]);
+                if (comment.trim()) fd.append('comment', comment.trim());
+
+                impSubmit.disabled = true;
+                impSubmit.textContent = 'Importing...';
+                api('/system/certificate/import', { method: 'POST', body: fd })
+                .then(function (data) {
+                    impSubmit.disabled = false; impSubmit.textContent = 'Import';
+                    if (!data) { if (msg) msg.textContent = 'No backend available.'; return; }
+                    showToast('Certificate imported', 'success');
+                    closeImport();
+                    if (certF) certF.value = ''; if (keyF) keyF.value = '';
+                    var cn = pg.querySelector('#cert-imp-cert-name'); if (cn) cn.textContent = 'No file selected';
+                    var kn = pg.querySelector('#cert-imp-key-name'); if (kn) kn.textContent = 'No file selected';
+                    loadCertList();
+                })
+                .catch(function (err) {
+                    impSubmit.disabled = false; impSubmit.textContent = 'Import';
+                    if (msg) msg.textContent = (err && err.message) || 'Import failed.';
+                });
+            });
+        }
+
+        loadCertList();
+
         return api('/monitor/ssl-cacert').then(function (d) {
             caPem = (d && d.output) ? d.output : '';
             if (statusEl) statusEl.textContent = caPem
@@ -4141,6 +4358,25 @@
             caPem = '';
             if (statusEl) statusEl.textContent = 'CA not created — enable deep SSL inspection to generate automatically';
         });
+    }
+
+    /* Populate the SSL-profile "server-cert" dropdown from imported certs. */
+    function populateCertificateSelects() {
+        return cachedApi('/config/system_certificate').then(function (data) {
+            var entries = (data && data.entries) ? data.entries : [];
+            document.querySelectorAll('.server-cert-select').forEach(function (sel) {
+                var cur = sel.value;
+                sel.innerHTML = '<option value="">-- Select imported certificate --</option>';
+                entries.forEach(function (e) {
+                    var id = e.id || e.name || '';
+                    if (!id) return;
+                    var opt = document.createElement('option');
+                    opt.value = id; opt.textContent = id;
+                    sel.appendChild(opt);
+                });
+                if (cur) sel.value = cur;
+            });
+        }).catch(function () {});
     }
 
     /* ── IPS Monitor: status card + recent alert log ──────────────── */
@@ -4227,8 +4463,6 @@
                 return loadIpsRulesets();
             } else if (tab === 'rules') {
                 return loadIpsRules();
-            } else if (tab === 'alerts') {
-                return loadIpsAlerts();
             } else if (tab === 'schedule') {
                 var scard = pg.querySelector('[data-ips-pane="schedule"] .form-card[data-settings]');
                 return scard ? settingsLoad(scard, 'security-schedule') : Promise.resolve();
@@ -4490,35 +4724,7 @@
                     loadIpsRules();
                 });
 
-                /* Alerts tab buttons */
-                var arBtn = pg.querySelector('#ips-alerts-refresh');
-                if (arBtn) arBtn.addEventListener('click', loadIpsAlerts);
-                var acBtn = pg.querySelector('#ips-alerts-clear');
-                if (acBtn) acBtn.addEventListener('click', function () {
-                    api('/ips/alerts-clear', { method: 'POST' })
-                        .then(function () { _alerts = []; renderIpsAlertsTable(); showToast('Alerts cleared', 'success'); })
-                        .catch(function () { showToast('Clear failed', 'error'); });
-                });
-                /* Alert info modal close buttons */
-                var adClose  = pg.querySelector('#ips-alert-detail-close');
-                var adClose2 = pg.querySelector('#ips-alert-detail-close2');
-                function closeAlertModal() {
-                    var m = pg.querySelector('#ips-alert-detail-modal');
-                    if (m) m.style.display = 'none';
-                }
-                if (adClose)  adClose.addEventListener('click', closeAlertModal);
-                if (adClose2) adClose2.addEventListener('click', closeAlertModal);
-
-                /* Alert info modal — delegate Info button clicks */
-                var alertTbody = pg.querySelector('#ips-alerts-tbody');
-                if (alertTbody) alertTbody.addEventListener('click', function (e) {
-                    var btn = e.target.closest('.ips-alert-info');
-                    if (!btn) return;
-                    var idx = parseInt(btn.dataset.idx, 10);
-                    var a = _alerts[idx];
-                    if (!a) return;
-                    showAlertDetail(a);
-                });
+                /* IPS alerts moved to LOG & REPORT > Firewall Log (initFwLogPage). */
             }
 
             /* Load first (or current active) tab — RETURN its promise so
@@ -4751,27 +4957,44 @@
         }
 
         /* ── Alerts tab ── */
+        function fwLogEl() { return document.getElementById('page-fw-log'); }
+
+        /* Severity name → coloured badge (shared shape with the Reports page).
+         * "Anomaly" is the ML bucket — a category, not a severity level. */
+        function sevBadge(s) {
+            var name = s || 'Unknown';
+            var cls = { Critical:'sev-critical', Major:'sev-major', Minor:'sev-minor',
+                        Informational:'sev-info', Anomaly:'sev-anomaly' }[name] || 'sev-unknown';
+            return '<span class="sev-badge ' + cls + '">' + esc(name) + '</span>';
+        }
+        /* Confidence cell: text band, plus the raw ML score when present. */
+        function confCell(a) {
+            var c = a.confidence || '—';
+            if (a.score >= 0) c += ' (' + parseFloat(a.score).toFixed(2) + ')';
+            return esc(c);
+        }
+
         function loadIpsAlerts() {
-            var pg = pageEl(); if (!pg) return Promise.resolve();
+            var pg = fwLogEl(); if (!pg) return Promise.resolve();
             var tbody = pg.querySelector('#ips-alerts-tbody');
-            if (tbody) tbody.innerHTML = '<tr><td colspan="8" class="table-empty">Loading…</td></tr>';
+            if (tbody) tbody.innerHTML = '<tr><td colspan="10" class="table-empty">Loading…</td></tr>';
             return api('/ips/alerts-json').then(function (data) {
                 _alerts = Array.isArray(data) ? data : [];
                 renderIpsAlertsTable();
             }).catch(function () {
                 _alerts = [];
-                var t = (pageEl() || {}).querySelector ? pageEl().querySelector('#ips-alerts-tbody') : null;
-                if (t) t.innerHTML = '<tr><td colspan="8" class="table-empty">Failed to load alerts</td></tr>';
+                var t = (fwLogEl() || {}).querySelector ? fwLogEl().querySelector('#ips-alerts-tbody') : null;
+                if (t) t.innerHTML = '<tr><td colspan="10" class="table-empty">Failed to load alerts</td></tr>';
             });
         }
 
         function renderIpsAlertsTable() {
-            var pg = pageEl(); if (!pg) return;
+            var pg = fwLogEl(); if (!pg) return;
             var tbody = pg.querySelector('#ips-alerts-tbody');
             var cntEl = pg.querySelector('#ips-alerts-count');
             if (!tbody) return;
             if (!_alerts.length) {
-                tbody.innerHTML = '<tr><td colspan="8" class="table-empty">No alerts</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="10" class="table-empty">No alerts</td></tr>';
                 if (cntEl) cntEl.textContent = '';
                 return;
             }
@@ -4787,6 +5010,8 @@
                     '<td style="white-space:nowrap;font-size:11px">' + esc(a.ts || '') + '</td>',
                     '<td>' + esc(String(a.sid || '')) + '</td>',
                     '<td class="' + vCls + '">' + esc(a.verdict || '') + '</td>',
+                    '<td>' + sevBadge(a.severity) + '</td>',
+                    '<td style="white-space:nowrap;font-size:11px">' + confCell(a) + '</td>',
                     '<td>' + esc(proto) + '</td>',
                     '<td style="white-space:nowrap">' + esc((a.src||'') + ':' + (a.sport||'')) + '</td>',
                     '<td style="white-space:nowrap">' + esc((a.dst||'') + ':' + (a.dport||'')) + '</td>',
@@ -4800,7 +5025,7 @@
         }
 
         function showAlertDetail(a) {
-            var pg = pageEl(); if (!pg) return;
+            var pg = fwLogEl(); if (!pg) return;
             var modal = pg.querySelector('#ips-alert-detail-modal');
             var body  = pg.querySelector('#ips-alert-detail-body');
             if (!modal || !body) return;
@@ -4812,6 +5037,8 @@
                 '<tr><td style="width:140px;color:#666;font-weight:600">Timestamp</td><td>' + esc(a.ts||'') + '</td></tr>',
                 '<tr><td>SID</td><td>' + esc(String(a.sid||'')) + '</td></tr>',
                 '<tr><td>Action</td><td class="' + (a.verdict==='DROP'?'verdict-drop':'verdict-alert') + '">' + esc(a.verdict||'') + '</td></tr>',
+                '<tr><td>Severity</td><td>' + sevBadge(a.severity) + '</td></tr>',
+                '<tr><td>Confidence</td><td>' + confCell(a) + '</td></tr>',
                 '<tr><td>Protocol</td><td>' + esc(proto) + '</td></tr>',
                 '<tr><td>Source</td><td>' + esc((a.src||'') + ':' + (a.sport||'')) + '</td></tr>',
                 '<tr><td>Destination</td><td>' + esc((a.dst||'') + ':' + (a.dport||'')) + '</td></tr>',
@@ -4823,7 +5050,450 @@
             modal.style.display = 'flex';
         }
 
+        /* ── LOG & REPORT > Firewall Log: IPS alerts (wiring + load) ── */
+        window.initFwLogPage = function (pg) {
+            if (!pg) return Promise.resolve();
+            if (!pg._fwLogInited) {
+                pg._fwLogInited = true;
+
+                var arBtn = pg.querySelector('#ips-alerts-refresh');
+                if (arBtn) arBtn.addEventListener('click', loadIpsAlerts);
+
+                var acBtn = pg.querySelector('#ips-alerts-clear');
+                if (acBtn) acBtn.addEventListener('click', function () {
+                    api('/ips/alerts-clear', { method: 'POST' })
+                        .then(function () { _alerts = []; renderIpsAlertsTable(); showToast('Alerts cleared', 'success'); })
+                        .catch(function () { showToast('Clear failed', 'error'); });
+                });
+
+                var adClose  = pg.querySelector('#ips-alert-detail-close');
+                var adClose2 = pg.querySelector('#ips-alert-detail-close2');
+                function closeAlertModal() {
+                    var m = pg.querySelector('#ips-alert-detail-modal');
+                    if (m) m.style.display = 'none';
+                }
+                if (adClose)  adClose.addEventListener('click', closeAlertModal);
+                if (adClose2) adClose2.addEventListener('click', closeAlertModal);
+
+                var alertTbody = pg.querySelector('#ips-alerts-tbody');
+                if (alertTbody) alertTbody.addEventListener('click', function (e) {
+                    var btn = e.target.closest('.ips-alert-info');
+                    if (!btn) return;
+                    var idx = parseInt(btn.dataset.idx, 10);
+                    var a = _alerts[idx];
+                    if (!a) return;
+                    showAlertDetail(a);
+                });
+            }
+            return loadIpsAlerts();
+        };
+
     })();  /* end IPS 5-tab module */
+
+    /* ================================================================
+     *  LOG & REPORT > Reports — IPS/IDS security report (FortiGate-style)
+     *  Client-side aggregation of /ips/alerts-json. View + Print/Save-PDF.
+     * ================================================================ */
+    (function () {
+        /* esc is module-local elsewhere; bind our own to the shared helper. */
+        var esc = (window.SgCommon && SgCommon.escHTML) ? SgCommon.escHTML
+            : function (s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+                return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); };
+        var TOP_N = 10;
+        var _sched = { mode: 'off' };   /* current report schedule (from /reports/schedule) */
+
+        function rptEl() { return document.getElementById('page-reports'); }
+        function $r(id) { var p = rptEl(); return p ? p.querySelector(id) : null; }
+
+        /* "YYYY-MM-DD HH:MM:SS" (local) → Date, or null. */
+        function parseTs(ts) {
+            if (!ts) return null;
+            var d = new Date(String(ts).replace(' ', 'T'));
+            return isNaN(d.getTime()) ? null : d;
+        }
+        function pad2(n) { return (n < 10 ? '0' : '') + n; }
+        function fmtDay(d) { return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()); }
+        function shortDay(k) { return k.slice(5); }   /* MM-DD */
+
+        /* Group an array into [{label,count}] sorted desc; blank labels folded to '(unknown)'. */
+        function groupCount(arr, keyFn) {
+            var map = Object.create(null);
+            arr.forEach(function (a) {
+                var k = keyFn(a); if (k === '' || k == null) k = '(unknown)';
+                map[k] = (map[k] || 0) + 1;
+            });
+            return Object.keys(map).map(function (k) { return { label: k, count: map[k] }; })
+                .sort(function (a, b) { return b.count - a.count; });
+        }
+
+        /* severity name → shared badge colour class (Critical/Major/Minor/Info). */
+        var SEV_CLS = { Critical:'sev-critical', Major:'sev-major', Minor:'sev-minor',
+                        Informational:'sev-info', Unknown:'sev-unknown' };
+
+        function renderRank(sel, rows) {
+            var el = $r(sel); if (!el) return;
+            if (!rows.length) { el.innerHTML = '<div class="report-empty">No matching data for this range</div>'; return; }
+            var max = rows[0].count || 1;
+            var html = '<table class="report-rank">';
+            rows.slice(0, TOP_N).forEach(function (r, i) {
+                var pct = Math.round((r.count / max) * 100);
+                html += '<tr>'
+                    + '<td class="rank-count" style="width:26px;color:#999">' + (i + 1) + '</td>'
+                    + '<td class="rank-label" title="' + esc(r.label) + '">' + esc(r.label) + '</td>'
+                    + '<td class="rank-bar"><div class="report-bar-track"><div class="report-bar-fill" style="width:' + pct + '%"></div></div></td>'
+                    + '<td class="rank-count">' + r.count + '</td>'
+                    + '</tr>';
+            });
+            html += '</table>';
+            el.innerHTML = html;
+        }
+
+        function renderSummary(alerts) {
+            var el = $r('#rpt-summary'); if (!el) return;
+            var blocked = 0, alerted = 0, srcs = Object.create(null), dsts = Object.create(null);
+            alerts.forEach(function (a) {
+                if (a.verdict === 'DROP') blocked++; else if (a.verdict === 'ALERT') alerted++;
+                if (a.src) srcs[a.src] = 1;
+                if (a.dst) dsts[a.dst] = 1;
+            });
+            var tiles = [
+                ['Total intrusions', alerts.length],
+                ['Blocked', blocked],
+                ['Alerted (not blocked)', alerted],
+                ['Unique sources', Object.keys(srcs).length],
+                ['Unique victims', Object.keys(dsts).length]
+            ];
+            el.innerHTML = tiles.map(function (t) {
+                return '<div class="report-stat"><div class="report-stat-val">' + t[1] + '</div>'
+                    + '<div class="report-stat-lbl">' + t[0] + '</div></div>';
+            }).join('');
+        }
+
+        /* Severity — SIGNATURE detections only (ML has no threat severity). */
+        function renderSeverity(alerts) {
+            var el = $r('#rpt-severity'); if (!el) return;
+            var order = ['Critical', 'Major', 'Minor', 'Informational', 'Unknown'];
+            var c = { Critical:0, Major:0, Minor:0, Informational:0, Unknown:0 };
+            var sig = 0;
+            alerts.forEach(function (a) {
+                if (a.severity === 'Anomaly') return;   /* ML → counted separately */
+                var s = a.severity || 'Unknown';
+                if (c[s] === undefined) s = 'Unknown';
+                c[s]++; sig++;
+            });
+            if (!sig) { el.innerHTML = '<div class="report-empty">No signature detections in this range</div>'; return; }
+            var html = '<div class="sev-row">';
+            order.forEach(function (k) {
+                if (k === 'Unknown' && !c[k]) return;   /* hide empty Unknown */
+                html += '<div class="sev-chip ' + SEV_CLS[k] + '">'
+                    + '<div class="sev-n">' + c[k] + '</div>'
+                    + '<div class="sev-l">' + k + '</div></div>';
+            });
+            el.innerHTML = html + '</div>';
+        }
+
+        /* ML anomalies — counted by CONFIDENCE (neutral tiles; confidence is not
+         * a severity, so no severity colour ramp here). */
+        function renderMlAnomalies(alerts) {
+            var el = $r('#rpt-ml-anomalies'); if (!el) return;
+            var ml = alerts.filter(function (a) {
+                return String(a.reason || '').indexOf('ml-') === 0 || a.severity === 'Anomaly';
+            });
+            if (!ml.length) { el.innerHTML = '<div class="report-empty">No ML anomaly detections in this range</div>'; return; }
+            var blocked = 0, conf = { 'Very High':0, High:0, Medium:0, Low:0 };
+            ml.forEach(function (a) {
+                if (a.verdict === 'DROP') blocked++;
+                var k = a.confidence; if (conf[k] === undefined) k = 'Low'; conf[k]++;
+            });
+            /* Headline totals (two independent numbers). */
+            var html = '<div class="report-stat-grid">'
+                + '<div class="report-stat"><div class="report-stat-val">' + ml.length + '</div><div class="report-stat-lbl">Anomaly detections</div></div>'
+                + '<div class="report-stat"><div class="report-stat-val">' + blocked + '</div><div class="report-stat-lbl">Blocked</div></div>'
+                + '</div>';
+            /* Confidence distribution — a breakdown of the total, as proportional bars. */
+            var order = ['Very High', 'High', 'Medium', 'Low'];
+            html += '<div class="report-sub">Confidence distribution '
+                + '<span class="report-note">(of the ' + ml.length + ' detections)</span></div>';
+            html += '<table class="report-rank">';
+            order.forEach(function (k) {
+                var pct = ml.length ? Math.round(conf[k] / ml.length * 100) : 0;
+                html += '<tr><td class="rank-label">' + k + '</td>'
+                    + '<td class="rank-bar"><div class="report-bar-track"><div class="report-bar-fill" style="width:' + pct + '%"></div></div></td>'
+                    + '<td class="rank-count">' + conf[k] + '</td>'
+                    + '<td class="rank-count" style="width:44px;color:#999">' + pct + '%</td></tr>';
+            });
+            el.innerHTML = html + '</table>';
+        }
+
+        function bucketHistory(alerts, rangeDays) {
+            if (rangeDays === 1) {
+                var b = [], labels = [], h;
+                for (h = 0; h < 24; h++) { b.push(0); labels.push(pad2(h) + ':00'); }
+                alerts.forEach(function (a) { var d = parseTs(a.ts); if (d) b[d.getHours()]++; });
+                return { counts: b, labels: labels };
+            }
+            var map = Object.create(null);
+            alerts.forEach(function (a) { var d = parseTs(a.ts); if (!d) return; var k = fmtDay(d); map[k] = (map[k] || 0) + 1; });
+            var keys = Object.keys(map).sort();
+            return { counts: keys.map(function (k) { return map[k]; }), labels: keys.map(shortDay) };
+        }
+
+        function drawHistory(counts, labels) {
+            var canvas = $r('#rpt-history'); if (!canvas || !canvas.getContext) return;
+            var dpr = window.devicePixelRatio || 1;
+            var W = 920, H = 240;
+            canvas.width = W * dpr; canvas.height = H * dpr;
+            canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+            var ctx = canvas.getContext('2d');
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.clearRect(0, 0, W, H);
+
+            var padL = 40, padR = 12, padT = 12, padB = 30;
+            var plotW = W - padL - padR, plotH = H - padT - padB;
+            var max = counts.reduce(function (m, v) { return v > m ? v : m; }, 0);
+            var yMax = Math.max(max, 1);
+
+            /* axes */
+            ctx.strokeStyle = '#ccc'; ctx.lineWidth = 1; ctx.fillStyle = '#888';
+            ctx.font = '11px sans-serif'; ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+            var ticks = 4, i;
+            for (i = 0; i <= ticks; i++) {
+                var yv = Math.round(yMax * i / ticks);
+                var y = padT + plotH - (plotH * i / ticks);
+                ctx.strokeStyle = '#eee';
+                ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+                ctx.fillText(String(yv), padL - 6, y);
+            }
+            if (max === 0) {
+                ctx.textAlign = 'center'; ctx.fillStyle = '#aaa';
+                ctx.fillText('No intrusions in this range', W / 2, padT + plotH / 2);
+                return;
+            }
+            /* bars */
+            var n = counts.length;
+            var slot = plotW / n, bw = Math.max(1, Math.min(slot * 0.7, 40));
+            ctx.fillStyle = '#24466b';
+            for (i = 0; i < n; i++) {
+                var bh = (counts[i] / yMax) * plotH;
+                var x = padL + slot * i + (slot - bw) / 2;
+                ctx.fillRect(x, padT + plotH - bh, bw, bh);
+            }
+            /* x labels (thin out to avoid crowding) */
+            ctx.fillStyle = '#888'; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+            var step = Math.ceil(n / 16);
+            for (i = 0; i < n; i++) {
+                if (i % step !== 0 && i !== n - 1) continue;
+                var lx = padL + slot * i + slot / 2;
+                ctx.fillText(labels[i], lx, padT + plotH + 6);
+            }
+        }
+
+        /* Byte formatter up to TB (the shared formatBytes caps at MB). */
+        function rptBytes(n) {
+            n = Number(n) || 0;
+            var u = ['B', 'KB', 'MB', 'GB', 'TB'], i = 0;
+            while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+            return (i === 0 ? n : n.toFixed(1)) + ' ' + u[i];
+        }
+
+        /* Traffic Snapshot — live conntrack figures captured at generate time. */
+        function renderTraffic(obj) {
+            var el = $r('#rpt-traffic'); if (!el) return;
+            var out = (obj && obj.bytes_out) || 0;
+            var inb = (obj && obj.bytes_in) || 0;
+            var tiles = [
+                ['Active sessions', (obj && obj.session_count) || 0],
+                ['Traffic out', rptBytes(out)],
+                ['Traffic in', rptBytes(inb)],
+                ['Total bytes', rptBytes(Number(out) + Number(inb))]
+            ];
+            el.innerHTML = tiles.map(function (t) {
+                return '<div class="report-stat"><div class="report-stat-val">' + esc(String(t[1]))
+                    + '</div><div class="report-stat-lbl">' + t[0] + '</div></div>';
+            }).join('');
+        }
+
+        /* Admin-login / failed-login tally → reuse the ranked-bar table. */
+        function renderLoginRank(sel, arr) {
+            renderRank(sel, (arr || []).map(function (a) {
+                return { label: a.user, count: a.count };
+            }));
+        }
+
+        /* Render a stored report object (from /reports/get) into the viewer. */
+        function renderReport(obj) {
+            var alerts = (obj && obj.alerts) || [];
+            var rangeDays = (obj && obj.range_days != null) ? obj.range_days : 7;
+            var g = $r('#rpt-generated'); if (g) g.textContent = (obj && obj.generated) || '—';
+            var rg = $r('#rpt-range'); if (rg) rg.textContent = (obj && obj.range_label) || '—';
+            var hh = $r('#rpt-host'); if (hh) hh.textContent = (obj && obj.host) || 'Stargazer';
+
+            renderSummary(alerts);
+            renderSeverity(alerts);
+            renderMlAnomalies(alerts);
+            renderRank('#rpt-top-intrusions', groupCount(alerts, function (a) { return a.msg || ('SID ' + a.sid) || ''; }));
+            renderRank('#rpt-top-blocked', groupCount(alerts.filter(function (a) { return a.verdict === 'DROP'; }), function (a) { return a.msg || ('SID ' + a.sid) || ''; }));
+            renderRank('#rpt-top-sources', groupCount(alerts, function (a) { return a.src || ''; }));
+            renderRank('#rpt-top-victims', groupCount(alerts, function (a) { return a.dst || ''; }));
+            renderTraffic(obj);
+            renderLoginRank('#rpt-admin-logins', (obj && obj.admin_logins) || []);
+            renderLoginRank('#rpt-failed-logins', (obj && obj.failed_logins) || []);
+            var hist = bucketHistory(alerts, rangeDays);
+            drawHistory(hist.counts, hist.labels);
+            var hint = $r('#rpt-history-hint');
+            if (hint) hint.textContent = rangeDays === 1 ? 'Intrusions per hour (last 24 hours).' : 'Intrusions per day.';
+        }
+
+        /* ── List / viewer switching ── */
+        function showList() {
+            var l = $r('#reports-list-view'), v = $r('#reports-viewer-view');
+            if (l) l.style.display = ''; if (v) v.style.display = 'none';
+        }
+        function showViewer() {
+            var l = $r('#reports-list-view'), v = $r('#reports-viewer-view');
+            if (l) l.style.display = 'none'; if (v) v.style.display = '';
+        }
+        function reportName(r) {
+            return (r.type === 'scheduled' ? 'Scheduled' : 'On-Demand') + '-' + (r.id || '');
+        }
+        function sizeFmt(b) {
+            b = +b || 0;
+            return b < 1024 ? (b + ' B') : ((b / 1024).toFixed(1) + ' KiB');
+        }
+        function renderList(reports) {
+            var tb = $r('#reports-tbody'); if (!tb) return;
+            if (!reports.length) {
+                tb.innerHTML = '<tr><td colspan="5" class="table-empty">No reports yet — click "Generate Now" to create one.</td></tr>';
+                return;
+            }
+            var frag = '';
+            reports.forEach(function (r) {
+                frag += '<tr>'
+                    + '<td style="white-space:nowrap"><a href="#" class="report-open" data-id="' + esc(r.id) + '">' + esc(reportName(r)) + '</a></td>'
+                    + '<td style="white-space:nowrap;font-size:12px">' + esc(r.data_start || '—') + '</td>'
+                    + '<td style="white-space:nowrap;font-size:12px">' + esc(r.data_end || '—') + '</td>'
+                    + '<td style="white-space:nowrap">' + esc(sizeFmt(r.size)) + '</td>'
+                    + '<td style="white-space:nowrap;text-align:right">'
+                    +   '<button class="btn report-open" data-id="' + esc(r.id) + '">View</button> '
+                    +   '<button class="btn report-del" data-id="' + esc(r.id) + '" style="color:var(--color-danger)">Delete</button>'
+                    + '</td></tr>';
+            });
+            tb.innerHTML = frag;
+        }
+        function loadList() {
+            var tb = $r('#reports-tbody');
+            if (tb) tb.innerHTML = '<tr><td colspan="5" class="table-empty">Loading…</td></tr>';
+            return api('/reports/list').then(function (data) {
+                renderList(Array.isArray(data) ? data : []);
+            }).catch(function () {
+                if (tb) tb.innerHTML = '<tr><td colspan="5" class="table-empty">Failed to load reports</td></tr>';
+            });
+        }
+        function openReport(id) {
+            return api('/reports/get?id=' + encodeURIComponent(id)).then(function (obj) {
+                if (!obj || !obj.id) { showToast('Report not found', 'error'); return; }
+                renderReport(obj);
+                showViewer();
+            }).catch(function () { showToast('Failed to open report', 'error'); });
+        }
+        function generateNow() {
+            var rng = $r('#report-gen-range');
+            var range = rng ? parseInt(rng.value, 10) : 7;
+            var btn = $r('#report-generate'); if (btn) btn.disabled = true;
+            invalidateApiCache('/reports/list');
+            /* send numbers as strings — webd's json reader (mg_json_get_str) only
+             * extracts JSON string values, not numbers. */
+            api('/reports/generate', { method: 'POST', body: { range: String(range), type: 'on-demand' } })
+                .then(function () { showToast('Report generated', 'success'); return loadList(); })
+                .catch(function () { showToast('Generate failed', 'error'); })
+                .then(function () { if (btn) btn.disabled = false; });
+        }
+        function deleteReport(id) {
+            invalidateApiCache('/reports/list');
+            api('/reports/delete', { method: 'POST', body: { id: id } })
+                .then(function () { showToast('Report deleted', 'success'); return loadList(); })
+                .catch(function () { showToast('Delete failed', 'error'); });
+        }
+
+        /* ── Schedule ── */
+        function hhmm(s) {
+            return ('0' + (s.hour || 0)).slice(-2) + ':' + ('0' + (s.minute || 0)).slice(-2);
+        }
+        function schedLabel(s) {
+            if (!s || !s.mode || s.mode === 'off') return 'Schedule: off';
+            if (s.mode === 'weekly') {
+                var days = ['', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+                return 'Schedule: Weekly (' + (days[s.day] || 'Sun') + ') at ' + hhmm(s);
+            }
+            return 'Schedule: Daily at ' + hhmm(s);
+        }
+        function loadSchedStatus() {
+            return api('/reports/schedule').then(function (s) {
+                _sched = s || { mode: 'off' };
+                var el = $r('#report-sched-status'); if (el) el.textContent = schedLabel(_sched);
+            }).catch(function () {});
+        }
+        function syncSchedDayRow() {
+            var mode = $r('#sched-mode'), row = $r('#sched-day-row');
+            if (row) row.style.display = (mode && mode.value === 'weekly') ? '' : 'none';
+        }
+        function openSchedModal() {
+            var m = $r('#report-sched-modal'); if (!m) return;
+            var s = _sched || { mode: 'off', hour: 2, day: 7 };
+            var mode = $r('#sched-mode'); if (mode) mode.value = s.mode || 'off';
+            var time = $r('#sched-time'); if (time) time.value = hhmm(s);
+            var day = $r('#sched-day'); if (day) day.value = String(s.day != null ? s.day : 7);
+            syncSchedDayRow();
+            m.style.display = 'flex';
+        }
+        function saveSched() {
+            var mode = ($r('#sched-mode') || {}).value || 'off';
+            var parts = (($r('#sched-time') || {}).value || '02:00').split(':');
+            var hour = parseInt(parts[0], 10) || 0;
+            var minute = parseInt(parts[1], 10) || 0;
+            var day = parseInt(($r('#sched-day') || {}).value || '7', 10);
+            invalidateApiCache('/reports/schedule');
+            /* strings, not numbers — see generateNow (mg_json_get_str). */
+            api('/reports/schedule', { method: 'POST', body: { mode: mode, hour: String(hour), minute: String(minute), day: String(day) } })
+                .then(function () {
+                    _sched = { mode: mode, hour: hour, minute: minute, day: day };
+                    var el = $r('#report-sched-status'); if (el) el.textContent = schedLabel(_sched);
+                    var m = $r('#report-sched-modal'); if (m) m.style.display = 'none';
+                    showToast('Schedule saved', 'success');
+                })
+                .catch(function () { showToast('Save failed', 'error'); });
+        }
+
+        window.initReportsPage = function (pg) {
+            if (!pg) return Promise.resolve();
+            if (!pg._reportsInited) {
+                pg._reportsInited = true;
+
+                var gen = pg.querySelector('#report-generate'); if (gen) gen.addEventListener('click', generateNow);
+                var rrf = pg.querySelector('#reports-refresh'); if (rrf) rrf.addEventListener('click', function () { invalidateApiCache('/reports/list'); loadList(); });
+                var back = pg.querySelector('#report-back'); if (back) back.addEventListener('click', showList);
+                var pr = pg.querySelector('#report-print'); if (pr) pr.addEventListener('click', function () { window.print(); });
+
+                var tb = pg.querySelector('#reports-tbody');
+                if (tb) tb.addEventListener('click', function (e) {
+                    var op = e.target.closest('.report-open');
+                    if (op) { e.preventDefault(); openReport(op.dataset.id); return; }
+                    var del = e.target.closest('.report-del');
+                    if (del && confirm('Delete this report?')) deleteReport(del.dataset.id);
+                });
+
+                var sb = pg.querySelector('#report-schedule-btn'); if (sb) sb.addEventListener('click', openSchedModal);
+                var sm = pg.querySelector('#sched-mode'); if (sm) sm.addEventListener('change', syncSchedDayRow);
+                var ssv = pg.querySelector('#sched-save'); if (ssv) ssv.addEventListener('click', saveSched);
+                var scl = pg.querySelector('#report-sched-close'); var scc = pg.querySelector('#report-sched-cancel');
+                function closeSched() { var m = pg.querySelector('#report-sched-modal'); if (m) m.style.display = 'none'; }
+                if (scl) scl.addEventListener('click', closeSched);
+                if (scc) scc.addEventListener('click', closeSched);
+            }
+            showList();
+            return Promise.all([loadSchedStatus(), loadList()]);
+        };
+    })();  /* end Reports module */
 
     /* ================================================================
      *  IPS Profile — embedded Signatures & Filters (FortiGate-style)
@@ -4836,7 +5506,33 @@
         var catalog  = [];
         var catalogTrunc = 0;      /* 1 → server truncated results */
         var pendingFilters = [];   /* filters buffered before profile is saved */
+        var dbFilters      = [];   /* filters already saved for this profile (from DB) */
         var _searchTimer   = null; /* debounce handle */
+
+        /* Duplicate detection — a profile holds at most one filter per
+         * (kind, normalized value). Signatures compare numerically (leading
+         * zeros / whitespace), categories case-fold + trim. Kept in sync with
+         * the server check in stargazer-mgmtd.c (ips_filter_is_dup). */
+        function normFilterVal(type, v) {
+            if (type === 'signature') {
+                var n = parseInt(v, 10);
+                return isNaN(n) ? '' : String(n);
+            }
+            return String(v == null ? '' : v).trim().toLowerCase();
+        }
+        /* Does (type,value) already exist among saved DB rows or pending adds? */
+        function filterExists(type, value) {
+            var nv = normFilterVal(type, value);
+            if (nv === '') return false;
+            var inDb = dbFilters.some(function (e) {
+                var t = e.rule ? 'signature' : (e.category ? 'category' : '');
+                return t === type && normFilterVal(t, e.rule || e.category) === nv;
+            });
+            var inPend = pendingFilters.some(function (pf) {
+                return pf.type === type && normFilterVal(pf.type, pf.value) === nv;
+            });
+            return inDb || inPend;
+        }
 
         function curProfileName() {
             var row = profForm ? profForm.querySelector('.form-row[data-key="name"] .form-input') : null;
@@ -4854,6 +5550,7 @@
             var pid = curProfileId();
 
             function paint(dbRows) {
+                dbFilters = dbRows || [];   /* keep dedup source in sync */
                 if (!dbRows.length && !pendingFilters.length) {
                     tb.innerHTML = '<tr><td colspan="5" style="opacity:.6">No filters yet. Click "Create New" to add.</td></tr>';
                     return;
@@ -4916,12 +5613,22 @@
         function renderCatalog() {
             var tb = sigTbody();
             if (!tb) return;
-            /* catalog already filtered by keyword on the backend → display directly */
-            var rows = catalog.slice(0, 100);
-            var total = catalog.length;
+            /* catalog already filtered by keyword on the backend → then drop the
+             * signatures already added to THIS profile (saved or pending) so they
+             * can't be picked again. Only exact SID matches are hidden — a signature
+             * that merely belongs to an already-added CATEGORY stays selectable, so
+             * the per-SID override use case still works. */
+            var avail = catalog.filter(function (s) {
+                return !filterExists('signature', s.sid);
+            });
+            var hidden = catalog.length - avail.length;
+            var rows = avail.slice(0, 100);
+            var total = avail.length;
             var countEl = document.getElementById('ips-sig-count');
             if (countEl) {
                 countEl.textContent = 'Showing ' + rows.length + ' of ' + total;
+                if (hidden)
+                    countEl.textContent += ' (' + hidden + ' already added)';
                 if (catalogTrunc)
                     countEl.textContent += ' — too many to list, refine your search';
             }
@@ -4953,6 +5660,7 @@
                 catalog.forEach(function (s) { if (s.category) cats[s.category] = 1; });
             sel.innerHTML = '<option value="all">all (every category)</option>';
             Object.keys(cats).sort().forEach(function (c) {
+                if (filterExists('category', c)) return;   /* already added → hide */
                 var o = document.createElement('option');
                 o.value = c; o.textContent = c;
                 sel.appendChild(o);
@@ -5095,25 +5803,38 @@
             var action   = (document.getElementById('ips-sig-action') || {}).value || 'default';
             var activeTab = document.querySelector('.ips-tab.active');
             var tab      = activeTab ? activeTab.dataset.tab : 'signature';
-            var jobs     = [];
+            var added = 0, skipped = 0;
             if (tab === 'signature') {
-                document.querySelectorAll('.ips-sig-cb:checked').forEach(function (cb) {
-                    jobs.push(addFilter('signature', cb.dataset.sid, action));
+                var checked = document.querySelectorAll('.ips-sig-cb:checked');
+                if (!checked.length) { showToast('Select at least 1 signature', 'error'); return; }
+                /* Skip signatures already present (in DB or pending) — also
+                 * dedups repeats WITHIN this batch, since addFilter appends to
+                 * pendingFilters as we go. */
+                checked.forEach(function (cb) {
+                    var sid = cb.dataset.sid;
+                    if (filterExists('signature', sid)) { skipped++; return; }
+                    addFilter('signature', sid, action); added++;
                 });
-                if (!jobs.length) { showToast('Select at least 1 signature', 'error'); return; }
+                if (!added) {
+                    showToast('Already in this profile (' + skipped + ' duplicate' +
+                              (skipped === 1 ? '' : 's') + ')', 'error');
+                    return;
+                }
             } else {
                 var sel = document.getElementById('ips-filter-cat');
                 var cat = sel ? sel.value : '';
                 if (!cat) { showToast('Select a category', 'error'); return; }
-                jobs.push(addFilter('category', cat, action));
+                if (filterExists('category', cat)) {
+                    showToast('Category already in this profile', 'error');
+                    return;
+                }
+                addFilter('category', cat, action); added = 1;
             }
-            Promise.all(jobs).then(function () {
-                showToast('Added ' + jobs.length + ' item(s)', 'success');
-                closeModal2();
-                renderProfileFilters();
-            }).catch(function (err) {
-                showToast((err && err.message) || 'Add failed', 'error');
-            });
+            showToast('Added ' + added + ' item(s)' +
+                      (skipped ? ', skipped ' + skipped + ' duplicate(s)' : ''),
+                      'success');
+            closeModal2();
+            renderProfileFilters();
         });
 
         /* Delete: saved filter from DB, or pending filter from local buffer */

@@ -1,7 +1,19 @@
-# Stargazer IPS signature auto-update — runs daily at 12:00.
-# Wrapper self-checks the security_ips auto-update mode (disable/daily/weekly) from .update.conf.
-0 12 * * * /usr/libexec/stargazer/ips-update-cron.sh >/dev/null 2>&1
+# Run jobs with a real shell + PATH. busybox crond otherwise uses the user's
+# login shell from /etc/passwd — which is /sbin/nologin for root on this box, so
+# every job would be refused by nologin and silently never run.
+SHELL=/bin/sh
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+# Stargazer IPS signature auto-update — wrapper runs every minute and self-checks
+# the cron schedule (cron-enabled + cron-minutes/hours/dom/months/dow) from
+# .update.conf, written by mgmtd from the WebUI Schedule tab. Root fs is read-only
+# so the schedule is matched in the wrapper, not by rewriting this crontab.
+* * * * * /usr/libexec/stargazer/ips-update-cron.sh >/dev/null 2>&1
 
 # Rotate ips-alert.log by size (default 5 MB, keep 5 copies) — checked hourly.
 # Rename the file then SIGHUP ipsd so it reopens the fd (busybox has no logrotate).
 0 * * * * /usr/libexec/stargazer/ips-log-rotate.sh >/dev/null 2>&1
+
+# Generate scheduled IPS/IDS reports — wrapper self-checks .schedule.conf
+# (mode=off|daily|weekly, hour, day) written by mgmtd; fires at the set hour.
+* * * * * /usr/libexec/stargazer/ips-report-cron.sh >/dev/null 2>&1

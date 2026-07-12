@@ -480,18 +480,21 @@ int handle_ssl_diag(int client_fd, const char *user,
 			int builtin = strcmp(id, "no-inspection") == 0;
 			char *st   = sg_db_get_val(SSL_PROF, id, "status");
 			char *mode = sg_db_get_val(SSL_PROF, id, "inspection-mode");
+			char *method = sg_db_get_val(SSL_PROF, id, "inspection-method");
 			char *nosni= sg_db_get_val(SSL_PROF, id, "no-sni");
 			char *untr = sg_db_get_val(SSL_PROF, id, "untrusted-server-cert");
 			char *exmpt= sg_db_get_val(SSL_PROF, id, "exempt");
 			int en   = !builtin && st && !strcmp(st, "enable");
-			int deep = mode && !strcmp(mode, "deep");
+			int deep = method && !strcmp(method, "deep");
 
 			ADD("\n[profile %s]%s\n", id, builtin ? " (builtin)" : "");
 			if (builtin) {
 				ADD("  inspection=none (traffic passes through, no decryption)\n");
 			} else {
 				ADD("  status=%s\n", en ? "enable" : "disable");
-				ADD("  inspection_mode=%s\n", mode ? mode : "certificate");
+				ADD("  inspection_mode=%s\n", mode ? mode : "multiple-clients");
+				if (!(mode && !strcmp(mode, "protecting-server")))
+					ADD("  inspection_method=%s\n", method ? method : "certificate");
 				ADD("  no_sni=%s\n", nosni ? nosni : "bump");
 				ADD("  untrusted_server_cert=%s\n", untr ? untr : "block");
 				int ex = 0;
@@ -517,7 +520,7 @@ int handle_ssl_diag(int client_fd, const char *user,
 				}
 			}
 			if (en) idx++;
-			free(st); free(mode); free(nosni); free(untr); free(exmpt);
+			free(st); free(mode); free(method); free(nosni); free(untr); free(exmpt);
 		}
 		free(list);
 	}
@@ -885,6 +888,305 @@ int handle_ips_update_log(int client_fd, const char *user,
 
 /* ── SG_CMD_IPS_ALERTS_JSON (689) — parse alert log → JSON array ─────── */
 
+/* ── IPS severity + confidence: sid → rule metadata, from active.rules ───────
+ * active.rules is raw Snort rule text (concatenated by mgmtd_ips_compile), so
+ * `signature_severity` and `confidence` metadata are preserved. We build a
+ * sorted sid→{severity,confidence} table once and reuse it until active.rules
+ * changes (mtime).
+ *   severity:   1 Informational · 2 Minor · 3 Major · 4 Critical · 0 unknown
+ *               (precedence signature_severity → priority:N → classtype)
+ *   confidence: 1 Low · 2 Medium · 3 High · 0 unset (ET `confidence` metadata)
+ * NOTE: severity and confidence are ORTHOGONAL. A signature carries a real
+ * severity (how bad the threat is). The ML path has NO severity (an anomaly
+ * detector does not identify the threat type) — it reports a confidence derived
+ * from its score, and its severity is the neutral bucket "Anomaly". */
+#define IPS_ACTIVE_RULES "/etc/stargazer/ips/rules/active.rules"
+
+struct sid_sev { uint32_t sid; uint8_t sev; uint8_t conf; };
+static struct sid_sev *g_sidsev = NULL;
+static size_t g_sidsev_n = 0, g_sidsev_cap = 0;
+static time_t g_sidsev_mtime = 0;
+static int    g_sidsev_valid = 0;
+
+static const char *sev_name(uint8_t s)
+{
+	switch (s) {
+	case 1: return "Informational";
+	case 2: return "Minor";
+	case 3: return "Major";
+	case 4: return "Critical";
+	default: return "Unknown";
+	}
+}
+static const char *conf_name(uint8_t c)
+{
+	switch (c) {
+	case 1: return "Low";
+	case 2: return "Medium";
+	case 3: return "High";
+	case 4: return "Very High";   /* only reachable from a high ML score */
+	default: return "—";     /* em dash: unset */
+	}
+}
+/* ET `confidence` metadata token → level (None/absent → 0). */
+static uint8_t conf_from_meta(const char *v)
+{
+	if (!strncmp(v, "High", 4))   return 3;
+	if (!strncmp(v, "Medium", 6)) return 2;
+	if (!strncmp(v, "Low", 3))    return 1;
+	return 0;   /* None / unrecognised */
+}
+static uint8_t sev_from_sigsev(const char *v)
+{
+	if (!strncmp(v, "Informational", 13)) return 1;
+	if (!strncmp(v, "Minor", 5))          return 2;
+	if (!strncmp(v, "Major", 5))          return 3;
+	if (!strncmp(v, "Critical", 8))       return 4;
+	return 0;
+}
+/* Snort priority (1 high … 3+ low) → level. Critical is reserved for an explicit
+ * signature_severity or a high ML score, so priority-1 maps to Major. */
+static uint8_t sev_from_priority(int prio)
+{
+	if (prio <= 1) return 3;   /* Major   */
+	if (prio == 2) return 2;   /* Minor   */
+	return 1;                  /* Informational */
+}
+/* classtype → default priority (subset of Snort classification.config). */
+static int classtype_priority(const char *ct, size_t len)
+{
+	static const char *p1[] = { "attempted-admin", "attempted-user",
+		"successful-admin", "successful-user", "trojan-activity",
+		"web-application-attack", "attempted-dos", "successful-dos",
+		"shellcode-detect", "successful-recon-largescale",
+		"unsuccessful-user", "inappropriate-content", "policy-violation",
+		"domain-c2", "credential-theft", "malware-cnc", NULL };
+	static const char *p3[] = { "not-suspicious", "unknown", "string-detect",
+		"network-scan", "icmp-event", "misc-activity",
+		"protocol-command-decode", "tcp-connection", NULL };
+	int i;
+	for (i = 0; p1[i]; i++)
+		if (strlen(p1[i]) == len && !strncmp(ct, p1[i], len)) return 1;
+	for (i = 0; p3[i]; i++)
+		if (strlen(p3[i]) == len && !strncmp(ct, p3[i], len)) return 3;
+	return 2;   /* default: medium */
+}
+static int sidsev_cmp(const void *a, const void *b)
+{
+	uint32_t x = ((const struct sid_sev *)a)->sid;
+	uint32_t y = ((const struct sid_sev *)b)->sid;
+	return x < y ? -1 : (x > y ? 1 : 0);
+}
+static void sidsev_build(void)
+{
+	struct stat st;
+	if (stat(IPS_ACTIVE_RULES, &st) != 0) {
+		free(g_sidsev); g_sidsev = NULL; g_sidsev_n = 0; g_sidsev_cap = 0;
+		g_sidsev_mtime = 0; g_sidsev_valid = 1; return;
+	}
+	if (g_sidsev_valid && st.st_mtime == g_sidsev_mtime) return;  /* cache hit */
+
+	g_sidsev_n = 0;   /* rebuild in place (keep any allocation) */
+	FILE *f = fopen(IPS_ACTIVE_RULES, "r");
+	if (!f) { g_sidsev_mtime = st.st_mtime; g_sidsev_valid = 1; return; }
+
+	char  *ln = NULL; size_t cap = 0; ssize_t r;
+	while ((r = getline(&ln, &cap, f)) >= 0) {
+		if (r < 10) continue;
+		char *sp = strstr(ln, "sid:");
+		if (!sp) continue;
+		uint32_t sid = (uint32_t)strtoul(sp + 4, NULL, 10);
+		if (!sid) continue;
+		uint8_t sev = 0;
+		char *ss = strstr(ln, "signature_severity ");
+		if (ss) sev = sev_from_sigsev(ss + 19);
+		if (!sev) { char *pr = strstr(ln, "priority:"); if (pr) sev = sev_from_priority(atoi(pr + 9)); }
+		if (!sev) {
+			char *ct = strstr(ln, "classtype:");
+			if (ct) { ct += 10; size_t l = 0;
+				  while (ct[l] && ct[l] != ';' && ct[l] != ' ') l++;
+				  sev = sev_from_priority(classtype_priority(ct, l)); }
+		}
+		if (!sev) continue;
+		uint8_t conf = 0;
+		char *cf = strstr(ln, "confidence ");
+		if (cf) conf = conf_from_meta(cf + 11);
+		if (g_sidsev_n == g_sidsev_cap) {
+			size_t nc = g_sidsev_cap ? g_sidsev_cap * 2 : 1024;
+			struct sid_sev *np = realloc(g_sidsev, nc * sizeof(*np));
+			if (!np) break;
+			g_sidsev = np; g_sidsev_cap = nc;
+		}
+		g_sidsev[g_sidsev_n].sid = sid;
+		g_sidsev[g_sidsev_n].sev = sev;
+		g_sidsev[g_sidsev_n].conf = conf;
+		g_sidsev_n++;
+	}
+	free(ln);
+	fclose(f);
+	if (g_sidsev_n) qsort(g_sidsev, g_sidsev_n, sizeof(*g_sidsev), sidsev_cmp);
+	g_sidsev_mtime = st.st_mtime;
+	g_sidsev_valid = 1;
+}
+static const struct sid_sev *sidsev_lookup(uint32_t sid)
+{
+	size_t lo = 0, hi = g_sidsev_n;
+	while (lo < hi) {
+		size_t mid = (lo + hi) / 2;
+		if (g_sidsev[mid].sid < sid) lo = mid + 1;
+		else if (g_sidsev[mid].sid > sid) hi = mid;
+		else return &g_sidsev[mid];
+	}
+	return NULL;
+}
+/* ML anomaly score → CONFIDENCE band (how sure the model is — NOT severity). */
+static const char *ml_conf_from_score(double s)
+{
+	if (s < 0)     return "—";
+	if (s <= 0.50) return "Low";
+	if (s <= 0.70) return "Medium";
+	if (s <= 0.90) return "High";
+	return "Very High";
+}
+
+/*
+ * build_alerts_json — parse the last `nlines` of ips-alert.log into a JSON array
+ * "[{...},…]" (same object shape as SG_CMD_IPS_ALERTS_JSON). Optionally keep only
+ * alerts with ts >= `cutoff` ("YYYY-MM-DD HH:MM:SS"; NULL/empty = no filter —
+ * the ISO-like layout is directly comparable with strcmp). Returns a malloc'd
+ * string the caller frees (NULL on OOM) and writes the item count to *out_count.
+ * Shared by the live alert view and the report-snapshot generator.
+ */
+static char *build_alerts_json(int nlines, const char *cutoff, int *out_count)
+{
+	if (out_count) *out_count = 0;
+	if (nlines < 1) nlines = 1;
+	if (nlines > 5000) nlines = 5000;
+
+	/* Build/refresh the sid→severity/confidence table (cached by mtime). */
+	sidsev_build();
+
+	/* Missing/empty alert log → a valid EMPTY array, not NULL. A report with no
+	 * intrusions is legitimate (fresh device / quiet range) and must still be
+	 * generated — returning NULL here made generate abort with no report. */
+	char *raw = read_last_lines("/etc/stargazer/logs/ips-alert.log", nlines);
+	if (!raw || !raw[0]) { free(raw); return strdup("[]"); }
+
+	size_t cap = (size_t)nlines * 400 + 64;
+	char *json = malloc(cap);
+	if (!json) { free(raw); return NULL; }
+
+	size_t pos = 0;
+	json[pos++] = '[';
+	int first = 1, count = 0;
+
+	char *p = raw;
+	while (*p) {
+		char *nl = strchr(p, '\n');
+		size_t llen = nl ? (size_t)(nl - p) : strlen(p);
+		if (llen == 0) { p = nl ? nl + 1 : p + llen; continue; }
+
+		char ts[24]="", verdict[8]="", src[48]="", dst[48]="";
+		char reason[24]="", msg_rest[256]="";
+		unsigned proto = 0, sport = 0, dport = 0, sid = 0;
+		double   score = -1.0;
+
+		char line[512];
+		size_t cp = llen < sizeof(line)-1 ? llen : sizeof(line)-1;
+		memcpy(line, p, cp); line[cp] = '\0';
+
+		char date[12]="", timebuf[10]="";
+		sscanf(line, "%11s %9s %7s", date, timebuf, verdict);
+		snprintf(ts, sizeof(ts), "%s %s", date, timebuf);
+
+		/* Range filter (skip out-of-range lines before the heavier parse). */
+		if (cutoff && cutoff[0] && strcmp(ts, cutoff) < 0) {
+			p = nl ? nl + 1 : p + llen; continue;
+		}
+
+		char *kv = line;
+		int tok = 0;
+		while (*kv) {
+			while (*kv == ' ') kv++;
+			char *end = kv; while (*end && *end != ' ') end++;
+			if (tok >= 3) {
+				char *eq = memchr(kv, '=', (size_t)(end - kv));
+				if (eq) {
+					*eq = '\0'; *end = '\0';
+					const char *key = kv, *val = eq + 1;
+					if (strcmp(key, "proto") == 0)       proto = (unsigned)atoi(val);
+					else if (strcmp(key, "src") == 0) {
+						const char *c = strrchr(val, ':');
+						if (c) {
+							size_t ilen = (size_t)(c - val);
+							if (ilen >= sizeof(src)) ilen = sizeof(src)-1;
+							memcpy(src, val, ilen); src[ilen] = '\0';
+							sport = (unsigned)atoi(c+1);
+						} else snprintf(src, sizeof(src), "%s", val);
+					} else if (strcmp(key, "dst") == 0) {
+						const char *c = strrchr(val, ':');
+						if (c) {
+							size_t ilen = (size_t)(c - val);
+							if (ilen >= sizeof(dst)) ilen = sizeof(dst)-1;
+							memcpy(dst, val, ilen); dst[ilen] = '\0';
+							dport = (unsigned)atoi(c+1);
+						} else snprintf(dst, sizeof(dst), "%s", val);
+					} else if (strcmp(key, "reason") == 0) snprintf(reason, sizeof(reason), "%s", val);
+					else if (strcmp(key, "score") == 0)  score = (val[0] == 'n') ? -1.0 : atof(val);
+					else if (strcmp(key, "sid") == 0)    sid   = (unsigned)atoi(val);
+					else if (strcmp(key, "msg") == 0)    snprintf(msg_rest, sizeof(msg_rest), "%s", val);
+					*end = ' '; *eq = '=';
+				}
+			}
+			tok++;
+			kv = *end ? end + 1 : end;
+		}
+
+		int is_ml = (strncmp(reason, "ml-", 3) == 0);
+		const char *sid_str; char sid_buf[16];
+		if (sid == 0 && is_ml) sid_str = "ML-ANOMALY";
+		else { snprintf(sid_buf, sizeof(sid_buf), "%u", sid); sid_str = sid_buf; }
+
+		const char *msg_disp = msg_rest[0] ? msg_rest :
+				(is_ml ? "ML anomaly detection" : "signature match (no msg)");
+
+		const char *sev_str, *conf_str;
+		if (is_ml) {
+			sev_str  = "Anomaly";
+			conf_str = ml_conf_from_score(score);
+		} else if (sid != 0) {
+			const struct sid_sev *e = sidsev_lookup(sid);
+			sev_str  = e ? sev_name(e->sev) : "Unknown";
+			conf_str = (e && e->conf) ? conf_name(e->conf) : "High";
+		} else {
+			sev_str  = "Unknown";
+			conf_str = "High";
+		}
+
+		if (!first) {
+			if (pos + 2 < cap) { json[pos++] = ','; json[pos++] = '\n'; }
+		}
+		first = 0;
+
+		int n = snprintf(json + pos, cap - pos,
+			"{\"ts\":\"%s\",\"verdict\":\"%s\",\"proto\":%u,"
+			"\"src\":\"%s\",\"sport\":%u,\"dst\":\"%s\",\"dport\":%u,"
+			"\"reason\":\"%s\",\"score\":%.3f,\"sid\":\"%s\","
+			"\"severity\":\"%s\",\"confidence\":\"%s\",\"msg\":\"%s\"}",
+			ts, verdict, proto, src, sport, dst, dport,
+			reason, score, sid_str, sev_str, conf_str, msg_disp);
+		if (n > 0 && (size_t)n < cap - pos) { pos += (size_t)n; count++; }
+
+		p = nl ? nl + 1 : p + llen;
+	}
+	free(raw);
+
+	if (pos + 2 < cap) { json[pos++] = ']'; json[pos] = '\0'; }
+	else { json[0] = '['; json[1] = ']'; json[2] = '\0'; }
+	if (out_count) *out_count = count;
+	return json;
+}
+
 int handle_ips_alerts_json(int client_fd, const char *user,
 			   const char *payload, const sg_request_hdr_t *hdr)
 {
@@ -902,6 +1204,9 @@ int handle_ips_alerts_json(int client_fd, const char *user,
 	int nlines = atoi(nlines_s);
 	if (nlines < 1 || nlines > 5000) nlines = 100;
 
+	/* Build/refresh the sid→severity table (cached by active.rules mtime). */
+	sidsev_build();
+
 	/* Read directly with fopen (no tail fork — busybox lacks the applet). */
 	char *raw = read_last_lines("/etc/stargazer/logs/ips-alert.log", nlines);
 	if (!raw || !raw[0]) {
@@ -910,8 +1215,8 @@ int handle_ips_alerts_json(int client_fd, const char *user,
 		return 0;
 	}
 
-	/* Allocate output buffer: each line → ~300 bytes JSON, add 64 overhead */
-	size_t cap = (size_t)nlines * 320 + 64;
+	/* Allocate output buffer: each line → ~330 bytes JSON, add 64 overhead */
+	size_t cap = (size_t)nlines * 400 + 64;
 	char *json = malloc(cap);
 	if (!json) { free(raw); send_ok(client_fd, NULL, "[]"); return 0; }
 
@@ -1007,6 +1312,24 @@ int handle_ips_alerts_json(int client_fd, const char *user,
 		const char *msg_disp = msg_rest[0] ? msg_rest :
 				(is_ml ? "ML anomaly detection" : "signature match (no msg)");
 
+		/* Severity + confidence are orthogonal:
+		 *  - signature → real severity (ET signature_severity/classtype) and
+		 *    confidence (ET confidence metadata; deterministic match → High).
+		 *  - ML → no severity (anomaly detector doesn't classify the threat) →
+		 *    "Anomaly"; confidence is the score band. */
+		const char *sev_str, *conf_str;
+		if (is_ml) {
+			sev_str  = "Anomaly";
+			conf_str = ml_conf_from_score(score);
+		} else if (sid != 0) {
+			const struct sid_sev *e = sidsev_lookup(sid);
+			sev_str  = e ? sev_name(e->sev) : "Unknown";
+			conf_str = (e && e->conf) ? conf_name(e->conf) : "High";
+		} else {
+			sev_str  = "Unknown";
+			conf_str = "High";
+		}
+
 		if (!first) {
 			if (pos + 2 < cap) { json[pos++] = ','; json[pos++] = '\n'; }
 		}
@@ -1015,10 +1338,11 @@ int handle_ips_alerts_json(int client_fd, const char *user,
 		int n = snprintf(json + pos, cap - pos,
 			"{\"ts\":\"%s\",\"verdict\":\"%s\",\"proto\":%u,"
 			"\"src\":\"%s\",\"sport\":%u,\"dst\":\"%s\",\"dport\":%u,"
-			"\"reason\":\"%s\",\"score\":%.3f,\"sid\":\"%s\",\"msg\":\"%s\"}",
+			"\"reason\":\"%s\",\"score\":%.3f,\"sid\":\"%s\","
+			"\"severity\":\"%s\",\"confidence\":\"%s\",\"msg\":\"%s\"}",
 			ts, verdict, proto,
 			src, sport, dst, dport,
-			reason, score, sid_str, msg_disp);
+			reason, score, sid_str, sev_str, conf_str, msg_disp);
 		if (n > 0 && (size_t)n < cap - pos) pos += (size_t)n;
 
 		p = nl ? nl + 1 : p + llen;
@@ -1028,6 +1352,479 @@ int handle_ips_alerts_json(int client_fd, const char *user,
 	if (pos + 2 < cap) { json[pos++] = ']'; json[pos] = '\0'; }
 	send_ok(client_fd, NULL, json);
 	free(json);
+	return 0;
+}
+
+/* ══ Local Reports (IPS/IDS) ════════════════════════════════════════════════
+ * Each generated report is a self-contained JSON snapshot of the alerts in a
+ * time range, stored under REPORT_DIR. The webui lists them, opens one to
+ * render, and prints to PDF. A cron wrapper generates scheduled reports. */
+#define REPORT_DIR        "/etc/stargazer/reports"
+#define REPORT_SCHED_CONF REPORT_DIR "/.schedule.conf"
+#define REPORT_ALERT_CAP  120     /* snapshot size — keeps GET < SG_RESPONSE_MAX */
+#define REPORT_KEEP_MAX   30      /* prune older reports beyond this */
+
+/* Report id = "YYYYMMDD-HHMMSS": digits and '-' only (blocks path traversal). */
+static int report_id_ok(const char *id)
+{
+	if (!id || !id[0] || strlen(id) > 32) return 0;
+	for (const char *p = id; *p; p++)
+		if (!((*p >= '0' && *p <= '9') || *p == '-')) return 0;
+	return 1;
+}
+/* Minimal JSON string escape (host/title): backslash and double-quote. */
+static void report_json_escape(const char *in, char *out, size_t outsz)
+{
+	size_t o = 0;
+	for (const char *p = in; *p && o + 2 < outsz; p++) {
+		if (*p == '"' || *p == '\\') out[o++] = '\\';
+		out[o++] = (char)*p;
+	}
+	out[o] = '\0';
+}
+/* Read a whole file (capped) into a malloc'd NUL-terminated buffer. */
+static char *report_read_file(const char *path, size_t maxlen)
+{
+	FILE *f = fopen(path, "r");
+	if (!f) return NULL;
+	char *buf = malloc(maxlen + 1);
+	if (!buf) { fclose(f); return NULL; }
+	size_t r = fread(buf, 1, maxlen, f);
+	fclose(f);
+	buf[r] = '\0';
+	return buf;
+}
+/* Extract a quoted-string field value from a flat JSON head (files we wrote). */
+static void report_field_str(const char *json, const char *key, char *out, size_t outsz)
+{
+	out[0] = '\0';
+	char pat[48]; snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+	const char *s = strstr(json, pat); if (!s) return;
+	s += strlen(pat);
+	size_t o = 0; while (*s && *s != '"' && o + 1 < outsz) out[o++] = *s++;
+	out[o] = '\0';
+}
+static int report_field_int(const char *json, const char *key)
+{
+	char pat[48]; snprintf(pat, sizeof(pat), "\"%s\":", key);
+	const char *s = strstr(json, pat); if (!s) return 0;
+	return atoi(s + strlen(pat));
+}
+static int report_name_cmp_desc(const void *a, const void *b)
+{ return strcmp(*(const char **)b, *(const char **)a); }   /* newest first */
+static int report_name_cmp_asc(const void *a, const void *b)
+{ return strcmp(*(const char **)a, *(const char **)b); }    /* oldest first */
+
+/* Delete oldest reports beyond REPORT_KEEP_MAX (ids sort chronologically). */
+static void report_prune(void)
+{
+	DIR *d = opendir(REPORT_DIR);
+	if (!d) return;
+	char **names = NULL; size_t n = 0, cap = 0;
+	struct dirent *de;
+	while ((de = readdir(d))) {
+		size_t l = strlen(de->d_name);
+		if (l < 6 || l > 40 || de->d_name[0] == '.') continue;
+		if (strcmp(de->d_name + l - 5, ".json") != 0) continue;
+		if (n == cap) { cap = cap ? cap * 2 : 32;
+			char **np = realloc(names, cap * sizeof(*np)); if (!np) break; names = np; }
+		names[n++] = strdup(de->d_name);
+	}
+	closedir(d);
+	if (n > REPORT_KEEP_MAX) {
+		qsort(names, n, sizeof(char *), report_name_cmp_asc);
+		size_t to_del = n - REPORT_KEEP_MAX;
+		for (size_t i = 0; i < to_del; i++) {
+			char path[512];
+			snprintf(path, sizeof(path), "%s/%s", REPORT_DIR, names[i]);
+			unlink(path);
+		}
+	}
+	for (size_t i = 0; i < n; i++) free(names[i]);
+	free(names);
+}
+
+/* ── Report extras: live traffic snapshot + admin-login tally ─────────────
+ *
+ * Stargazer keeps no historical traffic log, so these are LIVE snapshots taken
+ * at generate time: session count + total bytes read straight from
+ * /proc/net/nf_conntrack (nf_conntrack_acct is on), and a per-user login /
+ * failed-login tally parsed from the audit log. */
+
+static void report_traffic_snapshot(long *sessions,
+				    unsigned long long *bytes_out,
+				    unsigned long long *bytes_in)
+{
+	*sessions = 0; *bytes_out = 0; *bytes_in = 0;
+	FILE *fp = fopen("/proc/net/nf_conntrack", "r");
+	if (!fp)
+		return;
+	char line[2048];
+	while (fgets(line, sizeof(line), fp)) {
+		(*sessions)++;
+		/* Each flow line carries two "bytes=" tokens: original then reply
+		 * direction. Sum the 1st into out, the 2nd into in. */
+		char *b = line;
+		int idx = 0;
+		while ((b = strstr(b, "bytes=")) != NULL) {
+			b += 6;
+			unsigned long long v = strtoull(b, NULL, 10);
+			if (idx == 0)      *bytes_out += v;
+			else if (idx == 1) *bytes_in  += v;
+			idx++;
+		}
+	}
+	fclose(fp);
+}
+
+#define REPORT_LOGIN_USERS_MAX 32
+
+/* Parse the audit log for admin login attempts (event=310 = SG_CMD_AUTH_LOGIN)
+ * whose date is >= cutoff (compared on the leading "YYYY-MM-DD"). The admin
+ * username is the audit detail (first line of the login payload — the password
+ * is never logged). Emits two JSON arrays sorted by count desc:
+ * ok_buf = successful logins, fail_buf = failed logins, each
+ * [{"user":"..","count":N}]. */
+static void report_login_json(const char *cutoff,
+			      char *ok_buf, size_t ok_sz,
+			      char *fail_buf, size_t fail_sz)
+{
+	struct { char user[64]; long ok; long fail; } t[REPORT_LOGIN_USERS_MAX];
+	int n = 0;
+
+	FILE *fp = fopen("/etc/stargazer/logs/audit.log", "r");
+	if (!fp)
+		fp = fopen("/var/log/stargazer-audit.log", "r");
+	if (fp) {
+		char line[1024];
+		while (fgets(line, sizeof(line), fp)) {
+			if (cutoff && cutoff[0] &&
+			    strncmp(line, cutoff, 10) < 0)   /* date-only filter */
+				continue;
+			char *ev = strstr(line, " event=310 msg=");
+			if (!ev)
+				continue;
+			char *msg = ev + 15;   /* strlen(" event=310 msg=") */
+			int ok;
+			const char *u;
+			if (strncmp(msg, "OK ", 3) == 0) {
+				ok = 1; u = msg + 3;
+			} else if (strncmp(msg, "FAILED ", 7) == 0) {
+				char *c = strstr(msg, ": ");
+				if (!c) continue;
+				ok = 0; u = c + 2;
+			} else {
+				continue;
+			}
+			char ub[64];
+			size_t k = 0;
+			while (u[k] && u[k] != '\n' && u[k] != '\r' &&
+			       u[k] != ' ' && k < sizeof(ub) - 1) {
+				ub[k] = u[k]; k++;
+			}
+			ub[k] = '\0';
+			if (!ub[0])
+				continue;
+			int i;
+			for (i = 0; i < n; i++)
+				if (strcmp(t[i].user, ub) == 0)
+					break;
+			if (i == n) {
+				if (n >= REPORT_LOGIN_USERS_MAX)
+					continue;
+				snprintf(t[n].user, sizeof(t[n].user), "%s", ub);
+				t[n].ok = t[n].fail = 0;
+				n++;
+			}
+			if (ok) t[i].ok++; else t[i].fail++;
+		}
+		fclose(fp);
+	}
+
+	/* Emit each array, selection-sorting by the relevant count desc. */
+	for (int pass = 0; pass < 2; pass++) {
+		char *out  = pass ? fail_buf : ok_buf;
+		size_t osz = pass ? fail_sz  : ok_sz;
+		size_t pos = 0;
+		int used[REPORT_LOGIN_USERS_MAX] = {0};
+		int first = 1;
+		if (osz) out[0] = '\0';
+		pos += (size_t)snprintf(out + pos, osz - pos, "[");
+		for (;;) {
+			int best = -1;
+			long bestc = 0;
+			for (int i = 0; i < n; i++) {
+				long c = pass ? t[i].fail : t[i].ok;
+				if (used[i] || c <= 0) continue;
+				if (best < 0 || c > bestc) { best = i; bestc = c; }
+			}
+			if (best < 0) break;
+			used[best] = 1;
+			char ue[128];
+			report_json_escape(t[best].user, ue, sizeof(ue));
+			int w = snprintf(out + pos, osz - pos,
+					 "%s{\"user\":\"%s\",\"count\":%ld}",
+					 first ? "" : ",", ue, bestc);
+			if (w < 0 || (size_t)w >= osz - pos) break;
+			pos += (size_t)w;
+			first = 0;
+		}
+		snprintf(out + pos, osz - pos, "]");
+	}
+}
+
+/* SG_CMD_REPORT_GENERATE — snapshot alerts in range → REPORT_DIR/<id>.json.
+ * No permission gate: internal trigger (cron via ipc-cli) + webd already
+ * authenticated the session for the webui path. */
+int handle_report_generate(int client_fd, const char *user,
+			   const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)hdr; (void)user;
+
+	char range_s[16] = "7", type_s[16] = "on-demand";
+	if (payload && payload[0]) {
+		extract_val(payload, "range", range_s, sizeof(range_s));
+		extract_val(payload, "type",  type_s,  sizeof(type_s));
+	}
+	int range_days = atoi(range_s);
+	if (range_days < 0 || range_days > 3650) range_days = 7;
+	if (strcmp(type_s, "scheduled") != 0) snprintf(type_s, sizeof(type_s), "on-demand");
+
+	time_t now = time(NULL);
+	struct tm tn; localtime_r(&now, &tn);
+	char cutoff[24] = "", range_label[80], rstart[16] = "\xe2\x80\x94", rend[16];
+	strftime(rend, sizeof(rend), "%Y-%m-%d", &tn);   /* data end = today */
+	if (range_days > 0) {
+		time_t start = now - (time_t)range_days * 86400;
+		struct tm ts; localtime_r(&start, &ts);
+		strftime(cutoff, sizeof(cutoff), "%Y-%m-%d %H:%M:%S", &ts);
+		strftime(rstart, sizeof(rstart), "%Y-%m-%d", &ts);
+		snprintf(range_label, sizeof(range_label), "%s to %s (last %d day%s)",
+			 rstart, rend, range_days, range_days > 1 ? "s" : "");
+	} else {
+		snprintf(range_label, sizeof(range_label), "All available");
+	}
+
+	int cnt = 0;
+	char *alerts = build_alerts_json(REPORT_ALERT_CAP, cutoff[0] ? cutoff : NULL, &cnt);
+	if (!alerts) { send_error(client_fd, SG_ERR_INTERNAL, "generate failed"); return 0; }
+
+	char gen[24], id[24];
+	strftime(gen, sizeof(gen), "%Y-%m-%d %H:%M:%S", &tn);
+	strftime(id,  sizeof(id),  "%Y%m%d-%H%M%S", &tn);
+
+	char *host = sg_db_get_val("system_settings", "0", "hostname");
+	char hostbuf[80];
+	report_json_escape(host && host[0] ? host : "Stargazer", hostbuf, sizeof(hostbuf));
+	free(host);
+
+	/* Live traffic snapshot + admin-login tally (the "4 easy" report sections). */
+	long r_sess = 0;
+	unsigned long long r_bout = 0, r_bin = 0;
+	report_traffic_snapshot(&r_sess, &r_bout, &r_bin);
+	char r_logins[2048], r_faillogins[2048];
+	report_login_json(cutoff[0] ? cutoff : NULL,
+			  r_logins, sizeof(r_logins),
+			  r_faillogins, sizeof(r_faillogins));
+
+	mkdir(REPORT_DIR, 0700);
+	char path[512], tmp[520];
+	snprintf(path, sizeof(path), "%s/%s.json", REPORT_DIR, id);
+	snprintf(tmp,  sizeof(tmp),  "%s/.%s.tmp", REPORT_DIR, id);
+	FILE *f = fopen(tmp, "w");
+	if (!f) { free(alerts); send_error(client_fd, SG_ERR_INTERNAL, "cannot write report"); return 0; }
+	fprintf(f,
+		"{\"id\":\"%s\",\"title\":\"IPS/IDS Security Report\",\"generated\":\"%s\","
+		"\"type\":\"%s\",\"range_days\":%d,\"range_label\":\"%s\","
+		"\"range_start\":\"%s\",\"range_end\":\"%s\",\"host\":\"%s\","
+		"\"session_count\":%ld,\"bytes_out\":%llu,\"bytes_in\":%llu,"
+		"\"admin_logins\":%s,\"failed_logins\":%s,"
+		"\"count\":%d,\"alerts\":%s}",
+		id, gen, type_s, range_days, range_label, rstart, rend, hostbuf,
+		r_sess, r_bout, r_bin, r_logins, r_faillogins, cnt, alerts);
+	int werr = (fclose(f) != 0);
+	free(alerts);
+	if (werr || rename(tmp, path) != 0) {
+		unlink(tmp);
+		send_error(client_fd, SG_ERR_INTERNAL, "cannot store report");
+		return 0;
+	}
+	report_prune();
+
+	char resp[64];
+	snprintf(resp, sizeof(resp), "{\"ok\":true,\"id\":\"%s\"}", id);
+	send_ok(client_fd, NULL, resp);
+	return 0;
+}
+
+/* SG_CMD_REPORT_LIST — JSON array of report metadata, newest first. */
+int handle_report_list(int client_fd, const char *user,
+		       const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)hdr; (void)payload;
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED, "monitor required"); return 0;
+	}
+
+	DIR *d = opendir(REPORT_DIR);
+	if (!d) { send_ok(client_fd, NULL, "[]"); return 0; }
+	char **names = NULL; size_t n = 0, cap = 0;
+	struct dirent *de;
+	while ((de = readdir(d))) {
+		size_t l = strlen(de->d_name);
+		if (l < 6 || l > 40 || de->d_name[0] == '.') continue;
+		if (strcmp(de->d_name + l - 5, ".json") != 0) continue;
+		if (n == cap) { cap = cap ? cap * 2 : 32;
+			char **np = realloc(names, cap * sizeof(*np)); if (!np) break; names = np; }
+		names[n++] = strdup(de->d_name);
+	}
+	closedir(d);
+	if (n) qsort(names, n, sizeof(char *), report_name_cmp_desc);
+
+	size_t bufcap = n * 256 + 64;
+	if (bufcap > SG_RESPONSE_MAX) bufcap = SG_RESPONSE_MAX;
+	char *out = malloc(bufcap);
+	if (!out) { for (size_t i = 0; i < n; i++) free(names[i]); free(names);
+		send_ok(client_fd, NULL, "[]"); return 0; }
+	size_t pos = 0; out[pos++] = '['; int first = 1;
+	for (size_t i = 0; i < n; i++) {
+		char fpath[512]; snprintf(fpath, sizeof(fpath), "%s/%s", REPORT_DIR, names[i]);
+		char *head = report_read_file(fpath, 512);
+		if (head) {
+			char id[32] = "", title[80] = "", gen[24] = "", type[16] = "";
+			char rstart[16] = "", rend[16] = "";
+			report_field_str(head, "id", id, sizeof(id));
+			report_field_str(head, "title", title, sizeof(title));
+			report_field_str(head, "generated", gen, sizeof(gen));
+			report_field_str(head, "type", type, sizeof(type));
+			report_field_str(head, "range_start", rstart, sizeof(rstart));
+			report_field_str(head, "range_end", rend, sizeof(rend));
+			int count = report_field_int(head, "count");
+			free(head);
+			struct stat stt; long sz = (stat(fpath, &stt) == 0) ? (long)stt.st_size : 0;
+			if (id[0] && pos + 300 < bufcap) {
+				if (!first) { out[pos++] = ','; out[pos++] = '\n'; }
+				first = 0;
+				int w = snprintf(out + pos, bufcap - pos,
+					"{\"id\":\"%s\",\"title\":\"%s\",\"generated\":\"%s\","
+					"\"type\":\"%s\",\"data_start\":\"%s\",\"data_end\":\"%s\","
+					"\"size\":%ld,\"count\":%d}",
+					id, title, gen, type, rstart, rend, sz, count);
+				if (w > 0 && (size_t)w < bufcap - pos) pos += (size_t)w;
+			}
+		}
+		free(names[i]);
+	}
+	free(names);
+	if (pos + 2 < bufcap) { out[pos++] = ']'; out[pos] = '\0'; }
+	else { out[0] = '['; out[1] = ']'; out[2] = '\0'; }
+	send_ok(client_fd, NULL, out);
+	free(out);
+	return 0;
+}
+
+/* SG_CMD_REPORT_GET — return one report file verbatim (payload: id=<id>). */
+int handle_report_get(int client_fd, const char *user,
+		      const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)hdr;
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED, "monitor required"); return 0;
+	}
+	char id[40] = "";
+	if (payload && payload[0]) extract_val(payload, "id", id, sizeof(id));
+	if (!report_id_ok(id)) { send_error(client_fd, SG_ERR_INVALID_ARG, "bad report id"); return 0; }
+
+	char path[512]; snprintf(path, sizeof(path), "%s/%s.json", REPORT_DIR, id);
+	char *data = report_read_file(path, SG_RESPONSE_MAX - 256);
+	if (!data) { send_error(client_fd, SG_ERR_NOT_FOUND, "report not found"); return 0; }
+	send_ok(client_fd, NULL, data);
+	free(data);
+	return 0;
+}
+
+/* SG_CMD_REPORT_DELETE — remove a report (payload: id=<id>). */
+int handle_report_delete(int client_fd, const char *user,
+			 const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)hdr;
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "admin")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED, "admin required"); return 0;
+	}
+	char id[40] = "";
+	if (payload && payload[0]) extract_val(payload, "id", id, sizeof(id));
+	if (!report_id_ok(id)) { send_error(client_fd, SG_ERR_INVALID_ARG, "bad report id"); return 0; }
+
+	char path[512]; snprintf(path, sizeof(path), "%s/%s.json", REPORT_DIR, id);
+	if (unlink(path) != 0 && errno != ENOENT) {
+		send_error(client_fd, SG_ERR_INTERNAL, "delete failed"); return 0;
+	}
+	send_ok(client_fd, NULL, "{\"ok\":true}");
+	return 0;
+}
+
+/* SG_CMD_REPORT_SCHED_GET — read the report schedule. */
+int handle_report_sched_get(int client_fd, const char *user,
+			    const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)hdr; (void)payload;
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "monitor")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED, "monitor required"); return 0;
+	}
+	char mode[16] = "off"; int hour = 2, minute = 0, day = 7;
+	FILE *f = fopen(REPORT_SCHED_CONF, "r");
+	if (f) {
+		char ln[64];
+		while (fgets(ln, sizeof(ln), f)) {
+			char *eq = strchr(ln, '='); if (!eq) continue;
+			*eq = '\0'; char *k = ln, *v = eq + 1;
+			char *nlp = strchr(v, '\n'); if (nlp) *nlp = '\0';
+			if (!strcmp(k, "mode")) snprintf(mode, sizeof(mode), "%s", v);
+			else if (!strcmp(k, "hour"))   hour   = atoi(v);
+			else if (!strcmp(k, "minute")) minute = atoi(v);
+			else if (!strcmp(k, "day"))    day    = atoi(v);
+		}
+		fclose(f);
+	}
+	char resp[96];
+	snprintf(resp, sizeof(resp), "{\"mode\":\"%s\",\"hour\":%d,\"minute\":%d,\"day\":%d}",
+		 mode, hour, minute, day);
+	send_ok(client_fd, NULL, resp);
+	return 0;
+}
+
+/* SG_CMD_REPORT_SCHED_SET — write the report schedule (mode/hour/day). */
+int handle_report_sched_set(int client_fd, const char *user,
+			    const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)hdr;
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "admin")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED, "admin required"); return 0;
+	}
+	char mode[16] = "off", hour_s[8] = "2", min_s[8] = "0", day_s[8] = "7";
+	if (payload && payload[0]) {
+		extract_val(payload, "mode", mode, sizeof(mode));
+		extract_val(payload, "hour",   hour_s, sizeof(hour_s));
+		extract_val(payload, "minute", min_s,  sizeof(min_s));
+		extract_val(payload, "day",    day_s,  sizeof(day_s));
+	}
+	if (strcmp(mode, "daily") && strcmp(mode, "weekly") && strcmp(mode, "off"))
+		snprintf(mode, sizeof(mode), "off");
+	int hour   = atoi(hour_s); if (hour   < 0 || hour   > 23) hour   = 2;
+	int minute = atoi(min_s);  if (minute < 0 || minute > 59) minute = 0;
+	int day    = atoi(day_s);  if (day    < 1 || day    > 7)  day    = 7;
+
+	mkdir(REPORT_DIR, 0700);
+	FILE *f = fopen(REPORT_SCHED_CONF, "w");
+	if (!f) { send_error(client_fd, SG_ERR_INTERNAL, "cannot write schedule"); return 0; }
+	fprintf(f, "mode=%s\nhour=%d\nminute=%d\nday=%d\n", mode, hour, minute, day);
+	fclose(f);
+	send_ok(client_fd, NULL, "{\"ok\":true}");
 	return 0;
 }
 
@@ -2946,9 +3743,19 @@ int handle_show_sessions(int client_fd, const char *user,
 	if (nlmap < 0)
 		nlmap = 0;   /* getifaddrs failure → local flows just show "-" */
 
+	/* Cap the emitted listing so the IPC response never exceeds
+	 * SG_RESPONSE_MAX. Without this, a port scan (nmap -p-) creates tens of
+	 * thousands of conntrack entries, the dump grows to several MB, and the
+	 * client — which only reads payloads <= SG_RESPONSE_MAX — skips it, leaving
+	 * megabytes of stale bytes in the socket that desync every later command
+	 * (the symptom: `session list` hangs the CLI until the connection resets).
+	 * Leave headroom for the "active=" header and response framing. */
+	const size_t LIST_CAP = SG_RESPONSE_MAX - 4096;
 	long count = 0;
+	int truncated = 0;
 	char line[1024];
 	while (fgets(line, sizeof(line), fp_ct)) {
+		if (out.used >= LIST_CAP) { truncated = 1; break; }
 		if (ct_emit_line(line, &out, pmap, npmap, imap, nimap,
 				 lmap, nlmap, fp) == 0)
 			count++;
@@ -2959,12 +3766,20 @@ int handle_show_sessions(int client_fd, const char *user,
 	free(lmap);
 
 	struct dynbuf resp;
-	if (dbuf_init(&resp, out.used + 64) < 0) {
+	if (dbuf_init(&resp, out.used + 128) < 0) {
 		send_ok(client_fd, NULL, out.data);
 		free(out.data);
 		return 0;
 	}
-	dbuf_printf(&resp, "active=%ld\n", count);
+	if (truncated)
+		dbuf_printf(&resp,
+			    "active=%ld truncated=1\n"
+			    "# listing capped at %zuKB — narrow with a filter "
+			    "(e.g. 'session list dst <ip>') or use 'session stats' "
+			    "for the full count\n",
+			    count, (size_t)(LIST_CAP / 1024));
+	else
+		dbuf_printf(&resp, "active=%ld\n", count);
 	dbuf_append(&resp, out.data, out.used);
 	send_ok(client_fd, NULL, resp.data);
 	free(out.data);
@@ -3222,6 +4037,7 @@ struct sg_nf_conn_ml {
 	uint32_t psh_count;
 	uint32_t urg_count;
 	uint32_t pktlen_count;
+	uint64_t bwd_pktlen_sq_sum;   /* reply-dir payload Σx² → Bwd Packet Length Std */
 };
 
 /* Find attribute `want` in an nlattr stream [data, data+len); return payload. */

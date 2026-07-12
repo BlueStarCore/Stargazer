@@ -387,6 +387,38 @@ static char *strip_kv_keys(const char *kv, const char *const skip[])
 	return out;
 }
 
+/* Stage an uploaded blob to a unique /tmp/<prefix>.<rand> file (same
+ * constraints as the firmware upload: no mkstemp/stdio under webd's seccomp —
+ * generate an [a-z0-9] suffix and open O_WRONLY|O_CREAT|O_EXCL, write raw).
+ * On success copies the path into `out` and returns 0; -1 on failure. */
+static int webd_stage_file(const char *prefix, const char *buf, size_t len,
+			   char *out, size_t outsz)
+{
+	static const char A36[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+	static unsigned long stage_seq;
+	int sfd = -1;
+	for (int att = 0; att < 128 && sfd < 0; att++) {
+		unsigned long v = (stage_seq++ + (unsigned long)att) * 2654435761UL
+				^ (unsigned long)(uintptr_t)&att;
+		char suf[11];
+		for (int i = 0; i < 10; i++) { suf[i] = A36[v % 36]; v /= 36; }
+		suf[10] = '\0';
+		snprintf(out, outsz, "/tmp/%s.%s", prefix, suf);
+		sfd = open(out, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	}
+	if (sfd < 0) return -1;
+	size_t off = 0;
+	int ok = 1;
+	while (off < len) {
+		ssize_t wn = write(sfd, buf + off, len - off);
+		if (wn < 0) { if (errno == EINTR) continue; ok = 0; break; }
+		off += (size_t)wn;
+	}
+	if (close(sfd) != 0) ok = 0;
+	if (!ok) { unlink(out); return -1; }
+	return 0;
+}
+
 /* ── Route dispatch ──────────────────────────────────────────────────── */
 
 int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
@@ -1172,6 +1204,88 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 			}
 		}
 
+		/* POST /api/system/certificate/import — multipart: certificate, key,
+		 * name (+ optional comment). The two PEM files are staged to /tmp and
+		 * their paths handed to mgmtd (SG_CMD_CERT_IMPORT) which validates +
+		 * stores them; webd never writes into the persistent cert store. */
+		if (strcmp(segs[1], "certificate") == 0 &&
+		    nseg >= 3 && strcmp(segs[2], "import") == 0 &&
+		    mg_str_eq(hm->method, "POST")) {
+			struct mg_http_part part;
+			size_t mofs = 0;
+			struct mg_str cert_b = {0}, key_b = {0};
+			char cname[128] = {0}, comment[256] = {0};
+			while ((mofs = mg_http_next_multipart(hm->body, mofs, &part)) > 0) {
+				if (mg_str_eq(part.name, "certificate"))
+					cert_b = part.body;
+				else if (mg_str_eq(part.name, "key"))
+					key_b = part.body;
+				else if (mg_str_eq(part.name, "name")) {
+					size_t l = part.body.len < sizeof(cname) - 1
+						 ? part.body.len : sizeof(cname) - 1;
+					memcpy(cname, part.body.buf, l); cname[l] = '\0';
+				} else if (mg_str_eq(part.name, "comment")) {
+					size_t l = part.body.len < sizeof(comment) - 1
+						 ? part.body.len : sizeof(comment) - 1;
+					memcpy(comment, part.body.buf, l); comment[l] = '\0';
+				}
+			}
+			if (cert_b.len == 0 || cname[0] == '\0') {
+				reply_json(c, 400,
+					   "{\"error\":\"Need a certificate file and a name\"}");
+				return -1;
+			}
+
+			char cstage[64] = {0}, kstage[64] = {0};
+			if (webd_stage_file("sg-cert", cert_b.buf, cert_b.len,
+					    cstage, sizeof(cstage)) != 0) {
+				reply_json(c, 500,
+					   "{\"error\":\"Cannot stage certificate\"}");
+				return -1;
+			}
+			if (key_b.len > 0 &&
+			    webd_stage_file("sg-key", key_b.buf, key_b.len,
+					    kstage, sizeof(kstage)) != 0) {
+				unlink(cstage);
+				reply_json(c, 500, "{\"error\":\"Cannot stage key\"}");
+				return -1;
+			}
+
+			char pbuf[1024];
+			snprintf(pbuf, sizeof(pbuf),
+				 "name=%s\ncert=%s\n%s%s%s%s%s%s",
+				 cname, cstage,
+				 kstage[0] ? "key=" : "", kstage[0] ? kstage : "",
+				 kstage[0] ? "\n" : "",
+				 comment[0] ? "comment=" : "",
+				 comment[0] ? comment : "",
+				 comment[0] ? "\n" : "");
+			char *upayload = strdup(pbuf);
+			if (!upayload) {
+				unlink(cstage); if (kstage[0]) unlink(kstage);
+				reply_json(c, 500, "{\"error\":\"Out of memory\"}");
+				return -1;
+			}
+
+			work_item_t item;
+			memset(&item, 0, sizeof(item));
+			item.conn_id = c->id;
+			item.flow_type = FLOW_CERT_IMPORT;
+			snprintf(item.username, sizeof(item.username),
+				 "%s", sess.username);
+			item.session_tag = sess.ipc_session_tag;
+			item.payload = upayload;
+			item.payload_len = strlen(upayload);
+
+			if (webd_pool_enqueue(&item) != 0) {
+				free(upayload);
+				unlink(cstage); if (kstage[0]) unlink(kstage);
+				reply_json(c, 503, "{\"error\":\"Server busy\"}");
+				return -1;
+			}
+			return 0;
+		}
+
 		/* GET /api/system/interfaces/live — live kernel operstate overlay */
 		if (strcmp(segs[1], "interfaces") == 0 &&
 		    nseg >= 3 && strcmp(segs[2], "live") == 0 &&
@@ -1180,6 +1294,27 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 			memset(&item, 0, sizeof(item));
 			item.conn_id = c->id;
 			item.flow_type = FLOW_IFACE_LIVE;
+			snprintf(item.username, sizeof(item.username),
+				 "%s", sess.username);
+			item.session_tag = sess.ipc_session_tag;
+
+			if (webd_pool_enqueue(&item) != 0) {
+				reply_json(c, 503,
+					   "{\"error\":\"Server busy\"}");
+				return -1;
+			}
+			return 0;
+		}
+
+		/* GET /api/system/routes/live — live kernel routing table
+		 * (connected + static + default), parsed from `ip route`. */
+		if (strcmp(segs[1], "routes") == 0 &&
+		    nseg >= 3 && strcmp(segs[2], "live") == 0 &&
+		    mg_str_eq(hm->method, "GET")) {
+			work_item_t item;
+			memset(&item, 0, sizeof(item));
+			item.conn_id = c->id;
+			item.flow_type = FLOW_ROUTE_LIVE;
 			snprintf(item.username, sizeof(item.username),
 				 "%s", sess.username);
 			item.session_tag = sess.ipc_session_tag;
@@ -1478,6 +1613,69 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 			return -1;
 		}
 		return 0;
+	}
+
+	/* ══ Local Reports (IPS/IDS) ═══ all return raw JSON → verbatim passthrough */
+	if (strcmp(segs[0], "reports") == 0 && nseg == 2) {
+		int is_get  = mg_str_eq(hm->method, "GET");
+		int is_post = mg_str_eq(hm->method, "POST");
+		uint32_t cmd = 0;
+		char pl[128] = "";
+
+		if (is_get && strcmp(segs[1], "list") == 0) {
+			cmd = SG_CMD_REPORT_LIST;
+		} else if (is_get && strcmp(segs[1], "get") == 0) {
+			cmd = SG_CMD_REPORT_GET;
+			char *id = query_param(hm->query, "id");
+			if (id && id[0]) snprintf(pl, sizeof(pl), "id=%s", id);
+			free(id);
+		} else if (is_get && strcmp(segs[1], "schedule") == 0) {
+			cmd = SG_CMD_REPORT_SCHED_GET;
+		} else if (is_post && strcmp(segs[1], "generate") == 0) {
+			cmd = SG_CMD_REPORT_GENERATE;
+			char *range = json_str(hm->body, "$.range");
+			char *type  = json_str(hm->body, "$.type");
+			snprintf(pl, sizeof(pl), "range=%s\ntype=%s",
+				 (range && range[0]) ? range : "7",
+				 (type  && type[0])  ? type  : "on-demand");
+			free(range); free(type);
+		} else if (is_post && strcmp(segs[1], "delete") == 0) {
+			cmd = SG_CMD_REPORT_DELETE;
+			char *id = json_str(hm->body, "$.id");
+			if (id && id[0]) snprintf(pl, sizeof(pl), "id=%s", id);
+			free(id);
+		} else if (is_post && strcmp(segs[1], "schedule") == 0) {
+			cmd = SG_CMD_REPORT_SCHED_SET;
+			char *mode = json_str(hm->body, "$.mode");
+			char *hour = json_str(hm->body, "$.hour");
+			char *minute = json_str(hm->body, "$.minute");
+			char *day  = json_str(hm->body, "$.day");
+			snprintf(pl, sizeof(pl), "mode=%s\nhour=%s\nminute=%s\nday=%s",
+				 (mode && mode[0]) ? mode : "off",
+				 (hour && hour[0]) ? hour : "2",
+				 (minute && minute[0]) ? minute : "0",
+				 (day  && day[0])  ? day  : "7");
+			free(mode); free(hour); free(minute); free(day);
+		}
+
+		if (cmd != 0) {
+			work_item_t item;
+			memset(&item, 0, sizeof(item));
+			item.conn_id = c->id;
+			item.ipc_cmd = cmd;
+			item.flow_type = FLOW_IPS_ALERTS_JSON;   /* verbatim JSON passthrough */
+			snprintf(item.username, sizeof(item.username), "%s", sess.username);
+			item.session_tag = sess.ipc_session_tag;
+			if (pl[0]) {
+				item.payload = strdup(pl);
+				item.payload_len = item.payload ? strlen(item.payload) : 0;
+			}
+			if (webd_pool_enqueue(&item) != 0) {
+				reply_json(c, 503, "{\"error\":\"Server busy\"}");
+				return -1;
+			}
+			return 0;
+		}
 	}
 
 	/* ── GET /api/ips/update-log ── tail ips-update.log ─────────────────── */

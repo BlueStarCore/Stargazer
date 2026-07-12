@@ -186,6 +186,7 @@ $(KERNEL_DIR)/.config: Makefile | kernel-source
 			--enable NETFILTER_XT_TARGET_CT \
 			--enable NETFILTER_XT_MATCH_CONNTRACK \
 			--enable NETFILTER_XT_MATCH_STATE \
+			--enable NETFILTER_XT_MATCH_MULTIPORT \
 			--enable NETFILTER_XT_MATCH_LIMIT \
 			--enable NETFILTER_XT_TARGET_LOG \
 			--enable NETFILTER_XT_TARGET_REDIRECT \
@@ -1094,6 +1095,7 @@ IPSD_CORE_SRCS := $(IPSD_DIR)/main.c $(IPSD_DIR)/nfq.c $(IPSD_DIR)/ctdump.c \
                   $(IPSD_DIR)/engine.c $(IPSD_DIR)/fusion.c \
                   $(IPSD_DIR)/ml_scan.c \
                   $(IPSD_DIR)/insp_ipc.c \
+                  $(IPSD_DIR)/ml_eval.c \
                   $(IPSD_DIR)/ips_model.c
 IPSD_PREDICT_C := $(IPSD_DIR)/model/predict.c
 IPSD_PREDICT_O := $(BUILD_DIR)/ipsd/predict.o
@@ -1137,7 +1139,7 @@ OPENSSL_CROSS   := $(abspath $(MUSL_CROSS))
 
 SSLD_SRCS := $(SSLD_DIR)/main.c $(SSLD_DIR)/conn.c $(SSLD_DIR)/relay.c \
              $(SSLD_DIR)/origdst.c $(SSLD_DIR)/ca.c $(SSLD_DIR)/certcache.c \
-             $(SSLD_DIR)/bump.c \
+             $(SSLD_DIR)/bump.c $(SSLD_DIR)/revmap.c \
              $(IPSD_DIR)/tls_clienthello.c $(IPSD_DIR)/tls_policy.c \
              $(IPSD_DIR)/sig_rule.c $(IPSD_DIR)/ac.c
 

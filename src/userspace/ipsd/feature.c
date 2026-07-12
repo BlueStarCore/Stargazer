@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * feature.c - 14 features for LightGBM (see feature.h).
+ * feature.c - 17 features for LightGBM (see feature.h).
  *
  * All features computed as double (userspace, not bound by the kernel's
  * no-float rule). Formulas follow the EXACT CICFlowMeter definitions — the
@@ -23,8 +23,8 @@ const char *const feature_names[FEAT_COUNT] = {
 	"Fwd Packet Length Mean", "Bwd Packet Length Mean",
 	"SYN Flag Count", "ACK Flag Count", "PSH Flag Count", "URG Flag Count",
 	"Down/Up Ratio", "Init_Win_bytes_forward",
-	"Total Length of Fwd Packets", "Total Length of Bwd Packets",
-	"Flow Duration",
+	"Total Length of Fwd Packets", "Flow Duration",
+	"Bwd Packet Length Std",
 };
 
 /*
@@ -43,8 +43,9 @@ static double sample_var(double sum, double sqsum, uint64_t n)
 }
 
 /* Mirror struct must match the kernel size; catch layout drift at build time.
- * 144 bytes on LP64 (x86-64 host + aarch64 target, same alignment rules). */
-_Static_assert(sizeof(struct sg_nf_conn_ml) == 144,
+ * 160 bytes on LP64 (x86-64 host + aarch64 target, same alignment rules) after
+ * appending init_win_fwd (u32 + 4B tail padding to the struct's 8B alignment). */
+_Static_assert(sizeof(struct sg_nf_conn_ml) == 160,
 	       "sg_nf_conn_ml layout differs from kernel nf_conn_ml — recheck field types/order");
 
 void feature_extract(const struct sg_nf_conn_ml *ml,
@@ -90,8 +91,12 @@ void feature_extract(const struct sg_nf_conn_ml *ml,
 	out[FEAT_INIT_WIN_FWD] = (init_win_fwd < 0) ? -1.0 : (double)init_win_fwd;
 
 	/* --- Volume/thời lượng flow (Infiltration: tải payload lớn, kéo dài) --- */
-	out[FEAT_TOTLEN_FWD] = (double)ml->bytes_fwd;
-	out[FEAT_TOTLEN_BWD] = (double)ml->bytes_bwd;
+	out[FEAT_TOTLEN_FWD] = (double)ml->bytes_fwd;   /* ≡ Subflow F.Bytes (1 subflow) */
 	out[FEAT_FLOW_DUR]   = (ml->last_ns > ml->first_ns)
 			       ? (double)(ml->last_ns - ml->first_ns) / 1000.0 : 0.0;
+
+	/* --- Bwd Packet Length Std: SAMPLE std của payload chiều về (n = pkts_bwd,
+	 * cùng cơ sở với Bwd Packet Length Mean) --- */
+	out[FEAT_BWD_PKTLEN_STD] = sqrt(sample_var((double)ml->bytes_bwd,
+				       (double)ml->bwd_pktlen_sq_sum, pkts_bwd));
 }

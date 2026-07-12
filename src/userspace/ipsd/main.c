@@ -20,6 +20,7 @@
 #include "ctdump.h"
 #include "engine.h"
 #include "ips_model.h"   /* ips_score — called at the checkpoint */
+#include "ml_eval.h"     /* ips_ml_eval + ML_CKP_* thresholds (shared) */
 #include "flow_rule.h"
 #include "sig_reload.h"
 #include "fusion.h"
@@ -66,7 +67,7 @@ static struct ipsd_config g_cfg = {
 	.enabled     = 1,
 	.mode        = IPS_MODE_PREVENT,
 	.thr_block   = 0.95,
-	.thr_alert   = 0.50,
+	.thr_alert   = 0.7,
 	.snapshot_n  = 8,
 	.queue_num   = 0,
 	.rules_path  = DEFAULT_RULES,
@@ -222,16 +223,17 @@ static void write_pidfile(void)
 
 /* CHECKPOINT inference — thresholds derived from statistical analysis of
  * CIC-IDS-2017 (2.83 million flows): score ML exactly once when the flow hits
- * the FIRST trigger among {FIN/RST, N packets, K bytes, T age}, provided no
- * signature has matched any packet yet. Rationale:
+ * the FIRST trigger among {FIN/RST, N packets, T age, 16KB scan-window full},
+ * provided no signature has matched any packet yet. Rationale:
  *   FIN/RST → flow ENDS: score on the complete flow, CATCHING SHORT flows
- *             (PortScan ~2 packets/~0s) that never hit the packet/byte/time cap.
+ *             (PortScan ~2 packets/~0s) that never hit the packet/time cap.
  *   N=24  → covers ~all DoS/DDoS (≤16 packets: 95-100%) + Patator (≤32: 100%).
- *   K=14KB→ just below the kernel 16KB byte-window (catch heavy flows before offload).
- *   T=12s → gap between normal flows (<2s) and slow-DoS (60-97s) → catch slow early. */
-#define ML_CKP_PKTS    24u
-#define ML_CKP_BYTES   14000u
-#define ML_CKP_AGE_NS  12000000000ULL   /* 12 seconds (ns) */
+ *   T=12s → gap between normal flows (<2s) and slow-DoS (60-97s) → catch slow early.
+ *   16KB  → the signature scan window (REASS_MAX_BYTES) is exhausted → the flow is
+ *           about to be offloaded, so this is the FINAL fallback: score ML before it
+ *           escapes (catches heavy flows with few large packets, < N and no FIN yet).
+ * ML_CKP_PKTS / ML_CKP_AGE_NS are defined in ml_eval.h (shared with the bump and
+ * cert-mode paths so every entry point agrees on the same caps). */
 
 /* now in CLOCK_MONOTONIC ns — same clock as the kernel first_ns (ktime_get_ns). */
 static uint64_t mono_ns(void)
@@ -255,6 +257,10 @@ struct flow_slot {
 	struct reass_flow rf;
 	struct flowbit_state fb;      /* P5 — per-flow flowbits */
 	uint8_t             ml_done;  /* ML scored at the checkpoint (once/flow) */
+	int8_t              is_tls;   /* 0=unknown, 1=TLS (skip signature), -1=cleartext */
+	uint8_t             profid;   /* IPS profile id, cached from the ORIGINAL
+				       * direction (skb mark). REPLY-direction packets
+				       * carry no mark → they inspect under this. */
 };
 
 static struct flow_slot g_flows[FLOW_BUCKETS];
@@ -306,7 +312,14 @@ static struct flow_slot *flow_get(const struct nfq_pkt *pkt,
 		s->init_port = pkt->sport;
 		memset(&s->fb, 0, sizeof(s->fb));       /* P5 — new flow: clean flowbits */
 		s->ml_done = 0;                         /* new flow: ML not yet scored */
+		s->is_tls  = 0;                         /* new flow: TLS not yet determined */
+		s->profid  = 0;                         /* new flow: profile not yet known */
 	}
+	/* Cache the profile id from the ORIGINAL direction (only it carries the skb
+	 * mark). REPLY-direction packets arrive mark-less → the caller falls back to
+	 * this so both directions inspect under the same profile. */
+	if (pkt->ips_prof_id)
+		s->profid = pkt->ips_prof_id;
 	int to_server = (pkt->src_ip == s->init_ip && pkt->sport == s->init_port);
 	*dir_out = to_server ? REASS_TO_SERVER : REASS_TO_CLIENT;
 	return s;
@@ -414,19 +427,24 @@ static void write_rt_stats(void)
 	rename("/run/stargazer-ipsd.rt.tmp", "/run/stargazer-ipsd.rt");
 }
 
+/* Heuristic: does this payload start a TLS record (handshake)? A TLS record
+ * header is type(1) + version(2): 0x16 = handshake, version 0x03,0x00-0x04.
+ * Used to skip futile content-signature scanning of encrypted flows (ML still
+ * runs). Cheap + only checked once per flow on the to-server ClientHello. */
+static inline int looks_like_tls(const uint8_t *p, uint32_t len)
+{
+	return len >= 3 && p[0] == 0x16 && p[1] == 0x03 && p[2] <= 0x04;
+}
+
 /* ---- process one packet from NFQUEUE ------------------------------------ */
 
 static void process_packet(struct nfq_ctx *nfq, struct nfq_pkt *pkt,
 			    struct sig_reload *sr,
 			    const struct ips_config *ips_cfg)
 {
-	/* [0] A forward SYN packet (SYN set, ACK clear) carries
-	 * Init_Win_bytes_forward — cache it for the ML scoring pass (the conntrack
-	 * dump does NOT have this window). */
-	if (pkt->proto == 6 && pkt->init_win >= 0 &&
-	    (pkt->tcp_flags & SIG_TCP_SYN) && !(pkt->tcp_flags & SIG_TCP_ACK))
-		ml_iwin_put(pkt->proto, pkt->src_ip, pkt->dst_ip,
-			    pkt->sport, pkt->dport, pkt->init_win);
+	/* [0] Init_Win_bytes_forward now comes straight from conntrack CTA_ML
+	 * (ml->init_win_fwd — captured in the kernel ml_account on the forward SYN,
+	 * including the ssld/HTTPS leg). No userspace SYN-window cache is needed. */
 
 	/* [1] Get flow stats from conntrack */
 	struct ctdump_result ctr;
@@ -446,10 +464,11 @@ static void process_packet(struct nfq_ctx *nfq, struct nfq_pkt *pkt,
 		pkts_fwd = fs.pkts_fwd;
 		pkts_bwd = fs.pkts_bwd;
 		ctdump_to_features(&ctr, pkts_fwd, pkts_bwd,
-				   pkt->init_win, feat);
+				   ctr.ml.init_win_fwd ? (int32_t)ctr.ml.init_win_fwd : -1,
+				   feat);
 	}
 
-	/* [2] Evaluate: L1-builtin → L1-user → L2-payload → ML */
+	/* [2] Evaluate: L1- → L2-payload → ML */
 	struct flow_ctx fc;
 	nfq_pkt_to_flow_ctx(pkt, &fc);
 	/* P6 — flow: established = reverse-direction traffic has been seen (proxy).
@@ -476,6 +495,11 @@ static void process_packet(struct nfq_ctx *nfq, struct nfq_pkt *pkt,
 		struct flow_slot *slot = flow_get(pkt, &rs->ac, &dir);
 		if (slot) {
 			fc.to_server = (dir == REASS_TO_SERVER) ? 1 : 0;   /* P6 */
+			/* REPLY-direction packets carry no skb mark → recover the
+			 * profile cached from the ORIGINAL direction so the response
+			 * payload is inspected under the same profile. */
+			if (fc.prof_id == 0 && slot->profid)
+				fc.prof_id = slot->profid;
 			fc.fb = &slot->fb;                                 /* P5 */
 			struct l2_match mm = { .rs = rs, .rf = &slot->rf,
 					       .fc = fc, .fb = &slot->fb,
@@ -492,8 +516,19 @@ static void process_packet(struct nfq_ctx *nfq, struct nfq_pkt *pkt,
 						  l2_on_match, &mm);
 			}
 
+			/* Detect TLS once per flow (on the to-server ClientHello).
+			 * Everything reaching NFQUEUE is NOT being decrypted (deep/cert
+			 * are REDIRECTed to ssld), so a TLS flow here is encrypted-and-
+			 * not-decrypted → content signature is futile. Skip the scan and
+			 * let ML (behavioral) decide. Cleartext (HTTP) is untouched → full
+			 * signature. Fail-safe: undetermined → still scan. */
+			if (slot->is_tls == 0 && dir == REASS_TO_SERVER &&
+			    pkt->payload && pkt->plen)
+				slot->is_tls = looks_like_tls(pkt->payload, pkt->plen)
+					       ? 1 : -1;
+
 			int rrc = REASS_OK;
-			if (pkt->payload && pkt->plen) {
+			if (slot->is_tls != 1 && pkt->payload && pkt->plen) {
 				g_tcp_payload++;        /* TCP packet with payload reaching reass */
 				rrc = reass_segment(&slot->rf, dir, pkt->tcp_seq,
 						    pkt->payload, pkt->plen,
@@ -517,26 +552,22 @@ static void process_packet(struct nfq_ctx *nfq, struct nfq_pkt *pkt,
 			if (d.verdict == IPS_PASS && d.sig_rule == -1 &&
 			    !slot->ml_done && ct_ok && ctr.ml_valid) {
 				uint32_t N = fs.pkts_fwd + fs.pkts_bwd;
-				uint64_t B = ctr.ml.bytes_fwd + ctr.ml.bytes_bwd;
 				uint64_t now = mono_ns();
 				uint64_t age = (ctr.ml.first_ns && now > ctr.ml.first_ns)
 					       ? now - ctr.ml.first_ns : 0;
 				/* T1 — flow ends: score on the complete flow, catching
-				 * SHORT flows (PortScan ~2 packets) that never hit the cap below. */
+				 * SHORT flows (PortScan ~2 packets) that never hit the caps. */
 				int fin_rst = (pkt->tcp_flags &
 					       (SIG_TCP_FIN | SIG_TCP_RST)) != 0;
-				if (fin_rst || N >= ML_CKP_PKTS || B >= ML_CKP_BYTES ||
-				    age >= ML_CKP_AGE_NS) {
-					int32_t iwin = ml_iwin_get(pkt->proto,
-						pkt->src_ip, pkt->dst_ip,
-						pkt->sport, pkt->dport);
-					if (iwin < 0) iwin = pkt->init_win;
-					ctdump_to_features(&ctr, fs.pkts_fwd,
-						fs.pkts_bwd, iwin, feat);
-					double sc = ips_score(feat);
-					d = ips_fuse(ips_cfg, -1, 0, sc);
-					d.ml_evaluated = 1;
-					d.score        = sc;
+				/* FINAL fallback: the 16KB signature scan window is exhausted →
+				 * the flow is about to be offloaded, score ML before it escapes. */
+				if (fin_rst || N >= ML_CKP_PKTS || age >= ML_CKP_AGE_NS ||
+				    reass_inspected_bytes(&slot->rf) >= REASS_MAX_BYTES) {
+					int32_t iwin = ctr.ml.init_win_fwd
+						       ? (int32_t)ctr.ml.init_win_fwd : -1;
+					d = ips_ml_eval(&ctr, fs.pkts_fwd,
+							fs.pkts_bwd, iwin, ips_cfg);
+					double sc = d.score;
 					slot->ml_done  = 1;
 					/* This flow is now scored → offload unless DROP (DROP
 					 * already offloads via IPS_BLOCK). Includes ALERT (detect mode). */

@@ -76,7 +76,7 @@ int main(void)
   };
 
 	printf("model: get_num_feature()=%d\n", get_num_feature());
-	check(get_num_feature() == FEAT_COUNT, "model uses exactly 14 features");
+	check(get_num_feature() == FEAT_COUNT, "model uses exactly 17 features");
 
 	double s1 = ips_score(v1);
 	double s2 = ips_score(v2);

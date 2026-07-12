@@ -13,13 +13,13 @@
 
 | Lớp | File | Loại thay đổi |
 |---|---|---|
-| Kernel — data-plane | `src/modules/pkt_forward.c` | Sửa: enforcement connmark (BLOCK/INSPECTED) + `NF_QUEUE` N gói đầu + procfs bật/tắt IPS. `ml_account()` (accounting 14 feature) **đã có** |
+| Kernel — data-plane | `src/modules/pkt_forward.c` | Sửa: enforcement connmark (BLOCK/INSPECTED) + `NF_QUEUE` N gói đầu + procfs bật/tắt IPS. `ml_account()` (accounting 17 feature) **đã có** |
 | Kernel — conntrack | `stargazer-kernel/.../nf_conntrack_ml.h` | **Đã có**: `struct nf_conn_ml` + export `CTA_ML`. Chỉ đụng nếu thêm `init_win_fwd` (xem §2.4) |
 | Userspace — daemon | `src/userspace/ipsd/` | **Mới**: `stargazer-ipsd` |
 | Userspace — NFQUEUE | `src/userspace/ipsd/nfq.{c,h}` | **Mới**: mở queue, đọc payload + ctmark, trả verdict + set connmark |
 | Userspace — AC | `src/userspace/ipsd/ac.{c,h}` | **Mới**: engine Aho-Corasick |
 | Userspace — rule | `src/userspace/ipsd/sig_rule.{c,h}` | **Mới**: parser rule ET-OPEN-subset + lớp 1 flow rule |
-| Userspace — feature | `src/userspace/ipsd/feature.{c,h}` | **Mới**: 14 feature từ `CTA_ML` + parity |
+| Userspace — feature | `src/userspace/ipsd/feature.{c,h}` | **Mới**: 17 feature từ `CTA_ML` + parity |
 | Userspace — ML | `src/userspace/ipsd/model/` | **Mới**: `predict.{c,h}` (copy từ `Machine Learning/ips_c/`) |
 | Build | `Makefile` (root) | Sửa: target `ipsd`, đưa vào rootfs/test |
 | Quản lý | `mgmtd`, `cli`, `webui` | Sửa: config type `security_ips` |
@@ -39,7 +39,7 @@ Lớp signature theo **flow** (lớp 1, không cần payload) thì chỉ là và
 ```
                  kernel                          │            userspace (ipsd)
  ┌─────────────────────────────────────────┐    │   ┌──────────────────────────────────┐
- │ pkt_forward → nf_conntrack (đếm,integer)│    │   │ feature extraction → 14 feature  │
+ │ pkt_forward → nf_conntrack (đếm,integer)│    │   │ feature extraction → 17 feature  │
  │   ml_account → NF_CT_EXT_ML ────────────┼────┼──►│   (đọc CTA_ML qua ctnetlink dump) │
  │   N gói đầu → NF_QUEUE (payload) ────────┼────┼──►│ signature lớp 1 (flow rule)      │
  │                                          │    │   │ signature lớp 2 (Aho-Corasick)   │
@@ -56,7 +56,7 @@ Lớp signature theo **flow** (lớp 1, không cần payload) thì chỉ là và
 
 ## 2. Lớp A — Kernel: enforcement connmark + NFQUEUE (concrete)
 
-Accounting 14 feature (`ml_account` → `NF_CT_EXT_ML`) **đã có** trong `pkt_forward.c` và export qua `CTA_ML` — không phải viết lại. Phần cần thêm là **enforcement** (đọc connmark) và **đẩy N gói đầu lên userspace** (`NF_QUEUE`).
+Accounting 17 feature (`ml_account` → `NF_CT_EXT_ML`) **đã có** trong `pkt_forward.c` và export qua `CTA_ML` — không phải viết lại. Phần cần thêm là **enforcement** (đọc connmark) và **đẩy N gói đầu lên userspace** (`NF_QUEUE`).
 
 ### 2.1. Bit connmark cho IPS
 
@@ -353,7 +353,7 @@ src/userspace/ipsd/
 ├── nfq.c/.h          mở NFQUEUE (libnetfilter_queue): đọc gói + payload + NFQA_CT,
 │                     trả verdict ACCEPT/DROP kèm set connmark (CTA_MARK)
 ├── ctdump.c/.h       dump CTA_ML theo tuple để lấy flow-stats (tái dùng parser kiểu mgmtd_diag)
-├── feature.c/.h      nf_conn_ml → 14 feature (parity CICFlowMeter)
+├── feature.c/.h      nf_conn_ml → 17 feature (parity CICFlowMeter)
 ├── ac.c/.h           Aho-Corasick (mục 3)
 ├── sig_rule.c/.h     parser rule ET-OPEN-subset + lớp 1 flow rule + on_match
 ├── fusion.c/.h       gộp signature + ML → verdict (master plan §3.5)
@@ -368,7 +368,7 @@ Vòng chính (event-driven theo NFQUEUE, không poll):
 1. nạp rule → ac_build();  nạp model (link tĩnh)
 2. mỗi gói từ NFQUEUE:
    a. parse IP/TCP/UDP; lấy payload L4, ctmark, tuple; lấy TCP window (gói SYN → feature 13)
-   b. ctdump: đọc nf_conn_ml theo tuple → feature.c dựng vector 14 feature
+   b. ctdump: đọc nf_conn_ml theo tuple → feature.c dựng vector 17 feature
    c. sig_rule lớp 1 (flow): hit → verdict DROP
    d. ac_search(payload) → hit → verdict DROP
    e. ML: predict(feature) → postprocess() (sigmoid) → score ∈ [0,1]

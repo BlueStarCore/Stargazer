@@ -216,15 +216,23 @@ static void ml_account(struct sk_buff *skb, u8 proto, int iif, int oif)
 		ml->iif = (u16)iif;
 		ml->oif = (u16)oif;
 	}
+	/* Capture the forward SYN's advertised TCP window once → the model's
+	 * Init_Win_bytes_forward. Seen wherever the SYN traverses (FORWARD or the
+	 * LOCAL_IN ssld leg), so ipsd no longer needs to see the SYN via NFQUEUE.
+	 * 0 stays = not captured (non-TCP, or the SYN predates the module). */
+	if (th && dir == IP_CT_DIR_ORIGINAL && th->syn && ml->init_win_fwd == 0)
+		ml->init_win_fwd = ntohs(th->window);
 	/* Payload-length sum / sum-of-squares / sample count (both directions),
 	 * plus the per-direction payload totals for the fwd/bwd length means. */
 	ml->pktlen_sum    += len;
 	ml->pktlen_sq_sum += (u64)len * len;
 	ml->pktlen_count++;
-	if (dir == IP_CT_DIR_ORIGINAL)
+	if (dir == IP_CT_DIR_ORIGINAL) {
 		ml->bytes_fwd += len;
-	else
+	} else {
 		ml->bytes_bwd += len;
+		ml->bwd_pktlen_sq_sum += (u64)len * len;  /* -> Bwd Packet Length Std */
+	}
 
 	/* Inter-arrival times, kept in microseconds: the mean is
 	 * iat_sum_us/iat_count and the squares stay consistent with it. A gap is
@@ -367,6 +375,38 @@ static unsigned int local_in_hook(void *priv, struct sk_buff *skb,
 	return NF_ACCEPT;
 }
 
+/*
+ * Phase 4 — LOCAL_OUT hook (gated by ml_account_local). Taps the REPLY leg that
+ * LOCAL_IN cannot see: ssld→client (and ssld→backend), so the flow's backward-
+ * direction CTA_ML fields (bytes_bwd, reply lengths/flags) are populated too —
+ * otherwise the model gets a fwd-only, self-inconsistent vector. Feature-tap
+ * ONLY, never drops. Skips loopback: a lo packet traverses BOTH LOCAL_OUT and
+ * LOCAL_IN on the same conntrack entry, which would double-count it (LOCAL_IN
+ * already accounts loopback). Direction (fwd/bwd) still comes from conntrack
+ * (CTINFO2DIR) inside ml_account, so the reply packets land in the bwd fields.
+ */
+static unsigned int local_out_hook(void *priv, struct sk_buff *skb,
+				   const struct nf_hook_state *state)
+{
+	u8 proto;
+
+	if (!ml_account_local)              /* GATED: off → behaves like the old kernel */
+		return NF_ACCEPT;
+	if (state->out && (state->out->flags & IFF_LOOPBACK))
+		return NF_ACCEPT;              /* loopback counted once at LOCAL_IN */
+	if (!is_valid_ipv4(skb))
+		return NF_ACCEPT;
+	proto = ip_hdr(skb)->protocol;
+	if (proto != IPPROTO_TCP)
+		return NF_ACCEPT;
+	if (!pskb_may_pull(skb, (unsigned int)ip_hdr(skb)->ihl * 4 +
+			   sizeof(struct tcphdr)))
+		return NF_ACCEPT;
+	/* iif=0 (locally generated); dir is taken from conntrack inside ml_account. */
+	ml_account(skb, proto, 0, state->out ? state->out->ifindex : 0);
+	return NF_ACCEPT;
+}
+
 /* --- procfs: /proc/stargazer/pkt_forward_stats ---------------------------- */
 
 static struct proc_dir_entry *pf_proc_root;   /* /proc/stargazer */
@@ -418,6 +458,17 @@ static const struct nf_hook_ops nf_local_in_ops = {
 	.priority = NF_IP_PRI_CONNTRACK_DEFRAG + 1,
 };
 
+/* Phase 4 — LOCAL_OUT: taps the reply leg (ssld→client). MUST run AFTER
+ * conntrack, unlike LOCAL_IN: a locally-generated packet only gets its ct
+ * attached at the OUTPUT conntrack hook (NF_IP_PRI_CONNTRACK), so a hook before
+ * that would see no ct (nf_ct_get == NULL) and silently account nothing. */
+static const struct nf_hook_ops nf_local_out_ops = {
+	.hook     = local_out_hook,
+	.pf       = NFPROTO_IPV4,
+	.hooknum  = NF_INET_LOCAL_OUT,
+	.priority = NF_IP_PRI_CONNTRACK + 1,
+};
+
 static int __init pkt_forward_init(void)
 {
 	int ret;
@@ -441,6 +492,11 @@ static int __init pkt_forward_init(void)
 	if (nf_register_net_hook(&init_net, &nf_local_in_ops) < 0)
 		pr_warn("pkt_forward: LOCAL_IN hook registration failed — "
 			"ML-HTTPS (Phase 4) unavailable\n");
+	/* Phase 4 — LOCAL_OUT hook (gated). Taps the reply leg for backward-
+	 * direction CTA_ML. Non-fatal on failure (fwd-only degrade). */
+	if (nf_register_net_hook(&init_net, &nf_local_out_ops) < 0)
+		pr_warn("pkt_forward: LOCAL_OUT hook registration failed — "
+			"ML-HTTPS reply-direction features unavailable\n");
 
 	/* Create /proc/stargazer/ for the stats file. Failure is non-fatal —
 	 * the module still functions without procfs. */
@@ -458,6 +514,7 @@ static int __init pkt_forward_init(void)
 
 static void __exit pkt_forward_exit(void)
 {
+	nf_unregister_net_hook(&init_net, &nf_local_out_ops);
 	nf_unregister_net_hook(&init_net, &nf_local_in_ops);
 	nf_unregister_net_hook(&init_net, &nf_forward_ops);
 	nf_defrag_ipv4_disable(&init_net);

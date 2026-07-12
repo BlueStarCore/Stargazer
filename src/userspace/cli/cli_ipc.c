@@ -439,6 +439,21 @@ int ipc_send(uint32_t cmd, const char *payload, size_t payload_len,
 		}
 		resp->payload[n]  = '\0';
 		resp->payload_len = (size_t)n;
+	} else if (rhdr.payload_len > SG_RESPONSE_MAX) {
+		/* Oversized payload (a handler exceeded the protocol max). DRAIN and
+		 * discard it so the socket stays in sync for the next command —
+		 * otherwise the leftover bytes are misread as the next response
+		 * header and every later command desyncs/hangs. The status is still
+		 * valid; we just drop the (broken) payload. */
+		char drain[4096];
+		uint32_t left = rhdr.payload_len;
+		while (left > 0) {
+			size_t chunk = left < sizeof(drain) ? left : sizeof(drain);
+			ssize_t r = safe_read(fd, drain, chunk);
+			if (r <= 0)
+				break;
+			left -= (uint32_t)r;
+		}
 	}
 
 	/* IPC debug trace: response received (suppress for DEBUG_FETCH) */

@@ -206,34 +206,59 @@ static uint32_t line_sid(const char *line)
 
 
 /* Write /etc/stargazer/ips/.update.conf for cron (ips-update-cron.sh) to read —
- * avoids cron having to call ipc-cli (auth issue). Lists every enabled ruleset
- * from the security_ips-ruleset table. */
+ * avoids cron having to call ipc-cli (auth issue). Carries the scheduled-update
+ * spec (source of truth = the WebUI Schedule tab / the security_ips cron-* keys)
+ * plus every enabled ruleset URL. The static crontab runs the wrapper every
+ * minute; the wrapper matches these five cron fields against the current time
+ * and fires the download only on a match. */
 static void ips_write_update_conf(void)
 {
-	char *en = sg_db_get_val("security_ips", "0", "auto-update");
-	FILE *f  = fopen("/etc/stargazer/ips/.update.conf", "w");
-	if (!f) { free(en); return; }
+	FILE *f = fopen("/etc/stargazer/ips/.update.conf", "w");
+	if (!f) return;
 
-	fprintf(f, "enabled=%s\n", (en && en[0]) ? en : "disable");
-	free(en);
+	/* Cron schedule fields (mirror the validation defaults in sg_validate.c). */
+	static const struct { const char *key, *label, *dflt; } cf[] = {
+		{ "cron-enabled", "cron_enabled", "disable" },
+		{ "cron-minutes", "cron_min",     "0" },
+		{ "cron-hours",   "cron_hour",    "0" },
+		{ "cron-dom",     "cron_dom",     "*" },
+		{ "cron-months",  "cron_mon",     "*" },
+		{ "cron-dow",     "cron_dow",     "*" },
+	};
+	for (size_t i = 0; i < sizeof(cf) / sizeof(cf[0]); i++) {
+		char *v = sg_db_get_val("security_ips", "0", cf[i].key);
+		fprintf(f, "%s=%s\n", cf[i].label, (v && v[0]) ? v : cf[i].dflt);
+		free(v);
+	}
 
-	/* List enabled entries from security_ips-ruleset */
+	/* CSV of enabled ruleset IDs. The wrapper hands this straight to
+	 * SG_CMD_IPS_UPDATE_NOW — the SAME path the WebUI "Update Now" button
+	 * uses (run_ips_update_now) — so a scheduled run downloads, stamps
+	 * last-downloaded (the GUI "LAST UPDATED" column), and hot-reloads
+	 * identically to a manual update. No per-URL shell loop / category
+	 * derivation needed on the device. */
+	char csv[1024];
+	size_t cpos = 0;
+	csv[0] = '\0';
 	char *ids = sg_db_list("security_ips-ruleset");
-	int count = 0;
 	if (ids) {
 		char *sp = NULL;
 		for (char *id = strtok_r(ids, "\n", &sp); id;
 		     id = strtok_r(NULL, "\n", &sp)) {
 			char *ena = sg_db_get_val("security_ips-ruleset", id, "enabled");
 			char *url = sg_db_get_val("security_ips-ruleset", id, "url");
-			if (ena && strcmp(ena, "enable") == 0 && url && url[0])
-				fprintf(f, "url_%d=%s\n", count++, url);
+			if (ena && strcmp(ena, "enable") == 0 && url && url[0]) {
+				int n = snprintf(csv + cpos, sizeof(csv) - cpos,
+						 "%s%s", cpos ? "," : "", id);
+				if (n > 0 && (size_t)n < sizeof(csv) - cpos)
+					cpos += (size_t)n;
+			}
 			free(ena);
 			free(url);
 		}
 		free(ids);
 	}
-	fprintf(f, "url_count=%d\n", count);
+	fprintf(f, "ids=%s\n", csv);
 	fclose(f);
 }
 
@@ -253,41 +278,41 @@ int ips_profid(const char *id)
  * compile_one_profile (resolves categories/filters → rule text with the
  * effective action) into a temp full-text file, then projects it to the
  * sid→action map and drops the heavy intermediate. Returns rule count, -1 err. */
-static int compile_profile_map(const char *name)
-{
-	int profid = ips_profid(name);
-	if (profid < 1)
-		return -1;
+	static int compile_profile_map(const char *name)
+	{
+		int profid = ips_profid(name);
+		if (profid < 1)
+			return -1;
 
-	char text[512];                         /* intermediate profiles/<name>.rules */
-	int n = compile_one_profile(name, text, sizeof(text));
-	if (n < 0)
-		return -1;
+		char text[512];                         /* intermediate profiles/<name>.rules */
+		int n = compile_one_profile(name, text, sizeof(text));
+		if (n < 0)
+			return -1;
 
-	char map[512], maptmp[600];
-	snprintf(map,    sizeof(map),    "%s/%04d.rules", IPS_PROF_DIR, profid);
-	snprintf(maptmp, sizeof(maptmp), "%s/.%04d.tmp",  IPS_PROF_DIR, profid);
+		char map[512], maptmp[600];
+		snprintf(map,    sizeof(map),    "%s/%04d.rules", IPS_PROF_DIR, profid);
+		snprintf(maptmp, sizeof(maptmp), "%s/.%04d.tmp",  IPS_PROF_DIR, profid);
 
-	FILE *in  = fopen(text, "r");
-	FILE *out = fopen(maptmp, "w");
-	if (in && out) {
-		char line[16384];
-		while (fgets(line, sizeof(line), in)) {
-			uint32_t sid = line_sid(line);
-			if (!sid) continue;
-			const char *p = line;
-			while (*p == ' ' || *p == '\t') p++;
-			/* effective action = first token (drop→block, else alert) */
-			const char *act = (strncmp(p, "drop", 4) == 0) ? "block" : "alert";
-			fprintf(out, "%u %s\n", sid, act);
+		FILE *in  = fopen(text, "r");
+		FILE *out = fopen(maptmp, "w");
+		if (in && out) {
+			char line[16384];
+			while (fgets(line, sizeof(line), in)) {
+				uint32_t sid = line_sid(line);
+				if (!sid) continue;
+				const char *p = line;
+				while (*p == ' ' || *p == '\t') p++;
+				/* effective action = first token (drop→block, else alert) */
+				const char *act = (strncmp(p, "drop", 4) == 0) ? "block" : "alert";
+				fprintf(out, "%u %s\n", sid, act);
+			}
 		}
+		if (in)  fclose(in);
+		if (out) fclose(out);
+		rename(maptmp, map);            /* atomic publish of the map */
+		remove(text);                   /* drop the heavy full-text intermediate */
+		return n;
 	}
-	if (in)  fclose(in);
-	if (out) fclose(out);
-	rename(maptmp, map);            /* atomic publish of the map */
-	remove(text);                   /* drop the heavy full-text intermediate */
-	return n;
-}
 
 /* Signature of a profile's selection: its category/filter definition + the rule
  * TABLE generation (active.rules mtime). rebuild_ips_scope skips a profile whose
@@ -464,23 +489,58 @@ static sg_status_t rebuild_ips_scope(char *result, size_t rsize)
 		free(list);
 	}
 
-	/* Prune maps/sigs of profids no longer enabled. */
+	/* Sweep the profile dir: keep ONLY the canonical map/sig of an ENABLED
+	 * profile (exactly "%04d.rules" / "%04d.sig"). Everything else is removed:
+	 *   - canonical map of a now-disabled profid → real scope change (counts,
+	 *     SIGUSR2 below).
+	 *   - non-canonical orphans → old full-text "<name>.rules" or un-padded
+	 *     "<id>.rules" left over from a previous storage format; ipsd never reads
+	 *     them, so this is pure disk cleanup (does NOT count as a scope change).
+	 * The old sscanf("%d.%s") prune could not tell "1.rules" (orphan) from
+	 * "0001.rules" (current) — both parse to profid 1 — so those 28 MB
+	 * intermediates leaked and filled the config partition. */
+	int orphans = 0;
 	DIR *d = opendir(IPS_PROF_DIR);
 	if (d) {
 		struct dirent *de;
 		while ((de = readdir(d))) {
-			int pid2 = 0; char ext[8] = "";
-			if (sscanf(de->d_name, "%d.%7s", &pid2, ext) == 2 &&
-			    pid2 >= 1 && pid2 <= 31 && !valid[pid2] &&
-			    (strcmp(ext, "rules") == 0 || strcmp(ext, "sig") == 0)) {
-				char p[512];
-				snprintf(p, sizeof(p), "%s/%s", IPS_PROF_DIR, de->d_name);
-				remove(p);
-				changed++;
-			}
+			const char *nm = de->d_name;
+			if (nm[0] == '.')             /* ".", "..", ".NNNN.tmp" */
+				continue;
+			size_t nl = strlen(nm);
+			int rulesig = (nl > 6 && strcmp(nm + nl - 6, ".rules") == 0) ||
+				      (nl > 4 && strcmp(nm + nl - 4, ".sig")   == 0);
+			if (!rulesig)
+				continue;
+
+			/* canonical = exactly NNNN.rules (10 ch) or NNNN.sig (8 ch),
+			 * the first 4 characters all digits. */
+			int canon = (nl == 10 && strcmp(nm + 4, ".rules") == 0) ||
+				    (nl == 8  && strcmp(nm + 4, ".sig")   == 0);
+			int pid = 0;
+			if (canon)
+				for (int i = 0; i < 4; i++) {
+					if (nm[i] < '0' || nm[i] > '9') {
+						canon = 0; break;
+					}
+					pid = pid * 10 + (nm[i] - '0');
+				}
+
+			if (canon && pid >= 1 && pid <= 31 && valid[pid])
+				continue;            /* current profile's file → keep */
+
+			char p[512];
+			snprintf(p, sizeof(p), "%s/%s", IPS_PROF_DIR, nm);
+			remove(p);
+			if (canon && pid >= 1 && pid <= 31)
+				changed++;           /* disabled profid → scope change */
+			else
+				orphans++;           /* leaked old-format file → cleanup */
 		}
 		closedir(d);
 	}
+	if (orphans)
+		mgmt_log("INFO", "ips: swept %d orphan profile file(s)", orphans);
 
 	if (changed) {
 		pid_t pid = supervisor_get_pid("stargazer-ipsd");

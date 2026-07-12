@@ -19,11 +19,26 @@
 #include "ca.h"
 #include "certcache.h"
 #include <netinet/in.h>
+#include <openssl/x509.h>
+#include <openssl/evp.h>
 
 struct bump_cfg {
 	struct ca_ctx    *ca;
 	struct certcache *cc;
 	int               verify_upstream;   /* 1 = fail-closed if server cert errors */
+
+	/*
+	 * Reverse mode ("Protect SSL Server", inbound deep inspection): present the
+	 * REAL server cert+key to the client instead of forging via the CA — so an
+	 * external client sees a valid certificate (no CA install needed). When
+	 * reverse=1, srv_cert/srv_key are used and `upstream` (if non-NULL) overrides
+	 * the TLS#2 target with the real backend. Forward mode (reverse=0) uses ca/cc.
+	 */
+	int                       reverse;
+	X509                     *srv_cert;
+	STACK_OF(X509)           *srv_chain;  /* intermediate chain (may be NULL) */
+	EVP_PKEY                 *srv_key;
+	const struct sockaddr_in *upstream;  /* reverse backend; NULL = original dst */
 
 	/*
 	 * Inspect decrypted plaintext. to_server=1 (client->server) or 0

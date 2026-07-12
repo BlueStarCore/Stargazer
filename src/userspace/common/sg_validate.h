@@ -86,6 +86,11 @@ int sg_reg_is_valid_key(const char *type_name, const char *key);
  * Returns 1 if hidden, 0 otherwise (including unknown keys). */
 int sg_reg_is_hidden_key(const char *type_name, const char *key);
 
+/* For security_ssl-inspection-profile: is `key` settable under inspection-mode
+ * `mode` (multiple-clients vs protecting-server)? Fields of the other mode return
+ * 0 → CLI rejects/hides them, web hides them. Non-ssl types always return 1. */
+int sg_ssl_field_allowed(const char *type_name, const char *key, const char *mode);
+
 /* Check if key is optional. Returns 1 if optional, 0 if required. */
 int sg_reg_is_optional(const char *type_name, const char *key);
 

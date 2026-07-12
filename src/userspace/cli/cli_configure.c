@@ -601,6 +601,16 @@ static void register_set_cmds(const char *type_name, const char *action)
 			continue;
 		}
 
+		/* SSL profile: hide the OTHER inspection-mode's fields (here `action`
+		 * carries the current inspection-mode value). */
+		if (type_name &&
+		    strcmp(type_name, "security_ssl-inspection-profile") == 0 &&
+		    !sg_ssl_field_allowed(type_name, tok, action)) {
+			*end = saved;
+			tok = end;
+			continue;
+		}
+
 		char regpath[CLI_MAX_LINE + 272], regdesc[CLI_MAX_LINE + 272];
 		const char *desc = sg_reg_field_desc(type_name, tok);
 		snprintf(regpath, sizeof(regpath), "set %s", tok);
@@ -718,6 +728,12 @@ static int check_ref_exists(const char *type_name, const char *key,
 
 	if (!sg_parse_ref_kind(kind, rt, sizeof(rt), ro, sizeof(ro)))
 		return 1; /* not a ref kind — always valid */
+
+	/* ref-or-cidr: a raw CIDR (e.g. 203.0.113.10/32) is valid without an
+	 * object lookup — matches mgmtd's validate_ref_existence(). Without this
+	 * the CLI wrongly rejects a subnet as "does not exist as a ... entry". */
+	if (strncmp(kind, "ref-or-cidr:", 12) == 0 && sg_is_cidr(val))
+		return 1;
 
 	/* Check hardcoded options (e.g. "all", "any") */
 	if (ro[0] && sg_match_csv_option(ro, val)) {
@@ -918,7 +934,13 @@ static int context_entry(const char *type_name, const char *label,
 	ipc_resp_free(&resp);
 
 	cli_push();
-	register_entry_cmds(type_name, kv_get(&data, "action"));
+	/* Context value for field scoping: firewall_policy uses `action` (hide
+	 * ssl/ips-profile on deny); ssl-inspection-profile uses `inspection-mode`
+	 * (hide the other mode's fields). */
+	register_entry_cmds(type_name,
+		strcmp(type_name, "security_ssl-inspection-profile") == 0
+			? kv_get(&data, "inspection-mode")
+			: kv_get(&data, "action"));
 
 	char prompt[384];
 	snprintf(prompt, sizeof(prompt), "(%s-%s) # ", label, entry_id);
@@ -965,6 +987,16 @@ static int context_entry(const char *type_name, const char *label,
 			if (sg_reg_is_hidden_key(type_name, key)) {
 				printf("  Error: '%s' is an internal field"
 				       " and cannot be set\n", key);
+				continue;
+			}
+			/* SSL profile: a field belongs to ONE inspection-mode
+			 * (multiple-clients vs protecting-server). Reject the other
+			 * mode's fields as if they did not exist (FortiGate-style). */
+			if (strcmp(type_name, "security_ssl-inspection-profile") == 0 &&
+			    !sg_ssl_field_allowed(type_name, key,
+						  kv_get(&data, "inspection-mode"))) {
+				printf("  Error: invalid key '%s' for %s\n",
+				       key, type_name);
 				continue;
 			}
 			/* ips-status is an INTERNAL field — auto on/off based on ips-profile.
@@ -1036,6 +1068,28 @@ static int context_entry(const char *type_name, const char *label,
 				fprintf(stderr,
 					"[CFG-DBG] set: %s=%s"
 					" (valid)\n", key, val);
+			/* SSL profile: changing inspection-mode re-scopes which fields
+			 * are valid. Drop any value that belongs to the OTHER mode (e.g.
+			 * the multiple-clients defaults stamped at create time) so `show`
+			 * and what gets saved match the selected mode, then rebuild the
+			 * entry-context completions so `set ?` reflects the new mode
+			 * immediately — no need to save and re-edit. */
+			if (strcmp(type_name, "security_ssl-inspection-profile") == 0 &&
+			    strcmp(key, "inspection-mode") == 0) {
+				const char *mode = kv_get(&data, "inspection-mode");
+				char drop[KV_MAX_ENTRIES][KV_MAX_KEY];
+				int ndrop = 0;
+				for (int i = 0; i < data.count; i++) {
+					if (!sg_ssl_field_allowed(type_name,
+							data.entries[i].key, mode))
+						snprintf(drop[ndrop++], KV_MAX_KEY,
+							 "%s", data.entries[i].key);
+				}
+				for (int i = 0; i < ndrop; i++)
+					kv_unset(&data, drop[i]);
+				cli_clear();
+				register_entry_cmds(type_name, mode);
+			}
 			/* Convenience: on a policy, set ips-profile (always a real profile)
 			 * → auto-enable the internal toggle ips-status=enable. Disable = unset
 			 * ips-profile (handled in the unset branch). Web reload sees the switch. */

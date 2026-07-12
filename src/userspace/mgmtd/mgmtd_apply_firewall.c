@@ -183,6 +183,30 @@ static int resolve_service(const char *val,
 
 /* ── Helpers ────────────────────────────────────────────────────────────── */
 
+/* Emit the iptables destination-port match for a firewall service port spec.
+ * Accepts FortiOS-style values: a single port "80", a dash range "80-443", or
+ * a comma list "80,443,8000-8080". iptables needs ':' for ranges and
+ * "-m multiport --dports" for a list, so translate here (the DB keeps the
+ * FortiOS dash form; passing it verbatim to --dport made iptables-restore fail). */
+static void emit_service_dport(struct dynbuf *buf, const char *svc_port)
+{
+	char conv[VALBUFSZ];
+	size_t j = 0;
+	int has_comma = 0;
+	for (size_t i = 0; svc_port[i] && j < sizeof(conv) - 1; i++) {
+		char c = svc_port[i];
+		if (c == '-')      c = ':';   /* FortiOS range "-" → iptables ":" */
+		else if (c == ',') has_comma = 1;
+		conv[j++] = c;
+	}
+	conv[j] = '\0';
+
+	if (has_comma)
+		dbuf_printf(buf, " -m multiport --dports %s", conv);
+	else
+		dbuf_printf(buf, " --dport %s", conv);
+}
+
 static const char *action_to_target(const char *action)
 {
 	if (strcmp(action, "accept") == 0 || strcmp(action, "allow") == 0)
@@ -589,34 +613,82 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 				SG_CMK_IPS_BLOCK, SG_CMK_IPS_BLOCK);
 
 		/*
-		 * [IPS] Inspection window: when IPS is on + connbytes is available,
-		 * the ESTABLISHED fast-path only applies to flows that have ALREADY
-		 * EXCEEDED K bytes. Within the first K bytes, ESTABLISHED packets
-		 * (request/response data) do NOT fast-path but fall through to the
-		 * per-policy NFQUEUE so ipsd can inspect the payload. Without this
-		 * gate the fast-path accepts every ESTABLISHED data packet outright →
-		 * ipsd only sees the SYN (NEW) and content signatures NEVER match
-		 * (tcp_payload=0).
+		 * [IPS] Established/related return traffic — handled STATEFULLY and
+		 * direction-agnostically (keyed on conntrack + connmark, NOT on a
+		 * policy's -i/-o). A flow is authorised once, by its NEW packet in the
+		 * ORIGINAL direction; every later packet — including the whole REPLY
+		 * direction, which has no policy of its own — must be judged by flow
+		 * state, never re-matched against a directional policy that would drop
+		 * it at the default DROP.
+		 *
+		 * With connmark + connbytes (full model):
+		 *   [a] INSPECTED (ML-cleared) flow  → ACCEPT (offload, either dir).
+		 *   [b] non-IPS flow (connmark profid == 0) → ACCEPT, NOT connbytes-
+		 *       gated: a small flow's reply must not wait for a 16K window it
+		 *       will never reach. (This is the plain stateful firewall.)
+		 *   [c] IPS flow past the K-byte window → fast-path ACCEPT (either dir).
+		 *   [d] IPS flow within the window, REPLY direction only → NFQUEUE so
+		 *       ipsd inspects the response payload too (the ORIGINAL direction
+		 *       keeps falling through to the per-policy queue below, where it
+		 *       picks up the skb profile mark). ipsd provisional-ACCEPTs unless
+		 *       it matches; a match sets IPS_BLOCK → the whole flow is dropped
+		 *       by the rule above.
+		 * The ORIGINAL direction within the window matches none of these and
+		 * falls through to the per-policy rules → inspected exactly as before.
+		 *
+		 * All ACCEPT rules require DIRTY clear, so a flow dirtied by a policy
+		 * change falls through for re-evaluation and re-stamps on its next
+		 * ORIGINAL-direction packet.
+		 *
+		 * Fallbacks (no connmark, or no connbytes): we cannot tell IPS from
+		 * non-IPS flows, nor window them, per-flow → a single un-gated stateful
+		 * ACCEPT. Return traffic keeps flowing (IPS still inspects NEW packets
+		 * via the per-policy queue) rather than fail-closing small-flow replies.
 		 */
-		char cbw[160] = "";
-		if (ips_on && connbytes_supported())
-			snprintf(cbw, sizeof(cbw),
-				 " -m connbytes --connbytes %d:"
-				 " --connbytes-mode bytes --connbytes-dir both",
-				 ips_sbytes);
-
-		if (cmk)
-			/* Established/related flows fast-path ONLY while their DIRTY
-			 * bit is clear. A flow marked dirty on a policy change falls
-			 * through to the policy rules below for re-evaluation. */
-			dbuf_printf(&buf,
-				"-A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED%s"
-				" -m connmark ! --mark 0x%x/0x%x -j ACCEPT\n",
-				cbw, SG_CMK_DIRTY, SG_CMK_DIRTY);
-		else
+		if (!cmk) {
 			dbuf_printf(&buf,
 				"-A FORWARD -m conntrack"
-				" --ctstate ESTABLISHED,RELATED%s -j ACCEPT\n", cbw);
+				" --ctstate ESTABLISHED,RELATED -j ACCEPT\n");
+		} else if (!ips_on || !connbytes_supported()) {
+			dbuf_printf(&buf,
+				"-A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED"
+				" -m connmark ! --mark 0x%x/0x%x -j ACCEPT\n",
+				SG_CMK_DIRTY, SG_CMK_DIRTY);
+		} else {
+			/* [a] ML-cleared → offload. */
+			dbuf_printf(&buf,
+				"-A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED"
+				" -m connmark --mark 0x%x/0x%x -j ACCEPT\n",
+				SG_CMK_IPS_INSPECTED, SG_CMK_IPS_INSPECTED);
+			/* [b] non-IPS flow (profid == 0) → plain stateful accept. */
+			dbuf_printf(&buf,
+				"-A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED"
+				" -m connmark --mark 0x0/0x%x"
+				" -m connmark ! --mark 0x%x/0x%x -j ACCEPT\n",
+				SG_CMK_IPS_PROFID_MASK, SG_CMK_DIRTY, SG_CMK_DIRTY);
+			/* [c] IPS flow past the inspection window → fast-path. */
+			dbuf_printf(&buf,
+				"-A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED"
+				" -m connmark ! --mark 0x0/0x%x"
+				" -m connbytes --connbytes %d:"
+				" --connbytes-mode bytes --connbytes-dir both"
+				" -m connmark ! --mark 0x%x/0x%x -j ACCEPT\n",
+				SG_CMK_IPS_PROFID_MASK, ips_sbytes,
+				SG_CMK_DIRTY, SG_CMK_DIRTY);
+			/* [d] IPS flow, in-window, REPLY direction → inspect. */
+			dbuf_printf(&buf,
+				"-A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED"
+				" --ctdir REPLY"
+				" -m connmark ! --mark 0x0/0x%x"
+				" -m connbytes --connbytes 0:%d"
+				" --connbytes-mode bytes --connbytes-dir both"
+				" -m connmark ! --mark 0x%x/0x%x"
+				" -m connmark ! --mark 0x%x/0x%x"
+				" -j NFQUEUE --queue-num %d\n",
+				SG_CMK_IPS_PROFID_MASK, ips_sbytes,
+				SG_CMK_IPS_INSPECTED, SG_CMK_IPS_INSPECTED,
+				SG_CMK_DIRTY, SG_CMK_DIRTY, ips_q);
+		}
 
 		/* IPS NFQUEUE: emitted per-policy (FortiGate-style), NOT globally here.
 		 * Only an accept policy with ips-profile != none (profile enabled) emits
@@ -729,8 +801,7 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 					/* ICMP has no ports */
 					if (svc_port[0] &&
 					    strcmp(svc_proto, "icmp") != 0)
-						dbuf_printf(&buf, " --dport %s",
-							    svc_port);
+						emit_service_dport(&buf, svc_port);
 				}
 			}
 
@@ -834,6 +905,29 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 							dbuf_printf(&buf,
 							    " -j MARK --set-xmark"
 							    " 0x%x/0xff\n", pid);
+							dbuf_append(&buf, saved_pfx,
+								    pfx_len);
+							rule_count++;
+						}
+
+						/* [CMK] Stamp the profile id into the flow's
+						 * connmark (bits 3-7) so the stateful established
+						 * handling at the head of FORWARD can tell an IPS
+						 * flow (→ inspection window, both directions) from a
+						 * plain one (→ un-gated stateful accept). Non-
+						 * terminating, on the bare prefix → set on every
+						 * ORIGINAL-direction packet incl. the SYN, so the
+						 * REPLY direction is never seen before the flow is
+						 * marked. connmark (via the CONNMARK target + -m
+						 * connmark match) is core netfilter — reliable even on
+						 * a kernel lacking glue_ct, unlike NFQA_CT. */
+						if (cmk && pid >= 1 && pid <= 31) {
+							dbuf_printf(&buf,
+							    " -j CONNMARK --set-xmark"
+							    " 0x%x/0x%x\n",
+							    (unsigned)pid <<
+							        SG_CMK_IPS_PROFID_SHIFT,
+							    SG_CMK_IPS_PROFID_MASK);
 							dbuf_append(&buf, saved_pfx,
 								    pfx_len);
 							rule_count++;

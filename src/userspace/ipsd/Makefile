@@ -93,7 +93,7 @@ sig-dump: $(BUILD)/sig_dump
 # `make et` downloads it automatically if missing.
 #   make et                                  # load + report
 #   make et PAYLOAD="USER root" DPORT=21      # load + test match
-ET_URL  := https://rules.emergingthreats.net/open/snort-2.9.0/rules/emerging-scan.rules
+ET_URL  := https://rules.emergingthreats.net/open/snort-2.9.20/rules/emerging-scan.rules
 RULES   ?= rules/emerging-scan.rules
 PAYLOAD ?=
 DPORT   ?=
@@ -151,7 +151,7 @@ $(BUILD)/reass_test: ac.c ac.h reass.c reass.h reass_test.c | $(BUILD)
 IPSD_SRCS := main.c nfq.c ctdump.c feature.c flow_rule.c \
              sig_rule.c sig_reload.c ac.c reass.c \
              proto_buf.c tls_clienthello.c ml_scan.c \
-             engine.c fusion.c ips_model.c
+             engine.c fusion.c ips_model.c ml_eval.c insp_ipc.c
 
 $(BUILD)/stargazer-ipsd: $(IPSD_SRCS) model/predict.c $(BUILD)/predict.o | $(BUILD)
 	$(CC) -O2 -Wall -Wextra -std=c11 \
