@@ -96,7 +96,7 @@ static const struct field_entry field_table[] = {
 	{ "security_ips", "ipc-inspect",  "enum:enable,disable", 0, "enable", "Phase 4: ssld pushes decrypted HTTPS over IPC to the ipsd stateful engine (disable = per-chunk inspection)", 0 },
 	{ "security_ips", "ipc-failmode", "enum:open,closed",    0, "open",   "Phase 4: IPC error → open=fallback to per-chunk inspection; closed=block flow (fail-closed)", 0 },
 	{ "security_ips", "ml-https",     "enum:enable,disable", 0, "disable", "Phase 4 Part 2: ML on decrypted HTTPS — enables kernel LOCAL_IN hook (ml_account_local). Disabled by default (opt-in).", 0 },
-	{ "security_ips", "auto-update","enum:disable,daily,weekly", 0, "disable", "Auto-update signatures on schedule (cron)", 0 },
+	{ "security_ips", "auto-update","enum:disable,daily,weekly", 0, "disable", "Deprecated — schedule is set via the cron-* fields (Schedule tab); no longer read", 0 },
 	{ "security_ips", "update-url", "string",              1, NULL,      "Ruleset source URL (ET Open) for auto-update", 0 },
 	{ "security_ips", "cron-enabled","enum:enable,disable", 0, "disable", "Enable scheduled auto-update", 0 },
 	{ "security_ips", "cron-minutes","string",              1, "0",       "Cron minutes field (0-59, *)", 0 },
@@ -152,9 +152,7 @@ static const struct field_entry field_table[] = {
 	 * resolves it to /etc/stargazer/ssl/certs/<name>/{cert,key}.pem. The bundled key
 	 * comes with the import, so there is no separate server-key field. */
 	{ "security_ssl-inspection-profile", "server-cert",          "ref:system_certificate", 1, NULL,  "Imported server certificate (protect-server)", 0 },
-	{ "security_ssl-inspection-profile", "protect-vip",          "ipv4",         1, NULL,  "VIP/WAN IP the external client targets (protect-server)", 0 },
-	{ "security_ssl-inspection-profile", "protect-backend",      "ipv4",         1, NULL,  "Internal backend server IP (protect-server)", 0 },
-	{ "security_ssl-inspection-profile", "protect-backend-port", "uint:1:65535", 1, "443", "Backend TLS port (protect-server)", 0 },
+	{ "security_ssl-inspection-profile", "protect-vip",          "ipv4",         1, NULL,  "VIP/WAN IP the external client targets (protect-server; the backend is taken from the DNAT rule for this VIP)", 0 },
 	{ "security_ssl-inspection-profile", "protect-sni",          "string",       1, NULL,  "Pin to this SNI (optional, protect-server)", 0 },
 	{ "security_ssl-inspection-profile", "block-sni",            "string",       1, NULL,  "Web-filter: block these SNI/FQDN (comma list, *.domain ok) — certificate mode", 0 },
 
@@ -851,8 +849,7 @@ static char ssl_field_mode(const char *key)
 {
 	if (!key) return 0;
 	if (!strcmp(key, "server-cert") ||
-	    !strcmp(key, "protect-vip") || !strcmp(key, "protect-backend") ||
-	    !strcmp(key, "protect-backend-port") || !strcmp(key, "protect-sni"))
+	    !strcmp(key, "protect-vip") || !strcmp(key, "protect-sni"))
 		return 'p';
 	if (!strcmp(key, "inspection-method") || !strcmp(key, "no-sni") ||
 	    !strcmp(key, "untrusted-server-cert") || !strcmp(key, "unsupported") ||

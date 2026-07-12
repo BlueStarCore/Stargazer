@@ -133,12 +133,18 @@ static int ssl_profile_port(const char *name)
 static int ssl_steer_allowed(const char *prof, const char *ips_status,
 			     const char *ips_profile)
 {
-	/* deep = multiple-clients + inspection-method=deep (protecting-server has no
-	 * method field → NULL → not deep → always steers, like certificate). */
+	/* Both DECRYPTING modes exist only to feed IPS: deep (multiple-clients +
+	 * inspection-method=deep) and protecting-server (inbound reverse). If the
+	 * bound policy's IPS is off, decrypting is pointless — don't steer, traffic
+	 * flows straight through with no bump. Certificate mode only peeks SNI (no
+	 * decryption) → always allowed. */
 	char *method = sg_db_get_val(SSL_PROF_TYPE, prof, "inspection-method");
-	int is_deep = method && strcmp(method, "deep") == 0;
+	char *mode   = sg_db_get_val(SSL_PROF_TYPE, prof, "inspection-mode");
+	int is_deep    = method && strcmp(method, "deep") == 0;
+	int is_protect = mode   && strcmp(mode, "protecting-server") == 0;
 	free(method);
-	if (is_deep && !ips_policy_on(ips_status, ips_profile))
+	free(mode);
+	if ((is_deep || is_protect) && !ips_policy_on(ips_status, ips_profile))
 		return 0;
 	return 1;
 }
@@ -151,7 +157,12 @@ static int ssl_steer_allowed(const char *prof, const char *ips_status,
  */
 int emit_ssl_steering(struct dynbuf *buf)
 {
-	char *list = sg_db_list("firewall_policy");
+	/* Iterate in policy PRIORITY order (sequence DESC), matching the FORWARD
+	 * chain (rebuild_forward_chain uses sg_db_list_ordered too). REDIRECT is a
+	 * terminating NAT target, so when two policies overlap on a flow (e.g. one
+	 * srcintf=any, one srcintf=lan1) the first emitted rule wins — that must be
+	 * the higher-priority policy, not merely the lower-numbered policy id. */
+	char *list = sg_db_list_ordered("firewall_policy", "sequence");
 	if (!list)
 		return 0;
 	int n = 0;
@@ -180,7 +191,7 @@ int emit_ssl_steering(struct dynbuf *buf)
 			continue;               /* profile disabled/nonexistent */
 		if (!is_any(srcintf) && !valid_ifname(srcintf))
 			continue;               /* fail-safe against injection */
-		if (!ssl_steer_allowed(prof, ipst, ipp))
+		if (!ssl_steer_allowed(prof, ipst, ipp))	//deep SSL inspection only decrypts when the policy has IPS enabled. Returns 1 if the policy is allowed to steer into ssld; 0 if the profile is DEEP but the policy's IPS is off → skip (traffic flows as a normal accept, NO decryption — matching the requirement that "ssl inspection serves IPS"). Certificate mode never decrypts, so it is always allowed to steer (only peeks SNI/splice).
 			continue;               /* deep but IPS off → no decryption */
 
 		/* protect-server (inbound reverse): scope the REDIRECT to the VIP so it
@@ -195,13 +206,29 @@ int emit_ssl_steering(struct dynbuf *buf)
 			   ? sg_db_get_val(SSL_PROF_TYPE, prof, "protect-vip") : NULL;
 		int have_vip = pvip && valid_ipv4(pvip);
 
+		/* Scope the REDIRECT by the policy's source (and, for outbound, its
+		 * destination) address so it does not grab :443 flows belonging to
+		 * OTHER policies on the same interface. This narrows the coarse
+		 * PREROUTING match toward the policy's selectors — it does NOT fully
+		 * reproduce the FORWARD policy match (service/schedule are not applied
+		 * here); any/all/FQDN leave that dimension broad. */
+		char *psa = sg_db_get_val("firewall_policy", id, "srcaddr");	//policy source address object name (may be "all" or an address object)
+		char *pda = sg_db_get_val("firewall_policy", id, "dstaddr");
+		char sabuf[VALBUFSZ], dabuf[VALBUFSZ];	// Buffer to store resolved source and destination addresses
+
 		dbuf_printf(buf, "-A PREROUTING");
 		if (!is_any(srcintf))
 			dbuf_printf(buf, " -i %s", srcintf);
+		if (psa && resolve_address_ex(psa, sabuf, sizeof(sabuf)) == ADDR_CIDR)
+			dbuf_printf(buf, " -s %s", sabuf);
 		if (have_vip)
 			dbuf_printf(buf, " -d %s", pvip);
+		else if (pda && resolve_address_ex(pda, dabuf, sizeof(dabuf)) == ADDR_CIDR)
+			dbuf_printf(buf, " -d %s", dabuf);
 		dbuf_printf(buf, " -p tcp --dport 443 -j REDIRECT --to-ports %d\n",
 			    port);
+		free(psa);
+		free(pda);
 		mgmt_log("INFO", "SSL steering: policy %s prof=%s -i %s%s%s tcp:443 -> :%d",
 			 id, prof, is_any(srcintf) ? "any" : srcintf,
 			 have_vip ? " -d " : "", have_vip ? pvip : "", port);
@@ -256,6 +283,69 @@ static int write_reverse_to(const char *path, const char *vip, const char *cert,
 		(bport && *bport) ? bport : "443", (sni && *sni) ? sni : "-");
 	fclose(f);
 	return 0;
+}
+
+/* Derive the backend of a protecting-server profile from the DNAT rule that
+ * publishes the same VIP: that rule's mapped-ip (+ mapped-port) become the
+ * backend ssld re-encrypts to. DNAT performs the public->private address
+ * translation and is the single source of truth for "where the server is"; the
+ * proxy merely inherits its destination (the FortiGate model). Returns 1 if a
+ * mapping was found (ip_out/port_out filled). */
+static int derive_backend_from_dnat(const char *vip, char *ip_out, size_t iplen,
+				    char *port_out, size_t portlen)
+{
+	if (!vip || !*vip)
+		return 0;
+	char *list = sg_db_list("network_nat");
+	if (!list)
+		return 0;
+	int found = 0, found443 = 0;
+	char *sp = NULL;
+	for (char *id = strtok_r(list, "\n", &sp); id && !found443;
+	     id = strtok_r(NULL, "\n", &sp)) {
+		char *data = sg_db_get("network_nat", id);
+		if (!data)
+			continue;
+		char nattype[VALBUFSZ], status[VALBUFSZ], dstaddr[VALBUFSZ];
+		char mip[VALBUFSZ], mport[VALBUFSZ], dport[VALBUFSZ];
+		extract_val(data, "type",        nattype, sizeof(nattype));
+		extract_val(data, "status",      status,  sizeof(status));
+		extract_val(data, "dstaddr",     dstaddr, sizeof(dstaddr));
+		extract_val(data, "dstport",     dport,   sizeof(dport));
+		extract_val(data, "mapped-ip",   mip,     sizeof(mip));
+		extract_val(data, "mapped-port", mport,   sizeof(mport));
+		free(data);
+		if (strcmp(nattype, "dnat") != 0 ||
+		    strcmp(status, "disable") == 0 || !mip[0])
+			continue;
+		/* dstaddr may be a raw CIDR or an address object → resolve, then
+		 * compare its host part to the VIP. */
+		char resolved[VALBUFSZ], host[VALBUFSZ];
+		const char *cidr = resolve_address(dstaddr, resolved,
+						   sizeof(resolved));
+		if (!cidr || strcmp(cidr, "SKIP") == 0)
+			continue;
+		snprintf(host, sizeof(host), "%s", cidr);
+		char *slash = strchr(host, '/');
+		if (slash)
+			*slash = '\0';
+		if (strcmp(host, vip) != 0)
+			continue;
+		/* Prefer the rule that covers :443 (a 1:1/all-ports rule or an
+		 * explicit --dport 443) so a per-port split (443→A, other→B) picks
+		 * the HTTPS backend; otherwise keep the first VIP match as fallback. */
+		int is443 = !dport[0] || !strcmp(dport, "443") ||
+			    !strcmp(dport, "all") || !strcmp(dport, "any");
+		if (found && !is443)
+			continue;
+		snprintf(ip_out, iplen, "%s", mip);
+		if (port_out)
+			snprintf(port_out, portlen, "%s", mport);
+		found = 1;
+		found443 = is443;
+	}
+	free(list);
+	return found;
 }
 
 /* 1 if any enabled accept policy that uses ssl-profile `prof` also has IPS on
@@ -337,7 +427,7 @@ static void ssld_input_access_sync(void)
 	ipt_exec(ij);
 	const char *fl[] = {"iptables", "-F", "SG_SSLD", NULL};
 	ipt_exec(fl);
-
+// Logic same as emit_ssl_steering: iterate in policy PRIORITY order (sequence DESC), matching the FORWARD chain (rebuild_forward_chain uses sg_db_list_ordered too). REDIRECT is a terminating NAT target, so when two policies overlap on a flow (e.g. one srcintf=any, one srcintf=lan1) the first emitted rule wins — that must be the higher-priority policy, not merely the lower-numbered policy id.
 	char *list = sg_db_list("firewall_policy");
 	if (!list)
 		return;
@@ -378,7 +468,7 @@ static void ssld_input_access_sync(void)
 		 * non-terminating → placed BEFORE the ACCEPT in the same chain, same
 		 * match. Only when the flow will actually be inspected (IPS on). */
 		char xmark[24] = "";
-		if (ips_policy_on(ipst, ipp)) {
+		if (ips_policy_on(ipst, ipp)) {	//Neu IPS disable, truong hop di xuong toi day chi la khi ssl mode dang la certificate mode thoi, con deep/protect server thi duoc xu ly o ssl_steer_allowed() ngay phia tren roi.
 			int pid = ips_profid(ipp);
 			if (pid >= 1 && pid <= 31)
 				snprintf(xmark, sizeof(xmark), "0x%x/0x%x",
@@ -467,6 +557,20 @@ void ssld_sync(void)
 				continue;
 			int port = SSL_PORT_BASE + idx; idx++;
 
+			/* Decrypting SSL inspection (protecting-server / deep) exists only to
+			 * feed IPS. If no bound accept policy has IPS on, don't run ssld for
+			 * it — matches emit_ssl_steering (no REDIRECT), so traffic flows
+			 * straight through. Certificate mode (SNI peek, no decryption) always
+			 * runs. The port slot above is still consumed so numbering stays in
+			 * sync with ssl_profile_port(). */
+			{
+				char *m = sg_db_get_val(SSL_PROF_TYPE, id, "inspection-method");
+				int cert_mode = m && strcmp(m, "certificate") == 0;
+				free(m);
+				if (!cert_mode && !profile_bound_ips_on(id))
+					continue;
+			}
+
 			char *mode   = sg_db_get_val(SSL_PROF_TYPE, id, "inspection-mode");
 			char *method = sg_db_get_val(SSL_PROF_TYPE, id, "inspection-method");
 			char *nosni  = sg_db_get_val(SSL_PROF_TYPE, id, "no-sni");
@@ -482,15 +586,14 @@ void ssld_sync(void)
 			/* protect-server (inbound reverse): write this profile's reverse map.
 			 * server-cert is the NAME of an imported certificate; resolve it to
 			 * the PEM files written by the import path. */
-			char *sc=NULL,*pvip=NULL,*pbk=NULL,*pbp=NULL,*psni=NULL;
+			char *sc=NULL,*pvip=NULL,*psni=NULL;
+			char dbip[VALBUFSZ]="", dbport[VALBUFSZ]="";  /* backend derived from the VIP's DNAT rule */
 			char certpath[300]="", keypath[300]="";
 			char revfile[256]; int rev_ok = 0; long cert_mtime = 0;
 			snprintf(revfile, sizeof(revfile), "%s/reverse-%s.rev", SSL_DIR, id);
 			if (protect) {
 				sc   = sg_db_get_val(SSL_PROF_TYPE, id, "server-cert");
 				pvip = sg_db_get_val(SSL_PROF_TYPE, id, "protect-vip");
-				pbk  = sg_db_get_val(SSL_PROF_TYPE, id, "protect-backend");
-				pbp  = sg_db_get_val(SSL_PROF_TYPE, id, "protect-backend-port");
 				psni = sg_db_get_val(SSL_PROF_TYPE, id, "protect-sni");
 				if (sc && *sc) {
 					snprintf(certpath, sizeof(certpath),
@@ -498,14 +601,31 @@ void ssld_sync(void)
 					snprintf(keypath, sizeof(keypath),
 						 "%s/certs/%s/key.pem", SSL_DIR, sc);
 				}
+				/* The backend comes from the DNAT rule that publishes
+				 * this VIP: DNAT performs the public→private address
+				 * translation, ssld only inherits its destination (the
+				 * FortiGate model). A protecting-server profile therefore
+				 * requires a DNAT rule for its VIP; the :443-scoped rule is
+				 * preferred so a per-port split (443→A, other→B) works. */
+				const char *eff_bk = NULL, *eff_bp = NULL;
+				if (pvip && *pvip &&
+				    derive_backend_from_dnat(pvip, dbip, sizeof(dbip),
+							     dbport, sizeof(dbport))) {
+					eff_bk = dbip;
+					if (dbport[0])
+						eff_bp = dbport;
+					mgmt_log("INFO", "ssld_sync: profile %s backend from "
+						 "DNAT (%s -> %s:%s)", id, pvip, dbip,
+						 dbport[0] ? dbport : "443");
+				}
 				rev_ok = (write_reverse_to(revfile, pvip,
 						certpath[0] ? certpath : NULL,
 						keypath[0]  ? keypath  : NULL,
-						pbk, pbp, psni) == 0);
+						eff_bk, eff_bp, psni) == 0);
 				if (!rev_ok)
 					mgmt_log("WARN", "ssld_sync: profile %s protect-server "
-						 "missing cert/vip/backend — inbound "
-						 "inspection disabled", id);
+						 "missing cert/vip or no DNAT rule for the VIP "
+						 "— inbound inspection disabled", id);
 				else {
 					struct stat cst;   /* cert rotated in place → restart */
 					if (certpath[0] && stat(certpath, &cst) == 0)
@@ -534,7 +654,7 @@ void ssld_sync(void)
 				 port, certificate, nosni_splice, untr_block, ipc_off,
 				 ipc_closed, rules_mtime, exempt ? exempt : "",
 				 protect, cert_mtime, sc?sc:"", keypath, pvip?pvip:"",
-				 pbk?pbk:"", pbp?pbp:"", psni?psni:"",
+				 dbip, dbport, psni?psni:"",
 				 prof_ips_on, blocksni ? blocksni : "");
 			dpos += (size_t)snprintf(desired + dpos, sizeof(desired) - dpos,
 						 "%s\t%s\n", id, sig);
@@ -591,7 +711,7 @@ void ssld_sync(void)
 					 SSLD_BIN, id);
 			}
 			free(mode); free(method); free(nosni); free(untr); free(exempt);
-			free(sc); free(pvip); free(pbk); free(pbp); free(psni);
+			free(sc); free(pvip); free(psni);
 			free(blocksni);
 		}
 		free(list);

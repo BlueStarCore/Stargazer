@@ -1306,6 +1306,27 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 			return 0;
 		}
 
+		/* GET /api/system/routes/live — live kernel routing table
+		 * (connected + static + default), parsed from `ip route`. */
+		if (strcmp(segs[1], "routes") == 0 &&
+		    nseg >= 3 && strcmp(segs[2], "live") == 0 &&
+		    mg_str_eq(hm->method, "GET")) {
+			work_item_t item;
+			memset(&item, 0, sizeof(item));
+			item.conn_id = c->id;
+			item.flow_type = FLOW_ROUTE_LIVE;
+			snprintf(item.username, sizeof(item.username),
+				 "%s", sess.username);
+			item.session_tag = sess.ipc_session_tag;
+
+			if (webd_pool_enqueue(&item) != 0) {
+				reply_json(c, 503,
+					   "{\"error\":\"Server busy\"}");
+				return -1;
+			}
+			return 0;
+		}
+
 		/* POST /api/system/reboot */
 		if (strcmp(segs[1], "reboot") == 0 &&
 		    mg_str_eq(hm->method, "POST")) {
@@ -1592,6 +1613,69 @@ int webd_api_dispatch(struct mg_http_message *hm, struct mg_connection *c)
 			return -1;
 		}
 		return 0;
+	}
+
+	/* ══ Local Reports (IPS/IDS) ═══ all return raw JSON → verbatim passthrough */
+	if (strcmp(segs[0], "reports") == 0 && nseg == 2) {
+		int is_get  = mg_str_eq(hm->method, "GET");
+		int is_post = mg_str_eq(hm->method, "POST");
+		uint32_t cmd = 0;
+		char pl[128] = "";
+
+		if (is_get && strcmp(segs[1], "list") == 0) {
+			cmd = SG_CMD_REPORT_LIST;
+		} else if (is_get && strcmp(segs[1], "get") == 0) {
+			cmd = SG_CMD_REPORT_GET;
+			char *id = query_param(hm->query, "id");
+			if (id && id[0]) snprintf(pl, sizeof(pl), "id=%s", id);
+			free(id);
+		} else if (is_get && strcmp(segs[1], "schedule") == 0) {
+			cmd = SG_CMD_REPORT_SCHED_GET;
+		} else if (is_post && strcmp(segs[1], "generate") == 0) {
+			cmd = SG_CMD_REPORT_GENERATE;
+			char *range = json_str(hm->body, "$.range");
+			char *type  = json_str(hm->body, "$.type");
+			snprintf(pl, sizeof(pl), "range=%s\ntype=%s",
+				 (range && range[0]) ? range : "7",
+				 (type  && type[0])  ? type  : "on-demand");
+			free(range); free(type);
+		} else if (is_post && strcmp(segs[1], "delete") == 0) {
+			cmd = SG_CMD_REPORT_DELETE;
+			char *id = json_str(hm->body, "$.id");
+			if (id && id[0]) snprintf(pl, sizeof(pl), "id=%s", id);
+			free(id);
+		} else if (is_post && strcmp(segs[1], "schedule") == 0) {
+			cmd = SG_CMD_REPORT_SCHED_SET;
+			char *mode = json_str(hm->body, "$.mode");
+			char *hour = json_str(hm->body, "$.hour");
+			char *minute = json_str(hm->body, "$.minute");
+			char *day  = json_str(hm->body, "$.day");
+			snprintf(pl, sizeof(pl), "mode=%s\nhour=%s\nminute=%s\nday=%s",
+				 (mode && mode[0]) ? mode : "off",
+				 (hour && hour[0]) ? hour : "2",
+				 (minute && minute[0]) ? minute : "0",
+				 (day  && day[0])  ? day  : "7");
+			free(mode); free(hour); free(minute); free(day);
+		}
+
+		if (cmd != 0) {
+			work_item_t item;
+			memset(&item, 0, sizeof(item));
+			item.conn_id = c->id;
+			item.ipc_cmd = cmd;
+			item.flow_type = FLOW_IPS_ALERTS_JSON;   /* verbatim JSON passthrough */
+			snprintf(item.username, sizeof(item.username), "%s", sess.username);
+			item.session_tag = sess.ipc_session_tag;
+			if (pl[0]) {
+				item.payload = strdup(pl);
+				item.payload_len = item.payload ? strlen(item.payload) : 0;
+			}
+			if (webd_pool_enqueue(&item) != 0) {
+				reply_json(c, 503, "{\"error\":\"Server busy\"}");
+				return -1;
+			}
+			return 0;
+		}
 	}
 
 	/* ── GET /api/ips/update-log ── tail ips-update.log ─────────────────── */

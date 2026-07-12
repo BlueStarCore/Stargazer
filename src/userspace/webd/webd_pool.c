@@ -1776,6 +1776,135 @@ il_done:
 	}
 }
 
+/* GET /api/system/routes/live — call SG_CMD_SHOW_ROUTES (`ip route`) and parse
+ * the kernel routing table into JSON so the Home>Network "Route Flows" widget
+ * shows connected + static + default routes (FortiGate-style), not just the
+ * configured static routes. Each line looks like:
+ *   default via 192.168.122.1 dev port1 proto static metric 5
+ *   192.168.1.0/24 dev port2 proto kernel scope link src 192.168.1.1
+ * type = CONNECTED when proto is "kernel" or the route is scope link, else STATIC. */
+static void flow_route_live(work_item_t *item)
+{
+	webd_ipc_response_t resp;
+	if (webd_ipc_send(SG_CMD_SHOW_ROUTES, item->username,
+			  item->session_tag, "", &resp) != 0) {
+		char *json = json_error("Backend unavailable", NULL);
+		send_result(item->conn_id, 502, json, json ? strlen(json) : 0);
+		return;
+	}
+	if (resp.status != SG_OK) {
+		send_ipc_error(item->conn_id, resp.status, resp.extra);
+		webd_ipc_resp_free(&resp);
+		return;
+	}
+
+	size_t cap = 512, len = 0;
+	char *json = malloc(cap);
+	if (!json) {
+		webd_ipc_resp_free(&resp);
+		char *j = json_error("Out of memory", NULL);
+		send_result(item->conn_id, 500, j, j ? strlen(j) : 0);
+		return;
+	}
+
+#define RL_APP(s, n) do { \
+	while (len + (n) >= cap) { \
+		cap *= 2; \
+		char *tmp = realloc(json, cap); \
+		if (!tmp) { free(json); json = NULL; goto rl_done; } \
+		json = tmp; \
+	} \
+	memcpy(json + len, (s), (n)); \
+	len += (n); \
+} while (0)
+
+	RL_APP("{\"routes\":[", 11);
+
+	int first = 1;
+	const char *p = resp.payload ? resp.payload : "";
+	while (*p) {
+		const char *nl = strchr(p, '\n');
+		size_t llen = nl ? (size_t)(nl - p) : strlen(p);
+
+		/* Skip blanks, indented continuation lines, and "(no routes)". */
+		if (llen == 0 || p[0] == ' ' || p[0] == '\t' || p[0] == '(') {
+			p = nl ? nl + 1 : p + llen;
+			continue;
+		}
+
+		char row[512];
+		if (llen >= sizeof(row)) llen = sizeof(row) - 1;
+		memcpy(row, p, llen);
+		row[llen] = '\0';
+
+		char dest[64] = "", gw[64] = "", iface[32] = "";
+		char proto[24] = "", metric[16] = "";
+		int scope_link = 0;
+
+		char *sp = NULL;
+		int idx = 0;
+		for (char *tok = strtok_r(row, " \t", &sp); tok;
+		     tok = strtok_r(NULL, " \t", &sp), idx++) {
+			if (idx == 0) {
+				if (strcmp(tok, "default") == 0)
+					snprintf(dest, sizeof(dest), "0.0.0.0/0");
+				else
+					snprintf(dest, sizeof(dest), "%s", tok);
+			} else if (strcmp(tok, "via") == 0) {
+				tok = strtok_r(NULL, " \t", &sp); if (!tok) break;
+				snprintf(gw, sizeof(gw), "%s", tok);
+			} else if (strcmp(tok, "dev") == 0) {
+				tok = strtok_r(NULL, " \t", &sp); if (!tok) break;
+				snprintf(iface, sizeof(iface), "%s", tok);
+			} else if (strcmp(tok, "proto") == 0) {
+				tok = strtok_r(NULL, " \t", &sp); if (!tok) break;
+				snprintf(proto, sizeof(proto), "%s", tok);
+			} else if (strcmp(tok, "metric") == 0) {
+				tok = strtok_r(NULL, " \t", &sp); if (!tok) break;
+				snprintf(metric, sizeof(metric), "%s", tok);
+			} else if (strcmp(tok, "scope") == 0) {
+				tok = strtok_r(NULL, " \t", &sp); if (!tok) break;
+				if (strcmp(tok, "link") == 0) scope_link = 1;
+			}
+		}
+		if (!dest[0]) { p = nl ? nl + 1 : p + llen; continue; }
+
+		const char *type = (strcmp(proto, "kernel") == 0 || scope_link)
+				   ? "CONNECTED" : "STATIC";
+		const char *dist = metric[0] ? metric : "0";
+
+		char *ed = json_escape(dest);
+		char *eg = json_escape(gw);
+		char *ei = json_escape(iface);
+		if (!ed || !eg || !ei) { free(ed); free(eg); free(ei); goto rl_done; }
+
+		char frag[320];
+		int fn = snprintf(frag, sizeof(frag),
+				  "%s{\"dest\":\"%s\",\"gw\":\"%s\",\"iface\":\"%s\","
+				  "\"type\":\"%s\",\"distance\":\"%s\"}",
+				  first ? "" : ",", ed, eg, ei, type, dist);
+		free(ed); free(eg); free(ei);
+		if (fn > 0) RL_APP(frag, (size_t)fn < sizeof(frag) ? (size_t)fn : sizeof(frag) - 1);
+		first = 0;
+
+		p = nl ? nl + 1 : p + llen;
+	}
+
+	RL_APP("]}", 2);
+	RL_APP("\0", 1);
+
+rl_done:
+	webd_ipc_resp_free(&resp);
+#undef RL_APP
+
+	if (json)
+		send_result(item->conn_id, 200, json, len > 0 ? len - 1 : 0);
+	else {
+		char *j = json_error("Out of memory", NULL);
+		send_result(item->conn_id, 500, j, j ? strlen(j) : 0);
+	}
+}
+
 static void flow_firmware_upload(work_item_t *item)
 {
 	/* item->payload = "path=/tmp/sg-fw-upload.<rand>\n" (per-upload file).
@@ -2011,10 +2140,12 @@ static void flow_ips_alerts(work_item_t *item)
 /* GET /api/ips/alerts-json — mgmtd returns a READY JSON array [{...}]. Send it
  * verbatim, NOT through flow_simple/kv_to_json (which assumes payload is
  * key=value → would mangle it). */
+/* Verbatim JSON passthrough: send item->ipc_cmd and return mgmtd's payload as-is
+ * (used by ips/alerts-json AND the reports endpoints, which all return raw JSON). */
 static void flow_ips_alerts_json(work_item_t *item)
 {
 	webd_ipc_response_t resp;
-	if (webd_ipc_send(SG_CMD_IPS_ALERTS_JSON, item->username,
+	if (webd_ipc_send(item->ipc_cmd, item->username,
 			  item->session_tag,
 			  item->payload ? item->payload : "", &resp) != 0) {
 		char *json = json_error("Backend unavailable", NULL);
@@ -2296,6 +2427,7 @@ static void *worker_fn(void *arg)
 		case FLOW_ADMIN_CREATE: flow_admin_create(&item);    break;
 		case FLOW_CONFIG_MOVE:    flow_simple(&item);           break;
 		case FLOW_IFACE_LIVE:     flow_iface_live(&item);      break;
+		case FLOW_ROUTE_LIVE:     flow_route_live(&item);      break;
 		case FLOW_FIRMWARE_UPLOAD: flow_firmware_upload(&item); break;
 		default:                  flow_simple(&item);           break;
 		}

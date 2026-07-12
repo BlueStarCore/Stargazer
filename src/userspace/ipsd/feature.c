@@ -43,8 +43,9 @@ static double sample_var(double sum, double sqsum, uint64_t n)
 }
 
 /* Mirror struct must match the kernel size; catch layout drift at build time.
- * 144 bytes on LP64 (x86-64 host + aarch64 target, same alignment rules). */
-_Static_assert(sizeof(struct sg_nf_conn_ml) == 152,
+ * 160 bytes on LP64 (x86-64 host + aarch64 target, same alignment rules) after
+ * appending init_win_fwd (u32 + 4B tail padding to the struct's 8B alignment). */
+_Static_assert(sizeof(struct sg_nf_conn_ml) == 160,
 	       "sg_nf_conn_ml layout differs from kernel nf_conn_ml — recheck field types/order");
 
 void feature_extract(const struct sg_nf_conn_ml *ml,

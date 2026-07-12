@@ -133,8 +133,11 @@ static void insp_ml_leg(struct insp_conn *c, struct insp_verdict_body *vb)
 	if (N < ML_CKP_PKTS && reass_inspected_bytes(&c->rf) < REASS_MAX_BYTES)
 		return;   /* not enough accumulated yet — wait for the checkpoint */
 
+	/* Init_Win_bytes_forward from CTA_ML (kernel captured the client SYN's
+	 * window at the LOCAL_IN ssld leg → no longer -1 for HTTPS flows). */
+	int32_t iwin = ctr.ml.init_win_fwd ? (int32_t)ctr.ml.init_win_fwd : -1;
 	struct ips_decision d = ips_ml_eval(&ctr, fs.pkts_fwd, fs.pkts_bwd,
-					    -1, g_ips_cfg);
+					    iwin, g_ips_cfg);
 	c->ml_done = 1;
 	vb->src    = 1;                 /* ML */
 	vb->score  = (float)d.score;
