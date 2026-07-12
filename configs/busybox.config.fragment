@@ -325,3 +325,8 @@ CONFIG_CROND=y
 CONFIG_FEATURE_CROND_D=y
 CONFIG_FEATURE_CROND_CALL_SENDMAIL=n
 CONFIG_FEATURE_CROND_DIR="/var/spool/cron"
+
+# `date` — required by the cron wrappers (ips-report-cron.sh / ips-update-cron.sh)
+# to read the current time (date +%H etc.) and by `date -s` to set the clock.
+# Without it those wrappers see an empty time and never fire.
+CONFIG_DATE=y

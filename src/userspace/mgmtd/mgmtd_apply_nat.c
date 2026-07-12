@@ -243,6 +243,17 @@ sg_status_t rebuild_nat_chains(char *result, size_t rsize)
 
 	dbuf_append(&buf, "*nat\n", 5);
 
+	/* SSL inspection steering (REDIRECT :443 into stargazer-ssld) MUST precede
+	 * the DNAT rules below in PREROUTING: DNAT and REDIRECT are both terminating
+	 * NAT targets, so whichever is appended first wins. Emitting the REDIRECT
+	 * first lets an enabled protecting-server profile intercept :443 to its VIP
+	 * for decryption + inspection, while the DNAT rule for that same VIP still
+	 * serves every OTHER port (and binds the VIP so it answers ARP via the
+	 * proxy-VIP step) and also takes over :443 when SSL inspection is disabled
+	 * (no REDIRECT emitted → traffic passes straight through to the server).
+	 * No-op if no accept policy binds an enabled ssl-inspection-profile. */
+	emit_ssl_steering(&buf);
+
 	/* Read all NAT entries ordered by sequence DESC (highest first) */
 	char *list = sg_db_list_ordered("network_nat", "sequence");
 	int snat_count = 0, dnat_count = 0;
@@ -337,11 +348,6 @@ sg_status_t rebuild_nat_chains(char *result, size_t rsize)
 		}
 		free(list);
 	}
-
-	/* SSL inspection: REDIRECT forwarded HTTPS into stargazer-ssld.
-	 * Emitted into the same *nat restore so the table stays atomic.
-	 * No-op if no accept policy binds an enabled ssl-inspection-profile. */
-	emit_ssl_steering(&buf);
 
 	dbuf_append(&buf, "COMMIT\n", 7);
 

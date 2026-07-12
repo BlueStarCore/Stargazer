@@ -93,7 +93,7 @@ sig-dump: $(BUILD)/sig_dump
 # `make et` downloads it automatically if missing.
 #   make et                                  # load + report
 #   make et PAYLOAD="USER root" DPORT=21      # load + test match
-ET_URL  := https://rules.emergingthreats.net/open/snort-2.9.0/rules/emerging-scan.rules
+ET_URL  := https://rules.emergingthreats.net/open/snort-2.9.20/rules/emerging-scan.rules
 RULES   ?= rules/emerging-scan.rules
 PAYLOAD ?=
 DPORT   ?=

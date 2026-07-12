@@ -67,7 +67,7 @@ static struct ipsd_config g_cfg = {
 	.enabled     = 1,
 	.mode        = IPS_MODE_PREVENT,
 	.thr_block   = 0.95,
-	.thr_alert   = 0.50,
+	.thr_alert   = 0.7,
 	.snapshot_n  = 8,
 	.queue_num   = 0,
 	.rules_path  = DEFAULT_RULES,
@@ -258,6 +258,9 @@ struct flow_slot {
 	struct flowbit_state fb;      /* P5 — per-flow flowbits */
 	uint8_t             ml_done;  /* ML scored at the checkpoint (once/flow) */
 	int8_t              is_tls;   /* 0=unknown, 1=TLS (skip signature), -1=cleartext */
+	uint8_t             profid;   /* IPS profile id, cached from the ORIGINAL
+				       * direction (skb mark). REPLY-direction packets
+				       * carry no mark → they inspect under this. */
 };
 
 static struct flow_slot g_flows[FLOW_BUCKETS];
@@ -310,7 +313,13 @@ static struct flow_slot *flow_get(const struct nfq_pkt *pkt,
 		memset(&s->fb, 0, sizeof(s->fb));       /* P5 — new flow: clean flowbits */
 		s->ml_done = 0;                         /* new flow: ML not yet scored */
 		s->is_tls  = 0;                         /* new flow: TLS not yet determined */
+		s->profid  = 0;                         /* new flow: profile not yet known */
 	}
+	/* Cache the profile id from the ORIGINAL direction (only it carries the skb
+	 * mark). REPLY-direction packets arrive mark-less → the caller falls back to
+	 * this so both directions inspect under the same profile. */
+	if (pkt->ips_prof_id)
+		s->profid = pkt->ips_prof_id;
 	int to_server = (pkt->src_ip == s->init_ip && pkt->sport == s->init_port);
 	*dir_out = to_server ? REASS_TO_SERVER : REASS_TO_CLIENT;
 	return s;
@@ -433,13 +442,9 @@ static void process_packet(struct nfq_ctx *nfq, struct nfq_pkt *pkt,
 			    struct sig_reload *sr,
 			    const struct ips_config *ips_cfg)
 {
-	/* [0] A forward SYN packet (SYN set, ACK clear) carries
-	 * Init_Win_bytes_forward — cache it for the ML scoring pass (the conntrack
-	 * dump does NOT have this window). */
-	if (pkt->proto == 6 && pkt->init_win >= 0 &&
-	    (pkt->tcp_flags & SIG_TCP_SYN) && !(pkt->tcp_flags & SIG_TCP_ACK))
-		ml_iwin_put(pkt->proto, pkt->src_ip, pkt->dst_ip,
-			    pkt->sport, pkt->dport, pkt->init_win);
+	/* [0] Init_Win_bytes_forward now comes straight from conntrack CTA_ML
+	 * (ml->init_win_fwd — captured in the kernel ml_account on the forward SYN,
+	 * including the ssld/HTTPS leg). No userspace SYN-window cache is needed. */
 
 	/* [1] Get flow stats from conntrack */
 	struct ctdump_result ctr;
@@ -459,10 +464,11 @@ static void process_packet(struct nfq_ctx *nfq, struct nfq_pkt *pkt,
 		pkts_fwd = fs.pkts_fwd;
 		pkts_bwd = fs.pkts_bwd;
 		ctdump_to_features(&ctr, pkts_fwd, pkts_bwd,
-				   pkt->init_win, feat);
+				   ctr.ml.init_win_fwd ? (int32_t)ctr.ml.init_win_fwd : -1,
+				   feat);
 	}
 
-	/* [2] Evaluate: L1-builtin → L1-user → L2-payload → ML */
+	/* [2] Evaluate: L1- → L2-payload → ML */
 	struct flow_ctx fc;
 	nfq_pkt_to_flow_ctx(pkt, &fc);
 	/* P6 — flow: established = reverse-direction traffic has been seen (proxy).
@@ -489,6 +495,11 @@ static void process_packet(struct nfq_ctx *nfq, struct nfq_pkt *pkt,
 		struct flow_slot *slot = flow_get(pkt, &rs->ac, &dir);
 		if (slot) {
 			fc.to_server = (dir == REASS_TO_SERVER) ? 1 : 0;   /* P6 */
+			/* REPLY-direction packets carry no skb mark → recover the
+			 * profile cached from the ORIGINAL direction so the response
+			 * payload is inspected under the same profile. */
+			if (fc.prof_id == 0 && slot->profid)
+				fc.prof_id = slot->profid;
 			fc.fb = &slot->fb;                                 /* P5 */
 			struct l2_match mm = { .rs = rs, .rf = &slot->rf,
 					       .fc = fc, .fb = &slot->fb,
@@ -552,10 +563,8 @@ static void process_packet(struct nfq_ctx *nfq, struct nfq_pkt *pkt,
 				 * the flow is about to be offloaded, score ML before it escapes. */
 				if (fin_rst || N >= ML_CKP_PKTS || age >= ML_CKP_AGE_NS ||
 				    reass_inspected_bytes(&slot->rf) >= REASS_MAX_BYTES) {
-					int32_t iwin = ml_iwin_get(pkt->proto,
-						pkt->src_ip, pkt->dst_ip,
-						pkt->sport, pkt->dport);
-					if (iwin < 0) iwin = pkt->init_win;
+					int32_t iwin = ctr.ml.init_win_fwd
+						       ? (int32_t)ctr.ml.init_win_fwd : -1;
 					d = ips_ml_eval(&ctr, fs.pkts_fwd,
 							fs.pkts_bwd, iwin, ips_cfg);
 					double sc = d.score;

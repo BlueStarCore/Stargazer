@@ -206,34 +206,59 @@ static uint32_t line_sid(const char *line)
 
 
 /* Write /etc/stargazer/ips/.update.conf for cron (ips-update-cron.sh) to read —
- * avoids cron having to call ipc-cli (auth issue). Lists every enabled ruleset
- * from the security_ips-ruleset table. */
+ * avoids cron having to call ipc-cli (auth issue). Carries the scheduled-update
+ * spec (source of truth = the WebUI Schedule tab / the security_ips cron-* keys)
+ * plus every enabled ruleset URL. The static crontab runs the wrapper every
+ * minute; the wrapper matches these five cron fields against the current time
+ * and fires the download only on a match. */
 static void ips_write_update_conf(void)
 {
-	char *en = sg_db_get_val("security_ips", "0", "auto-update");
-	FILE *f  = fopen("/etc/stargazer/ips/.update.conf", "w");
-	if (!f) { free(en); return; }
+	FILE *f = fopen("/etc/stargazer/ips/.update.conf", "w");
+	if (!f) return;
 
-	fprintf(f, "enabled=%s\n", (en && en[0]) ? en : "disable");
-	free(en);
+	/* Cron schedule fields (mirror the validation defaults in sg_validate.c). */
+	static const struct { const char *key, *label, *dflt; } cf[] = {
+		{ "cron-enabled", "cron_enabled", "disable" },
+		{ "cron-minutes", "cron_min",     "0" },
+		{ "cron-hours",   "cron_hour",    "0" },
+		{ "cron-dom",     "cron_dom",     "*" },
+		{ "cron-months",  "cron_mon",     "*" },
+		{ "cron-dow",     "cron_dow",     "*" },
+	};
+	for (size_t i = 0; i < sizeof(cf) / sizeof(cf[0]); i++) {
+		char *v = sg_db_get_val("security_ips", "0", cf[i].key);
+		fprintf(f, "%s=%s\n", cf[i].label, (v && v[0]) ? v : cf[i].dflt);
+		free(v);
+	}
 
-	/* List enabled entries from security_ips-ruleset */
+	/* CSV of enabled ruleset IDs. The wrapper hands this straight to
+	 * SG_CMD_IPS_UPDATE_NOW — the SAME path the WebUI "Update Now" button
+	 * uses (run_ips_update_now) — so a scheduled run downloads, stamps
+	 * last-downloaded (the GUI "LAST UPDATED" column), and hot-reloads
+	 * identically to a manual update. No per-URL shell loop / category
+	 * derivation needed on the device. */
+	char csv[1024];
+	size_t cpos = 0;
+	csv[0] = '\0';
 	char *ids = sg_db_list("security_ips-ruleset");
-	int count = 0;
 	if (ids) {
 		char *sp = NULL;
 		for (char *id = strtok_r(ids, "\n", &sp); id;
 		     id = strtok_r(NULL, "\n", &sp)) {
 			char *ena = sg_db_get_val("security_ips-ruleset", id, "enabled");
 			char *url = sg_db_get_val("security_ips-ruleset", id, "url");
-			if (ena && strcmp(ena, "enable") == 0 && url && url[0])
-				fprintf(f, "url_%d=%s\n", count++, url);
+			if (ena && strcmp(ena, "enable") == 0 && url && url[0]) {
+				int n = snprintf(csv + cpos, sizeof(csv) - cpos,
+						 "%s%s", cpos ? "," : "", id);
+				if (n > 0 && (size_t)n < sizeof(csv) - cpos)
+					cpos += (size_t)n;
+			}
 			free(ena);
 			free(url);
 		}
 		free(ids);
 	}
-	fprintf(f, "url_count=%d\n", count);
+	fprintf(f, "ids=%s\n", csv);
 	fclose(f);
 }
 

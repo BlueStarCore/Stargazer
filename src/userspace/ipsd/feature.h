@@ -63,6 +63,7 @@ struct sg_nf_conn_ml {
 	uint32_t syn_count, ack_count, psh_count, urg_count;
 	uint32_t pktlen_count;                    /* payload sample count (both directions) */
 	uint64_t bwd_pktlen_sq_sum;               /* reply-dir payload Σx² → Bwd Packet Length Std */
+	uint32_t init_win_fwd;                    /* TCP window of the forward SYN (kernel-captured); 0 = not seen */
 };
 
 /*

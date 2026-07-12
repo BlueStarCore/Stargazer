@@ -109,7 +109,12 @@ start_crond() {
     # it out then starting again guarantees exactly ONE crond (safe for both start and restart).
     killall crond 2>/dev/null
     log "Starting crond..."
-    crond -b -c /var/spool/cron/crontabs 2>/dev/null && log "crond OK" || log "crond FAIL"
+    # -l 9: busybox crond defaults to log level 8, which prints a "USER root pid N
+    # cmd ..." line for EVERY job dispatch. The report wrapper runs every minute
+    # (to catch the scheduled HH:MM) and mostly just exits, so at level 8 crond
+    # floods the console once a minute. -l 9 raises the threshold so routine
+    # dispatch lines are suppressed while real errors (level >= 9) still log.
+    crond -b -l 9 -c /var/spool/cron/crontabs 2>/dev/null && log "crond OK" || log "crond FAIL"
 }
 
 case "$1" in

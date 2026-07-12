@@ -352,12 +352,9 @@ fi
 # AND at least one policy has ips-profile=default), and stops ipsd when no rules remain.
 # Init does not start ipsd directly — just as webd is supervised by mgmtd.
 
-# crond — runs the IPS signature auto-update schedule (wrapper self-checks the enable/disable config).
-if command -v crond >/dev/null 2>&1; then
-	mkdir -p /var/spool/cron/crontabs
-	crond -b -c /var/spool/cron/crontabs -L /dev/null 2>/dev/null \
-		&& echo "[stargazer] crond started (IPS auto-update schedule)"
-fi
+# crond is started by /etc/init.d/stargazer (start_crond, called above at boot)
+# which does a killall+start so exactly ONE crond runs — do not start a second
+# one here (a duplicate crond fires every cron job twice).
 
 # Create commands (remove busybox symlinks first to avoid "Text file busy")
 rm -f /sbin/service /sbin/poweroff /sbin/reboot /sbin/halt /sbin/shutdown

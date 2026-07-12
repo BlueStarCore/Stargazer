@@ -118,6 +118,9 @@
                     <div class="nav-sub-item" data-page="fw-log">
                         <span class="sub-label">FIREWALL LOG</span>
                     </div>
+                    <div class="nav-sub-item" data-page="reports">
+                        <span class="sub-label">REPORTS</span>
+                    </div>
                 </div>
             </div>
 
@@ -946,6 +949,8 @@
                                 <th>TIMESTAMP</th>
                                 <th>SID</th>
                                 <th>ACTION</th>
+                                <th>SEVERITY</th>
+                                <th>CONFIDENCE</th>
                                 <th>PROTO</th>
                                 <th>SOURCE</th>
                                 <th>DESTINATION</th>
@@ -964,6 +969,159 @@
                         <div class="modal-body" id="ips-alert-detail-body"></div>
                         <div class="modal-footer">
                             <button class="btn" id="ips-alert-detail-close2">Close</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ======== LOG & REPORT > REPORTS PAGE (IPS/IDS) ======== -->
+            <div id="page-reports" class="page" style="display:none">
+                <div class="page-header"><h1 class="page-title">REPORTS</h1></div>
+
+                <!-- LIST VIEW: generated report entries + Generate/Schedule -->
+                <div id="reports-list-view">
+                    <div class="form-card">
+                        <div class="toolbar" style="margin:8px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                            <label class="form-label" style="margin:0">Range</label>
+                            <select class="form-input" id="report-gen-range" style="width:auto;min-width:150px">
+                                <option value="1">Last 24 hours</option>
+                                <option value="7" selected>Last 7 days</option>
+                                <option value="30">Last 30 days</option>
+                                <option value="0">All available</option>
+                            </select>
+                            <button class="btn btn-primary" id="report-generate">Generate Now</button>
+                            <button class="btn" id="report-schedule-btn">Report Schedule</button>
+                            <span id="report-sched-status" style="font-size:12px;color:#666;margin-left:4px"></span>
+                            <button class="btn" id="reports-refresh" style="margin-left:auto">Refresh</button>
+                        </div>
+                        <div class="table-scroll">
+                            <table class="data-table" id="reports-table">
+                                <thead><tr>
+                                    <th>NAME</th><th>DATA START</th><th>DATA END</th><th>SIZE</th><th></th>
+                                </tr></thead>
+                                <tbody id="reports-tbody"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- VIEWER VIEW: a single opened report (hidden until an entry is opened) -->
+                <div id="reports-viewer-view" style="display:none">
+                    <div class="form-card report-controls">
+                        <div class="toolbar" style="margin:8px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                            <button class="btn" id="report-back">&larr; Back to reports</button>
+                            <button class="btn btn-primary" id="report-print">Print / Save PDF</button>
+                            <span id="report-status" style="font-size:12px;color:#666;margin-left:8px"></span>
+                        </div>
+                    </div>
+
+                    <!-- Printable report document -->
+                    <div id="report-root" class="report-doc">
+                    <div class="report-cover">
+                        <div class="report-brand">Stargazer NGFW</div>
+                        <h1 class="report-title">IPS / IDS Security Report</h1>
+                        <div class="report-meta">
+                            <div>Report generated: <span id="rpt-generated">&mdash;</span></div>
+                            <div>Data range: <span id="rpt-range">&mdash;</span></div>
+                            <div>Host: <span id="rpt-host">&mdash;</span></div>
+                        </div>
+                    </div>
+
+                    <div class="report-section">
+                        <h2 class="report-h2">Summary</h2>
+                        <div class="report-stat-grid" id="rpt-summary"></div>
+                    </div>
+
+                    <div class="report-section">
+                        <h2 class="report-h2">Intrusion History</h2>
+                        <div class="report-canvas-wrap">
+                            <canvas id="rpt-history" width="920" height="240"></canvas>
+                        </div>
+                        <div class="report-hint" id="rpt-history-hint"></div>
+                    </div>
+
+                    <div class="report-section">
+                        <h2 class="report-h2">Intrusions by Severity <span class="report-note">(signature detections only &mdash; each rule's signature_severity / classtype)</span></h2>
+                        <div id="rpt-severity"></div>
+                    </div>
+
+                    <div class="report-section">
+                        <h2 class="report-h2">ML Anomaly Detections <span class="report-note">(an anomaly detector has no threat severity &mdash; shown by model confidence)</span></h2>
+                        <div id="rpt-ml-anomalies"></div>
+                    </div>
+
+                    <div class="report-section">
+                        <h2 class="report-h2">Top Intrusions Detected</h2>
+                        <div id="rpt-top-intrusions"></div>
+                    </div>
+
+                    <div class="report-section">
+                        <h2 class="report-h2">Top Intrusions Blocked</h2>
+                        <div id="rpt-top-blocked"></div>
+                    </div>
+
+                    <div class="report-section">
+                        <h2 class="report-h2">Top Intrusion Sources</h2>
+                        <div id="rpt-top-sources"></div>
+                    </div>
+
+                    <div class="report-section">
+                        <h2 class="report-h2">Top Intrusion Victims</h2>
+                        <div id="rpt-top-victims"></div>
+                    </div>
+
+                    <div class="report-section">
+                        <h2 class="report-h2">Traffic Snapshot <span class="report-note">(live at report generation &mdash; current active flows from conntrack, not a historical total)</span></h2>
+                        <div class="report-stat-grid" id="rpt-traffic"></div>
+                    </div>
+
+                    <div class="report-section">
+                        <h2 class="report-h2">Admin Login Summary <span class="report-note">(successful logins per administrator, this range)</span></h2>
+                        <div id="rpt-admin-logins"></div>
+                    </div>
+
+                    <div class="report-section">
+                        <h2 class="report-h2">Failed Logins <span class="report-note">(failed login attempts per user, this range)</span></h2>
+                        <div id="rpt-failed-logins"></div>
+                    </div>
+
+                    <div class="report-footer">Stargazer NGFW &mdash; IPS/IDS Security Report</div>
+                    </div><!-- /#report-root -->
+                </div><!-- /#reports-viewer-view -->
+
+                <!-- Report Schedule modal -->
+                <div class="modal-overlay" id="report-sched-modal" style="display:none">
+                    <div class="form-card" style="max-width:480px;width:90vw" role="dialog" aria-modal="true">
+                        <div class="form-section"><span class="modal-title-text">REPORT SCHEDULE</span><button class="modal-close" type="button" id="report-sched-close">&#10005;</button></div>
+                        <div class="modal-body">
+                            <div class="form-grid">
+                                <div class="form-row" data-key="mode"><label class="form-label">Frequency</label>
+                                    <select class="form-input" id="sched-mode">
+                                        <option value="off">Off (on-demand only)</option>
+                                        <option value="daily">Daily</option>
+                                        <option value="weekly">Weekly</option>
+                                    </select>
+                                </div>
+                                <div class="form-row" data-key="day" id="sched-day-row"><label class="form-label">Day of week</label>
+                                    <select class="form-input" id="sched-day">
+                                        <option value="1">Monday</option><option value="2">Tuesday</option>
+                                        <option value="3">Wednesday</option><option value="4">Thursday</option>
+                                        <option value="5">Friday</option><option value="6">Saturday</option>
+                                        <option value="7">Sunday</option>
+                                    </select>
+                                </div>
+                                <div class="form-row" data-key="time"><label class="form-label">Time</label>
+                                    <input class="form-input" type="time" id="sched-time" value="02:00">
+                                </div>
+                                <div class="form-row form-row-full" data-key="email"><label class="form-label">Email generated reports</label>
+                                    <span style="font-size:12px;color:#999">Coming soon &mdash; not yet available</span>
+                                </div>
+                            </div>
+                            <div class="report-note" style="margin-top:8px">Daily reports cover the last 24 hours; weekly reports cover the last 7 days. Generated automatically at the chosen time.</div>
+                        </div>
+                        <div class="modal-footer">
+                            <button class="btn btn-primary" id="sched-save">Save</button>
+                            <button class="btn" id="report-sched-cancel">Cancel</button>
                         </div>
                     </div>
                 </div>
@@ -1173,8 +1331,6 @@
                             <!-- Protecting SSL Server (inbound) -->
                             <div class="form-row" data-mode="protecting-server" data-key="server-cert"><label class="form-label">Server Certificate</label><select class="form-input server-cert-select"><option value="">-- Select imported certificate --</option></select></div>
                             <div class="form-row" data-mode="protecting-server" data-key="protect-vip"><label class="form-label">VIP / WAN IP</label><input class="form-input" type="text" placeholder="203.0.113.10"></div>
-                            <div class="form-row" data-mode="protecting-server" data-key="protect-backend"><label class="form-label">Backend Server IP</label><input class="form-input" type="text" placeholder="10.0.0.20"></div>
-                            <div class="form-row" data-mode="protecting-server" data-key="protect-backend-port"><label class="form-label">Backend Port</label><input class="form-input" type="number" min="1" max="65535" placeholder="443"></div>
                             <div class="form-row" data-mode="protecting-server" data-key="protect-sni"><label class="form-label">Pin SNI (optional)</label><input class="form-input" type="text" placeholder="www.example.com"></div>
                             <div class="form-row form-row-full form-row-wide" data-key="exempt"><label class="form-label">Exempt domains (SNI)</label><input class="form-input" type="text" placeholder="*.bank.com,*.health.gov"></div>
                             <div class="form-row form-row-full form-row-wide" data-key="comment"><label class="form-label">Comment</label><input class="form-input" type="text" placeholder="Optional description" maxlength="255"></div>

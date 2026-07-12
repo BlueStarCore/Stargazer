@@ -16,6 +16,7 @@
 #include <poll.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -211,6 +212,16 @@ int bump_run(int client_fd, const char *sni, const struct sockaddr_in *dst,
 		cfg->reverse ? " (reverse)" : "",
 		cfg->verify_upstream ? " (verified)" : "");
 
+	/* Break the poll/OpenSSL-buffer deadlock: after the handshake the peer may
+	 * send TLS 1.3 post-handshake records (NewSessionTicket) that make one
+	 * side readable with no app data; a blocking SSL_read would then wait for
+	 * app data that never comes until we relay the other direction. A short
+	 * recv timeout lets SSL_read return WANT_READ so we go back to poll. */
+	{
+		struct timeval rto = { .tv_sec = 0, .tv_usec = 20000 }; /* 20 ms */
+		setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &rto, sizeof(rto));
+		setsockopt(up_fd,     SOL_SOCKET, SO_RCVTIMEO, &rto, sizeof(rto));
+	}
 	/* -- [3] relay plaintext both ways + inspect ------------------------ */
 	{
 		int c_open = 1, u_open = 1, blocked = 0;

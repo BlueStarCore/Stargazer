@@ -2174,7 +2174,12 @@ static int mgmtd_first_boot_seed(void)
 
 	/* ── IPS ruleset sources (builtin defaults) ──────────────────── */
 	/* Seeded non-critically: if they fail, don't block boot */
-#define ET_BASE "https://rules.emergingthreats.net/open/snort-2.9.0/rules/"
+/* ET Open serves ONE current snort-2.9 ruleset for any /open/snort-2.9.x/ path —
+ * the version in the URL is a label the server ignores (verified: identical
+ * bytes for 2.9.0, 2.9.13, 2.9.20). We name 2.9.20, the last/highest Snort 2.9
+ * release still in ET's QA, purely as documentation. Snort-2.9 syntax is what
+ * ipsd's sig parser expects (unknown keywords are skipped safely). */
+#define ET_BASE "https://rules.emergingthreats.net/open/snort-2.9.20/rules/"
 	sg_db_set("security_ips-ruleset", "et-botcc",
 		  "description=ET open/botcc (Command-and-Control)\n"
 		  "url=" ET_BASE "emerging-botcc.rules\n"
@@ -2501,7 +2506,12 @@ static void mgmtd_reconcile_config(void)
 	 * boot, so rulesets added by new firmware land even when the DB was
 	 * originally seeded by an older build (BOOT_NORMAL path). */
 	{
-#define ET_BASE "https://rules.emergingthreats.net/open/snort-2.9.0/rules/"
+/* ET Open serves ONE current snort-2.9 ruleset for any /open/snort-2.9.x/ path —
+ * the version in the URL is a label the server ignores (verified: identical
+ * bytes for 2.9.0, 2.9.13, 2.9.20). We name 2.9.20, the last/highest Snort 2.9
+ * release still in ET's QA, purely as documentation. Snort-2.9 syntax is what
+ * ipsd's sig parser expects (unknown keywords are skipped safely). */
+#define ET_BASE "https://rules.emergingthreats.net/open/snort-2.9.20/rules/"
 		static const struct { const char *id; const char *data; } ips_rs[] = {
 			{ "et-botcc",
 			  "description=ET open/botcc (Command-and-Control)\n"
@@ -5080,6 +5090,80 @@ static int handle_factory_reset(int client_fd, const char *user,
 	return 0;
 }
 
+/* Normalize an IPS category name for comparison: trim ASCII whitespace and
+ * fold to lower case (ET category names are matched case-insensitively). */
+static void ips_norm_category(const char *in, char *out, size_t cap)
+{
+	while (*in == ' ' || *in == '\t')
+		in++;
+	size_t n = strlen(in);
+	while (n > 0 && (in[n - 1] == ' ' || in[n - 1] == '\t'))
+		n--;
+	size_t i = 0;
+	for (; i < n && i + 1 < cap; i++)
+		out[i] = (char)tolower((unsigned char)in[i]);
+	out[i] = '\0';
+}
+
+/* Within ONE IPS profile a filter must be unique by (kind, normalized value):
+ * signatures compare numerically (leading zeros / surrounding whitespace),
+ * categories case-fold + trim. A signature and a category are different kinds
+ * (a per-SID override layered on a category base) → they never collide with
+ * each other. db_id is "<profid>/<seq>"; scan the siblings that share the
+ * "<profid>/" prefix, skipping db_id itself so editing a filter's own
+ * action/status is not flagged against its own row. *nsib (if non-NULL)
+ * receives the count of sibling filters (excluding self). Returns 1 on a
+ * duplicate, else 0. */
+static int ips_filter_is_dup(const char *db_id, const char *ru, const char *ca,
+			     int *nsib)
+{
+	if (nsib)
+		*nsib = 0;
+	const char *slash = strchr(db_id, '/');
+	if (!slash)
+		return 0;
+	size_t pfxlen = (size_t)(slash - db_id) + 1;    /* "<profid>/" */
+	unsigned long new_sid = (ru && ru[0]) ? strtoul(ru, NULL, 10) : 0;
+	char new_cat[VALBUFSZ] = "";
+	if (ca && ca[0])
+		ips_norm_category(ca, new_cat, sizeof(new_cat));
+
+	char *fl = sg_db_list("security_ips-filter");
+	if (!fl)
+		return 0;
+	int dup = 0;
+	char *sp = NULL;
+	for (char *fid = strtok_r(fl, "\n", &sp); fid;
+	     fid = strtok_r(NULL, "\n", &sp)) {
+		if (strncmp(fid, db_id, pfxlen) != 0)
+			continue;                       /* different profile */
+		if (strcmp(fid, db_id) == 0)
+			continue;                       /* self */
+		if (nsib)
+			(*nsib)++;
+		if (dup)
+			continue;
+		if (ru && ru[0]) {
+			char *o = sg_db_get_val("security_ips-filter", fid, "rule");
+			if (o && o[0] && strtoul(o, NULL, 10) == new_sid)
+				dup = 1;
+			free(o);
+		} else if (ca && ca[0]) {
+			char *o = sg_db_get_val("security_ips-filter", fid,
+						"category");
+			if (o && o[0]) {
+				char on[VALBUFSZ];
+				ips_norm_category(o, on, sizeof(on));
+				if (strcmp(on, new_cat) == 0)
+					dup = 1;
+			}
+			free(o);
+		}
+	}
+	free(fl);
+	return dup;
+}
+
 /* ── Request handler ────────────────────────────────────────────────────── */
 
 static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
@@ -5429,6 +5513,28 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 				free(existing);
 				send_error(client_fd, SG_ERR_INVALID_ARG,
 					   "set exactly one of 'rule' or 'category'");
+				return 0;
+			}
+
+			/* Reject a duplicate filter within the same profile: at
+			 * most one filter per (kind, normalized value). Editing a
+			 * filter's action/status keeps its own value → not flagged
+			 * (self is skipped). */
+			int nsib = 0;
+			if (ips_filter_is_dup(db_id, ru, ca, &nsib)) {
+				free(existing);
+				send_error(client_fd, SG_ERR_INVALID_ARG,
+					   ru[0] ? "Signature already in this profile"
+						 : "Category already in this profile");
+				return 0;
+			}
+			/* Cap per-profile filters (matches MAX_FILTERS in
+			 * mgmtd_apply_ips.c — extra rows are dropped at compile). */
+			if (is_new_entry && nsib >= 256) {
+				free(existing);
+				send_error(client_fd, SG_ERR_INVALID_VAL,
+					   "Reached the limit of 256 filters "
+					   "per profile");
 				return 0;
 			}
 		}
@@ -7375,6 +7481,19 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 
 	case SG_CMD_IPS_ALERTS_JSON:
 		return handle_ips_alerts_json(client_fd, user, payload, hdr);
+
+	case SG_CMD_REPORT_GENERATE:
+		return handle_report_generate(client_fd, user, payload, hdr);
+	case SG_CMD_REPORT_LIST:
+		return handle_report_list(client_fd, user, payload, hdr);
+	case SG_CMD_REPORT_GET:
+		return handle_report_get(client_fd, user, payload, hdr);
+	case SG_CMD_REPORT_DELETE:
+		return handle_report_delete(client_fd, user, payload, hdr);
+	case SG_CMD_REPORT_SCHED_GET:
+		return handle_report_sched_get(client_fd, user, payload, hdr);
+	case SG_CMD_REPORT_SCHED_SET:
+		return handle_report_sched_set(client_fd, user, payload, hdr);
 
 	case SG_CMD_IPS_UPDATE_LOG:
 		return handle_ips_update_log(client_fd, user, payload, hdr);
