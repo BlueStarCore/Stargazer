@@ -1,0 +1,77 @@
+# Build artifacts
+build/
+*.ko
+*.o
+*.mod
+*.mod.c
+*.order
+*.symvers
+.*.cmd
+.tmp_versions/
+.cache.mk
+
+# Kernel source (large external dependency ~500MB)
+/kernel/
+
+# LightGBM (clone externally)
+./stargazer-lightgbm/
+
+# Rootfs (generated)
+./stargazer-rootfs/
+rootfs/
+*.img
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Do not commit copyrighted book PDFs or other proprietary documents
+docs/*.pdf
+
+# Private keys & secrets
+*.pem
+*.key
+.env
+
+# Cache
+.cache/
+*.tmp
+
+# AI conversation exchange
+ai-conversation/
+
+# Local code-intelligence index (codegraph MCP)
+.codegraph/
+
+# ML training / pcap-tooling artifacts (not source code, large in size)
+CICFlowMeter/
+Machine Learning/
+*.pcap
+error_screenshot.png
+
+# Pentest / lab artifacts (not source code — reproducible, do not commit)
+hulk/
+hydra.restore
+*.restore
+rockyou*.txt
+stargazer-ca.crt
+*.crt
+__pycache__/
+
+# Test files — kept on disk for local `make test`, not part of the submission
+*_test.c
+/tests/
+scripts/test_*.sh
+scripts/qemu-selftest.py
+
+# ML host-only training/parity tools (not compiled into any daemon)
+src/userspace/ipsd/pcap_feat.c
+
+# Lab scaffolding (reproducible, removed from tree)
+/lab/

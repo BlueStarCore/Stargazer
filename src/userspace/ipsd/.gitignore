@@ -1,0 +1,4 @@
+build/
+# ET OPEN ruleset downloaded (third-party, regenerate with `make rules-fetch`).
+# Kept on disk across reboots but not committed to the repo.
+rules/emerging-*.rules

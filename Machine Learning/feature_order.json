@@ -1,0 +1,19 @@
+[
+  "Flow IAT Std",
+  "Flow IAT Min",
+  "Flow IAT Mean",
+  "Fwd IAT Std",
+  "Packet Length Variance",
+  "Packet Length Std",
+  "Fwd Packet Length Mean",
+  "Bwd Packet Length Mean",
+  "SYN Flag Count",
+  "ACK Flag Count",
+  "PSH Flag Count",
+  "URG Flag Count",
+  "Down/Up Ratio",
+  "Init_Win_bytes_forward",
+  "Total Length of Fwd Packets",
+  "Flow Duration",
+  "Bwd Packet Length Std"
+]

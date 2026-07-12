@@ -1,0 +1,332 @@
+#
+# Stargazer NGFW — BusyBox applet whitelist (62 applets)
+#
+# This fragment is appended to the output of `make allnoconfig` and then
+# `make oldconfig` is run to resolve dependencies. It is the SINGLE source
+# of truth for which BusyBox applets ship in the Stargazer rootfs.
+#
+# Adding a new applet:
+#   1. Justify the use case in a comment below.
+#   2. Add `CONFIG_<APPLET>=y` (and any required FEATURE_* flags).
+#   3. Update the BUSYBOX-WHITELIST selftest expected count.
+#
+# Removing an applet: just delete the line — `oldconfig` handles dependencies.
+#
+# Audit philosophy: every applet is a potential LOLBin in the hands of an
+# attacker who has popped the CLI sandbox. Default is "off"; opt in by name.
+#
+
+# ── Build infrastructure ────────────────────────────────────────────────────
+CONFIG_STATIC=y
+CONFIG_LFS=y
+CONFIG_LONG_OPTS=y
+CONFIG_DESKTOP=y
+# SHOW_USAGE is the parent gate for all applet usage/`--help` text. Without
+# it, oldconfig force-disables FEATURE_VERBOSE_USAGE (which depends on it),
+# so `<applet> --help` prints nothing. Enable both so busybox applets show
+# usage the way standalone binaries (iptables) do.
+CONFIG_SHOW_USAGE=y
+CONFIG_FEATURE_VERBOSE_USAGE=y
+CONFIG_FEATURE_SYSLOG=y
+CONFIG_FEATURE_IPV6=y
+CONFIG_PLATFORM_LINUX=y
+
+# ── Networking (11) ─────────────────────────────────────────────────────────
+# `ip` — interface/address/route management (mgmtd, udhcpc default.script)
+CONFIG_IP=y
+CONFIG_FEATURE_IP_ADDRESS=y
+CONFIG_FEATURE_IP_LINK=y
+CONFIG_FEATURE_IP_ROUTE=y
+CONFIG_FEATURE_IP_NEIGH=y
+CONFIG_FEATURE_IP_RULE=y
+CONFIG_FEATURE_IP_SHORT_FORMS=y
+
+# `ping` — connectivity diagnose (mgmtd_network.c)
+CONFIG_PING=y
+CONFIG_FEATURE_FANCY_PING=y
+
+# `nc` — netcat: a LAN VM acts as the target sink (nc -l -p N) so the TCP handshake
+# completes and data packets pass through the firewall for IPS payload-signature inspection.
+CONFIG_NC=y
+CONFIG_NC_SERVER=y
+CONFIG_NC_EXTRA=y
+
+# `traceroute` — route diagnose (mgmtd_network.c)
+CONFIG_TRACEROUTE=y
+CONFIG_FEATURE_TRACEROUTE_VERBOSE=y
+
+# `nslookup` — DNS diagnose (mgmtd_network.c)
+CONFIG_NSLOOKUP=y
+CONFIG_FEATURE_NSLOOKUP_LONG_OPTIONS=y
+
+# `arping` — L2 reachability (mgmtd_network.c)
+CONFIG_ARPING=y
+
+# `udhcpc` — DHCP client (mgmtd_apply_iface.c, supervised by mgmtd)
+CONFIG_UDHCPC=y
+CONFIG_FEATURE_UDHCPC_ARPING=y
+CONFIG_FEATURE_UDHCPC_SANITIZEOPT=y
+CONFIG_UDHCPC_DEFAULT_SCRIPT="/usr/share/udhcpc/default.script"
+CONFIG_FEATURE_UDHCP_RFC3397=y
+CONFIG_FEATURE_UDHCP_8021Q=y
+CONFIG_UDHCPC_SLACK_FOR_BUGGY_SERVERS=80
+
+# `udhcpd` — DHCP server (mgmtd_apply_dhcp.c)
+CONFIG_UDHCPD=y
+CONFIG_FEATURE_UDHCPD_WRITE_LEASES_EARLY=y
+CONFIG_DHCPD_LEASES_FILE="/var/lib/misc/udhcpd.leases"
+
+# `ntpd` — always-on time sync (per project memory)
+CONFIG_NTPD=y
+CONFIG_FEATURE_NTPD_SERVER=y
+CONFIG_FEATURE_NTPD_CONF=y
+
+# `wget` — firmware download (mgmtd_firmware.c)
+CONFIG_WGET=y
+CONFIG_FEATURE_WGET_LONG_OPTIONS=y
+CONFIG_FEATURE_WGET_TIMEOUT=y
+CONFIG_FEATURE_WGET_HTTPS=y
+CONFIG_FEATURE_WGET_OPENSSL=y
+
+# `tftp` — firmware download fallback (mgmtd_firmware.c)
+CONFIG_TFTP=y
+CONFIG_FEATURE_TFTP_GET=y
+CONFIG_FEATURE_TFTP_BLOCKSIZE=y
+
+# `logger` — syslog from shell (udhcpc default.script)
+CONFIG_LOGGER=y
+
+# `tar` — firmware package extraction (mgmtd_firmware.c: fw_child_upgrade_steps)
+# FEATURE_SEAMLESS_GZ + GUNZIP: provide the gzip decompressor so `tar -xzf`
+#   can unpack the .tar.gz firmware package (busybox has no separate
+#   FEATURE_TAR_GZIP symbol; tar's -z support is FEATURE_SEAMLESS_GZ).
+# FEATURE_TAR_LONG_OPTIONS: required for --strip-components (reserved for future
+#   firmware package formats that wrap content in a subdirectory)
+CONFIG_TAR=y
+CONFIG_FEATURE_SEAMLESS_GZ=y
+CONFIG_GUNZIP=y
+CONFIG_FEATURE_TAR_LONG_OPTIONS=y
+CONFIG_FEATURE_TAR_GNU_EXTENSIONS=y
+CONFIG_FEATURE_TAR_CREATE=y
+
+# ── Filesystem & block (10) ─────────────────────────────────────────────────
+# `mount` — init mount of /proc /sys /dev /tmp + sgdata/sglogs partitions
+CONFIG_MOUNT=y
+CONFIG_FEATURE_MOUNT_FLAGS=y
+CONFIG_FEATURE_MOUNT_FSTAB=y
+CONFIG_FEATURE_MOUNT_LABEL=y
+
+# `umount` — shutdown unmount path
+CONFIG_UMOUNT=y
+CONFIG_FEATURE_UMOUNT_ALL=y
+
+# `mountpoint` — init checks before mount/umount
+CONFIG_MOUNTPOINT=y
+
+# `mkdir` — init + login dir creation
+CONFIG_MKDIR=y
+CONFIG_FEATURE_MKDIR_LONG_OPTIONS=y
+
+# `mkfifo` — init creates /run/mgmtd-ready FIFO for ready signal
+CONFIG_MKFIFO=y
+
+# `blkid` — init partition type/label probe
+CONFIG_BLKID=y
+CONFIG_FEATURE_BLKID_TYPE=y
+
+# `mke2fs` (provides /sbin/mke2fs and /sbin/mkfs.ext2)
+# init formats blank/wrong-typed sgdata and sglogs partitions on first boot
+CONFIG_MKE2FS=y
+
+# `dd` — init patches ext2 superblock to clear s_max_mnt_count + s_checkinterval
+CONFIG_DD=y
+# REQUIRED: enables conv=notrunc, iflag, oflag, seek. Without this, dd
+# silently ignores conv=notrunc and the ext2 superblock patch fails, which
+# leaves sgdata in a state the kernel refuses to mount ("unchecked fs").
+CONFIG_FEATURE_DD_IBS_OBS=y
+
+# `sync` — shutdown.sh syncs disks before halt/reboot
+CONFIG_SYNC=y
+
+# `sha256sum` — firmware upgrade verifies the FIT image against the
+# manifest's fit_sha256 before flashing, and reads the partition back and
+# re-checks it after (mgmtd_firmware.c steps 3 and 5). Without it the
+# verify command produces no output and the upgrade aborts with
+# "Firmware checksum verification failed".
+CONFIG_SHA256SUM=y
+
+# Note: e2fsck is intentionally NOT enabled (BusyBox has no e2fsck applet
+# anyway — `### config E2FSCK` is commented out in busybox-src). The init
+# script's `_sg_fsck` helper guards with `command -v e2fsck` and skips when
+# missing, so absence is benign.
+
+# ── File ops (8) ────────────────────────────────────────────────────────────
+# `cp` — restore /etc/{passwd,shadow,group} from sgdata, firmware DB backup
+CONFIG_CP=y
+
+# `mv` — atomic write of dhcp-status, passwd/group edits
+CONFIG_MV=y
+
+# `rm` — cleanup of pidfiles, runtime files
+CONFIG_RM=y
+
+# `chmod` — init perms hardening, login dir lockdown
+CONFIG_CHMOD=y
+
+# `chown` — login admin home directory ownership
+CONFIG_CHOWN=y
+
+# `touch` — shutdown.sh creates /tmp/stargazer-shutdown marker
+CONFIG_TOUCH=y
+CONFIG_FEATURE_TOUCH_SUSV3=y
+
+# `cat` — init reads /proc/cmdline, login reads /proc/sys/kernel/random/uuid
+CONFIG_CAT=y
+
+# `mktemp` — login creates safe /etc/passwd.XXXXXX during user file edits
+CONFIG_MKTEMP=y
+
+# ── Process / kernel module (9) ─────────────────────────────────────────────
+# `insmod` — init.d/stargazer loads pkt_forward.ko and friends
+CONFIG_INSMOD=y
+
+# `rmmod` — init.d/stargazer unloads on stop
+CONFIG_RMMOD=y
+
+# `lsmod` — init.d/stargazer status check
+CONFIG_LSMOD=y
+CONFIG_FEATURE_CHECK_TAINTED_MODULE=y
+
+# `kill` — shutdown.sh process group teardown
+CONFIG_KILL=y
+
+# `killall` — shutdown.sh fallback process kill
+CONFIG_KILLALL=y
+
+# `timeout` — bound the ipsd ruleset syntax check (`ipsd -C`); sig_build can
+# hang on malformed/oversized rulesets on slow ARM/QEMU. ips-update.sh wraps
+# the check in `timeout 60`; without the applet it fails with "timeout: not
+# found" and the update is misreported as a syntax failure.
+CONFIG_TIMEOUT=y
+
+# `sleep` — init/login timing waits
+CONFIG_SLEEP=y
+CONFIG_FEATURE_FANCY_SLEEP=y
+# REQUIRED: shutdown.sh uses `sleep 0.3` and `sleep 0.5` for graceful kill
+# pacing. Without FLOAT_DURATION, BusyBox sleep rejects fractional args
+# with "invalid number" and the shutdown sequence races kill→umount.
+CONFIG_FLOAT_DURATION=y
+
+# `dmesg` — init suppresses kernel log on console; mgmtd diag reads kernel log
+CONFIG_DMESG=y
+CONFIG_FEATURE_DMESG_PRETTY=y
+
+# `setsid` — init wraps stargazer-login so PID = PGID for clean signal teardown
+CONFIG_SETSID=y
+
+# `halt`, `reboot` — shutdown.sh final action invokes `/bin/busybox halt -f`
+# and `/bin/busybox reboot -f` directly. These are SEPARATE Kconfig symbols
+# in BusyBox 1.36 (init/Config.in:47–63), not bundled — enable both.
+#
+# POWEROFF is intentionally NOT enabled: the BPI-R4 (MT7988A) ATF lacks
+# PSCI SYSTEM_OFF, so `poweroff` triggers an unsupported error. shutdown.sh
+# uses `halt -f` for "off" action instead (init:447–452).
+CONFIG_HALT=y
+CONFIG_REBOOT=y
+CONFIG_FEATURE_CALL_TELINIT=y
+
+# ── Text utilities (6) ──────────────────────────────────────────────────────
+# `grep` — many shell scripts (init, init.d, login, udhcpc, config_lib)
+CONFIG_GREP=y
+CONFIG_FEATURE_GREP_EGREP_ALIAS=y
+CONFIG_FEATURE_GREP_CONTEXT=y
+
+# `sed` — init blkid value extraction, login passwd file rewrite
+CONFIG_SED=y
+
+# `cut` — udhcpc parses status file, login parses passwd
+CONFIG_CUT=y
+
+# `tr` — init.d/stargazer sysctl key normalization, login lowercases username
+CONFIG_TR=y
+CONFIG_FEATURE_TR_CLASSES=y
+
+# `head` — login extracts first matching passwd line
+CONFIG_HEAD=y
+
+# `printf` — defensive (dash builtin handles most cases)
+CONFIG_PRINTF=y
+
+# ── Misc (4) ────────────────────────────────────────────────────────────────
+# `clear` — init banner
+CONFIG_CLEAR=y
+
+# `uname` — init prints kernel/arch on banner
+CONFIG_UNAME=y
+
+# `stty` — init/login restore terminal sanity after CLI raw mode
+CONFIG_STTY=y
+
+# `echo` — defensive (dash builtin handles most cases)
+CONFIG_ECHO=y
+
+# ── System inspection (10) ──────────────────────────────────────────────────
+# Read-only diagnostic applets reachable as root via `execute system <cmd>`
+# (mgmtd handle_sys_exec). None of these write or destroy state; they let an
+# admin inspect the filesystem, disks, memory and processes from the CLI the
+# way FortiOS `fnsysctl` does. Adding them here must stay in lock-step with
+# the BUSYBOX-WHITELIST selftest array in cli_diagnose_busybox.c.
+
+# Human-readable sizes (-h): shared libbb feature used by df, du, ls -lh,
+# free. Without it those applets reject `-h` with "invalid option".
+CONFIG_FEATURE_HUMAN_READABLE=y
+
+# `ls` — list directory contents
+CONFIG_LS=y
+CONFIG_FEATURE_LS_FILETYPES=y
+CONFIG_FEATURE_LS_SORTFILES=y
+CONFIG_FEATURE_LS_TIMESTAMPS=y
+CONFIG_FEATURE_LS_USERNAME=y
+CONFIG_FEATURE_LS_RECURSIVE=y
+
+# `df` — filesystem disk-space usage
+CONFIG_DF=y
+CONFIG_FEATURE_DF_FANCY=y
+
+# `du` — per-directory disk usage
+CONFIG_DU=y
+
+# `ps` — process snapshot
+CONFIG_PS=y
+
+# `free` — memory usage summary
+CONFIG_FREE=y
+
+# `uptime` — load average and time since boot
+CONFIG_UPTIME=y
+
+# `top` — live process monitor (also backs `execute diagnose top`)
+CONFIG_TOP=y
+CONFIG_FEATURE_TOP_CPU_USAGE_PERCENTAGE=y
+CONFIG_FEATURE_TOP_DECIMALS=y
+
+# `tail` — show end of a file/log
+CONFIG_TAIL=y
+
+# `wc` — count lines/words/bytes
+CONFIG_WC=y
+
+# `stat` — file/inode metadata
+CONFIG_STAT=y
+
+# `crond` — scheduled IPS signature auto-update (ips-update.sh)
+# (sha256sum, used by the same update flow, is already enabled above.)
+CONFIG_CROND=y
+CONFIG_FEATURE_CROND_D=y
+CONFIG_FEATURE_CROND_CALL_SENDMAIL=n
+CONFIG_FEATURE_CROND_DIR="/var/spool/cron"
+
+# `date` — required by the cron wrappers (ips-report-cron.sh / ips-update-cron.sh)
+# to read the current time (date +%H etc.) and by `date -s` to set the clock.
+# Without it those wrappers see an empty time and never fire.
+CONFIG_DATE=y

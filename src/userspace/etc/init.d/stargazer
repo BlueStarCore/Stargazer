@@ -1,0 +1,144 @@
+#!/bin/sh
+# Stargazer NGFW Service
+# Manages module loading and kernel parameters
+#
+# NOTE: Config replay is handled by stargazer-login (runs after config
+# files are generated on first boot). This script only handles modules
+# and sysctl which don't depend on config files.
+
+NAME="stargazer"
+MODULE_DIR="/lib/modules/stargazer"
+MODULES_CONF="/etc/modules-load.d/stargazer.conf"
+SYSCTL_CONF="/etc/sysctl.d/10-stargazer.conf"
+
+log() { echo "[$NAME] $1"; }
+
+# --------------------------------------------------------------------------
+# Secure boot: set default firewall policies before mgmtd starts
+# --------------------------------------------------------------------------
+harden_firewall() {
+    # Returns 0 only if the IPv4 FORWARD default-deny was actually
+    # established. The caller MUST NOT enable IP forwarding otherwise —
+    # forwarding with no FORWARD filter is fail-open (router passes all
+    # traffic). rc tracks that guarantee.
+    _hf_rc=1
+    # IPv4: Default deny on FORWARD chain (fail-closed)
+    if command -v iptables >/dev/null 2>&1; then
+        if iptables -P FORWARD DROP 2>/dev/null; then
+            log "Set iptables -P FORWARD DROP"
+            _hf_rc=0
+        else
+            log "WARNING: Could not set FORWARD policy to DROP"
+        fi
+        # Flush any existing FORWARD rules (policy DROP protects us)
+        iptables -F FORWARD 2>/dev/null
+    else
+        log "WARNING: iptables not found — cannot establish FORWARD deny"
+    fi
+    # IPv6: Explicitly deny all forwarding and drop all packets
+    if command -v ip6tables >/dev/null 2>&1; then
+        if ip6tables -P FORWARD DROP 2>/dev/null; then
+            log "Set ip6tables -P FORWARD DROP"
+        else
+            log "WARNING: Could not set ip6tables FORWARD policy to DROP"
+        fi
+        # Flush existing FORWARD rules
+        ip6tables -F FORWARD 2>/dev/null
+        # Also drop all INPUT/OUTPUT on IPv6 for consistency
+        ip6tables -P INPUT DROP 2>/dev/null
+        ip6tables -P OUTPUT DROP 2>/dev/null
+        # Allow loopback on IPv6
+        ip6tables -A INPUT -i lo -j ACCEPT 2>/dev/null
+        ip6tables -A OUTPUT -o lo -j ACCEPT 2>/dev/null
+    fi
+    return "$_hf_rc"
+}
+
+load_modules() {
+    [ -f "$MODULES_CONF" ] || return 0
+    while read -r mod || [ -n "$mod" ]; do
+        case "$mod" in \#*|"") continue ;; esac
+        [ -f "$MODULE_DIR/${mod}.ko" ] && {
+            log "Loading: $mod"
+            insmod "$MODULE_DIR/${mod}.ko" 2>/dev/null && log "OK: $mod" || log "FAIL: $mod"
+        }
+    done < "$MODULES_CONF"
+}
+
+unload_modules() {
+    [ -f "$MODULES_CONF" ] || return 0
+    mods=""
+    while read -r mod || [ -n "$mod" ]; do
+        case "$mod" in \#*|"") continue ;; esac
+        mods="$mod $mods"
+    done < "$MODULES_CONF"
+    for mod in $mods; do
+        log "Unloading: $mod"
+        rmmod "$mod" 2>/dev/null
+    done
+}
+
+apply_sysctl() {
+    [ -f "$SYSCTL_CONF" ] || return 0
+    log "Applying sysctl..."
+    while IFS='=' read -r key val || [ -n "$key" ]; do
+        case "$key" in \#*|"") continue ;;
+esac
+        key=$(echo "$key" | tr -d ' ')
+        val=$(echo "$val" | tr -d ' ')
+        path="/proc/sys/$(echo "$key" | tr '.' '/')"
+        [ -f "$path" ] && echo "$val" > "$path" 2>/dev/null
+    done < "$SYSCTL_CONF"
+}
+
+harden_perms() {
+    # Restrict config files to root-only — CLI reads via mgmtd IPC
+    [ -f "$MODULES_CONF" ] && chmod 0600 "$MODULES_CONF"
+    [ -f "$SYSCTL_CONF" ]  && chmod 0600 "$SYSCTL_CONF"
+    [ -d /etc/stargazer ]  && chmod 0700 /etc/stargazer
+}
+
+start_crond() {
+    # crond runs the IPS signature auto-update + rotates ips-alert.log
+    # (/var/spool/cron/crontabs/root). No crond → neither job runs.
+    command -v crond >/dev/null 2>&1 || {
+        log "WARNING: crond not found — IPS auto-update + log rotation disabled"
+        return 0
+    }
+    # killall first: busybox has no pidof/pgrep to detect a stale instance; clearing
+    # it out then starting again guarantees exactly ONE crond (safe for both start and restart).
+    killall crond 2>/dev/null
+    log "Starting crond..."
+    # -l 9: busybox crond defaults to log level 8, which prints a "USER root pid N
+    # cmd ..." line for EVERY job dispatch. The report wrapper runs every minute
+    # (to catch the scheduled HH:MM) and mostly just exits, so at level 8 crond
+    # floods the console once a minute. -l 9 raises the threshold so routine
+    # dispatch lines are suppressed while real errors (level >= 9) still log.
+    crond -b -l 9 -c /var/spool/cron/crontabs 2>/dev/null && log "crond OK" || log "crond FAIL"
+}
+
+case "$1" in
+    start)
+        log "Starting..."
+        harden_perms
+        if harden_firewall; then _fw_ok=1; else _fw_ok=0; fi
+        apply_sysctl
+        # Fail-closed: never enable forwarding without a FORWARD filter in
+        # place. If hardening could not set the default-deny (e.g. iptables
+        # missing), force forwarding OFF even though sysctl.d requests it on.
+        if [ "$_fw_ok" -ne 1 ]; then
+            log "CRITICAL: FORWARD deny not established — disabling IP forwarding (fail-closed)"
+            echo 0 > /proc/sys/net/ipv4/ip_forward 2>/dev/null
+            echo 0 > /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null
+        fi
+        load_modules
+        start_crond
+        log "Started"
+        ;;
+    stop)    log "Stopping..."; killall crond 2>/dev/null; unload_modules; log "Stopped" ;;
+    restart) $0 stop; sleep 1; $0 start ;;
+    status)  lsmod | grep -q pkt_forward && log "Running" || log "Not running" ;;
+    *)       echo "Usage: $0 {start|stop|restart|status}" ;;
+esac
+
+exit $?

@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<!--
+  Stargazer NGFW — IPS/IDS block notification page (FortiGate-style).
+
+  This page is served by stargazer-ssld to the client when a decrypted HTTPS flow
+  is scored DROP by IPS (prevent mode). ssld substitutes dynamic content into the placeholders:
+    {{URL}}         — blocked host/URL (SNI + path if present)
+    {{SIGNATURE}}   — matched signature name/SID
+    {{POLICY}}      — policy id
+    {{DESCRIPTION}} — description (currently left blank)
+  This standalone file is for viewing/editing the UI; the version embedded in ssld must
+  match the markup/CSS of this file.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Access Blocked — Stargazer NGFW</title>
+<style>
+  :root {
+    --bg:        #0a0e1a;
+    --card:      #141c30;
+    --border:    #2a3452;
+    --danger:    #d4524e;
+    --danger-dk: #8f2a27;
+    --text:      #e8eaf0;
+    --text-dim:  #a0a8b8;
+    --accent:    #e8956a;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%;
+    background: radial-gradient(circle at 50% 0%, #16203a 0%, var(--bg) 70%);
+    color: var(--text);
+    font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap {
+    min-height: 100%;
+    display: flex; align-items: center; justify-content: center;
+    padding: 32px;
+  }
+  .card {
+    width: 100%; max-width: 640px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-top: 4px solid var(--danger);
+    border-radius: 10px;
+    box-shadow: 0 18px 50px rgba(0,0,0,.55);
+    overflow: hidden;
+  }
+  .head {
+    display: flex; align-items: center; gap: 14px;
+    padding: 22px 28px;
+    border-bottom: 1px solid var(--border);
+    background: linear-gradient(180deg, rgba(212,82,78,.10), transparent);
+  }
+  .shield {
+    flex: 0 0 auto;
+    width: 46px; height: 46px; border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--danger-dk);
+    border: 1px solid var(--danger);
+    font-size: 24px;
+  }
+  .brand { font-size: 12px; letter-spacing: 1px; color: var(--text-dim); text-transform: uppercase; }
+  .brand b { color: var(--accent); }
+  .title { font-size: 19px; font-weight: 700; margin-top: 4px; color: #fff; }
+  .body { padding: 24px 28px 28px; }
+  .lead {
+    font-size: 13.5px; line-height: 1.6; color: var(--text-dim); margin: 0 0 20px;
+  }
+  .lead b { color: var(--text); }
+  table.detail {
+    width: 100%; border-collapse: collapse; font-size: 13px;
+  }
+  table.detail th, table.detail td {
+    text-align: left; padding: 11px 12px; vertical-align: top;
+    border-bottom: 1px solid var(--border);
+  }
+  table.detail th {
+    width: 130px; color: var(--text-dim); font-weight: 600;
+    white-space: nowrap;
+  }
+  table.detail td { color: var(--text); word-break: break-all; }
+  table.detail tr:last-child th, table.detail tr:last-child td { border-bottom: 0; }
+  .pill {
+    display: inline-block; padding: 3px 10px; border-radius: 20px;
+    font-size: 11px; font-weight: 700; letter-spacing: .5px;
+    background: var(--danger-dk); color: #ffd9d7; border: 1px solid var(--danger);
+  }
+  .foot {
+    padding: 16px 28px; border-top: 1px solid var(--border);
+    font-size: 11.5px; color: var(--text-dim);
+    display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  }
+  .muted { color: #6a7080; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card" role="alert" aria-live="assertive">
+      <div class="head">
+        <div class="shield" aria-hidden="true">&#9888;</div>
+        <div>
+          <div class="brand"><b>Stargazer NGFW</b> &middot; Intrusion Prevention</div>
+          <div class="title">Access Blocked</div>
+        </div>
+      </div>
+      <div class="body">
+        <p class="lead">
+          Your request was blocked by <b>Stargazer NGFW Intrusion Prevention</b>
+          because it matched an attack signature. If you believe this is an error,
+          please contact your network administrator.
+        </p>
+        <table class="detail">
+          <tr><th>Status</th><td><span class="pill">BLOCKED</span></td></tr>
+          <tr><th>URL</th><td>{{URL}}</td></tr>
+          <tr><th>Description</th><td>{{DESCRIPTION}}</td></tr>
+        </table>
+      </div>
+      <div class="foot">
+        <span>Stargazer NGFW &middot; Intrusion Prevention System</span>
+        <span class="muted">Blocked by IPS engine</span>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

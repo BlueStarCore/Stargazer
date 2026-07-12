@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Stargazer - Login</title>
+<link rel="icon" type="image/png" href="img/icon.png">
+<link rel="stylesheet" href="css/fonts.css">
+<style>
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+    width: 100vw;
+    height: 100vh;
+    overflow: hidden;
+    font-family: 'Press Start 2P', monospace;
+    background: #020610;
+}
+
+/* --- Night sky canvas (behind everything) --- */
+#sky-canvas {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    z-index: 0;
+}
+
+/* --- Login panel --- */
+.login-wrapper {
+    position: relative;
+    z-index: 10;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
+}
+
+.login-box {
+    background: rgba(6, 12, 30, 0.75);
+    border: 1px solid rgba(100, 160, 240, 0.20);
+    border-radius: 4px;
+    padding: 56px 50px 44px;
+    max-width: 530px;
+    width: 90vw;
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    box-shadow:
+        0 0 60px rgba(60, 130, 220, 0.06),
+        0 4px 32px rgba(0, 0, 0, 0.5);
+}
+
+.login-brand {
+    text-align: center;
+    margin-bottom: 44px;
+}
+
+.login-brand h1 {
+    font-family: 'Press Start 2P', monospace;
+    font-size: 25px;
+    color: #d0e4f8;
+    letter-spacing: 6px;
+    text-shadow: 0 0 20px rgba(80, 160, 255, 0.4);
+    margin-bottom: 12px;
+}
+
+.login-brand .subtitle {
+    font-family: 'Press Start 2P', monospace;
+    font-size: 10px;
+    color: rgba(120, 180, 255, 0.6);
+    letter-spacing: 2px;
+}
+
+.login-field {
+    margin-bottom: 28px;
+}
+
+.login-field label {
+    display: block;
+    font-family: 'Press Start 2P', monospace;
+    font-size: 11px;
+    color: rgba(200, 200, 210, 0.7);
+    margin-bottom: 12px;
+    letter-spacing: 1px;
+}
+
+.login-field input {
+    width: 100%;
+    padding: 16px 18px;
+    background: rgba(20, 28, 48, 0.8);
+    border: 1px solid rgba(74, 127, 181, 0.3);
+    border-radius: 3px;
+    color: #e0e0e8;
+    font-family: 'Press Start 2P', monospace;
+    font-size: 14px;
+    outline: none;
+    transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.login-field input:focus {
+    border-color: rgba(80, 160, 255, 0.6);
+    box-shadow: 0 0 12px rgba(80, 160, 255, 0.15);
+}
+
+.login-field input::placeholder {
+    color: rgba(160, 160, 180, 0.4);
+    font-size: 11px;
+}
+
+.login-btn {
+    width: 100%;
+    padding: 18px;
+    margin-top: 12px;
+    background: linear-gradient(135deg, #3080d0 0%, #2060a8 100%);
+    border: none;
+    border-radius: 3px;
+    color: #e8f0ff;
+    font-family: 'Press Start 2P', monospace;
+    font-size: 14px;
+    letter-spacing: 3px;
+    cursor: pointer;
+    transition: transform 0.15s, box-shadow 0.2s;
+    text-shadow: 0 1px 0 rgba(0, 0, 0, 0.2);
+}
+
+.login-btn:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 20px rgba(60, 140, 240, 0.35);
+}
+
+.login-btn:active {
+    transform: translateY(0);
+}
+
+.login-error {
+    display: none;
+    margin-top: 22px;
+    padding: 14px 16px;
+    background: rgba(180, 50, 50, 0.25);
+    border: 1px solid rgba(220, 80, 80, 0.4);
+    border-radius: 3px;
+    font-family: 'Press Start 2P', monospace;
+    font-size: 10px;
+    color: #e88;
+    text-align: center;
+    line-height: 1.6;
+}
+
+.login-footer {
+    margin-top: 32px;
+    text-align: center;
+    font-family: 'Press Start 2P', monospace;
+    font-size: 8px;
+    color: rgba(160, 170, 200, 0.3);
+    letter-spacing: 1px;
+}
+
+/* --- Cinematic bars --- */
+.bar-top, .bar-bottom {
+    position: fixed;
+    left: 0; right: 0;
+    z-index: 20;
+    height: 52px;
+    display: flex;
+    align-items: center;
+    padding: 0 32px;
+    pointer-events: none;
+}
+.bar-top {
+    top: 0;
+    justify-content: space-between;
+}
+.bar-bottom {
+    bottom: 0;
+    justify-content: space-between;
+}
+.bar-top .bar-text, .bar-bottom .bar-text {
+    font-family: 'Press Start 2P', monospace;
+    font-size: 8px;
+    color: rgba(140, 170, 220, 0.35);
+    letter-spacing: 2px;
+}
+</style>
+</head>
+<body>
+
+<canvas id="sky-canvas"></canvas>
+
+<div class="bar-top">
+    <span class="bar-text">STARGAZER NGFW</span>
+    <span class="bar-text">v@VERSION@</span>
+</div>
+<div class="bar-bottom">
+    <span class="bar-text"></span>
+    <span class="bar-text"></span>
+</div>
+
+<div class="login-wrapper">
+    <div class="login-box">
+        <div class="login-brand">
+            <h1>STARGAZER</h1>
+            <div class="subtitle">FIREWALL MANAGEMENT</div>
+        </div>
+
+        <form id="login-form" autocomplete="off">
+            <div class="login-field">
+                <label>USERNAME</label>
+                <input type="text" id="login-user" name="username"
+                       placeholder="admin" autocomplete="username" autofocus required>
+            </div>
+            <div class="login-field">
+                <label>PASSWORD</label>
+                <input type="password" id="login-pass" name="password"
+                       placeholder="--------" autocomplete="current-password" required>
+            </div>
+            <button type="submit" class="login-btn">LOGIN</button>
+        </form>
+
+        <div class="login-error" id="login-error"></div>
+        <div class="login-footer">STARGAZER NGFW v@VERSION@</div>
+    </div>
+</div>
+
+<script src="js/sg-common.js"></script>
+<script src="js/login.js"></script>
+</body>
+</html>
