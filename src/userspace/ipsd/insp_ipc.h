@@ -29,7 +29,8 @@ enum {
 	INSP_OPEN    = 1,   /* ssld → ipsd: start an HTTPS flow */
 	INSP_DATA    = 2,   /* ssld → ipsd: one plaintext chunk (follows the header) */
 	INSP_CLOSE   = 3,   /* ssld → ipsd: end of flow */
-	INSP_VERDICT = 128, /* ipsd → ssld: verdict for one chunk */
+	INSP_SCORE   = 4,   /* ssld → ipsd: ML-only (cert mode, no plaintext) → verdict */
+	INSP_VERDICT = 128, /* ipsd → ssld: verdict for one chunk / score */
 };
 
 /* verdict.action */

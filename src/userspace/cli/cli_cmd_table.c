@@ -184,6 +184,50 @@ static void fw_parse_val(const char *data, const char *key,
 	}
 }
 
+/* execute certificate import <name> <cert-file> [key-file]
+ * Imports a server certificate (+ optional private key) that already exists on
+ * the device (e.g. uploaded via scp). mgmtd reads the PEM files, validates them,
+ * and stores them as system_certificate/<name> for use by Protecting-SSL-Server
+ * profiles. The user's source files are NOT removed. */
+static int cmd_cert_import(const char *args, const char *permissions)
+{
+	(void)permissions;
+	char name[128] = {0}, certp[256] = {0}, keyp[256] = {0};
+	if (!args || sscanf(args, "%127s %255s %255s", name, certp, keyp) < 2) {
+		printf("  Usage: execute certificate import <name> <cert-file> [key-file]\n");
+		printf("  Files must already exist on the device (e.g. via scp).\n");
+		return 0;
+	}
+	if (!sg_is_safe_id(name)) {
+		printf("  Invalid certificate name (letters/digits/-_. only).\n");
+		return 0;
+	}
+
+	char payload[SG_PAYLOAD_MAX];
+	if (keyp[0])
+		snprintf(payload, sizeof(payload),
+			 "name=%s\ncert=%s\nkey=%s\n", name, certp, keyp);
+	else
+		snprintf(payload, sizeof(payload),
+			 "name=%s\ncert=%s\n", name, certp);
+
+	struct ipc_response resp;
+	if (ipc_send_str(SG_CMD_CERT_IMPORT, payload, &resp) != 0) {
+		ipc_resp_free(&resp);
+		printf("  Error: could not contact management daemon.\n");
+		return 0;
+	}
+	if (resp.status != SG_OK) {
+		print_ipc_error("Certificate import failed", &resp);
+		ipc_resp_free(&resp);
+		return 0;
+	}
+	ipc_resp_free(&resp);
+	printf("  Certificate '%s' imported%s.\n", name,
+	       keyp[0] ? " (with private key)" : "");
+	return 0;
+}
+
 static int cmd_fw_upgrade(const char *args, const char *permissions)
 {
 	(void)permissions;

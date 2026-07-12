@@ -19,6 +19,7 @@
 #include "certcache.h"
 
 struct sig_ruleset;   /* ../ipsd/sig_rule.h — fwd decl */
+struct revmap;        /* revmap.h — reverse ("Protect SSL Server") map, fwd decl */
 
 /* Limit on accumulated (peeked) ClientHello bytes before giving up the parse. */
 #define CONN_HELLO_MAX 16384
@@ -29,6 +30,10 @@ struct ssld_ctx {
 	struct ca_ctx           *ca;       /* NULL -> SPLICE only (no bump) */
 	struct certcache        *cc;
 	struct sig_ruleset      *rules;    /* NULL -> bump does not inspect payload */
+	const struct revmap     *revmap;   /* NULL -> no reverse ("Protect SSL Server") */
+	int                      cert_inspect;  /* 1 -> certificate inspection (no decrypt) */
+	int                      ips_on;        /* 1 -> profile bound to an IPS-enabled policy */
+	const struct tls_policy *block;         /* SNI/FQDN web-filter block list (NULL = none) */
 	int                      verify_upstream;
 	int                      no_ipc;         /* P4: 1 = inspect per-chunk, no IPC */
 	int                      ipc_failclosed; /* P4: 1 = IPC error -> block flow */

@@ -2404,7 +2404,7 @@ static void mgmtd_reconcile_config(void)
 			{ "security_ssl-inspection-profile", "no-inspection",
 			  "name=no-inspection\n"
 			  "status=enable\n"
-			  "inspection-mode=certificate\n"
+			  "inspection-mode=multiple-clients\n"
 			  "builtin=yes\n"
 			  "immutable=yes\n"
 			  "comment=Built-in: no SSL inspection (read-only)\n" },
@@ -6209,6 +6209,15 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 					fqdn_object_removed(db_id);
 				free(adata);
 			}
+		} else if (strcmp(db_type, "system_certificate") == 0) {
+			/* Remove the imported PEM files. The reference check above
+			 * guarantees no ssl-profile still uses this certificate. */
+			char cdir[300], cpem[320], kpem[320];
+			snprintf(cdir, sizeof(cdir),
+				 "/etc/stargazer/ssl/certs/%s", db_id);
+			snprintf(cpem, sizeof(cpem), "%s/cert.pem", cdir);
+			snprintf(kpem, sizeof(kpem), "%s/key.pem", cdir);
+			unlink(cpem); unlink(kpem); rmdir(cdir);
 		}
 		/* Firewall/NAT: no per-rule unapply needed — atomic
 		 * rebuild after DB delete handles everything. */
@@ -7343,6 +7352,8 @@ static int handle_request_dispatch(int client_fd, sg_request_hdr_t *hdr,
 
 	case SG_CMD_SSL_CACERT:
 		return handle_ssl_cacert(client_fd, user, payload, hdr);
+	case SG_CMD_CERT_IMPORT:
+		return handle_cert_import(client_fd, user, payload, hdr);
 
 	case SG_CMD_SSL_DIAG:
 		return handle_ssl_diag(client_fd, user, payload, hdr);

@@ -27,11 +27,13 @@
 
 #include "mgmtd_apply.h"
 #include "mgmtd_dynbuf.h"
+#include "mgmtd_internal.h"   /* send_ok/send_error, get_user_permissions */
 #include "sg_db.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>         /* open — staged cert/key files */
 #include <sys/stat.h>      /* stat — active.rules mtime into ssld sig */
 #include <unistd.h>
 
@@ -77,6 +79,21 @@ static int is_any(const char *s)
 	return !s || !*s || !strcmp(s, "any") || !strcmp(s, "all");
 }
 
+/* Dotted IPv4 safe for iptables-restore (digits + 3 dots only). The value already
+ * passed the "ipv4" validator at config time; this is defence-in-depth. */
+static int valid_ipv4(const char *s)
+{
+	if (!s || !*s || strlen(s) > 15)
+		return 0;
+	int dots = 0;
+	for (const char *p = s; *p; p++) {
+		if (*p == '.')      dots++;
+		else if (*p < '0' || *p > '9')
+			return 0;
+	}
+	return dots == 3;
+}
+
 /* ssld port of a profile (enabled, != no-inspection) by DB listing INDEX.
  * Returns >0 if active, 0 if disabled/no-inspection/nonexistent. SHARED by
  * ssld_sync (launch) and emit_ssl_steering (redirect) → consistent ports. */
@@ -116,9 +133,11 @@ static int ssl_profile_port(const char *name)
 static int ssl_steer_allowed(const char *prof, const char *ips_status,
 			     const char *ips_profile)
 {
-	char *mode = sg_db_get_val(SSL_PROF_TYPE, prof, "inspection-mode");
-	int is_deep = mode && strcmp(mode, "deep") == 0;
-	free(mode);
+	/* deep = multiple-clients + inspection-method=deep (protecting-server has no
+	 * method field → NULL → not deep → always steers, like certificate). */
+	char *method = sg_db_get_val(SSL_PROF_TYPE, prof, "inspection-method");
+	int is_deep = method && strcmp(method, "deep") == 0;
+	free(method);
 	if (is_deep && !ips_policy_on(ips_status, ips_profile))
 		return 0;
 	return 1;
@@ -164,13 +183,29 @@ int emit_ssl_steering(struct dynbuf *buf)
 		if (!ssl_steer_allowed(prof, ipst, ipp))
 			continue;               /* deep but IPS off → no decryption */
 
+		/* protect-server (inbound reverse): scope the REDIRECT to the VIP so it
+		 * ONLY catches traffic destined to the protected server. Without this the
+		 * rule would grab EVERY :443 on the interface → other services / non-VIP
+		 * flows would be answered with a forged cert → cert errors. Scoping by VIP
+		 * keeps internal + external access to everything else uninterrupted. */
+		char *pmode = sg_db_get_val(SSL_PROF_TYPE, prof, "inspection-mode");
+		int is_protect = pmode && strcmp(pmode, "protecting-server") == 0;
+		free(pmode);
+		char *pvip = is_protect
+			   ? sg_db_get_val(SSL_PROF_TYPE, prof, "protect-vip") : NULL;
+		int have_vip = pvip && valid_ipv4(pvip);
+
 		dbuf_printf(buf, "-A PREROUTING");
 		if (!is_any(srcintf))
 			dbuf_printf(buf, " -i %s", srcintf);
+		if (have_vip)
+			dbuf_printf(buf, " -d %s", pvip);
 		dbuf_printf(buf, " -p tcp --dport 443 -j REDIRECT --to-ports %d\n",
 			    port);
-		mgmt_log("INFO", "SSL steering: policy %s prof=%s -i %s tcp:443 "
-			 "-> :%d", id, prof, is_any(srcintf) ? "any" : srcintf, port);
+		mgmt_log("INFO", "SSL steering: policy %s prof=%s -i %s%s%s tcp:443 -> :%d",
+			 id, prof, is_any(srcintf) ? "any" : srcintf,
+			 have_vip ? " -d " : "", have_vip ? pvip : "", port);
+		free(pvip);
 		n++;
 	}
 	free(list);
@@ -199,6 +234,58 @@ static int write_exempt_to(const char *path, const char *list)
 	}
 	fclose(f);
 	return n;
+}
+
+/*
+ * Write a one-entry reverse map (revmap.h format) for a protect-server profile:
+ *   <vip>:443 <cert> <key> <backend>:<bport> <sni>
+ * Returns 0 if all required fields are present (file written), -1 otherwise
+ * (caller then skips -R → ssld runs without inbound inspection, fail-safe).
+ */
+static int write_reverse_to(const char *path, const char *vip, const char *cert,
+			    const char *key, const char *backend,
+			    const char *bport, const char *sni)
+{
+	if (!vip || !*vip || !cert || !*cert || !key || !*key ||
+	    !backend || !*backend)
+		return -1;
+	FILE *f = fopen(path, "w");
+	if (!f)
+		return -1;
+	fprintf(f, "%s:443 %s %s %s:%s %s\n", vip, cert, key, backend,
+		(bport && *bport) ? bport : "443", (sni && *sni) ? sni : "-");
+	fclose(f);
+	return 0;
+}
+
+/* 1 if any enabled accept policy that uses ssl-profile `prof` also has IPS on
+ * (certificate mode passes -I so ssld knows whether to run the IPS ML check). */
+static int profile_bound_ips_on(const char *prof)
+{
+	char *list = sg_db_list("firewall_policy");
+	if (!list)
+		return 0;
+	int on = 0;
+	char *sp = NULL;
+	for (char *id = strtok_r(list, "\n", &sp); id && !on;
+	     id = strtok_r(NULL, "\n", &sp)) {
+		char *data = sg_db_get("firewall_policy", id);
+		if (!data)
+			continue;
+		char action[VALBUFSZ], st[VALBUFSZ], pr[VALBUFSZ];
+		char ipst[VALBUFSZ], ipp[VALBUFSZ];
+		extract_val(data, "action",      action, sizeof(action));
+		extract_val(data, "status",      st,     sizeof(st));
+		extract_val(data, "ssl-profile", pr,     sizeof(pr));
+		extract_val(data, "ips-status",  ipst,   sizeof(ipst));
+		extract_val(data, "ips-profile", ipp,    sizeof(ipp));
+		free(data);
+		if (strcmp(action, "accept") == 0 && strcmp(st, "enable") == 0 &&
+		    strcmp(pr, prof) == 0 && ips_policy_on(ipst, ipp))
+			on = 1;
+	}
+	free(list);
+	return on;
 }
 
 /* Find the line "name\t<sig>" in the set (prev/desired). cmp_sig!=NULL → return
@@ -380,23 +467,75 @@ void ssld_sync(void)
 				continue;
 			int port = SSL_PORT_BASE + idx; idx++;
 
-			char *mode  = sg_db_get_val(SSL_PROF_TYPE, id, "inspection-mode");
-			char *nosni = sg_db_get_val(SSL_PROF_TYPE, id, "no-sni");
-			char *untr  = sg_db_get_val(SSL_PROF_TYPE, id, "untrusted-server-cert");
-			char *exempt= sg_db_get_val(SSL_PROF_TYPE, id, "exempt");
-			int certificate  = mode  && strcmp(mode, "certificate") == 0;
+			char *mode   = sg_db_get_val(SSL_PROF_TYPE, id, "inspection-mode");
+			char *method = sg_db_get_val(SSL_PROF_TYPE, id, "inspection-method");
+			char *nosni  = sg_db_get_val(SSL_PROF_TYPE, id, "no-sni");
+			char *untr   = sg_db_get_val(SSL_PROF_TYPE, id, "untrusted-server-cert");
+			char *exempt = sg_db_get_val(SSL_PROF_TYPE, id, "exempt");
+			/* mode = direction; method (multiple-clients only) = certificate|deep */
+			int protect      = mode && strcmp(mode, "protecting-server") == 0;
+			int certificate  = !protect && method &&
+					   strcmp(method, "certificate") == 0;
 			int nosni_splice = nosni && strcmp(nosni, "splice") == 0;
 			int untr_block   = !untr || strcmp(untr, "block") == 0;
 
-			char exfile[256], portstr[16], child[128], sig[384];
+			/* protect-server (inbound reverse): write this profile's reverse map.
+			 * server-cert is the NAME of an imported certificate; resolve it to
+			 * the PEM files written by the import path. */
+			char *sc=NULL,*pvip=NULL,*pbk=NULL,*pbp=NULL,*psni=NULL;
+			char certpath[300]="", keypath[300]="";
+			char revfile[256]; int rev_ok = 0; long cert_mtime = 0;
+			snprintf(revfile, sizeof(revfile), "%s/reverse-%s.rev", SSL_DIR, id);
+			if (protect) {
+				sc   = sg_db_get_val(SSL_PROF_TYPE, id, "server-cert");
+				pvip = sg_db_get_val(SSL_PROF_TYPE, id, "protect-vip");
+				pbk  = sg_db_get_val(SSL_PROF_TYPE, id, "protect-backend");
+				pbp  = sg_db_get_val(SSL_PROF_TYPE, id, "protect-backend-port");
+				psni = sg_db_get_val(SSL_PROF_TYPE, id, "protect-sni");
+				if (sc && *sc) {
+					snprintf(certpath, sizeof(certpath),
+						 "%s/certs/%s/cert.pem", SSL_DIR, sc);
+					snprintf(keypath, sizeof(keypath),
+						 "%s/certs/%s/key.pem", SSL_DIR, sc);
+				}
+				rev_ok = (write_reverse_to(revfile, pvip,
+						certpath[0] ? certpath : NULL,
+						keypath[0]  ? keypath  : NULL,
+						pbk, pbp, psni) == 0);
+				if (!rev_ok)
+					mgmt_log("WARN", "ssld_sync: profile %s protect-server "
+						 "missing cert/vip/backend — inbound "
+						 "inspection disabled", id);
+				else {
+					struct stat cst;   /* cert rotated in place → restart */
+					if (certpath[0] && stat(certpath, &cst) == 0)
+						cert_mtime = (long)cst.st_mtime;
+				}
+			}
+
+			char exfile[256], portstr[16], child[128], sig[2048];
 			snprintf(exfile, sizeof(exfile),
 				 "/etc/stargazer/ssl/exempt-%s.txt", id);
 			write_exempt_to(exfile, exempt);
+
+			/* certificate mode: web-filter block list + whether IPS is on */
+			char *blocksni = certificate
+				? sg_db_get_val(SSL_PROF_TYPE, id, "block-sni") : NULL;
+			char blockfile[256]; int block_n = 0;
+			snprintf(blockfile, sizeof(blockfile), "%s/block-%s.txt", SSL_DIR, id);
+			if (certificate)
+				block_n = write_exempt_to(blockfile, blocksni);
+			int prof_ips_on = certificate ? profile_bound_ips_on(id) : 0;
+
 			snprintf(portstr, sizeof(portstr), "%d", port);
 			snprintf(child, sizeof(child), "stargazer-ssld-%s", id);
-			snprintf(sig, sizeof(sig), "%d|%d|%d|%d|%d|%d|%ld|%s", port,
-				 certificate, nosni_splice, untr_block, ipc_off,
-				 ipc_closed, rules_mtime, exempt ? exempt : "");
+			snprintf(sig, sizeof(sig),
+				 "%d|%d|%d|%d|%d|%d|%ld|%s|P%d|%ld|%s|%s|%s|%s|%s|%s|C%d|%s",
+				 port, certificate, nosni_splice, untr_block, ipc_off,
+				 ipc_closed, rules_mtime, exempt ? exempt : "",
+				 protect, cert_mtime, sc?sc:"", keypath, pvip?pvip:"",
+				 pbk?pbk:"", pbp?pbp:"", psni?psni:"",
+				 prof_ips_on, blocksni ? blocksni : "");
 			dpos += (size_t)snprintf(desired + dpos, sizeof(desired) - dpos,
 						 "%s\t%s\n", id, sig);
 
@@ -408,7 +547,11 @@ void ssld_sync(void)
 				const char *argv[24]; int ai = 0;
 				argv[ai++] = SSLD_BIN;
 				argv[ai++] = "-p"; argv[ai++] = portstr;
-				if (certificate)  argv[ai++] = "-S";
+				if (certificate) {
+					argv[ai++] = "-C";   /* certificate inspection */
+					if (block_n > 0) { argv[ai++] = "-L"; argv[ai++] = blockfile; }
+					if (prof_ips_on)   argv[ai++] = "-I";
+				}
 				if (nosni_splice) argv[ai++] = "-B";
 				if (untr_block)   argv[ai++] = "-V";
 				if (ipc_off)      argv[ai++] = "-Q";   /* P4: disable IPC */
@@ -422,6 +565,15 @@ void ssld_sync(void)
 				if (ipc_off && access(SSL_IPS_RULES, R_OK) == 0) {
 					argv[ai++] = "-r"; argv[ai++] = SSL_IPS_RULES;
 				}
+				if (protect) {
+					/* protect-server: NEVER forward-forge. Matched VIP →
+					 * reverse (real cert). Anything else (non-VIP that slipped
+					 * through, or a misconfigured/missing cert) → splice, so the
+					 * server stays reachable instead of answering with a forged
+					 * cert. -S disables forge but leaves reverse (revmap) intact. */
+					argv[ai++] = "-S";
+					if (rev_ok) { argv[ai++] = "-R"; argv[ai++] = revfile; }
+				}
 				argv[ai++] = "-c"; argv[ai++] = SSL_CACERT;
 				argv[ai++] = "-k"; argv[ai++] = SSL_CAKEY;
 				argv[ai] = NULL;
@@ -430,13 +582,17 @@ void ssld_sync(void)
 					mgmt_log("ERROR", "ssld_sync: start %s failed", child);
 				else
 					mgmt_log("INFO", "ssld_sync: %s running :%d mode=%s",
-						 child, port, certificate ? "certificate" : "deep");
+						 child, port,
+						 protect ? "protecting-server"
+						 : certificate ? "certificate" : "deep");
 			} else {
 				mgmt_log("WARN", "ssld_sync: %s missing — profile %s "
 					 "cannot be inspected (that HTTPS policy may break)",
 					 SSLD_BIN, id);
 			}
-			free(mode); free(nosni); free(untr); free(exempt);
+			free(mode); free(method); free(nosni); free(untr); free(exempt);
+			free(sc); free(pvip); free(pbk); free(pbp); free(psni);
+			free(blocksni);
 		}
 		free(list);
 	}
@@ -474,4 +630,153 @@ void ssld_sync(void)
 	 * swallows them all → client hangs). Run AFTER knowing which profiles/ports
 	 * are active. */
 	ssld_input_access_sync();
+}
+
+/* ── Certificate import (SG_CMD_CERT_IMPORT) ─────────────────────────────────
+ *
+ * Imported certificates are stored as PEM files under
+ * /etc/stargazer/ssl/certs/<name>/{cert.pem,key.pem}; the DB carries only
+ * metadata (system_certificate) so they appear in the cert dropdown. mgmtd does
+ * NOT link OpenSSL, so it only checks the PEM markers — it does not parse X.509.
+ * A protect-server ssl-profile resolves server-cert=<name> to these files in
+ * ssld_sync(). The PEM material itself is staged to disk by webd/CLI; the IPC
+ * payload carries only the staged paths + name (well under SG_PAYLOAD_MAX).
+ */
+#define CERT_DIR  SSL_DIR "/certs"
+#define CERT_MAX  65536
+
+/* Copy the value of a `key=...` line out of a text payload. 1 if found. */
+static int cert_payload_get(const char *payload, const char *key,
+			    char *out, size_t outsz)
+{
+	out[0] = '\0';
+	if (!payload) return 0;
+	size_t klen = strlen(key);
+	for (const char *p = payload; *p; ) {
+		const char *eol = strchr(p, '\n');
+		size_t ll = eol ? (size_t)(eol - p) : strlen(p);
+		if (ll > klen && strncmp(p, key, klen) == 0 && p[klen] == '=') {
+			size_t vlen = ll - klen - 1;
+			if (vlen >= outsz) vlen = outsz - 1;
+			memcpy(out, p + klen + 1, vlen);
+			out[vlen] = '\0';
+			return 1;
+		}
+		if (!eol) break;
+		p = eol + 1;
+	}
+	return 0;
+}
+
+static ssize_t cert_read_file(const char *path, char *buf, size_t bufsz)
+{
+	int fd = open(path, O_RDONLY);
+	if (fd < 0) return -1;
+	ssize_t n = read(fd, buf, bufsz - 1);
+	close(fd);
+	if (n < 0) return -1;
+	buf[n] = '\0';
+	return n;
+}
+
+static int cert_write_file(const char *path, const char *buf, size_t len,
+			   mode_t mode)
+{
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
+	if (fd < 0) return -1;
+	ssize_t w = write(fd, buf, len);
+	close(fd);
+	return (w == (ssize_t)len) ? 0 : -1;
+}
+
+int handle_cert_import(int client_fd, const char *user,
+		       const char *payload, const sg_request_hdr_t *hdr)
+{
+	(void)hdr;
+	const char *perms = get_user_permissions(user);
+	if (!has_permission(perms, "admin")) {
+		send_error(client_fd, SG_ERR_PERM_DENIED,
+			   "admin permission required");
+		return 0;
+	}
+
+	char name[128], certp[256], keyp[256], comment[256];
+	cert_payload_get(payload, "name", name, sizeof(name));
+	cert_payload_get(payload, "cert", certp, sizeof(certp));
+	cert_payload_get(payload, "key",  keyp,  sizeof(keyp));
+	cert_payload_get(payload, "comment", comment, sizeof(comment));
+
+	if (!sg_is_safe_id(name)) {
+		send_error(client_fd, SG_ERR_INVALID_ARG,
+			   "invalid certificate name (letters/digits/-_. only)");
+		return 0;
+	}
+	if (!certp[0]) {
+		send_error(client_fd, SG_ERR_INVALID_ARG, "no certificate file");
+		return 0;
+	}
+
+	/* Read + sanity-check the staged PEM(s). */
+	char cbuf[CERT_MAX];
+	ssize_t cn = cert_read_file(certp, cbuf, sizeof(cbuf));
+	if (cn <= 0 || !strstr(cbuf, "-----BEGIN CERTIFICATE-----")) {
+		send_error(client_fd, SG_ERR_INVALID_VAL,
+			   "certificate file is not a PEM certificate");
+		return 0;
+	}
+	int have_key = 0;
+	char kbuf[CERT_MAX];
+	ssize_t kn = 0;
+	if (keyp[0]) {
+		kn = cert_read_file(keyp, kbuf, sizeof(kbuf));
+		if (kn <= 0 || !strstr(kbuf, "PRIVATE KEY-----")) {
+			send_error(client_fd, SG_ERR_INVALID_VAL,
+				   "key file is not a PEM private key");
+			return 0;
+		}
+		have_key = 1;
+	}
+
+	/* Write into /etc/stargazer/ssl/certs/<name>/ */
+	char dir[256], cdst[320], kdst[320];
+	mkdir(SSL_DIR, 0700);
+	mkdir(CERT_DIR, 0700);
+	snprintf(dir, sizeof(dir), "%s/%s", CERT_DIR, name);
+	mkdir(dir, 0700);
+	snprintf(cdst, sizeof(cdst), "%s/cert.pem", dir);
+	snprintf(kdst, sizeof(kdst), "%s/key.pem", dir);
+
+	if (cert_write_file(cdst, cbuf, (size_t)cn, 0644) != 0) {
+		send_error(client_fd, SG_ERR_INTERNAL, "could not store certificate");
+		return 0;
+	}
+	if (have_key && cert_write_file(kdst, kbuf, (size_t)kn, 0600) != 0) {
+		send_error(client_fd, SG_ERR_INTERNAL, "could not store private key");
+		return 0;
+	}
+	/* NOTE: source files are NOT removed here — webd's staged /tmp uploads are
+	 * cleaned by flow_cert_import (success + failure), while the CLI passes the
+	 * user's own on-device paths which must be left intact. */
+
+	/* DB metadata row → lists in the certificate dropdown. */
+	char meta[768];
+	snprintf(meta, sizeof(meta), "name=%s\nhas-key=%s\n%s%s%s",
+		 name, have_key ? "yes" : "no",
+		 comment[0] ? "comment=" : "",
+		 comment[0] ? comment : "",
+		 comment[0] ? "\n" : "");
+	if (sg_db_set("system_certificate", name, meta) != 0) {
+		send_error(client_fd, SG_ERR_INTERNAL,
+			   "certificate stored but DB update failed");
+		return 0;
+	}
+
+	/* A protect-server profile may already reference this name (or the cert was
+	 * rotated in place) — re-sync so ssld picks up the new material. */
+	ssld_sync();
+
+	mgmt_log("INFO", "cert import: '%s' (key=%s)", name,
+		 have_key ? "yes" : "no");
+	send_ok(client_fd, NULL, "certificate imported");
+	return 0;
 }

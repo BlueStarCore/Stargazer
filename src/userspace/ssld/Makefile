@@ -20,7 +20,7 @@ BUILD  := build
 IPSD   := ../ipsd/tls_clienthello.c ../ipsd/tls_policy.c \
           ../ipsd/sig_rule.c ../ipsd/ac.c
 
-SSLD_SRCS := main.c conn.c relay.c origdst.c ca.c certcache.c bump.c $(IPSD)
+SSLD_SRCS := main.c conn.c relay.c origdst.c ca.c certcache.c bump.c revmap.c $(IPSD)
 
 .PHONY: test relay-test ca-test bump-test ssld clean
 

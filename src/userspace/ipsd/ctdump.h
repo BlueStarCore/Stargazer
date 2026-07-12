@@ -2,10 +2,10 @@
 /*
  * ctdump.h - query conntrack for a specific flow via ctnetlink.
  *
- * ipsd uses this module to fetch CTA_ML (14 ML feature accumulators) and
+ * ipsd uses this module to fetch CTA_ML (17 ML feature accumulators) and
  * CTA_COUNTERS (pkts_fwd / pkts_bwd from the ACCT extension) after receiving a
  * packet from NFQUEUE. The result is fed into feature_extract() to compute the
- * 14-feature vector.
+ * 17-feature vector.
  *
  * Design: parsing is split from I/O → ctdump_parse_response() is a pure
  * function over a buffer, testable on the host without a kernel;

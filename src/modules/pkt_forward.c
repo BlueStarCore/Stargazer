@@ -221,10 +221,12 @@ static void ml_account(struct sk_buff *skb, u8 proto, int iif, int oif)
 	ml->pktlen_sum    += len;
 	ml->pktlen_sq_sum += (u64)len * len;
 	ml->pktlen_count++;
-	if (dir == IP_CT_DIR_ORIGINAL)
+	if (dir == IP_CT_DIR_ORIGINAL) {
 		ml->bytes_fwd += len;
-	else
+	} else {
 		ml->bytes_bwd += len;
+		ml->bwd_pktlen_sq_sum += (u64)len * len;  /* -> Bwd Packet Length Std */
+	}
 
 	/* Inter-arrival times, kept in microseconds: the mean is
 	 * iat_sum_us/iat_count and the squares stay consistent with it. A gap is

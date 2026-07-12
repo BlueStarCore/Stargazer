@@ -7,6 +7,7 @@
 #include "relay.h"
 #include "origdst.h"
 #include "bump.h"
+#include "revmap.h"
 #include "tls_clienthello.h"
 #include "sig_rule.h"        /* ../ipsd: sig_match, struct flow_ctx, SIG_* */
 #include "insp_ipc.h"        /* Phase 4: IPC client -> ipsd stateful engine */
@@ -36,6 +37,164 @@ static int connect_upstream(const struct sockaddr_in *dst)
 		return -1;
 	}
 	return fd;
+}
+
+/*
+ * Certificate-inspection probe: do a VERIFIED TLS handshake to the real server
+ * (separate short-lived connection) to validate its certificate WITHOUT touching
+ * the client's session. SSL_VERIFY_PEER makes SSL_connect fail on expired/
+ * untrusted-CA/broken-chain; SSL_set1_host adds CN/SAN-vs-SNI name matching.
+ * Returns 1 = cert valid & trusted & name matches, 0 = invalid/untrusted.
+ * (Revocation/OCSP is not checked in this MVP.)
+ */
+static int probe_server_cert(const struct sockaddr_in *dst, const char *sni)
+{
+	int fd = connect_upstream(dst);
+	if (fd < 0)
+		return 1;   /* cannot reach server to probe → don't block on our error */
+
+	int ok = 0;
+	SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+	if (ctx) {
+		SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+		if (SSL_CTX_load_verify_locations(ctx,
+				"/etc/ssl/certs/ca-certificates.crt", NULL) != 1)
+			SSL_CTX_set_default_verify_paths(ctx);
+		SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+
+		SSL *ssl = SSL_new(ctx);
+		if (ssl) {
+			SSL_set_fd(ssl, fd);
+			if (sni && *sni) {
+				SSL_set_tlsext_host_name(ssl, sni);
+				SSL_set1_host(ssl, sni);   /* cert name must match SNI */
+			}
+			if (SSL_connect(ssl) == 1 &&
+			    SSL_get_verify_result(ssl) == X509_V_OK)
+				ok = 1;
+			SSL_shutdown(ssl);
+			SSL_free(ssl);
+		}
+		SSL_CTX_free(ctx);
+	}
+	close(fd);
+	return ok;
+}
+
+/* Forward decls — ssld_ipc_* are defined later but used by cert_inspect_flow. */
+static int  ssld_ipc_open(int client_fd, uint16_t dport, const char *sni,
+			  const struct sockaddr_in *dst);
+static void ssld_ipc_close(int fd);
+
+/*
+ * Cert-mode splice relay that ALSO drives ipsd ML scoring: relay raw bytes both
+ * ways (encryption stays end-to-end) and, every CERT_SCORE_EVERY bytes, send an
+ * INSP_SCORE to ipsd (ML-only, no plaintext). ipsd scores ONCE at the checkpoint
+ * (24 packets / 14 KB on the leg) and replies; DROP → stop (the caller closes,
+ * which tears down the flow). After ML has run (src==1) we stop asking.
+ * Returns 1 if blocked by ML, 0 if relayed to EOF.
+ */
+#define CERT_SCORE_EVERY  4096u
+static int cert_relay(int client_fd, int up_fd, int ipc_fd)
+{
+	int a_open = 1, b_open = 1, scored = 0;
+	size_t since = 0;
+	struct pollfd pfd[2];
+
+	while (a_open || b_open) {
+		pfd[0].fd = a_open ? client_fd : -1; pfd[0].events = POLLIN; pfd[0].revents = 0;
+		pfd[1].fd = b_open ? up_fd : -1;     pfd[1].events = POLLIN; pfd[1].revents = 0;
+
+		if (poll(pfd, 2, -1) < 0) {
+			if (errno == EINTR) continue;
+			return 0;
+		}
+		char buf[RELAY_BUF_SIZE];
+		if (a_open && (pfd[0].revents & (POLLIN | POLLHUP | POLLERR))) {
+			ssize_t n = read(client_fd, buf, sizeof(buf));
+			if (n > 0) { if (relay_write_all(up_fd, buf, (size_t)n) < 0) return 0; since += (size_t)n; }
+			else { a_open = 0; if (n == 0) shutdown(up_fd, SHUT_WR); else b_open = 0; }
+		}
+		if (b_open && (pfd[1].revents & (POLLIN | POLLHUP | POLLERR))) {
+			ssize_t n = read(up_fd, buf, sizeof(buf));
+			if (n > 0) { if (relay_write_all(client_fd, buf, (size_t)n) < 0) return 0; since += (size_t)n; }
+			else { b_open = 0; if (n == 0) shutdown(client_fd, SHUT_WR); else a_open = 0; }
+		}
+
+		/* periodic ML score (until ML has actually run once) */
+		if (!scored && ipc_fd >= 0 && since >= CERT_SCORE_EVERY) {
+			since = 0;
+			struct insp_hdr q;
+			memset(&q, 0, sizeof(q));
+			q.type = INSP_SCORE;
+			struct { struct insp_hdr h; struct insp_verdict_body v; } reply;
+			if (send(ipc_fd, &q, sizeof(q), MSG_NOSIGNAL) < 0 ||
+			    recv(ipc_fd, &reply, sizeof(reply), 0) != (ssize_t)sizeof(reply) ||
+			    reply.h.type != INSP_VERDICT) {
+				ipc_fd = -1;                 /* IPC broken → keep relaying, no ML */
+			} else if (reply.v.action == INSP_DROP) {
+				return 1;                    /* ML blocked the flow */
+			} else if (reply.v.src == 1) {
+				scored = 1;                  /* ML ran (PASS/ALERT) → stop asking */
+			}
+		}
+	}
+	return 0;
+}
+
+/*
+ * Certificate-inspection mode (FortiGate "certificate inspection"): NO payload
+ * decryption. Inspect handshake metadata only:
+ *   1. Web filter — block by SNI/FQDN (block list).
+ *   2. Validate the server certificate (probe). Block if invalid AND the profile
+ *      says block-on-untrusted (verify_upstream).
+ *   3. Otherwise splice (raw relay) — TLS stays end-to-end, client sees the REAL
+ *      server cert, no CA install needed.
+ * NOTE: routing the passed flow into the IPS ML check (cert-mode + IPS on) is a
+ * follow-up — currently a passed flow is relayed as-is.
+ */
+static void cert_inspect_flow(int client_fd, const struct sockaddr_in *dst,
+			      const char *sni, int has_sni,
+			      const struct ssld_ctx *ctx,
+			      const char *dip, int dport, struct ssld_stats *st)
+{
+	/* (1) web filter: block by SNI */
+	if (ctx->block && has_sni && tls_policy_is_bypassed(ctx->block, sni)) {
+		fprintf(stderr, "ssld: CERT-BLOCK (web-filter) sni=%s\n", sni);
+		if (st) st->n_error++;
+		close(client_fd);
+		return;
+	}
+	/* (2) server certificate validation (only act when configured to block) */
+	if (ctx->verify_upstream && !probe_server_cert(dst, has_sni ? sni : NULL)) {
+		fprintf(stderr, "ssld: CERT-BLOCK (invalid/untrusted cert) host=%s\n",
+			has_sni ? sni : dip);
+		if (st) st->n_error++;
+		close(client_fd);
+		return;
+	}
+	/* (3) pass → splice (encryption stays end-to-end). If the profile is bound to
+	 * an IPS-enabled policy, also drive ipsd ML scoring via INSP_SCORE (cert mode
+	 * has no plaintext → ML-only, no signature). */
+	if (st) st->n_splice++;
+	fprintf(stderr, "ssld: CERT-PASS %s:%d sni=%s%s\n", dip, dport,
+		has_sni ? sni : "(none)", ctx->ips_on ? " [ips-ml]" : "");
+	int up = connect_upstream(dst);
+	if (up < 0) {
+		if (st) st->n_error++;
+		close(client_fd);
+		return;
+	}
+	int ipc_fd = (ctx->ips_on && !ctx->no_ipc)
+		     ? ssld_ipc_open(client_fd, (uint16_t)dport, has_sni ? sni : NULL, dst)
+		     : -1;
+	int blocked = cert_relay(client_fd, up, ipc_fd);   /* ClientHello still in socket → relayed */
+	if (blocked)
+		fprintf(stderr, "ssld: CERT-DROP (ML) host=%s\n", has_sni ? sni : dip);
+	if (ipc_fd >= 0)
+		ssld_ipc_close(ipc_fd);
+	close(up);
+	close(client_fd);
 }
 
 /*
@@ -90,6 +249,11 @@ struct insp_ctx {
 	int                 ipc_fd;
 	uint32_t            chunk_id;
 	int                 fail_closed;   /* IPC error -> block flow instead of fallback */
+	/* Flow-IPS offload: bytes inspected per direction (0=to_server, 1=to_client).
+	 * Past INSP_WINDOW the rest of that direction is relayed uninspected — the
+	 * userspace mirror of the kernel `connbytes 0:N` offload on the NFQUEUE path,
+	 * so large HTTPS transfers run at near-native speed after the window. */
+	uint32_t            inspected[2];
 };
 
 /* Log alerts to the SAME file as ipsd so `execute diagnose ips alerts` also sees
@@ -185,7 +349,7 @@ static int conn_inspect_local(struct insp_ctx *ic, const unsigned char *data,
 	int drop = (ic->rs->rules[idx].action == SIG_DROP);
 	conn_alert(ic, drop, ic->rs->rules[idx].sid,
 		   ic->rs->rules[idx].msg, to_server, 0 /*signature*/, 0.0f);
-	return drop ? 1 : 0;
+	return drop 	? 1 : 0;
 }
 
 /* Phase 4: push a plaintext chunk over IPC to the ipsd stateful engine (reass +
@@ -238,12 +402,21 @@ static int conn_inspect_ipc(struct insp_ctx *ic, const unsigned char *data,
 	return 0;
 }
 
+/* Inspection window per direction. Attack signatures live in the request headers
+ * and the early response body, so inspect only the first window then offload to a
+ * raw relay. Matches the cleartext NFQUEUE budget (connbytes 0:16384). */
+#define INSP_WINDOW 16384u
+
 static int conn_inspect(const unsigned char *data, int len, int to_server,
 			void *ud)
 {
 	struct insp_ctx *ic = ud;
 	if (len <= 0)
 		return 0;
+	int dir = to_server ? 0 : 1;
+	if (ic->inspected[dir] >= INSP_WINDOW)
+		return 0;                       /* window exhausted -> offload (relay only) */
+	ic->inspected[dir] += (uint32_t)len;
 	if (ic->ipc_fd >= 0)
 		return conn_inspect_ipc(ic, data, len, to_server);
 	return conn_inspect_local(ic, data, len, to_server);
@@ -458,6 +631,54 @@ void ssld_handle_conn(int client_fd, const struct ssld_ctx *ctx,
 	enum tls_ch_result res = peek_clienthello(client_fd, &ch);
 	int has_sni = (res == TLS_CH_OK && ch.has_sni);
 	const char *sni = has_sni ? ch.sni : NULL;
+
+	/* [3-rev] REVERSE ("Protect SSL Server"): if the ORIGINAL destination (the
+	 * VIP the external client targeted) matches a configured protected server,
+	 * terminate with that server's REAL cert+key and re-encrypt to its backend.
+	 * Takes precedence over the forward forge/splice decision. */
+	if (ctx->revmap) {
+		const struct rev_server *rev = revmap_match(ctx->revmap,
+				dst.sin_addr.s_addr, dst.sin_port, sni);
+		if (rev) {
+			if (st) st->n_bump++;
+			struct insp_ctx ic = {
+				.rs = ctx->rules, .dport = (uint16_t)dport,
+				.host = has_sni ? ch.sni : dip,
+			};
+			snprintf(ic.dst_ip, sizeof(ic.dst_ip), "%s", dip);
+			struct sockaddr_in peer;
+			socklen_t plen = sizeof(peer);
+			if (getpeername(client_fd, (struct sockaddr *)&peer, &plen) == 0) {
+				inet_ntop(AF_INET, &peer.sin_addr, ic.src_ip,
+					  sizeof(ic.src_ip));
+				ic.src_port = ntohs(peer.sin_port);
+			}
+			ic.fail_closed = ctx->ipc_failclosed;
+			ic.ipc_fd = ctx->no_ipc ? -1
+					: ssld_ipc_open(client_fd, ic.dport, sni, &dst);
+
+			struct bump_cfg bc = {
+				.reverse   = 1,
+				.srv_cert  = rev->cert,
+				.srv_chain = rev->chain,
+				.srv_key   = rev->key,
+				.upstream  = &rev->backend,
+				.verify_upstream = 0,   /* backend is our own server */
+				.inspect = conn_inspect, .inspect_ud = &ic,
+				.on_block = conn_on_block,
+			};
+			bump_run(client_fd, sni, &dst, &bc);   /* consumes client_fd */
+			ssld_ipc_close(ic.ipc_fd);
+			return;
+		}
+	}
+
+	/* [3-cert] CERTIFICATE inspection mode: validate cert + web-filter, NO
+	 * decryption. Block on bad cert / blocked SNI, else splice. */
+	if (ctx->cert_inspect) {
+		cert_inspect_flow(client_fd, &dst, sni, has_sni, ctx, dip, dport, st);
+		return;
+	}
 
 	/* [3] decision */
 	enum tls_action act = tls_policy_decide(ctx->pol, sni, has_sni);

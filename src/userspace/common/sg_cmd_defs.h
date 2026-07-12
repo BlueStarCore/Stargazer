@@ -63,6 +63,9 @@ X("configure security ssl-inspection-profile", "Configure SSL inspection profile
 X("execute firmware",                       "Firmware management",                     "admin",           0,  NULL)
 X("execute firmware upgrade",               "Upgrade firmware from URL",               "admin",           1,  cmd_fw_upgrade)
 
+X("execute certificate",                    "Certificate management",                  "admin",           0,  NULL)
+X("execute certificate import",             "Import server cert+key: <name> <cert-file> [key-file]", "admin", 1, cmd_cert_import)
+
 X("execute ping",                           "Ping a host (ICMP echo request)",         "monitor",         1,  cmd_ping)
 X("execute traceroute",                     "Trace route to a host",                   "monitor",         1,  cmd_traceroute)
 X("execute nslookup",                       "DNS lookup for a host or IP",             "monitor",         1,  cmd_nslookup)

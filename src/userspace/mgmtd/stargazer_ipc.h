@@ -184,6 +184,7 @@ typedef enum {
 	SG_CMD_IPS_ALERTS_CLEAR      = 692,   /* truncate ips-alert.log (root) */
 	SG_CMD_IPS_SCORES            = 693,   /* per-flow ML scores (ipsd dump loop) */
 	SG_CMD_SSL_DIAG              = 694,   /* SSL inspection diagnostics (debug) */
+	SG_CMD_CERT_IMPORT           = 695,   /* import a server cert/key (payload: name=+cert=+key= staged paths) */
 
 	/* Keepalive / ping (9xx) */
 	SG_CMD_PING          = 900,

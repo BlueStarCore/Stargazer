@@ -3,7 +3,7 @@
  * ips_model.h - thin wrapper around the LightGBM model converted to C (tl2cgen).
  *
  * The model code lives in model/predict.{c,h} (MACHINE-GENERATED — do not edit by hand).
- * This file just wraps it conveniently: takes a 14-feature vector (in feature.h order)
+ * This file just wraps it conveniently: takes a 17-feature vector (in feature.h order)
  * → returns a probability.
  */
 #ifndef SG_IPS_MODEL_H

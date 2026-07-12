@@ -149,6 +149,8 @@ int handle_ssl_cacert(int client_fd, const char *user,
 		      const char *payload, const sg_request_hdr_t *hdr);
 int handle_ssl_diag(int client_fd, const char *user,
 		    const char *payload, const sg_request_hdr_t *hdr);
+int handle_cert_import(int client_fd, const char *user,
+		       const char *payload, const sg_request_hdr_t *hdr);
 int handle_ips_status(int client_fd, const char *user,
 		      const char *payload, const sg_request_hdr_t *hdr);
 int handle_ips_alerts(int client_fd, const char *user,

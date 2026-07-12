@@ -96,10 +96,10 @@ Ràng buộc cứng của dự án: **không float trong kernel**. LightGBM (tl2
    ── ipsd nhận gói từ NFQUEUE ──────────────────────────────────────────────
    1. parse IP/TCP/UDP; lấy payload L4; lấy ctmark + tuple (NFQA_CT)
    2. đọc flow-stats: dump CTA_ML theo tuple (tái dùng parser mgmtd) → 14 feature
-   3. signature L1 (flow rule): cờ/đếm/port  ─┐
-   4. signature L2 (Aho-Corasick trên payload)├─► fusion
-   5. LightGBM: predict()+sigmoid → score ────┘
-   6. fusion → verdict:
+   3. signature L1 (flow rule: cờ/đếm/port) ──► khớp? ─Yes─► verdict NGAY (short-circuit, KHỎI chạy ML)
+   4. signature L2 (Aho-Corasick payload)   ──► khớp? ─Yes─► verdict NGAY (short-circuit)
+   5. CHỈ KHI không signature nào khớp → LightGBM: predict()+sigmoid → score
+   6. fusion → verdict (signature thắng; ML chỉ quyết khi không có sig):
         sig DROP / score≥block  → set connmark=BLOCK, nfq verdict DROP, log alert
         score≥alert (< block)   → log alert, connmark=INSPECTED, nfq ACCEPT  (mode detect)
         ngược lại               → connmark=INSPECTED, nfq ACCEPT

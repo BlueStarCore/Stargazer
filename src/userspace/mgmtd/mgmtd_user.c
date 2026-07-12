@@ -1012,201 +1012,201 @@ int handle_admin_lock_pw(int client_fd, const char *user,
  *
  * Permission: caller must be root (logind runs as UID 0).
  */
-int handle_auth_login(int client_fd, const char *user,
-		      const char *payload, const sg_request_hdr_t *hdr)
-{
-	(void)hdr;
-
-	/* Only privileged daemons can call auth commands:
-	 * root (logind) and __webd (web login proxy). */
-	if (strcmp(user, "root") != 0 && strcmp(user, "__webd") != 0) {
-		send_error(client_fd, SG_ERR_PERM_DENIED,
-			   "Auth commands require privileged caller");
-		return 0;
-	}
-
-	if (!payload) {
-		send_error(client_fd, SG_ERR_MISSING_ARG, "Missing credentials");
-		return 0;
-	}
-
-	/* Parse "username\npassword\n" */
-	char target[SG_USERNAME_MAX] = {0};
-	char password[MAX_LINE] = {0};
-
-	const char *nl = strchr(payload, '\n');
-	if (!nl) {
-		send_error(client_fd, SG_ERR_INVALID_ARG, "Bad payload format");
-		return 0;
-	}
-	size_t ulen = (size_t)(nl - payload);
-	if (ulen == 0 || ulen >= sizeof(target)) {
-		send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid username");
-		return 0;
-	}
-	memcpy(target, payload, ulen);
-	target[ulen] = '\0';
-
-	const char *pw_start = nl + 1;
-	size_t pw_len = strlen(pw_start);
-	if (pw_len > 0 && pw_start[pw_len - 1] == '\n')
-		pw_len--;
-	if (pw_len >= sizeof(password)) {
-		send_error(client_fd, SG_ERR_INVALID_ARG, "Password too long");
-		return 0;
-	}
-	memcpy(password, pw_start, pw_len);
-	password[pw_len] = '\0';
-
-	if (!sg_is_safe_id(target)) {
-		explicit_bzero(password, sizeof(password));
-		send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid username");
-		return 0;
-	}
-
-	/*
-	 * Constant-time defense (BUG-AUTH-01): dummy hash for crypt() when
-	 * user not found or account locked — ensures response latency
-	 * doesn't leak username validity or lockout state.
-	 */
-	static const char dummy_hash[] =
-		"$6$dummy.salt.value$"
-		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-
-	/*
-	 * Lockout check (before real crypt — avoids wasting CPU on locked
-	 * accounts).  Like OpenSSH/PAM pam_faillock: lockout is checked
-	 * and enforced inside the auth handler, not by the caller.
-	 * The same "Invalid credentials" message is returned for locked
-	 * accounts to avoid leaking lockout state to an attacker.
-	 */
-	int lockout_fail_count = 0;
-	long lockout_until = 0;
-	sg_db_lockout_get(target, &lockout_fail_count, &lockout_until);
-	time_t now = time(NULL);
-	if (lockout_until > 0 && now < lockout_until) {
-		/* Account locked — run crypt on dummy for timing defense */
-		(void)crypt(password, dummy_hash);
-		explicit_bzero(password, sizeof(password));
-		mgmt_log("INFO", "auth: login rejected for %s "
-			 "(locked until %ld, now %ld)", target,
-			 lockout_until, (long)now);
-		send_error(client_fd, SG_ERR_AUTH_FAIL, "Invalid credentials");
-		return 0;
-	}
-	/* If lockout has expired, reset the counter */
-	if (lockout_until > 0 && now >= lockout_until) {
-		lockout_fail_count = 0;
-		lockout_until = 0;
-	}
-
-	struct spwd *sp = getspnam(target);
-	const char *hash = sp ? sp->sp_pwdp : dummy_hash;
-
-	char *result = crypt(password, hash);
-
-	int auth_ok = 0;
-
-	if (!sp) {
-		/* User not found — fail after crypt (timing constant) */
-	} else if (sp->sp_pwdp[0] == '!' || sp->sp_pwdp[0] == '*') {
-		/* Shadow-locked account (passwd -l, or a freshly-created admin
-		 * whose password is unset). Do NOT early-return a distinct
-		 * status: that would leak account existence/state via a unique
-		 * error code and a faster (no-compare) response. crypt() already
-		 * ran above for timing parity; leave auth_ok=0 so this falls
-		 * through to the same "Invalid credentials" + lockout path as a
-		 * wrong password. (A '!'/'*' hash can never equal a crypt result.) */
-	} else if (sp->sp_pwdp[0] == '\0' && password[0] == '\0') {
-		/* Empty password (first-login) */
-		auth_ok = 1;
-	} else if (result && strcmp(result, sp->sp_pwdp) == 0) {
-		auth_ok = 1;
-	}
-
-	if (!auth_ok) {
-		explicit_bzero(password, sizeof(password));
-		/* Lockout accounting: increment fail count, set lockout
-		 * time if threshold reached. Escalating backoff like
-		 * pam_faillock: 2min → 4min → 8min ... max 1hr. */
-		lockout_fail_count++;
-		if (lockout_fail_count >= AUTH_MAX_FAILS) {
-			int rounds = (lockout_fail_count - AUTH_MAX_FAILS)
-				     / AUTH_MAX_FAILS;
-			long duration = AUTH_LOCK_BASE;
-			for (int i = 0; i < rounds && duration < AUTH_LOCK_MAX;
-			     i++)
-				duration *= 2;
-			if (duration > AUTH_LOCK_MAX)
-				duration = AUTH_LOCK_MAX;
-			lockout_until = (long)now + duration;
-			mgmt_log("WARN", "auth: locking %s for %lds "
-				 "(fail_count=%d)", target, duration,
-				 lockout_fail_count);
-		}
-		sg_db_lockout_set(target, lockout_fail_count, lockout_until);
-		send_error(client_fd, SG_ERR_AUTH_FAIL, "Invalid credentials");
-		return 0;
-	}
-
-	/* Auth succeeded — clear lockout state */
-	if (lockout_fail_count > 0)
-		sg_db_lockout_clear(target);
-
-	/*
-	 * Ghost account check (BUG-AUTH-2): shadow entry exists but no DB
-	 * record means the account was never created through mgmtd.  Reject
-	 * it so that manually injected shadow entries have no effect.
-	 */
+	int handle_auth_login(int client_fd, const char *user,
+				const char *payload, const sg_request_hdr_t *hdr)
 	{
-		char *admin_cfg = sg_db_get("system_admin", target);
-		if (!admin_cfg) {
-			explicit_bzero(password, sizeof(password));
-			mgmt_log("WARN", "auth: ghost account rejected: %s "
-				 "(shadow entry exists but no DB record)", target);
-			send_error(client_fd, SG_ERR_AUTH_FAIL,
-				   "Invalid credentials");
+		(void)hdr;
+
+		/* Only privileged daemons can call auth commands:
+		* root (logind) and __webd (web login proxy). */
+		if (strcmp(user, "root") != 0 && strcmp(user, "__webd") != 0) {
+			send_error(client_fd, SG_ERR_PERM_DENIED,
+				"Auth commands require privileged caller");
 			return 0;
 		}
-		free(admin_cfg);
+
+		if (!payload) {
+			send_error(client_fd, SG_ERR_MISSING_ARG, "Missing credentials");
+			return 0;
+		}
+
+		/* Parse "username\npassword\n" */
+		char target[SG_USERNAME_MAX] = {0};
+		char password[MAX_LINE] = {0};
+
+		const char *nl = strchr(payload, '\n');
+		if (!nl) {
+			send_error(client_fd, SG_ERR_INVALID_ARG, "Bad payload format");
+			return 0;
+		}
+		size_t ulen = (size_t)(nl - payload);
+		if (ulen == 0 || ulen >= sizeof(target)) {
+			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid username");
+			return 0;
+		}
+		memcpy(target, payload, ulen);
+		target[ulen] = '\0';
+
+		const char *pw_start = nl + 1;
+		size_t pw_len = strlen(pw_start);
+		if (pw_len > 0 && pw_start[pw_len - 1] == '\n')
+			pw_len--;
+		if (pw_len >= sizeof(password)) {
+			send_error(client_fd, SG_ERR_INVALID_ARG, "Password too long");
+			return 0;
+		}
+		memcpy(password, pw_start, pw_len);
+		password[pw_len] = '\0';
+
+		if (!sg_is_safe_id(target)) {
+			explicit_bzero(password, sizeof(password));
+			send_error(client_fd, SG_ERR_INVALID_ARG, "Invalid username");
+			return 0;
+		}
+
+		/*
+		* Constant-time defense (BUG-AUTH-01): dummy hash for crypt() when
+		* user not found or account locked — ensures response latency
+		* doesn't leak username validity or lockout state.
+		*/
+		static const char dummy_hash[] =
+			"$6$dummy.salt.value$"
+			"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+			"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+		/*
+		* Lockout check (before real crypt — avoids wasting CPU on locked
+		* accounts).  Like OpenSSH/PAM pam_faillock: lockout is checked
+		* and enforced inside the auth handler, not by the caller.
+		* The same "Invalid credentials" message is returned for locked
+		* accounts to avoid leaking lockout state to an attacker.
+		*/
+		int lockout_fail_count = 0;
+		long lockout_until = 0;
+		sg_db_lockout_get(target, &lockout_fail_count, &lockout_until);
+		time_t now = time(NULL);
+		if (lockout_until > 0 && now < lockout_until) {
+			/* Account locked — run crypt on dummy for timing defense */
+			(void)crypt(password, dummy_hash);
+			explicit_bzero(password, sizeof(password));
+			mgmt_log("INFO", "auth: login rejected for %s "
+				"(locked until %ld, now %ld)", target,
+				lockout_until, (long)now);
+			send_error(client_fd, SG_ERR_AUTH_FAIL, "Invalid credentials");
+			return 0;
+		}
+		/* If lockout has expired, reset the counter */
+		if (lockout_until > 0 && now >= lockout_until) {
+			lockout_fail_count = 0;
+			lockout_until = 0;
+		}
+
+		struct spwd *sp = getspnam(target);
+		const char *hash = sp ? sp->sp_pwdp : dummy_hash;
+
+		char *result = crypt(password, hash);
+
+		int auth_ok = 0;
+
+		if (!sp) {
+			/* User not found — fail after crypt (timing constant) */
+		} else if (sp->sp_pwdp[0] == '!' || sp->sp_pwdp[0] == '*') {
+			/* Shadow-locked account (passwd -l, or a freshly-created admin
+			* whose password is unset). Do NOT early-return a distinct
+			* status: that would leak account existence/state via a unique
+			* error code and a faster (no-compare) response. crypt() already
+			* ran above for timing parity; leave auth_ok=0 so this falls
+			* through to the same "Invalid credentials" + lockout path as a
+			* wrong password. (A '!'/'*' hash can never equal a crypt result.) */
+		} else if (sp->sp_pwdp[0] == '\0' && password[0] == '\0') {
+			/* Empty password (first-login) */
+			auth_ok = 1;
+		} else if (result && strcmp(result, sp->sp_pwdp) == 0) {
+			auth_ok = 1;
+		}
+
+		if (!auth_ok) {
+			explicit_bzero(password, sizeof(password));
+			/* Lockout accounting: increment fail count, set lockout
+			* time if threshold reached. Escalating backoff like
+			* pam_faillock: 2min → 4min → 8min ... max 1hr. */
+			lockout_fail_count++;
+			if (lockout_fail_count >= AUTH_MAX_FAILS) {
+				int rounds = (lockout_fail_count - AUTH_MAX_FAILS)
+						/ AUTH_MAX_FAILS;
+				long duration = AUTH_LOCK_BASE;
+				for (int i = 0; i < rounds && duration < AUTH_LOCK_MAX;
+					i++)
+					duration *= 2;
+				if (duration > AUTH_LOCK_MAX)
+					duration = AUTH_LOCK_MAX;
+				lockout_until = (long)now + duration;
+				mgmt_log("WARN", "auth: locking %s for %lds "
+					"(fail_count=%d)", target, duration,
+					lockout_fail_count);
+			}
+			sg_db_lockout_set(target, lockout_fail_count, lockout_until);
+			send_error(client_fd, SG_ERR_AUTH_FAIL, "Invalid credentials");
+			return 0;
+		}
+
+		/* Auth succeeded — clear lockout state */
+		if (lockout_fail_count > 0)
+			sg_db_lockout_clear(target);
+
+		/*
+		* Ghost account check (BUG-AUTH-2): shadow entry exists but no DB
+		* record means the account was never created through mgmtd.  Reject
+		* it so that manually injected shadow entries have no effect.
+		*/
+		{
+			char *admin_cfg = sg_db_get("system_admin", target);
+			if (!admin_cfg) {
+				explicit_bzero(password, sizeof(password));
+				mgmt_log("WARN", "auth: ghost account rejected: %s "
+					"(shadow entry exists but no DB record)", target);
+				send_error(client_fd, SG_ERR_AUTH_FAIL,
+					"Invalid credentials");
+				return 0;
+			}
+			free(admin_cfg);
+		}
+
+		/*
+		* Authentication succeeded. Check enforce flags and policy.
+		*/
+		int enforce_change = 0;
+		char *epc_val = sg_db_get_val("system_admin", target,
+						"enforce-change-password");
+		if (epc_val) {
+			if (strcmp(epc_val, "enable") == 0)
+				enforce_change = 1;
+			free(epc_val);
+		}
+
+		int policy_mismatch = 0;
+		if (mgmtd_is_policy_enforced(target)) {
+			const char *reason = NULL;
+			int rc = mgmtd_validate_password(target, password, NULL,
+							&reason);
+			if (rc != 0)
+				policy_mismatch = 1;
+		}
+
+		explicit_bzero(password, sizeof(password));
+
+		char resp[128];
+		snprintf(resp, sizeof(resp), "enforce_change=%d\npolicy_mismatch=%d\n",
+			enforce_change, policy_mismatch);
+
+		if (g_debug_flags & SG_DBG_FLAG_AUTH)
+			debug_buf_push("[AUTH-DBG] auth_login user=%s result=ok "
+					"enforce=%d policy_mismatch=%d\n",
+					target, enforce_change, policy_mismatch);
+
+		send_ok(client_fd, NULL, resp);
+		return 0;
 	}
-
-	/*
-	 * Authentication succeeded. Check enforce flags and policy.
-	 */
-	int enforce_change = 0;
-	char *epc_val = sg_db_get_val("system_admin", target,
-				       "enforce-change-password");
-	if (epc_val) {
-		if (strcmp(epc_val, "enable") == 0)
-			enforce_change = 1;
-		free(epc_val);
-	}
-
-	int policy_mismatch = 0;
-	if (mgmtd_is_policy_enforced(target)) {
-		const char *reason = NULL;
-		int rc = mgmtd_validate_password(target, password, NULL,
-						  &reason);
-		if (rc != 0)
-			policy_mismatch = 1;
-	}
-
-	explicit_bzero(password, sizeof(password));
-
-	char resp[128];
-	snprintf(resp, sizeof(resp), "enforce_change=%d\npolicy_mismatch=%d\n",
-		 enforce_change, policy_mismatch);
-
-	if (g_debug_flags & SG_DBG_FLAG_AUTH)
-		debug_buf_push("[AUTH-DBG] auth_login user=%s result=ok "
-			       "enforce=%d policy_mismatch=%d\n",
-			       target, enforce_change, policy_mismatch);
-
-	send_ok(client_fd, NULL, resp);
-	return 0;
-}
 
 /*
  * SG_CMD_AUTH_CHANGE_PW — Change password during forced login flow.

@@ -183,6 +183,30 @@ static int resolve_service(const char *val,
 
 /* ── Helpers ────────────────────────────────────────────────────────────── */
 
+/* Emit the iptables destination-port match for a firewall service port spec.
+ * Accepts FortiOS-style values: a single port "80", a dash range "80-443", or
+ * a comma list "80,443,8000-8080". iptables needs ':' for ranges and
+ * "-m multiport --dports" for a list, so translate here (the DB keeps the
+ * FortiOS dash form; passing it verbatim to --dport made iptables-restore fail). */
+static void emit_service_dport(struct dynbuf *buf, const char *svc_port)
+{
+	char conv[VALBUFSZ];
+	size_t j = 0;
+	int has_comma = 0;
+	for (size_t i = 0; svc_port[i] && j < sizeof(conv) - 1; i++) {
+		char c = svc_port[i];
+		if (c == '-')      c = ':';   /* FortiOS range "-" → iptables ":" */
+		else if (c == ',') has_comma = 1;
+		conv[j++] = c;
+	}
+	conv[j] = '\0';
+
+	if (has_comma)
+		dbuf_printf(buf, " -m multiport --dports %s", conv);
+	else
+		dbuf_printf(buf, " --dport %s", conv);
+}
+
 static const char *action_to_target(const char *action)
 {
 	if (strcmp(action, "accept") == 0 || strcmp(action, "allow") == 0)
@@ -729,8 +753,7 @@ sg_status_t rebuild_forward_chain(char *result, size_t rsize)
 					/* ICMP has no ports */
 					if (svc_port[0] &&
 					    strcmp(svc_proto, "icmp") != 0)
-						dbuf_printf(&buf, " --dport %s",
-							    svc_port);
+						emit_service_dport(&buf, svc_port);
 				}
 			}
 
